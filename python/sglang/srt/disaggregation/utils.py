@@ -441,9 +441,14 @@ def kv_to_page_indices(kv_indices: np.ndarray, page_size: int):
     # 2. page index = kv_index // page_size
     # The return vector is kv_indices[::page_size] // page_size
     if page_size == 1:  # shortcut
-        return kv_indices
+        return np.asarray(kv_indices, dtype=np.int32)
 
-    return kv_indices[::page_size] // page_size
+    # NIXL serializes this array as raw bytes and the receiver decodes it as
+    # int32.  Torch allocator indices arrive here as NumPy int64; preserving
+    # that dtype turns every page id into two wire entries (page_id, 0), which
+    # silently transfers every other source page into page zero.  Keep the
+    # wire-format contract explicit at this shared boundary.
+    return np.asarray(kv_indices[::page_size] // page_size, dtype=np.int32)
 
 
 def kv_to_page_num(num_kv_indices: int, page_size: int):

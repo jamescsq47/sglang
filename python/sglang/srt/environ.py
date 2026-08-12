@@ -300,6 +300,56 @@ class Envs:
     # Mooncake Store
     SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_MOONCAKE_REUSE_TE = EnvBool(True)
+    # Experimental request-generation KV lifecycle for multi-turn PD serving.
+    # Defaults are intentionally off so stock SGLang baseline behavior is unchanged.
+    SGLANG_AGENTIC_KV_LIFECYCLE = EnvBool(False)
+    SGLANG_AGENTIC_KV_FAST_TOOL_THRESHOLD = EnvFloat(0.2)
+    SGLANG_AGENTIC_KV_DIRECT_BOOTSTRAP_PORT = EnvInt(0)
+    SGLANG_AGENTIC_KV_DIRECT_HANDSHAKE_TIMEOUT = EnvFloat(2.0)
+    SGLANG_AGENTIC_KV_HOST_TRANSITION_GRACE = EnvFloat(8.0)
+    SGLANG_AGENTIC_KV_READY_TIMEOUT = EnvFloat(120.0)
+    SGLANG_AGENTIC_KV_STALE_SECONDS = EnvFloat(300.0)
+    SGLANG_AGENTIC_KV_HIGH_WATERMARK = EnvFloat(0.90)
+    SGLANG_AGENTIC_KV_CAPACITY_GIB = EnvFloat(256.0)
+    SGLANG_AGENTIC_KV_D_WRITERS = EnvInt(1)
+    SGLANG_AGENTIC_KV_LEDGER_PATH = EnvStr("")
+    # Slow agentic D->P path: D writes a P-owned shared pinned Host extent with
+    # its own PCIe endpoint; P restores it on demand.  Defaults remain off for
+    # an unmodified serving baseline.
+    SGLANG_AGENTIC_KV_HOST_STAGING = EnvBool(False)
+    # When P-Host staging is enabled, D only needs a lightweight Mooncake
+    # metadata client.  Skip the large decode-side Host KV pool/controller.
+    SGLANG_AGENTIC_KV_D_HOSTLESS = EnvBool(False)
+    SGLANG_AGENTIC_KV_STAGING_LEDGER_PATH = EnvStr("")
+    SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_DIR = EnvStr("")
+    SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_GIB = EnvFloat(128.0)
+    # NUMA-aware remote-D relay.  Arena-local D workers reserve fixed HBM
+    # chunks and relay remote-D KV via NVLink before their local PCIe D2H.
+    SGLANG_AGENTIC_KV_RELAY_ENABLED = EnvBool(False)
+    SGLANG_AGENTIC_KV_RELAY_ID = EnvStr("")
+    SGLANG_AGENTIC_KV_GPU_NUMA_NODE = EnvInt(-1)
+    SGLANG_AGENTIC_KV_ARENA_NUMA_NODE = EnvInt(-1)
+    SGLANG_AGENTIC_KV_RELAY_D2H_GIBPS = EnvFloat(21.0)
+    SGLANG_AGENTIC_KV_DIRECT_CROSS_NUMA_GIBPS = EnvFloat(7.45)
+    SGLANG_AGENTIC_KV_RELAY_NVLINK_GIBPS = EnvFloat(220.0)
+    SGLANG_AGENTIC_KV_RELAY_STALE_SECONDS = EnvFloat(5.0)
+    # Fixed relay-HBM chunk geometry.  Defaults reserve 128 MiB-class storage
+    # per Arena-local relay rather than one full request snapshot.
+    SGLANG_AGENTIC_KV_STAGING_SLOT_MIB = EnvInt(64)
+    SGLANG_AGENTIC_KV_STAGING_SLOTS = EnvInt(2)
+    SGLANG_AGENTIC_KV_P_HOST_HIGH_WATERMARK = EnvFloat(0.80)
+    SGLANG_AGENTIC_KV_P_HOST_LOW_WATERMARK = EnvFloat(0.70)
+    SGLANG_AGENTIC_KV_P_HOST_HARD_WATERMARK = EnvFloat(0.90)
+    # Bound large Mooncake PUTs across all same-node decode workers so a burst
+    # of D->Store snapshots cannot starve the P worker's Store->P GET path.
+    # This is consulted only when SGLANG_AGENTIC_KV_LIFECYCLE is enabled.
+    SGLANG_AGENTIC_KV_MAX_CONCURRENT_PUTS = EnvInt(1)
+    SGLANG_AGENTIC_KV_PUT_ADMISSION_DIR = EnvStr(
+        "/dev/shm/sglang-agentic-mooncake-put"
+    )
+    SGLANG_AGENTIC_KV_PUT_ADMISSION_MIN_BYTES = EnvInt(64 * 1024 * 1024)
+    SGLANG_AGENTIC_KV_TOOL_MEAN_SECONDS = EnvStr("{}")
+    SGLANG_AGENTIC_KV_TERMINAL_TOMBSTONE_SECONDS = EnvFloat(300.0)
     MOONCAKE_MASTER = EnvStr(None)
     MOONCAKE_CLIENT = EnvStr(None)
     MOONCAKE_LOCAL_HOSTNAME = EnvStr("localhost")

@@ -870,6 +870,8 @@ class SchedulerMetricsMixin:
             num_tokens = self._get_mamba_token_info()[0]
         else:
             num_tokens = self._get_token_info()[0]
+        num_physical_used_tokens = num_tokens
+        num_running_kv_tokens = sum(req.seqlen for req in self.running_batch.reqs)
 
         # Tokens in waiting queue, bootstrap queue, prealloc queue
         waiting_queues = [self.waiting_queue]
@@ -880,6 +882,18 @@ class SchedulerMetricsMixin:
             waiting_queues.append(self.disagg_decode_transfer_queue.queue)
             waiting_queues.append(self.disagg_decode_prealloc_queue.retracted_queue)
 
+        decode_prealloc_reqs = decode_transfer_reqs = 0
+        decode_prealloc_tokens = decode_transfer_tokens = 0
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            decode_prealloc_reqs = len(self.disagg_decode_prealloc_queue.queue)
+            decode_transfer_reqs = len(self.disagg_decode_transfer_queue.queue)
+            decode_prealloc_tokens = sum(
+                req.seqlen for req in self.disagg_decode_prealloc_queue.queue
+            )
+            decode_transfer_tokens = sum(
+                req.seqlen for req in self.disagg_decode_transfer_queue.queue
+            )
+
         num_tokens += sum(req.seqlen for queue in waiting_queues for req in queue)
         num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
 
@@ -889,6 +903,14 @@ class SchedulerMetricsMixin:
             num_waiting_reqs=num_waiting_reqs,
             num_tokens=num_tokens,
             ts_tic=time.perf_counter(),
+            num_physical_used_tokens=num_physical_used_tokens,
+            num_running_kv_tokens=num_running_kv_tokens,
+            max_total_num_tokens=self.max_total_num_tokens,
+            max_running_requests=self.max_running_requests,
+            decode_prealloc_queue_reqs=decode_prealloc_reqs,
+            decode_transfer_queue_reqs=decode_transfer_reqs,
+            decode_prealloc_queue_tokens=decode_prealloc_tokens,
+            decode_transfer_queue_tokens=decode_transfer_tokens,
         )
 
     def get_loads(self: Scheduler, req: GetLoadsReqInput = None) -> GetLoadsReqOutput:
@@ -908,6 +930,7 @@ class SchedulerMetricsMixin:
         include_all = "all" in include
 
         num_running_reqs = len(self.running_batch.reqs)
+        num_running_kv_tokens = sum(req.seqlen for req in self.running_batch.reqs)
 
         waiting_queues = [self.waiting_queue]
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -976,6 +999,8 @@ class SchedulerMetricsMixin:
             prefill_inflight = 0
             decode_prealloc = 0
             decode_transfer = 0
+            decode_prealloc_tokens = 0
+            decode_transfer_tokens = 0
             decode_retracted = 0
 
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -986,6 +1011,14 @@ class SchedulerMetricsMixin:
                 mode_str = "decode"
                 decode_prealloc = len(self.disagg_decode_prealloc_queue.queue)
                 decode_transfer = len(self.disagg_decode_transfer_queue.queue)
+                decode_prealloc_tokens = sum(
+                    request.seqlen
+                    for request in self.disagg_decode_prealloc_queue.queue
+                )
+                decode_transfer_tokens = sum(
+                    request.seqlen
+                    for request in self.disagg_decode_transfer_queue.queue
+                )
                 decode_retracted = len(
                     self.disagg_decode_prealloc_queue.retracted_queue
                 )
@@ -996,6 +1029,8 @@ class SchedulerMetricsMixin:
                 prefill_inflight_queue_reqs=prefill_inflight,
                 decode_prealloc_queue_reqs=decode_prealloc,
                 decode_transfer_queue_reqs=decode_transfer,
+                decode_prealloc_queue_tokens=decode_prealloc_tokens,
+                decode_transfer_queue_tokens=decode_transfer_tokens,
                 decode_retracted_queue_reqs=decode_retracted,
                 kv_transfer_speed_gb_s=self.stats.kv_transfer_speed_gb_s,
                 kv_transfer_latency_ms=self.stats.kv_transfer_latency_ms,
@@ -1022,6 +1057,7 @@ class SchedulerMetricsMixin:
             cache_hit_rate=round(self.stats.cache_hit_rate, 4),
             utilization=round(self.stats.utilization, 4),
             max_running_requests=self.max_running_requests,
+            num_running_kv_tokens=num_running_kv_tokens,
             memory=memory,
             speculative=speculative,
             lora=lora,

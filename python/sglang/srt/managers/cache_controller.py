@@ -197,6 +197,7 @@ class StorageOperation:
         last_hash: Optional[str] = None,
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
+        storage_namespace: Optional[str] = None,
     ):
         self.host_indices = host_indices
         self.token_ids = token_ids
@@ -204,6 +205,7 @@ class StorageOperation:
         self.completed_tokens = 0
         self.hash_value = hash_value if hash_value is not None else []
         self.prefix_keys = prefix_keys
+        self.storage_namespace = storage_namespace
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
@@ -220,14 +222,29 @@ class PrefetchOperation(StorageOperation):
         token_ids: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        storage_namespace: Optional[str] = None,
+        agentic_expected_tokens: Optional[int] = None,
+        agentic_extra_key: Optional[str] = None,
     ):
         self.request_id = request_id
 
         self._lock = threading.Lock()
         self._terminated_flag = False
         self.start_time = time.monotonic()
+        self.agentic_expected_tokens = agentic_expected_tokens
+        # HiRadixCache normally derives the radix namespace from the matched
+        # Host node.  A request-generation snapshot can start at the root,
+        # whose extra_key is necessarily None, so carry the trajectory
+        # namespace explicitly for the eventual Host-cache insertion.
+        self.agentic_extra_key = agentic_extra_key
 
-        super().__init__(host_indices, token_ids, last_hash, prefix_keys=prefix_keys)
+        super().__init__(
+            host_indices,
+            token_ids,
+            last_hash,
+            prefix_keys=prefix_keys,
+            storage_namespace=storage_namespace,
+        )
 
     def increment(self, num_tokens: int):
         with self._lock:
@@ -794,12 +811,22 @@ class HiCacheController:
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        storage_namespace: Optional[str] = None,
+        agentic_expected_tokens: Optional[int] = None,
+        agentic_extra_key: Optional[str] = None,
     ) -> PrefetchOperation:
         """
         Prefetch KV caches from storage backend to host memory.
         """
         operation = PrefetchOperation(
-            request_id, host_indices, new_input_tokens, last_hash, prefix_keys
+            request_id,
+            host_indices,
+            new_input_tokens,
+            last_hash,
+            prefix_keys,
+            storage_namespace,
+            agentic_expected_tokens,
+            agentic_extra_key,
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -864,7 +891,12 @@ class HiCacheController:
             ]
             prev_completed_tokens = operation.completed_tokens
             # Get one batch token, and update the completed_tokens if succeed
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            extra_info = HiCacheStorageExtraInfo(
+                prefix_keys=prefix_keys,
+                extra_info={"agentic_page_namespace": operation.storage_namespace}
+                if operation.storage_namespace
+                else None,
+            )
             self.page_get_func(operation, batch_hashes, batch_host_indices, extra_info)
             # Check termination
             if (
@@ -925,7 +957,12 @@ class HiCacheController:
                     batch_tokens[i : i + self.page_size], last_hash
                 )
                 batch_hashes.append(last_hash)
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            extra_info = HiCacheStorageExtraInfo(
+                prefix_keys=prefix_keys,
+                extra_info={"agentic_page_namespace": operation.storage_namespace}
+                if operation.storage_namespace
+                else None,
+            )
             hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
             hash_value.extend(batch_hashes[:hit_page_num])
             storage_query_count += hit_page_num * self.page_size
@@ -962,7 +999,12 @@ class HiCacheController:
                     )
                     storage_hit_count = storage_hit_count_tensor.item()
 
-                if storage_hit_count < self.prefetch_threshold:
+                required_hit_count = (
+                    operation.agentic_expected_tokens
+                    if operation.agentic_expected_tokens is not None
+                    else self.prefetch_threshold
+                )
+                if storage_hit_count < required_hit_count:
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
                     self.append_host_mem_release(operation.host_indices)
@@ -992,12 +1034,17 @@ class HiCacheController:
         token_ids: List[int],
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
+        storage_namespace: Optional[str] = None,
     ) -> int:
         """
         Write KV caches from host memory to storage backend.
         """
         operation = StorageOperation(
-            host_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
+            host_indices,
+            token_ids,
+            hash_value=hash_value,
+            prefix_keys=prefix_keys,
+            storage_namespace=storage_namespace,
         )
         self.backup_queue.put(operation)
         return operation.id
@@ -1026,7 +1073,12 @@ class HiCacheController:
             ]
             # Set one batch token, and record if success.
             # todo: allow partial success
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            extra_info = HiCacheStorageExtraInfo(
+                prefix_keys=prefix_keys,
+                extra_info={"agentic_page_namespace": operation.storage_namespace}
+                if operation.storage_namespace
+                else None,
+            )
             success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
             if not success:
                 logger.warning(

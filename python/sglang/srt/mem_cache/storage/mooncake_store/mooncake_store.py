@@ -285,6 +285,36 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self.store = MooncakeDistributedStore()
 
             self.config = self._load_config(storage_config)
+            self._agentic_put_admission = None
+            if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get():
+                max_concurrent_puts = (
+                    envs.SGLANG_AGENTIC_KV_MAX_CONCURRENT_PUTS.get()
+                )
+                if max_concurrent_puts > 0:
+                    from sglang.srt.mem_cache.storage.mooncake_store.agentic_put_admission import (
+                        AgenticMooncakePutAdmission,
+                    )
+
+                    store_identity = "|".join(
+                        (
+                            str(self.config.master_server_address),
+                            str(self.config.metadata_server),
+                            str(self.config.protocol),
+                        )
+                    )
+                    self._agentic_put_admission = AgenticMooncakePutAdmission(
+                        max_concurrent_puts=max_concurrent_puts,
+                        min_bytes=envs.SGLANG_AGENTIC_KV_PUT_ADMISSION_MIN_BYTES.get(),
+                        base_dir=envs.SGLANG_AGENTIC_KV_PUT_ADMISSION_DIR.get(),
+                        store_identity=store_identity,
+                    )
+                    logger.info(
+                        "Agentic Mooncake PUT admission enabled: max_puts=%d, "
+                        "min_bytes=%d, token_dir=%s",
+                        max_concurrent_puts,
+                        envs.SGLANG_AGENTIC_KV_PUT_ADMISSION_MIN_BYTES.get(),
+                        self._agentic_put_admission.token_dir,
+                    )
             extra_config = (
                 getattr(storage_config, "extra_config", None)
                 if storage_config
@@ -577,6 +607,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        keys = self._apply_agentic_namespace(keys, extra_info)
         # Apply extra_backend_tag prefix if available
         if self.extra_backend_tag is not None:
             prefix = self.extra_backend_tag
@@ -604,6 +635,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        keys = self._apply_agentic_namespace(keys, extra_info)
         # Apply extra_backend_tag prefix if available
         if self.extra_backend_tag is not None:
             prefix = self.extra_backend_tag
@@ -771,6 +803,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def batch_exists(
         self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
+        keys = self._apply_agentic_namespace(keys, extra_info)
         # Apply extra_backend_tag prefix if available
         if self.extra_backend_tag is not None:
             prefix = self.extra_backend_tag
@@ -807,10 +840,79 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def clear(self) -> None:
         self.store.remove_all()
 
+    @staticmethod
+    def _apply_agentic_namespace(
+        keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo]
+    ) -> List[str]:
+        namespace = None
+        if extra_info is not None and isinstance(extra_info.extra_info, dict):
+            namespace = extra_info.extra_info.get("agentic_page_namespace")
+        if not namespace:
+            return keys
+        return [f"{namespace}{key}" for key in keys]
+
+    def agentic_physical_page_keys(
+        self,
+        logical_page_keys: List[str],
+        storage_namespace: Optional[str] = None,
+    ) -> tuple[str, ...]:
+        """Return every physical Mooncake object belonging to logical KV pages.
+
+        HiCache addresses a page by its logical chained hash, while Mooncake
+        stores one object per K/V component (and, when required, per split TP
+        head).  Agentic request-level deletion must therefore expand the full
+        physical key set instead of removing only the logical hashes.
+        """
+
+        keys = list(logical_page_keys)
+        if storage_namespace:
+            keys = [f"{storage_namespace}{key}" for key in keys]
+        if self.extra_backend_tag is not None:
+            keys = [f"{self.extra_backend_tag}_{key}" for key in keys]
+
+        physical_keys = []
+        if self.is_mla_backend:
+            for key in keys:
+                physical_keys.append(f"{key}_{self.mla_suffix}_k")
+            return tuple(physical_keys)
+
+        suffixes = self.mha_suffix if isinstance(self.mha_suffix, list) else [self.mha_suffix]
+        for key in keys:
+            for suffix in suffixes:
+                physical_keys.append(f"{key}_{suffix}_k")
+                physical_keys.append(f"{key}_{suffix}_v")
+        return tuple(physical_keys)
+
+    def agentic_snapshot_layout(
+        self,
+        logical_page_keys: List[str],
+        host_indices: torch.Tensor,
+        storage_namespace: str,
+    ) -> tuple[tuple[str, ...], int]:
+        """Return exact physical objects and bytes for one private snapshot."""
+
+        keys = [f"{storage_namespace}{key}" for key in logical_page_keys]
+        if self.extra_backend_tag is not None:
+            keys = [f"{self.extra_backend_tag}_{key}" for key in keys]
+        physical_keys, _, element_sizes = self._batch_preprocess(keys, host_indices)
+        return tuple(physical_keys), sum(int(size) for size in element_sizes)
+
+    def agentic_snapshot_store(self):
+        """Create the request-generation manifest facade over this store."""
+
+        from sglang.srt.disaggregation.agentic_kv_lifecycle import (
+            MooncakeSnapshotStore,
+        )
+
+        return MooncakeSnapshotStore(self.store)
+
     def _put_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
     ) -> List[int]:
-        return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
+        if self._agentic_put_admission is None:
+            return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
+        with self._agentic_put_admission.admit(sum(buffer_sizes)):
+            return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
 
     def _get_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]

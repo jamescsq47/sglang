@@ -21,6 +21,34 @@ logger = logging.getLogger(__name__)
 
 
 class SchedulerRuntimeCheckerMixin:
+    def _agentic_reserved_tokens(
+        self: Scheduler, *, include_pending_releases: bool = True
+    ) -> int:
+        """Return fixed KV reservations owned by agentic transport helpers."""
+
+        reserved = 0
+        host_staging = getattr(self, "agentic_host_staging_manager", None)
+        if host_staging is not None:
+            reserved += int(host_staging.reserved_token_count)
+        decode_offload = getattr(self, "decode_offload_manager", None)
+        if decode_offload is not None:
+            reserved += int(decode_offload.agentic_reserved_token_count)
+            if include_pending_releases:
+                reserved += int(
+                    decode_offload.agentic_pending_release_token_count
+                )
+        # Early reverse-NIXL receives deliberately allocate exact-size P HBM
+        # pages before a tokenized Req exists.  They are allocator-owned
+        # staging, not a leak; after Req binding the entry is removed and the
+        # same pages are accounted by the Radix cache instead.
+        early_direct = getattr(self, "agentic_early_direct_receives", None)
+        if early_direct:
+            reserved += sum(
+                int(entry.manifest.token_count)
+                for entry in early_direct.values()
+            )
+        return reserved
+
     def _session_held_tokens(self: Scheduler) -> int:
         if isinstance(self.tree_cache, SessionAwareCache):
             return self.tree_cache.session_held_tokens()
@@ -184,10 +212,14 @@ class SchedulerRuntimeCheckerMixin:
         _, _, available_size, evictable_size = self._get_token_info()
         protected_size = self.tree_cache.protected_size()
         session_held = self._session_held_tokens()
+        staging_reserved = self._agentic_reserved_tokens()
         memory_leak = (available_size + evictable_size) != (
-            self.max_total_num_tokens - protected_size - session_held
+            self.max_total_num_tokens
+            - protected_size
+            - session_held
+            - staging_reserved
         )
-        token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}, {session_held=}\n"
+        token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}, {session_held=}, {staging_reserved=}\n"
         return memory_leak, token_msg
 
     def _get_batch_uncached_size(self: Scheduler, batch: ScheduleBatch) -> int:
@@ -236,12 +268,16 @@ class SchedulerRuntimeCheckerMixin:
             logger.info(log_msg)
 
         session_held = self._session_held_tokens()
+        staging_reserved = self._agentic_reserved_tokens(
+            include_pending_releases=False
+        )
         total_tokens = (
             available_size
             + evictable_size
             + protected_size
             + uncached_size
             + session_held
+            + staging_reserved
         )
         assert (
             total_tokens == self.max_total_num_tokens
@@ -361,16 +397,51 @@ class SchedulerRuntimeCheckerMixin:
         if self.enable_hisparse and self.hisparse_coordinator.has_ongoing_staging():
             return
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            if len(self.disagg_prefill_inflight_queue) > 0:
+            if len(self.disagg_prefill_inflight_queue) > 0 or len(
+                getattr(self, "agentic_kv_waiting_queue", ())
+            ) > 0:
                 return
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             queue_size = (
                 len(self.waiting_queue)
                 + len(self.disagg_decode_transfer_queue.queue)
                 + len(self.disagg_decode_prealloc_queue.queue)
+                # Async P->D metadata publication owns fully preallocated KV
+                # after leaving PreallocQueue and before entering
+                # TransferQueue.  It is live work, not an allocator leak.
+                + int(
+                    getattr(
+                        self.disagg_decode_prealloc_queue,
+                        "_async_metadata_pending_count",
+                        0,
+                    )
+                )
             )
             if self.server_args.disaggregation_decode_enable_offload_kvcache:
                 queue_size += len(self.decode_offload_manager.ongoing_offload)
+                # A fast D->P offer intentionally retains the finished D KV
+                # until P has reserved HBM and the NIXL transfer completes.
+                # These pages are owned, not leaked, but are outside native
+                # decode queues while the metadata handshake is in progress.
+                queue_size += len(
+                    getattr(
+                        self.decode_offload_manager,
+                        "agentic_direct_candidates",
+                        (),
+                    )
+                )
+                # Transport completion is produced on a background thread;
+                # allocator and req-pool release is committed on the scheduler
+                # thread shortly afterwards.  Do not run the idle leak checker
+                # in that ownership hand-off window.
+                queue_size += int(
+                    getattr(
+                        self.decode_offload_manager,
+                        "_decode_pending_release_tokens",
+                        0,
+                    )
+                    > 0
+                )
             if queue_size:
                 return
 

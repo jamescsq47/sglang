@@ -621,10 +621,6 @@ async def server_info():
 @app.get("/get_load")
 async def get_load():
     """Get load metrics (deprecated - use /v1/loads instead)."""
-    logger.warning(
-        "Endpoint '/get_load' is deprecated and will be removed in a future version. "
-        "Please use '/v1/loads' instead."
-    )
     return await _global_state.tokenizer_manager.get_load()
 
 

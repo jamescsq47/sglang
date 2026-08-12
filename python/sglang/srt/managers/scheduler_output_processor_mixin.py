@@ -461,11 +461,13 @@ class SchedulerOutputProcessorMixin:
 
             req.check_finished(new_accepted_len)
 
-            if (
-                self.server_args.disaggregation_decode_enable_offload_kvcache
-                and not req.finished()
-            ):
-                self.decode_offload_manager.offload_kv_cache(req)
+            # Keep the complete KV history resident while full-attention decode
+            # is still running. DecodeKVCacheOffloadManager frees page-aligned
+            # device slots after an asynchronous backup; calling it here for an
+            # unfinished request makes the next decode step consume freed (and
+            # potentially reused) KV slots. Persist the generated KV only from
+            # the finished-request branch below, where releasing device slots is
+            # safe and the stored prefix can be reused by the next agent turn.
 
             if req.finished():
                 # delete feature to save memory
@@ -473,16 +475,25 @@ class SchedulerOutputProcessorMixin:
                     req.multimodal_inputs.release_features()
                 self.maybe_collect_routed_experts(req)
 
+                response_ready = True
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
-                    if not self.decode_offload_manager.offload_kv_cache(req):
+                    if self.decode_offload_manager.offload_kv_cache(req):
+                        # Do not block the scheduler on Device->Host->storage.
+                        # stream_output_generation gates this request until the
+                        # manager observes the durable-storage ACK.
+                        response_ready = not self.decode_offload_manager.is_response_pending(
+                            req.rid
+                        )
+                    else:
                         self.decode_offload_manager.finalize_release_on_finish(req)
                 else:
                     if self.enable_hisparse:
                         self.hisparse_coordinator.request_finished(req)
                     release_kv_cache(req, self.tree_cache)
 
-                req.time_stats.set_completion_time()
+                if response_ready:
+                    req.time_stats.set_completion_time()
 
             self.maybe_collect_customized_info(i, req, logits_output)
 
@@ -982,6 +993,12 @@ class SchedulerOutputProcessorMixin:
 
         for req in reqs:
             if req is skip_req:
+                continue
+
+            if (
+                self.decode_offload_manager is not None
+                and self.decode_offload_manager.is_response_pending(req.rid)
+            ):
                 continue
 
             if req.finished():

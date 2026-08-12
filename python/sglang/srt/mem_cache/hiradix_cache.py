@@ -40,10 +40,14 @@ from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
     TreeNode,
     compute_node_hash_values,
+    page_align_keys,
     split_node_hash_value,
 )
 from sglang.srt.mem_cache.utils import convert_to_bigram_key
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
+from sglang.srt.disaggregation.agentic_kv_lifecycle import (
+    SnapshotState,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -143,12 +147,19 @@ class HiRadixCache(RadixCache):
         self.ongoing_write_through = {}
         # record the node segments with ongoing load back
         self.ongoing_load_back = {}
+        self.ongoing_agentic_load_back = {}
+        self.pending_agentic_snapshot_deletes = {}
+        # A P->D ACK can race with the asynchronous write-through ACK for the
+        # same private request branch.  Keep a bounded retry instead of
+        # leaking that branch until normal cache pressure happens to evict it.
+        self.pending_agentic_request_releases = {}
         # record the ongoing prefetch requests
         self.ongoing_prefetch = {}
         self.ongoing_backup = {}
         # track per-request tokens loaded from storage (L3 hits)
         # key: request_id, value: number of tokens actually loaded from storage
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
+        self.prefetch_failed_by_reqid: set[str] = set()
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
@@ -575,6 +586,10 @@ class HiRadixCache(RadixCache):
         self.token_to_kv_pool_host.clear()
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
+        self.prefetch_failed_by_reqid.clear()
+        self.ongoing_agentic_load_back.clear()
+        self.pending_agentic_snapshot_deletes.clear()
+        self.pending_agentic_request_releases.clear()
         self.evictable_host_leaves.clear()
         super().reset()
 
@@ -708,9 +723,232 @@ class HiRadixCache(RadixCache):
             for ack_id in ack_list:
                 end_node = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(end_node)
+                lifecycle = self.ongoing_agentic_load_back.pop(ack_id, None)
+                if lifecycle is not None:
+                    req, snapshot_store, manifest, claim_id = lifecycle
+                    p_gpu = None
+                    try:
+                        p_gpu = snapshot_store.mark_p_gpu(manifest, claim_id)
+                        req._agentic_kv_manifest = p_gpu
+                    except Exception:
+                        logger.exception(
+                            "Failed to ACK agentic P H2D for req %s",
+                            req.rid,
+                        )
+                    if p_gpu is None:
+                        continue
+                    try:
+                        result = snapshot_store.delete_snapshot(
+                            p_gpu, final_state=SnapshotState.CONSUMED
+                        )
+                        logger.info(
+                            "AgenticKV mooncake_consumed snapshot=%s tokens=%d req=%s",
+                            p_gpu.snapshot_id,
+                            p_gpu.token_count,
+                            req.rid,
+                        )
+                        if not result.removed:
+                            self.queue_agentic_delete_retry(
+                                snapshot_store, p_gpu.request
+                            )
+                            logger.info(
+                                "Agentic snapshot %s deletion awaits %d leased pages",
+                                p_gpu.snapshot_id,
+                                len(result.remaining_keys),
+                            )
+                    except Exception:
+                        self.queue_agentic_delete_retry(
+                            snapshot_store, p_gpu.request
+                        )
+                        logger.exception(
+                            "Failed to consume agentic snapshot after P H2D for req %s",
+                            req.rid,
+                        )
 
         # ACK until all events are processed
         del self.cache_controller.ack_load_queue[:finish_count]
+        self._retry_agentic_snapshot_deletes()
+
+    def queue_agentic_delete_retry(self, snapshot_store, request) -> None:
+        self.pending_agentic_snapshot_deletes[request.snapshot_id] = (
+            snapshot_store,
+            request,
+        )
+
+    def _retry_agentic_snapshot_deletes(self) -> None:
+        if not self.pending_agentic_snapshot_deletes:
+            return
+        for snapshot_id, (snapshot_store, request) in list(
+            self.pending_agentic_snapshot_deletes.items()
+        ):
+            try:
+                manifest = snapshot_store.load(request, require_ready=False)
+                if manifest is None or manifest.state in {
+                    SnapshotState.CONSUMED,
+                    SnapshotState.EVICTED,
+                }:
+                    self.pending_agentic_snapshot_deletes.pop(snapshot_id, None)
+                    continue
+                if manifest.state is SnapshotState.P_GPU:
+                    result = snapshot_store.delete_snapshot(
+                        manifest, final_state=SnapshotState.CONSUMED
+                    )
+                    if result.removed:
+                        self.pending_agentic_snapshot_deletes.pop(snapshot_id, None)
+                    continue
+                if manifest.state is not SnapshotState.DELETE_PENDING:
+                    continue
+                result = snapshot_store.delete_snapshot(
+                    manifest, final_state=manifest.deletion_target
+                )
+                if result.removed:
+                    self.pending_agentic_snapshot_deletes.pop(snapshot_id, None)
+            except Exception:
+                logger.exception("Retrying agentic snapshot delete failed: %s", snapshot_id)
+
+    def release_agentic_request_cache(
+        self,
+        req,
+        *,
+        committed_len: Optional[int] = None,
+        _defer_if_blocked: bool = True,
+    ) -> int:
+        """Drop one private request branch from P GPU and Host HiCache.
+
+        Agentic V1 assigns a trajectory-unique ``extra_key``, therefore nodes
+        on this branch cannot be shared by another request.  This method is
+        called only after the P->D transfer ACK, when D owns the complete KV.
+        """
+
+        if not getattr(req, "extra_key", None):
+            return 0
+        committed_len = int(
+            getattr(req, "kv_committed_len", 0)
+            if committed_len is None
+            else committed_len
+        )
+        token_ids = (req.origin_input_ids + req.output_ids)[:committed_len]
+        keys = convert_to_bigram_key(token_ids) if self.is_eagle else token_ids
+        keys = page_align_keys(keys, self.page_size)
+        if not keys:
+            return 0
+        node = self._match_agentic_request_cache(keys, req.extra_key)
+        if node is self.root_node or node.key.extra_key != req.extra_key:
+            logger.warning(
+                "Could not rematch agentic P cache branch after P->D ACK: %s",
+                req.rid,
+            )
+            return 0
+        released = 0
+        while (
+            node is not None
+            and node is not self.root_node
+            and node.lock_ref == 0
+            and node.host_ref_counter == 0
+            and len(node.children) == 0
+            and node.key.extra_key == req.extra_key
+        ):
+            parent = node.parent
+            if not node.evicted:
+                if node.backuped:
+                    released += self._evict_backuped(node)
+                else:
+                    released += len(node.value)
+                    self._evict_regular(node)
+                    node = parent
+                    continue
+
+            # A backuped node is now Host-only.  Remove its host page and the
+            # tree node exactly as the normal Host eviction path does.
+            if node.backuped:
+                released += self.cache_controller.evict_host(node.host_value)
+            key = self.get_child_key_fn(node.key)
+            removed = parent.children.pop(key, None)
+            if removed is not node:
+                raise RuntimeError("agentic cache branch changed during release")
+            self.evictable_leaves.discard(node)
+            self.evictable_host_leaves.discard(node)
+            self._update_leaf_status(parent)
+            self._update_host_leaf_status(parent)
+            node = parent
+
+        # The branch still exists only when an asynchronous HiCache operation
+        # temporarily protects it (or when a descendant is still present).
+        # Retry from the scheduler event loop after write/load ACK processing.
+        remaining = self._match_agentic_request_cache(keys, req.extra_key)
+        release_key = (req.rid, req.extra_key)
+        if remaining is not self.root_node and remaining.key.extra_key == req.extra_key:
+            if _defer_if_blocked:
+                self.pending_agentic_request_releases[release_key] = (
+                    req,
+                    committed_len,
+                    time.monotonic() + 30.0,
+                )
+                logger.info(
+                    "AgenticKV p_to_d_release_deferred req=%s extra_key=%s "
+                    "lock_ref=%d host_ref=%d children=%d",
+                    req.rid,
+                    req.extra_key,
+                    remaining.lock_ref,
+                    remaining.host_ref_counter,
+                    len(remaining.children),
+                )
+        else:
+            self.pending_agentic_request_releases.pop(release_key, None)
+        return released
+
+    def _match_agentic_request_cache(self, keys, extra_key):
+        match = self.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(keys, extra_key, is_bigram=self.is_eagle)
+            )
+        )
+        # The complete branch may be GPU-resident, Host-only, or mixed.  Pick
+        # whichever match reaches deeper in the tree; a GPU-only branch makes
+        # last_host_node climb to the nearest backuped ancestor.
+        return max(
+            [match.last_device_node, match.last_host_node], key=self.get_height
+        )
+
+    def _retry_agentic_request_releases(self) -> None:
+        if not self.pending_agentic_request_releases:
+            return
+        now = time.monotonic()
+        for release_key, (req, committed_len, deadline) in list(
+            self.pending_agentic_request_releases.items()
+        ):
+            released = self.release_agentic_request_cache(
+                req,
+                committed_len=committed_len,
+                _defer_if_blocked=False,
+            )
+            token_ids = (req.origin_input_ids + req.output_ids)[:committed_len]
+            keys = convert_to_bigram_key(token_ids) if self.is_eagle else token_ids
+            keys = page_align_keys(keys, self.page_size)
+            remaining = (
+                self._match_agentic_request_cache(keys, req.extra_key)
+                if keys
+                else self.root_node
+            )
+            if remaining is self.root_node or remaining.key.extra_key != req.extra_key:
+                self.pending_agentic_request_releases.pop(release_key, None)
+                logger.info(
+                    "AgenticKV p_to_d_release_retry tokens=%d req=%s extra_key=%s",
+                    released,
+                    req.rid,
+                    req.extra_key,
+                )
+            elif now >= deadline:
+                self.pending_agentic_request_releases.pop(release_key, None)
+                logger.error(
+                    "AgenticKV p_to_d_release_retry_timeout req=%s extra_key=%s "
+                    "lock_ref=%d host_ref=%d children=%d",
+                    req.rid,
+                    req.extra_key,
+                    remaining.lock_ref,
+                    remaining.host_ref_counter,
+                    len(remaining.children),
+                )
 
     def evictable_size(self):
         return self.evictable_size_
@@ -951,6 +1189,15 @@ class HiRadixCache(RadixCache):
         if last_node.evicted:
             loading_values = self.load_back(last_node, mem_quota)
             if loading_values is not None:
+                req = params.req
+                manifest = getattr(req, "_agentic_kv_manifest", None)
+                if manifest is not None and manifest.state is SnapshotState.P_HOST:
+                    self.ongoing_agentic_load_back[last_node.id] = (
+                        req,
+                        req._agentic_kv_snapshot_store,
+                        manifest,
+                        req._agentic_kv_claim_id,
+                    )
                 logger.debug(
                     f"loading back {len(loading_values)} tokens for node {last_node.id}"
                 )
@@ -977,6 +1224,7 @@ class HiRadixCache(RadixCache):
     def check_hicache_events(self):
         self.writing_check()
         self.loading_check()
+        self._retry_agentic_request_releases()
         if self.enable_storage:
             self.drain_storage_control_queues()
         if self.enable_storage_metrics:
@@ -1022,6 +1270,13 @@ class HiRadixCache(RadixCache):
         )
 
     def can_terminate_prefetch(self, operation: PrefetchOperation):
+        if operation.agentic_expected_tokens is not None:
+            complete = (
+                operation.completed_tokens == operation.agentic_expected_tokens
+            )
+            # A failed page transfer marks the op terminated.  Let the main
+            # thread perform all-or-nothing cleanup instead of waiting forever.
+            return complete or operation.is_terminated()
         can_terminate = True
 
         if self.prefetch_stop_policy == "best_effort":
@@ -1095,12 +1350,33 @@ class HiRadixCache(RadixCache):
                 group=self.tp_group,
             )
             min_completed_tokens = completed_tokens_tensor.item()
+        agentic_failed = (
+            operation.agentic_expected_tokens is not None
+            and min_completed_tokens != operation.agentic_expected_tokens
+        )
+        if agentic_failed:
+            # Never insert a partial request-generation into Host HiCache.
+            self.cache_controller.mem_pool_host.free(
+                host_indices[:min_completed_tokens]
+            )
+            last_host_node.release_host()
+            del self.ongoing_prefetch[req_id]
+            self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+            self.prefetch_loaded_tokens_by_reqid[req_id] = 0
+            self.prefetch_failed_by_reqid.add(req_id)
+            return True
+
         fetched_token_ids = token_ids[:min_completed_tokens]
         written_indices = host_indices[:min_completed_tokens]
+        insertion_extra_key = (
+            operation.agentic_extra_key
+            if operation.agentic_extra_key is not None
+            else last_host_node.key.extra_key
+        )
         matched_length = self._insert_helper_host(
             last_host_node,
             RadixKey(
-                token_ids=fetched_token_ids, extra_key=last_host_node.key.extra_key
+                token_ids=fetched_token_ids, extra_key=insertion_extra_key
             ),
             written_indices,
             hash_value[: min_completed_tokens // self.page_size],
@@ -1139,6 +1415,12 @@ class HiRadixCache(RadixCache):
         This should be called after check_prefetch_progress() returns True.
         """
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
+
+    def pop_prefetch_failed(self, req_id: str) -> bool:
+        if req_id in self.prefetch_failed_by_reqid:
+            self.prefetch_failed_by_reqid.remove(req_id)
+            return True
+        return False
 
     def match_prefix(self, params: MatchPrefixParams):
         key = params.key
@@ -1185,12 +1467,17 @@ class HiRadixCache(RadixCache):
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        storage_namespace: Optional[str] = None,
+        agentic_expected_tokens: Optional[int] = None,
+        agentic_extra_key: Optional[str] = None,
     ):
         new_input_tokens = (
             convert_to_bigram_key(new_input_tokens)
             if self.is_eagle
             else new_input_tokens
         )
+        if agentic_expected_tokens is not None:
+            new_input_tokens = new_input_tokens[:agentic_expected_tokens]
         # align the number of fetching tokens to the page size
         prefetch_length = len(new_input_tokens) - (
             len(new_input_tokens) % self.page_size
@@ -1198,7 +1485,10 @@ class HiRadixCache(RadixCache):
         new_input_tokens = new_input_tokens[:prefetch_length]
         if (
             not self.enable_storage
-            or prefetch_length < self.prefetch_threshold
+            or (
+                agentic_expected_tokens is None
+                and prefetch_length < self.prefetch_threshold
+            )
             or self.cache_controller.prefetch_rate_limited()
         ):
             return
@@ -1213,7 +1503,14 @@ class HiRadixCache(RadixCache):
             # no sufficient host memory for prefetch
             return
         operation = self.cache_controller.prefetch(
-            req_id, host_indices, new_input_tokens, last_hash, prefix_keys
+            req_id,
+            host_indices,
+            new_input_tokens,
+            last_hash,
+            prefix_keys,
+            storage_namespace,
+            agentic_expected_tokens,
+            agentic_extra_key,
         )
         self.ongoing_prefetch[req_id] = (
             last_host_node,
@@ -1404,6 +1701,7 @@ class HiRadixCache(RadixCache):
     def release_aborted_request(self, rid: str):
         # Clean up storage hit tracking for aborted request
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
+        self.prefetch_failed_by_reqid.discard(rid)
 
         if rid not in self.ongoing_prefetch:
             return

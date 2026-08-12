@@ -1016,7 +1016,7 @@ class NixlKVReceiver(CommonKVReceiver):
         self.started_transfer = True
         self.init_time = time.time()
 
-    def poll(self) -> KVPoll:
+    def poll(self, *, update_transport: bool = True) -> KVPoll:
         if self.conclude_state is not None:
             return self.conclude_state
         status = self.kv_mgr.check_status(self.bootstrap_room)
@@ -1038,7 +1038,8 @@ class NixlKVReceiver(CommonKVReceiver):
             self.conclude_state = KVPoll.Failed
             return KVPoll.Failed
 
-        self.kv_mgr.update_transfer_status()
+        if update_transport:
+            self.kv_mgr.update_transfer_status()
         if self.kv_mgr.check_transfer_done(self.bootstrap_room):  # type: ignore
             self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
                 self.bootstrap_room
@@ -1054,6 +1055,24 @@ class NixlKVReceiver(CommonKVReceiver):
             del self.kv_mgr.transfer_statuses[self.bootstrap_room]
             return self.conclude_state  # type: ignore
         return KVPoll.WaitingForInput  # type: ignore
+
+    @classmethod
+    def poll_many(cls, receivers: list["NixlKVReceiver"]) -> list[KVPoll]:
+        """Poll receivers sharing one manager with one notification drain.
+
+        ``update_transfer_status`` drains notifications for every room owned by
+        the manager. Calling it once per request makes a long transfer queue do
+        the same global transport work repeatedly and creates head-of-line
+        stalls. Decode groups only receivers from one queue/manager here.
+        """
+
+        if not receivers:
+            return []
+        manager = receivers[0].kv_mgr
+        if any(receiver.kv_mgr is not manager for receiver in receivers):
+            return [receiver.poll() for receiver in receivers]
+        manager.update_transfer_status()
+        return [receiver.poll(update_transport=False) for receiver in receivers]
 
     def _register_kv_args(self):
         for bootstrap_info in self.bootstrap_infos:

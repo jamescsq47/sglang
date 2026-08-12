@@ -1753,6 +1753,16 @@ class GetLoadReqOutput(BaseReq):
     num_waiting_reqs: int
     num_tokens: int
     ts_tic: float
+    # Extended fields used by token-aware PD routers.  Defaults preserve wire
+    # compatibility with older clients of the deprecated /get_load endpoint.
+    num_physical_used_tokens: int = 0
+    num_running_kv_tokens: int = 0
+    max_total_num_tokens: int = 0
+    max_running_requests: int = 0
+    decode_prealloc_queue_reqs: int = 0
+    decode_transfer_queue_reqs: int = 0
+    decode_prealloc_queue_tokens: int = 0
+    decode_transfer_queue_tokens: int = 0
 
 
 @dataclass
@@ -1808,6 +1818,12 @@ class DisaggregationMetrics:
     )
     decode_transfer_queue_reqs: int = field(
         default=0, metadata={"metric": ("gauge", "Decode transfer queue requests")}
+    )
+    decode_prealloc_queue_tokens: int = field(
+        default=0, metadata={"metric": ("gauge", "Decode prealloc queue KV tokens")}
+    )
+    decode_transfer_queue_tokens: int = field(
+        default=0, metadata={"metric": ("gauge", "Decode transfer queue KV tokens")}
     )
     decode_retracted_queue_reqs: int = field(
         default=0, metadata={"metric": ("gauge", "Decode retracted queue requests")}
@@ -1887,6 +1903,10 @@ class GetLoadsReqOutput(BaseReq):
     )
     max_running_requests: int = field(
         metadata={"metric": ("gauge", "Maximum running requests capacity")}
+    )
+    num_running_kv_tokens: int = field(
+        default=0,
+        metadata={"metric": ("gauge", "KV tokens belonging to running requests")},
     )
 
     memory: Optional[MemoryMetrics] = None

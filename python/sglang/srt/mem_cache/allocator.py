@@ -492,7 +492,14 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         if self.is_not_in_free_group:
-            free_page_indices = torch.unique(free_index // self.page_size)
+            # Request KV locations are stored in token order, so repeated
+            # entries for a physical page are contiguous.  ``unique`` sorts
+            # tens of thousands of token locations on every agentic release;
+            # ``unique_consecutive`` is equivalent for this invariant and
+            # avoids a large scheduler-side CUDA synchronization.
+            free_page_indices = torch.unique_consecutive(
+                free_index // self.page_size
+            )
             if self.need_sort:
                 self.release_pages = torch.cat((free_page_indices, self.release_pages))
             else:

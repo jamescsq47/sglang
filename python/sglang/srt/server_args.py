@@ -3240,8 +3240,18 @@ class ServerArgs:
 
     def _handle_pd_disaggregation(self):
         if self.disaggregation_mode == "decode":
-            self.disable_radix_cache = True
-            logger.warning("KV cache is forced as chunk cache for decode server")
+            enable_decode_radix = os.getenv(
+                "SGLANG_PD_DECODE_ENABLE_RADIX_CACHE", "0"
+            ).lower() in {"1", "true", "yes", "on"}
+            if enable_decode_radix:
+                self.disable_radix_cache = False
+                logger.warning(
+                    "Experimental PD Decode Radix cache enabled: imported full "
+                    "snapshots will deduplicate resident prefixes after transfer"
+                )
+            else:
+                self.disable_radix_cache = True
+                logger.warning("KV cache is forced as chunk cache for decode server")
 
         elif self.disaggregation_mode == "prefill":
             assert (
