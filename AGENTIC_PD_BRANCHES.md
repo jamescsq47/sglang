@@ -28,6 +28,10 @@ Do not let multiple machines write to the same node branch.
   python -m pip install -e ./python --no-deps
   ```
 
+The `pd` branches pin the editable package metadata to `0.5.10.post1`. This
+avoids setuptools-scm incorrectly selecting a newer upstream tag that happens
+to exist in the clone. Update this pin only when creating a new baseline.
+
 Before a baseline experiment, verify the branch and source location:
 
 ```bash
