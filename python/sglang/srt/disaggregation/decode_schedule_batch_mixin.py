@@ -17,6 +17,23 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 
+def cache_pd_decode_committed_req(tree_cache, req) -> None:
+    """Insert only D KV that has actually been computed/imported.
+
+    A prebuilt request carries the sampled first output token in ``fill_ids``,
+    but its KV does not exist until the first Decode forward.  If that token
+    closes a page boundary, caching all of ``fill_ids`` inserts the permanent
+    dummy KV slot into Radix as though it were a real page.
+    """
+
+    fill_ids = req.fill_ids
+    req.fill_ids = fill_ids[: int(req.kv_committed_len)]
+    try:
+        tree_cache.cache_unfinished_req(req)
+    finally:
+        req.fill_ids = fill_ids
+
+
 class ScheduleBatchDisaggregationDecodeMixin:
 
     def prepare_for_prebuilt(self: ScheduleBatch):
@@ -110,7 +127,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
         self.output_ids = []
         for req in self.reqs:
             self.output_ids.append(req.output_ids[-1])
-            self.tree_cache.cache_unfinished_req(req)
+            cache_pd_decode_committed_req(self.tree_cache, req)
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
                 try:

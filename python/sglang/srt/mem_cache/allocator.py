@@ -491,6 +491,28 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
 
+        if self.debug_mode and self.is_not_in_free_group:
+            candidate_page_stream = free_index // self.page_size
+            candidate_pages = torch.unique(candidate_page_stream)
+            candidate_runs = torch.unique_consecutive(candidate_page_stream)
+            assert candidate_runs.numel() == candidate_pages.numel(), (
+                "Paged KV allocator duplicate page in one free batch: "
+                f"unique_pages={candidate_pages.numel()} "
+                f"page_runs={candidate_runs.numel()} "
+                f"candidate_tokens={free_index.numel()}"
+            )
+            owned_pages = [self.free_pages, self.release_pages]
+            owned_pages = [pages for pages in owned_pages if pages.numel() > 0]
+            if owned_pages:
+                already_free = candidate_pages[
+                    torch.isin(candidate_pages, torch.cat(owned_pages))
+                ]
+                assert already_free.numel() == 0, (
+                    "Paged KV allocator double free against free pool: "
+                    f"pages={already_free[:16].tolist()} "
+                    f"candidate_tokens={free_index.numel()}"
+                )
+
         if self.is_not_in_free_group:
             # Request KV locations are stored in token order, so repeated
             # entries for a physical page are contiguous.  ``unique`` sorts

@@ -806,18 +806,21 @@ class HiRadixCache(RadixCache):
             except Exception:
                 logger.exception("Retrying agentic snapshot delete failed: %s", snapshot_id)
 
-    def release_agentic_request_cache(
+    def release_request_generation_cache(
         self,
         req,
         *,
         committed_len: Optional[int] = None,
         _defer_if_blocked: bool = True,
+        event_prefix: str = "request_generation_release",
+        allow_shared_ancestors: bool = False,
     ) -> int:
-        """Drop one private request branch from P GPU and Host HiCache.
+        """Drop one request-generation branch from GPU and Host HiCache.
 
-        Agentic V1 assigns a trajectory-unique ``extra_key``, therefore nodes
-        on this branch cannot be shared by another request.  This method is
-        called only after the P->D transfer ACK, when D owns the complete KV.
+        The caller first releases this generation's live Radix lock without
+        inserting its newly completed suffix.  This method then removes the
+        now-unreferenced leaf path.  Ancestors still referenced by another
+        live request-generation remain intact; the final owner removes them.
         """
 
         if not getattr(req, "extra_key", None):
@@ -835,11 +838,12 @@ class HiRadixCache(RadixCache):
         node = self._match_agentic_request_cache(keys, req.extra_key)
         if node is self.root_node or node.key.extra_key != req.extra_key:
             logger.warning(
-                "Could not rematch agentic P cache branch after P->D ACK: %s",
+                "Could not rematch request-generation cache branch after ACK: %s",
                 req.rid,
             )
             return 0
         released = 0
+        direct_credit_pool = getattr(req, "_agentic_direct_credit_pool", None)
         while (
             node is not None
             and node is not self.root_node
@@ -854,7 +858,18 @@ class HiRadixCache(RadixCache):
                     released += self._evict_backuped(node)
                 else:
                     released += len(node.value)
-                    self._evict_regular(node)
+                    if direct_credit_pool is None:
+                        self._evict_regular(node)
+                    else:
+                        # The restored parent may live in the permanent Direct
+                        # reserve while its newly Prefilled suffix uses the
+                        # ordinary allocator. Return each subset to its owner.
+                        self._record_remove_event(node)
+                        direct_credit_pool.reclaim_node_indices(
+                            node.value,
+                            self.cache_controller.mem_pool_device_allocator,
+                        )
+                        self._delete_leaf(node)
                     node = parent
                     continue
 
@@ -878,15 +893,27 @@ class HiRadixCache(RadixCache):
         remaining = self._match_agentic_request_cache(keys, req.extra_key)
         release_key = (req.rid, req.extra_key)
         if remaining is not self.root_node and remaining.key.extra_key == req.extra_key:
+            # Decode deliberately uses one shared Radix namespace.  A matched
+            # ancestor that is still locked or has descendants belongs to
+            # another live generation and is the prefix we must retain, not a
+            # delayed release owned by this request.
+            if allow_shared_ancestors and (
+                remaining.lock_ref > 0 or len(remaining.children) > 0
+            ):
+                self.pending_agentic_request_releases.pop(release_key, None)
+                return released
             if _defer_if_blocked:
                 self.pending_agentic_request_releases[release_key] = (
                     req,
                     committed_len,
                     time.monotonic() + 30.0,
+                    event_prefix,
+                    allow_shared_ancestors,
                 )
                 logger.info(
-                    "AgenticKV p_to_d_release_deferred req=%s extra_key=%s "
+                    "AgenticKV %s_deferred req=%s extra_key=%s "
                     "lock_ref=%d host_ref=%d children=%d",
+                    event_prefix,
                     req.rid,
                     req.extra_key,
                     remaining.lock_ref,
@@ -895,7 +922,30 @@ class HiRadixCache(RadixCache):
                 )
         else:
             self.pending_agentic_request_releases.pop(release_key, None)
+            if direct_credit_pool is not None:
+                for name in (
+                    "_agentic_direct_credit_pool",
+                    "_agentic_direct_credit_allocation",
+                ):
+                    if hasattr(req, name):
+                        delattr(req, name)
         return released
+
+    def release_agentic_request_cache(
+        self,
+        req,
+        *,
+        committed_len: Optional[int] = None,
+        _defer_if_blocked: bool = True,
+    ) -> int:
+        """Backward-compatible P->D request-generation release entrypoint."""
+
+        return self.release_request_generation_cache(
+            req,
+            committed_len=committed_len,
+            _defer_if_blocked=_defer_if_blocked,
+            event_prefix="p_to_d_release",
+        )
 
     def _match_agentic_request_cache(self, keys, extra_key):
         match = self.match_prefix(
@@ -914,13 +964,20 @@ class HiRadixCache(RadixCache):
         if not self.pending_agentic_request_releases:
             return
         now = time.monotonic()
-        for release_key, (req, committed_len, deadline) in list(
-            self.pending_agentic_request_releases.items()
-        ):
-            released = self.release_agentic_request_cache(
+        for release_key, record in list(self.pending_agentic_request_releases.items()):
+            (
+                req,
+                committed_len,
+                deadline,
+                event_prefix,
+                allow_shared_ancestors,
+            ) = record
+            released = self.release_request_generation_cache(
                 req,
                 committed_len=committed_len,
                 _defer_if_blocked=False,
+                event_prefix=event_prefix,
+                allow_shared_ancestors=allow_shared_ancestors,
             )
             token_ids = (req.origin_input_ids + req.output_ids)[:committed_len]
             keys = convert_to_bigram_key(token_ids) if self.is_eagle else token_ids
@@ -930,10 +987,18 @@ class HiRadixCache(RadixCache):
                 if keys
                 else self.root_node
             )
-            if remaining is self.root_node or remaining.key.extra_key != req.extra_key:
+            if (
+                remaining is self.root_node
+                or remaining.key.extra_key != req.extra_key
+                or (
+                    allow_shared_ancestors
+                    and (remaining.lock_ref > 0 or len(remaining.children) > 0)
+                )
+            ):
                 self.pending_agentic_request_releases.pop(release_key, None)
                 logger.info(
-                    "AgenticKV p_to_d_release_retry tokens=%d req=%s extra_key=%s",
+                    "AgenticKV %s_retry tokens=%d req=%s extra_key=%s",
+                    event_prefix,
                     released,
                     req.rid,
                     req.extra_key,
@@ -941,8 +1006,9 @@ class HiRadixCache(RadixCache):
             elif now >= deadline:
                 self.pending_agentic_request_releases.pop(release_key, None)
                 logger.error(
-                    "AgenticKV p_to_d_release_retry_timeout req=%s extra_key=%s "
+                    "AgenticKV %s_retry_timeout req=%s extra_key=%s "
                     "lock_ref=%d host_ref=%d children=%d",
+                    event_prefix,
                     req.rid,
                     req.extra_key,
                     remaining.lock_ref,

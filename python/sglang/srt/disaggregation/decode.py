@@ -110,7 +110,13 @@ def reconcile_pd_decode_imported_prefix(scheduler, req) -> int:
         scheduler.req_to_token_pool.write(
             (req.req_pool_idx, slice(0, prefix_len)), req.prefix_indices
         )
-        scheduler.token_to_kv_pool_allocator.free(imported_prefix)
+        # Slot 0 is SGLang's permanent dummy KV location.  A complete PD
+        # import may contain it for padding at a page boundary; returning it
+        # to the paged allocator creates one phantom free page and eventually
+        # aliases two live requests to the same physical KV storage.
+        imported_prefix = imported_prefix[imported_prefix != 0]
+        if imported_prefix.numel():
+            scheduler.token_to_kv_pool_allocator.free(imported_prefix)
     req._pd_decode_radix_reused_tokens = prefix_len
     if prefix_len:
         logger.info(

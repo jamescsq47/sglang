@@ -350,9 +350,152 @@ def test_direct_fallback_does_not_overwrite_an_active_p_claim():
     fallback = store.begin_slow_fallback(ready, owner_id="d0")
     assert fallback is not None
     assert fallback.state is SnapshotState.SLOW_FALLBACK
-    assert raw.is_exist(request.claim_key) == 0
+    assert fallback.claim_id == "fallback:d0"
+    assert raw.is_exist(request.claim_key) == 1
     with pytest.raises(SnapshotNotReadyError):
         store.claim_direct(request, "late-p")
+    consumed = store.complete_slow_fallback(fallback)
+    assert consumed.state is SnapshotState.CONSUMED
+    assert consumed.claim_id is None
+    assert raw.is_exist(request.claim_key) == 0
+
+
+def test_node_local_claim_fences_direct_from_fallback_when_store_claim_is_lost(
+    monkeypatch, tmp_path
+):
+    """The tmpfs fence is authoritative across independent P/D clients."""
+
+    monkeypatch.setenv("SGLANG_PD_P_READY_DIR", str(tmp_path))
+    raw = FakeMooncakeStore()
+    p_store = MooncakeSnapshotStore(raw)
+    d_store = MooncakeSnapshotStore(raw)
+    request = RequestGeneration("direct-local-fence", 0)
+    offer = SnapshotManifest(
+        request=request,
+        page_keys=(),
+        token_count=128,
+        byte_size=0,
+        state=SnapshotState.DIRECT_READY,
+        token_digest="abc",
+        direct_bootstrap_addr="127.0.0.1:45501",
+        direct_room=457,
+    )
+    p_store.publish_direct_offer(offer)
+    loading = p_store.claim_direct(request, "p0")
+
+    # Reproduce Mooncake's ambiguous cross-key window: the storage claim is
+    # temporarily absent even though P still owns the Direct lifecycle.
+    raw.remove(request.claim_key, force=False)
+    assert d_store.begin_slow_fallback(offer, owner_id="d0") is None
+    assert d_store.load(request, require_ready=False).state is SnapshotState.DIRECT_LOADING
+
+    ready = p_store.release_direct_claim(loading, "p0")
+    fallback = d_store.begin_slow_fallback(ready, owner_id="d0")
+    assert fallback is not None
+    assert fallback.state is SnapshotState.SLOW_FALLBACK
+
+
+def test_fallback_never_takes_over_orphaned_direct_loading(monkeypatch, tmp_path):
+    monkeypatch.setenv("SGLANG_PD_P_READY_DIR", str(tmp_path))
+    raw = FakeMooncakeStore()
+    store = MooncakeSnapshotStore(raw)
+    request = RequestGeneration("orphaned-direct-loading", 0)
+    offer = SnapshotManifest(
+        request=request,
+        page_keys=(),
+        token_count=128,
+        byte_size=0,
+        state=SnapshotState.DIRECT_READY,
+        token_digest="abc",
+        direct_bootstrap_addr="127.0.0.1:45501",
+        direct_room=458,
+    )
+    raw.objects[request.manifest_key] = replace(
+        offer, state=SnapshotState.DIRECT_LOADING, claim_id="late-p"
+    ).to_bytes()
+
+    assert store.begin_slow_fallback(offer, owner_id="d0") is None
+    current = store.load(request, require_ready=False)
+    assert current.state is SnapshotState.DIRECT_LOADING
+    assert current.claim_id == "late-p"
+
+
+def test_non_owner_cannot_fail_an_active_direct_claim(monkeypatch, tmp_path):
+    monkeypatch.setenv("SGLANG_PD_P_READY_DIR", str(tmp_path))
+    raw = FakeMooncakeStore()
+    store = MooncakeSnapshotStore(raw)
+    request = RequestGeneration("non-owner-fail", 0)
+    offer = SnapshotManifest(
+        request=request,
+        page_keys=(),
+        token_count=128,
+        byte_size=0,
+        state=SnapshotState.DIRECT_READY,
+        token_digest="abc",
+        direct_bootstrap_addr="127.0.0.1:45501",
+        direct_room=459,
+    )
+    store.publish_direct_offer(offer)
+    loading = store.claim_direct(request, "p-owner")
+
+    with pytest.raises(SnapshotNotReadyError, match="does not own"):
+        store.mark_failed(
+            loading,
+            reason="d-must-not-overwrite-p",
+            owner_claim_id="d-non-owner",
+        )
+
+    current = store.load(request, require_ready=False)
+    assert current.state is SnapshotState.DIRECT_LOADING
+    assert current.claim_id == "p-owner"
+    assert store._local_claim_owner(request) == "p-owner"
+
+
+def test_terminal_offer_loses_cleanly_when_p_claims_first(monkeypatch, tmp_path):
+    monkeypatch.setenv("SGLANG_PD_P_READY_DIR", str(tmp_path))
+    raw = FakeMooncakeStore()
+    store = MooncakeSnapshotStore(raw)
+    request = RequestGeneration("terminal-claim-race", 0)
+    offer = SnapshotManifest(
+        request=request,
+        page_keys=(),
+        token_count=128,
+        byte_size=0,
+        state=SnapshotState.DIRECT_READY,
+        token_digest="abc",
+        direct_bootstrap_addr="127.0.0.1:45501",
+        direct_room=460,
+    )
+    store.publish_direct_offer(offer)
+    loading = store.claim_direct(request, "p-owner")
+
+    assert store.finalize_direct_offer(offer, owner_id="d-final") is None
+    current = store.load(request, require_ready=False)
+    assert current.state is SnapshotState.DIRECT_LOADING
+    assert current.claim_id == "p-owner"
+    store.release_direct_claim(loading, "p-owner")
+
+
+def test_terminal_offer_wins_atomically_before_p_claim(monkeypatch, tmp_path):
+    monkeypatch.setenv("SGLANG_PD_P_READY_DIR", str(tmp_path))
+    raw = FakeMooncakeStore()
+    store = MooncakeSnapshotStore(raw)
+    offer = make_manifest(
+        state=SnapshotState.DIRECT_READY,
+        request_id="terminal-first",
+        generation=0,
+        page_keys=(),
+        token_digest="abc",
+        direct_bootstrap_addr="127.0.0.1:45501",
+        direct_room=461,
+    )
+    store.publish_direct_offer(offer)
+
+    terminal = store.finalize_direct_offer(offer, owner_id="d-final")
+    assert terminal is not None
+    assert terminal.state is SnapshotState.FINAL
+    with pytest.raises(SnapshotNotReadyError):
+        store.claim_direct(offer.request, "late-p")
 
 
 def test_direct_fallback_tolerates_transient_manifest_read_miss(monkeypatch):
@@ -385,6 +528,76 @@ def test_direct_fallback_tolerates_transient_manifest_read_miss(monkeypatch):
     assert fallback is not None
     assert fallback.state is SnapshotState.SLOW_FALLBACK
     assert store.load(request, require_ready=False).state is SnapshotState.SLOW_FALLBACK
+
+
+def test_persistent_fallback_claim_fences_a_stale_direct_reader(monkeypatch):
+    """P must not rewind SLOW_FALLBACK even if its manifest GET is stale."""
+
+    raw = FakeMooncakeStore()
+    store = MooncakeSnapshotStore(raw)
+    request = RequestGeneration("direct-stale-after-fallback", 0)
+    offer = SnapshotManifest(
+        request=request,
+        page_keys=(),
+        token_count=128,
+        byte_size=0,
+        state=SnapshotState.DIRECT_READY,
+        token_digest="abc",
+        direct_bootstrap_addr="127.0.0.1:45501",
+        direct_room=790,
+    )
+    store.publish_direct_offer(offer)
+    fallback = store.begin_slow_fallback(offer, owner_id="d0")
+    assert fallback is not None
+
+    original_get = raw.get
+
+    def stale_direct_manifest(key):
+        if key == request.manifest_key:
+            return offer.to_bytes()
+        return original_get(key)
+
+    monkeypatch.setattr(raw, "get", stale_direct_manifest)
+    upserts_before = sum(event[0] == "upsert" for event in raw.events)
+    with pytest.raises(SnapshotNotReadyError, match="already claimed"):
+        store.claim_direct(request, "late-p")
+    assert sum(event[0] == "upsert" for event in raw.events) == upserts_before
+
+    monkeypatch.setattr(raw, "get", original_get)
+    current = store.load(request, require_ready=False)
+    assert current.state is SnapshotState.SLOW_FALLBACK
+    assert current.claim_id == "fallback:d0"
+
+
+def test_slow_fallback_claim_is_released_only_after_mooncake_commit():
+    raw = FakeMooncakeStore()
+    store = MooncakeSnapshotStore(raw)
+    request = RequestGeneration("slow-publish", 0)
+    offer = SnapshotManifest(
+        request=request,
+        page_keys=(),
+        token_count=128,
+        byte_size=0,
+        state=SnapshotState.DIRECT_READY,
+        token_digest="abc",
+        direct_bootstrap_addr="127.0.0.1:45501",
+        direct_room=791,
+    )
+    store.publish_direct_offer(offer)
+    fallback = store.begin_slow_fallback(offer, owner_id="d0")
+    offloading = replace(
+        fallback,
+        page_keys=("slow-page",),
+        byte_size=1024,
+    ).transition(SnapshotState.OFFLOADING)
+    store.continue_slow_publish(offloading)
+    raw.objects["slow-page"] = b"page"
+
+    assert raw.is_exist(request.claim_key) == 1
+    ready = store.commit_publish(request)
+    assert ready.state is SnapshotState.MOONCAKE_READY
+    assert ready.claim_id is None
+    assert raw.is_exist(request.claim_key) == 0
 
 
 def test_direct_claim_retries_transient_illegal_client_without_losing_claim():

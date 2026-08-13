@@ -41,8 +41,13 @@ class SchedulerRuntimeCheckerMixin:
         # pages before a tokenized Req exists.  They are allocator-owned
         # staging, not a leak; after Req binding the entry is removed and the
         # same pages are accounted by the Radix cache instead.
+        direct_credit_pool = getattr(self, "agentic_direct_credit_pool", None)
         early_direct = getattr(self, "agentic_early_direct_receives", None)
-        if early_direct:
+        if direct_credit_pool is not None:
+            # Free reserve pages and pre-bind receives are allocator-owned but
+            # absent from Radix. Bound receives are already counted by Radix.
+            reserved += int(direct_credit_pool.unaccounted_tokens)
+        elif early_direct:
             reserved += sum(
                 int(entry.manifest.token_count)
                 for entry in early_direct.values()

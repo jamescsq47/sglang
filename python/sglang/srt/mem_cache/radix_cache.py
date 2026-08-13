@@ -507,6 +507,56 @@ class RadixCache(BasePrefixCache):
         # Remove req slot release the cache lock
         self.dec_lock_ref(req.last_node)
 
+    def release_request_generation_cache(
+        self,
+        req: Req,
+        *,
+        committed_len: Optional[int] = None,
+        _defer_if_blocked: bool = True,
+        event_prefix: str = "request_generation_release",
+        allow_shared_ancestors: bool = False,
+    ) -> int:
+        """Delete the zero-reference leaf path owned by one generation.
+
+        ``cache_finished_req(..., is_insert=False)`` must run first so the
+        generation no longer holds a live lock and its new suffix is freed.
+        Shared ancestors remain while any other live branch references them.
+        """
+
+        del _defer_if_blocked, event_prefix, allow_shared_ancestors
+        if not getattr(req, "extra_key", None):
+            return 0
+        committed_len = int(
+            getattr(req, "kv_committed_len", 0)
+            if committed_len is None
+            else committed_len
+        )
+        token_ids = (req.origin_input_ids + req.output_ids)[:committed_len]
+        keys = convert_to_bigram_key(token_ids) if self.is_eagle else token_ids
+        keys = page_align_keys(keys, self.page_size)
+        if not keys:
+            return 0
+        match = self.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
+            )
+        )
+        node = match.last_device_node
+        released = 0
+        while (
+            node is not self.root_node
+            and node.lock_ref == 0
+            and len(node.children) == 0
+            and node.key.extra_key == req.extra_key
+        ):
+            parent = node.parent
+            released += len(node.value)
+            self.token_to_kv_pool_allocator.free(node.value)
+            self._record_remove_event(node)
+            self._delete_leaf(node)
+            node = parent
+        return released
+
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
         if self.disable:

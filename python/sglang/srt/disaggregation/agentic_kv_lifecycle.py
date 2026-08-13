@@ -204,7 +204,11 @@ _ALLOWED_TRANSITIONS: Mapping[SnapshotState, frozenset[SnapshotState]] = {
         }
     ),
     SnapshotState.SLOW_FALLBACK: frozenset(
-        {SnapshotState.OFFLOADING, SnapshotState.FAILED}
+        {
+            SnapshotState.OFFLOADING,
+            SnapshotState.CONSUMED,
+            SnapshotState.FAILED,
+        }
     ),
     SnapshotState.OFFLOADING: frozenset(
         {SnapshotState.MOONCAKE_READY, SnapshotState.FAILED}
@@ -633,11 +637,102 @@ class MooncakeSnapshotStore:
     def __init__(self, store: MooncakeRawStore):
         self.store = store
 
+    @staticmethod
+    def _local_claim_path(request: RequestGeneration) -> Optional[str]:
+        """Return the node-local fence shared by P and every D worker.
+
+        Mooncake's create-if-absent claim protects the storage object, but a
+        claim-key PUT and a manifest UPSERT are two independent transactions.
+        In addition, an ambiguous UPSERT can still be completing in the master
+        after the client has returned ``ILLEGAL_CLIENT``.  The V1 direct path
+        is node-local already, so an O_EXCL file in the run's P-ready tmpfs is
+        the authoritative cross-process owner fence for Direct versus slow
+        fallback.  It contains only a short owner id; no KV data is copied.
+        """
+
+        directory = os.getenv("SGLANG_PD_P_READY_DIR", "")
+        if not directory:
+            return None
+        digest = hashlib.sha256(request.snapshot_id.encode("utf-8")).hexdigest()
+        return os.path.join(directory, f"lifecycle-claim-{digest}")
+
+    @classmethod
+    def _acquire_local_claim(
+        cls, request: RequestGeneration, claim_id: str
+    ) -> bool:
+        path = cls._local_claim_path(request)
+        if path is None:
+            # Lightweight tests and non-node-local storage configurations keep
+            # the original Mooncake-only behavior.
+            return True
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            return False
+        try:
+            os.write(fd, claim_id.encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        return True
+
+    @classmethod
+    def _release_local_claim(
+        cls, request: RequestGeneration, claim_id: Optional[str]
+    ) -> None:
+        path = cls._local_claim_path(request)
+        if path is None:
+            return
+        try:
+            with open(path, "rb") as file_obj:
+                owner = file_obj.read(1024).decode("utf-8")
+        except FileNotFoundError:
+            return
+        except (OSError, UnicodeDecodeError):
+            return
+        if claim_id is not None and owner != claim_id:
+            return
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+    @classmethod
+    def _local_claim_owner(cls, request: RequestGeneration) -> Optional[str]:
+        path = cls._local_claim_path(request)
+        if path is None:
+            return None
+        try:
+            with open(path, "rb") as file_obj:
+                return file_obj.read(1024).decode("utf-8")
+        except FileNotFoundError:
+            return None
+        except (OSError, UnicodeDecodeError):
+            return None
+
+    @classmethod
+    def _require_local_claim_owner(
+        cls, request: RequestGeneration, claim_id: str
+    ) -> None:
+        """Fence every claimed transition by the caller's actual owner id."""
+
+        path = cls._local_claim_path(request)
+        if path is None:
+            return
+        owner = cls._local_claim_owner(request)
+        if owner != claim_id:
+            raise SnapshotNotReadyError(
+                f"snapshot {request.snapshot_id} claim is owned by {owner!r}, "
+                f"not {claim_id!r}"
+            )
+
     def _update_claimed_transition(
         self,
         manifest: SnapshotManifest,
         *,
         expected_states: Iterable[SnapshotState],
+        owner_claim_id: Optional[str] = None,
         max_attempts: int = 6,
     ) -> None:
         """Retry an ambiguous Mooncake upsert while holding the claim object.
@@ -658,7 +753,13 @@ class MooncakeSnapshotStore:
         expected = frozenset(expected_states)
         if not expected:
             raise ValueError("expected_states must not be empty")
-        retry_delay = 0.005
+        owner_claim_id = owner_claim_id or manifest.claim_id
+        if not owner_claim_id:
+            raise SnapshotLifecycleError(
+                f"claimed transition for {manifest.snapshot_id} has no owner"
+            )
+        self._require_local_claim_owner(manifest.request, owner_claim_id)
+        retry_delay = 0.01
         last_code = 0
         for attempt in range(max_attempts):
             last_code = self.store.upsert(
@@ -669,20 +770,27 @@ class MooncakeSnapshotStore:
             if last_code != -601:
                 break
 
-            observed = self.load(manifest.request, require_ready=False)
-            if (
-                observed is not None
-                and observed.state is manifest.state
-                and observed.claim_id == manifest.claim_id
-            ):
-                return
-            if observed is not None and observed.state not in expected:
-                raise SnapshotNotReadyError(
-                    f"snapshot {manifest.snapshot_id} advanced to "
-                    f"{observed.state.value} while updating {manifest.state.value}"
-                )
-            if attempt + 1 < max_attempts:
+            # Do not immediately launch another UPSERT.  Mooncake may still
+            # be completing the previous PutEnd after returning -601.  Polling
+            # its result under the node-local owner fence avoids self-overlap
+            # and prevents a subsequent owner from racing an unfinished PUT.
+            settle_deadline = time.monotonic() + 0.25
+            while time.monotonic() < settle_deadline:
                 time.sleep(retry_delay)
+                observed = self.load(manifest.request, require_ready=False)
+                if (
+                    observed is not None
+                    and observed.state is manifest.state
+                    and observed.claim_id == manifest.claim_id
+                ):
+                    return
+                if observed is not None and observed.state not in expected:
+                    raise SnapshotNotReadyError(
+                        f"snapshot {manifest.snapshot_id} advanced to "
+                        f"{observed.state.value} while updating "
+                        f"{manifest.state.value}"
+                    )
+            if attempt + 1 < max_attempts:
                 retry_delay = min(retry_delay * 2.0, 0.08)
 
         raise SnapshotLifecycleError(
@@ -720,8 +828,13 @@ class MooncakeSnapshotStore:
     ) -> SnapshotManifest:
         if not claim_id:
             raise ValueError("claim_id must be non-empty")
+        if not self._acquire_local_claim(request, claim_id):
+            raise SnapshotNotReadyError(
+                f"direct snapshot {request.snapshot_id} is locally claimed"
+            )
         claim_code = self.store.put(request.claim_key, f"direct:{claim_id}".encode())
         if claim_code != 0:
+            self._release_local_claim(request, claim_id)
             raise SnapshotNotReadyError(
                 f"direct snapshot {request.snapshot_id} is already claimed"
             )
@@ -741,6 +854,7 @@ class MooncakeSnapshotStore:
             return claimed
         except Exception:
             self.store.remove(request.claim_key, force=False)
+            self._release_local_claim(request, claim_id)
             raise
 
     def complete_direct(
@@ -757,8 +871,13 @@ class MooncakeSnapshotStore:
             manifest.transition(SnapshotState.CONSUMED),
             terminal_at=time.time(),
         )
-        self.update(terminal)
+        self._update_claimed_transition(
+            terminal,
+            expected_states=(SnapshotState.DIRECT_LOADING,),
+            owner_claim_id=claim_id,
+        )
         self.store.remove(terminal.request.claim_key, force=False)
+        self._release_local_claim(terminal.request, claim_id)
         _discard_shared_ledger_snapshot(terminal.snapshot_id)
         return terminal
 
@@ -775,27 +894,44 @@ class MooncakeSnapshotStore:
         ready = replace(manifest, claim_id=None).transition(
             SnapshotState.DIRECT_READY
         )
-        self.update(ready)
+        self._update_claimed_transition(
+            ready,
+            expected_states=(SnapshotState.DIRECT_LOADING,),
+            owner_claim_id=claim_id,
+        )
         self.store.remove(manifest.request.claim_key, force=False)
+        self._release_local_claim(manifest.request, claim_id)
         return ready
 
     def begin_slow_fallback(
         self, manifest: SnapshotManifest, owner_id: str = "decode"
     ) -> Optional[SnapshotManifest]:
-        """Try to serialize Direct→Mooncake fallback against a P claim.
+        """Transfer ownership from Direct to the complete slow-path pipeline.
 
         The direct claim object is the per-generation mutex.  At high
         concurrency P may be claiming DIRECT_READY at the exact instant D's
         fast-tool timer expires.  Removing P's claim and concurrently
         upserting the manifest caused Mooncake ``ILLEGAL_CLIENT`` errors and
-        allowed D to overwrite DIRECT_LOADING.  D now acquires the same
-        create-if-absent claim first; ``None`` means P owns it and D must keep
-        the candidate alive and poll again.
+        allowed D to overwrite DIRECT_LOADING.
+
+        The fallback claim deliberately remains live after this method returns.
+        Mooncake metadata operations on the claim key and manifest key do not
+        form a cross-key transaction: releasing the claim immediately after the
+        manifest upsert allowed a late P to acquire the claim, read a stale
+        DIRECT_READY manifest, and overwrite SLOW_FALLBACK.  The slow-path
+        owner therefore keeps the claim until either the complete Shared-Host
+        snapshot reaches P GPU, or a Mooncake publish reaches MOONCAKE_READY.
+        ``None`` means P owns the direct claim and D must keep the candidate
+        alive and poll again.
         """
 
-        claim_value = f"fallback:{owner_id}".encode()
-        if self.store.put(manifest.request.claim_key, claim_value) != 0:
+        claim_id = f"fallback:{owner_id}"
+        if not self._acquire_local_claim(manifest.request, claim_id):
             return None
+        if self.store.put(manifest.request.claim_key, claim_id.encode()) != 0:
+            self._release_local_claim(manifest.request, claim_id)
+            return None
+        keep_claim = False
         try:
             # Mooncake GET may briefly return empty immediately after the
             # successful offer PUT.  Once D owns the exclusive fallback claim,
@@ -803,26 +939,65 @@ class MooncakeSnapshotStore:
             # begin or complete a direct transition until this claim is
             # released.  Prefer a visible newer value when one is available.
             current = self.load(manifest.request, require_ready=False) or manifest
-            if current.state not in {
-                SnapshotState.DIRECT_READY,
-                SnapshotState.DIRECT_LOADING,
-            }:
+            # DIRECT_LOADING always belongs to a P receiver.  Even if an
+            # earlier ambiguous metadata call temporarily made its Mooncake
+            # claim invisible, D must not overwrite that in-flight state.
+            # P's release settles it back to DIRECT_READY; D retries then.
+            if current.state is SnapshotState.DIRECT_LOADING:
+                return None
+            if current.state is not SnapshotState.DIRECT_READY:
                 raise SnapshotLifecycleError(
                     f"cannot fall back to slow Put from {current.state.value}"
                 )
-            fallback = replace(current, claim_id=None).transition(
+            fallback = replace(current, claim_id=claim_id).transition(
                 SnapshotState.SLOW_FALLBACK
             )
             self._update_claimed_transition(
                 fallback,
-                expected_states=(
-                    SnapshotState.DIRECT_READY,
-                    SnapshotState.DIRECT_LOADING,
-                ),
+                expected_states=(SnapshotState.DIRECT_READY,),
+                owner_claim_id=claim_id,
             )
+            keep_claim = True
             return fallback
         finally:
-            self.store.remove(manifest.request.claim_key, force=False)
+            if not keep_claim:
+                self.store.remove(manifest.request.claim_key, force=False)
+                self._release_local_claim(manifest.request, claim_id)
+
+    @staticmethod
+    def _is_fallback_claim(claim_id: Optional[str]) -> bool:
+        return bool(claim_id and claim_id.startswith("fallback:"))
+
+    def complete_slow_fallback(
+        self, manifest: SnapshotManifest
+    ) -> SnapshotManifest:
+        """Acknowledge complete Shared-Host→P-GPU recovery.
+
+        The P GPU copy is authoritative before this transition.  CONSUMED is
+        the same terminal ownership state used by a successful Direct receive;
+        only after publishing it may the persistent fallback claim be removed.
+        """
+
+        if (
+            manifest.state is not SnapshotState.SLOW_FALLBACK
+            or not self._is_fallback_claim(manifest.claim_id)
+        ):
+            raise SnapshotLifecycleError(
+                f"invalid slow fallback completion for {manifest.snapshot_id}"
+            )
+        terminal = replace(
+            manifest.transition(SnapshotState.CONSUMED),
+            claim_id=None,
+            terminal_at=time.time(),
+        )
+        self._update_claimed_transition(
+            terminal,
+            expected_states=(SnapshotState.SLOW_FALLBACK,),
+            owner_claim_id=manifest.claim_id,
+        )
+        self.store.remove(manifest.request.claim_key, force=False)
+        self._release_local_claim(manifest.request, manifest.claim_id)
+        return terminal
 
     def publish_failure(
         self,
@@ -851,14 +1026,132 @@ class MooncakeSnapshotStore:
         return marker
 
     def mark_failed(
-        self, manifest: SnapshotManifest, *, reason: str
+        self,
+        manifest: SnapshotManifest,
+        *,
+        reason: str,
+        owner_claim_id: Optional[str] = None,
     ) -> SnapshotManifest:
+        old_claim_id = manifest.claim_id
         failed = replace(
             manifest, failure_reason=reason[:256], claim_id=None
         ).transition(SnapshotState.FAILED)
-        self.update(failed)
+        if old_claim_id:
+            if owner_claim_id != old_claim_id:
+                raise SnapshotNotReadyError(
+                    f"cannot fail claimed snapshot {manifest.snapshot_id}: "
+                    "caller does not own its lifecycle claim"
+                )
+            self._update_claimed_transition(
+                failed,
+                expected_states=(manifest.state,),
+                owner_claim_id=old_claim_id,
+            )
+        else:
+            self.update(failed)
         self.store.remove(manifest.request.claim_key, force=False)
+        self._release_local_claim(manifest.request, old_claim_id)
         return failed
+
+    def _terminalize_direct_offer(
+        self,
+        manifest: SnapshotManifest,
+        *,
+        state: SnapshotState,
+        owner_id: str,
+        reason: Optional[str] = None,
+    ) -> Optional[SnapshotManifest]:
+        """Atomically retire an unclaimed Direct offer.
+
+        D may learn from the application parser that a provisional tool-looking
+        result is terminal or invalid at the same time P tries to claim it.
+        The same local+Mooncake fence used by Direct/fallback arbitration must
+        decide that race.  A ``None`` result means P won; D must leave the
+        snapshot and its KV untouched until P completes or releases its claim.
+        """
+
+        if state not in {SnapshotState.FINAL, SnapshotState.FAILED}:
+            raise ValueError("direct offer may only be retired as FINAL or FAILED")
+        claim_id = f"terminal:{owner_id}"
+        if not self._acquire_local_claim(manifest.request, claim_id):
+            return None
+        if self.store.put(manifest.request.claim_key, claim_id.encode()) != 0:
+            self._release_local_claim(manifest.request, claim_id)
+            return None
+        try:
+            current = self.load(manifest.request, require_ready=False) or manifest
+            if current.state is not SnapshotState.DIRECT_READY:
+                return None
+            terminal = replace(
+                current.transition(state),
+                claim_id=None,
+                failure_reason=(reason[:256] if reason else current.failure_reason),
+                terminal_at=time.time(),
+            )
+            self._update_claimed_transition(
+                terminal,
+                expected_states=(SnapshotState.DIRECT_READY,),
+                owner_claim_id=claim_id,
+            )
+            return terminal
+        finally:
+            self.store.remove(manifest.request.claim_key, force=False)
+            self._release_local_claim(manifest.request, claim_id)
+
+    def finalize_direct_offer(
+        self, manifest: SnapshotManifest, *, owner_id: str
+    ) -> Optional[SnapshotManifest]:
+        return self._terminalize_direct_offer(
+            manifest, state=SnapshotState.FINAL, owner_id=owner_id
+        )
+
+    def fail_direct_offer(
+        self, manifest: SnapshotManifest, *, owner_id: str, reason: str
+    ) -> Optional[SnapshotManifest]:
+        return self._terminalize_direct_offer(
+            manifest,
+            state=SnapshotState.FAILED,
+            owner_id=owner_id,
+            reason=reason,
+        )
+
+    def continue_slow_publish(self, manifest: SnapshotManifest) -> None:
+        """Move an owned fallback snapshot from SLOW_FALLBACK to OFFLOADING."""
+
+        if (
+            manifest.state is not SnapshotState.OFFLOADING
+            or not self._is_fallback_claim(manifest.claim_id)
+        ):
+            raise SnapshotLifecycleError(
+                "continue_slow_publish requires an owned OFFLOADING manifest"
+            )
+        self._update_claimed_transition(
+            manifest,
+            expected_states=(SnapshotState.SLOW_FALLBACK,),
+            owner_claim_id=manifest.claim_id,
+        )
+
+    def rollback_slow_publish(
+        self,
+        offloading: SnapshotManifest,
+        fallback: SnapshotManifest,
+    ) -> None:
+        """Restore an owned spill placeholder after an incomplete page Put."""
+
+        if offloading.request != fallback.request:
+            raise SnapshotLifecycleError("spill rollback request mismatch")
+        if (
+            offloading.state is not SnapshotState.OFFLOADING
+            or fallback.state is not SnapshotState.SLOW_FALLBACK
+            or not self._is_fallback_claim(fallback.claim_id)
+            or offloading.claim_id != fallback.claim_id
+        ):
+            raise SnapshotLifecycleError("invalid owned spill rollback")
+        self._update_claimed_transition(
+            fallback,
+            expected_states=(SnapshotState.OFFLOADING,),
+            owner_claim_id=fallback.claim_id,
+        )
 
     def commit_publish(self, request: RequestGeneration) -> SnapshotManifest:
         """Make a snapshot visible only after every physical page exists."""
@@ -877,16 +1170,39 @@ class MooncakeSnapshotStore:
                 f"cannot publish incomplete snapshot {manifest.snapshot_id}; "
                 f"{len(missing)} physical objects are missing"
             )
+        fallback_claim = self._is_fallback_claim(manifest.claim_id)
         ready = manifest.transition(SnapshotState.MOONCAKE_READY)
-        self.update(ready)
+        if fallback_claim:
+            ready = replace(ready, claim_id=None)
+            self._update_claimed_transition(
+                ready,
+                expected_states=(SnapshotState.OFFLOADING,),
+                owner_claim_id=manifest.claim_id,
+            )
+            self.store.remove(manifest.request.claim_key, force=False)
+            self._release_local_claim(manifest.request, manifest.claim_id)
+        else:
+            self.update(ready)
         return ready
 
     def fail_publish(self, manifest: SnapshotManifest) -> SnapshotDeleteResult:
         """Hide an incomplete publish and remove every page that did arrive."""
 
+        fallback_claim = self._is_fallback_claim(manifest.claim_id)
         if manifest.state is SnapshotState.OFFLOADING:
-            failed = manifest.transition(SnapshotState.FAILED)
-            self.update(failed)
+            failed = replace(
+                manifest.transition(SnapshotState.FAILED), claim_id=None
+            )
+            if fallback_claim:
+                self._update_claimed_transition(
+                    failed,
+                    expected_states=(SnapshotState.OFFLOADING,),
+                    owner_claim_id=manifest.claim_id,
+                )
+                self.store.remove(manifest.request.claim_key, force=False)
+                self._release_local_claim(manifest.request, manifest.claim_id)
+            else:
+                self.update(failed)
         elif manifest.state is SnapshotState.FAILED:
             failed = manifest
         else:
@@ -1148,6 +1464,10 @@ class MooncakeSnapshotStore:
         now = time.time() if now is None else now
         if now - manifest.terminal_at < max(0.0, retention_seconds):
             return False
+        # A process can die after publishing a terminal state but before
+        # removing its ownership claim.  Terminal GC cleans both tiny metadata
+        # objects so a crash cannot leak per-generation fences indefinitely.
+        self.store.remove(manifest.request.claim_key, force=False)
         code = self.store.remove(manifest.manifest_key, force=False)
         return code == 0 or self.store.is_exist(manifest.manifest_key) != 1
 

@@ -46,6 +46,31 @@ class AgenticEarlyClaimStore:
     def tool_path(self, request: RequestGeneration) -> Path:
         return self.tool_directory / f"{self._digest(request)}.json"
 
+    def producer_path(self, request: RequestGeneration) -> Path:
+        # Keep producer tombstones at the top level so the run-script's
+        # bounded /dev/shm cleanup removes them without a recursive scan.
+        return self.directory / f"producer-{self._digest(request)}"
+
+    def claim_generation_producer(self, request: RequestGeneration) -> bool:
+        """Elect exactly one D producer for a request-generation.
+
+        Long model calls can outlive an HTTP client's retry timeout.  A retry
+        may then be routed to a different D and finish concurrently with the
+        original.  Retain this tiny O_EXCL tombstone for the run so only the
+        first D may publish or mutate the generation's KV lifecycle.
+        """
+
+        path = self.producer_path(request)
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            return False
+        try:
+            os.write(fd, f"{os.getpid()}\n".encode())
+        finally:
+            os.close(fd)
+        return True
+
     @staticmethod
     def _publish(path: Path, request: RequestGeneration, kind: str) -> dict[str, Any]:
         now = time.time()

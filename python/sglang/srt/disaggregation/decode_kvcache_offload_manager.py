@@ -581,7 +581,7 @@ class DecodeKVCacheOffloadManager:
         allocator = getattr(self, "token_to_kv_pool_allocator", None)
         grouped_free = allocator is not None and hasattr(
             allocator, "free_group_begin"
-        )
+        ) and not getattr(allocator, "debug_mode", False)
         if grouped_free:
             allocator.free_group_begin()
         try:
@@ -798,6 +798,21 @@ class DecodeKVCacheOffloadManager:
             self._publish_agentic_failure(metadata, "empty_aligned_snapshot")
             return False
         all_tokens = all_tokens[:aligned_len]
+        producer_store = getattr(self, "agentic_early_claim_store", None)
+        if (
+            producer_store is not None
+            and not producer_store.claim_generation_producer(metadata.current)
+        ):
+            # The original execution remains authoritative. This duplicate
+            # still returns its deterministic model response to unblock the
+            # retrying caller, but must not mutate lifecycle state owned by
+            # another D worker.
+            logger.warning(
+                "AgenticKV duplicate_generation_skip snapshot=%s req=%s",
+                metadata.current.snapshot_id,
+                req.rid,
+            )
+            return False
         if self.agentic_direct_runtime is not None:
             try:
                 if self._publish_agentic_direct_candidate(req, metadata, all_tokens):
@@ -1023,16 +1038,16 @@ class DecodeKVCacheOffloadManager:
             candidate, metadata, now, force=True
         )
         if manifest.state is SnapshotState.DIRECT_READY:
-            self.agentic_snapshot_store.update(
-                manifest.transition(SnapshotState.FINAL)
+            terminal = self.agentic_snapshot_store.finalize_direct_offer(
+                manifest,
+                owner_id=f"d-final:{metadata.current.storage_id}",
             )
+            if terminal is None:
+                return False
         elif manifest.state is SnapshotState.DIRECT_LOADING:
-            # P claimed a tool-looking generation before the application
-            # parser rejected it, but DMA has not started.  FAILED tells P to
-            # free its provisional allocation and recompute any repair turn.
-            self.agentic_snapshot_store.mark_failed(
-                manifest, reason="application_terminal_or_invalid_tool"
-            )
+            # P owns this generation.  Never let D invalidate P's in-flight
+            # receive; the Direct completion/release path settles ownership.
+            return False
         else:
             return False
         self._enqueue_agentic_release(candidate["req"], 0)
@@ -1061,14 +1076,17 @@ class DecodeKVCacheOffloadManager:
 
         if candidate.get("staging") or candidate.get("sent"):
             return False
-        if manifest.state not in {
-            SnapshotState.DIRECT_READY,
-            SnapshotState.DIRECT_LOADING,
-        }:
+        if manifest.state is SnapshotState.DIRECT_LOADING:
             return False
-        self.agentic_snapshot_store.mark_failed(
-            manifest, reason="application_tool_unconfirmed"
+        if manifest.state is not SnapshotState.DIRECT_READY:
+            return False
+        failed = self.agentic_snapshot_store.fail_direct_offer(
+            manifest,
+            owner_id=f"d-unconfirmed:{candidate['metadata'].current.storage_id}",
+            reason="application_tool_unconfirmed",
         )
+        if failed is None:
+            return False
         self._enqueue_agentic_release(candidate["req"], 0)
         self._cleanup_agentic_direct_sender(candidate)
         self._agentic_release_early_claim(candidate, "unconfirmed_tool")
@@ -1154,6 +1172,7 @@ class DecodeKVCacheOffloadManager:
                     created_at=direct_manifest.created_at,
                     tool_type=metadata.tool_type,
                     tool_started_at=direct_manifest.tool_started_at,
+                    claim_id=direct_manifest.claim_id,
                     token_digest=token_ids_digest(all_tokens),
                 ).transition(SnapshotState.OFFLOADING)
         except Exception:
@@ -1181,7 +1200,7 @@ class DecodeKVCacheOffloadManager:
                 if direct_manifest is None:
                     self.agentic_snapshot_store.begin_publish(manifest)
                 else:
-                    self.agentic_snapshot_store.update(manifest)
+                    self.agentic_snapshot_store.continue_slow_publish(manifest)
             except Exception:
                 self._agentic_cancel_reservation(manifest)
                 logger.exception(
@@ -1227,6 +1246,11 @@ class DecodeKVCacheOffloadManager:
             fallback = manifest
         else:
             return False
+        # begin_slow_fallback keeps the ownership claim for the complete slow
+        # lifecycle.  Retain the returned manifest on the candidate before any
+        # Shared-Arena operation that may raise, so a retry remains idempotent
+        # instead of trying to reacquire its own persistent claim.
+        candidate["manifest"] = fallback
         token_count = len(candidate["tokens"])
         token_indices = self.req_to_token_pool.req_to_token[
             candidate["req"].req_pool_idx, :token_count
@@ -1247,7 +1271,6 @@ class DecodeKVCacheOffloadManager:
             logical_hashes=logical_hashes,
             byte_size=bytes_per_page * len(source_pages),
         )
-        candidate["manifest"] = fallback
         candidate["staging"] = True
         candidate["source_token_indices"] = token_indices
         logger.info(
@@ -1267,7 +1290,9 @@ class DecodeKVCacheOffloadManager:
         try:
             if current_manifest is not None:
                 self.agentic_snapshot_store.mark_failed(
-                    current_manifest, reason=reason
+                    current_manifest,
+                    reason=reason,
+                    owner_claim_id=current_manifest.claim_id,
                 )
             else:
                 self.agentic_snapshot_store.publish_failure(
@@ -1818,7 +1843,34 @@ class DecodeKVCacheOffloadManager:
                 raise RuntimeError(
                     "PD Decode Radix release requires a complete request snapshot"
                 )
-            release_kv_cache(req, self.tree_cache)
+            is_agentic_generation = hasattr(req, "_pd_transport_extra_key")
+            committed_len = int(getattr(req, "kv_committed_len", 0))
+            release_kv_cache(
+                req,
+                self.tree_cache,
+                is_insert=not is_agentic_generation,
+            )
+            if is_agentic_generation:
+                release_generation = getattr(
+                    self.tree_cache, "release_request_generation_cache", None
+                )
+                if release_generation is None:
+                    raise RuntimeError(
+                        "PD agentic Decode Radix cache must support "
+                        "request-generation release"
+                    )
+                released = release_generation(
+                    req,
+                    committed_len=committed_len,
+                    event_prefix="d_generation_release",
+                    allow_shared_ancestors=True,
+                )
+                logger.info(
+                    "AgenticKV d_generation_release tokens=%d req=%s extra_key=%s",
+                    released,
+                    req.rid,
+                    req.extra_key,
+                )
             if req.rid in self.offloaded_state:
                 del self.offloaded_state[req.rid]
             return

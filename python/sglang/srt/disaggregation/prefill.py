@@ -406,11 +406,17 @@ class SchedulerDisaggregationPrefillMixin:
                 prefetch(room)
 
     def start_prefill_transfer_progress_worker(self: Scheduler) -> None:
-        """Poll P->D senders without blocking Prefill scheduling.
+        """Start the P-ready FIFO and independent P->D transfer consumers.
 
-        Sender polling may become slow after many long-lived NIXL transfers.
-        The worker only caches transport states; request/KV cleanup remains on
-        the scheduler thread in ``process_disagg_prefill_inflight_queue``.
+        The scheduler is only the producer: after Prefill it snapshots an
+        immutable transfer payload and appends the request to
+        ``_prefill_ready_queue``.  Consumers publish P-ready in FIFO order and
+        independently drive one sender through poll/init/send/terminal.  A
+        slow transport operation therefore occupies one consumer instead of
+        serializing every ready request or the Prefill scheduler.
+
+        Request/KV cleanup remains scheduler-owned after a consumer publishes
+        a terminal cached poll.
         """
 
         if self.tp_size != 1:
@@ -422,7 +428,6 @@ class SchedulerDisaggregationPrefillMixin:
         if enabled not in {"1", "true", "yes", "on"}:
             return
         self._prefill_transfer_poll_lock = threading.Lock()
-        self._prefill_transfer_wakeup = threading.Event()
         self._prefill_transfer_stop = threading.Event()
         self._prefill_transfer_interval = max(
             0.0005,
@@ -432,101 +437,175 @@ class SchedulerDisaggregationPrefillMixin:
                 )
             ),
         )
-        self._prefill_transfer_async_enabled = True
-        self._prefill_transfer_thread = threading.Thread(
-            target=self._prefill_transfer_progress_worker,
-            name=f"sglang-prefill-transfer-{os.getpid()}",
-            daemon=True,
+        # ``max_transfer_inflight`` is enforced independently by every D.
+        # Size P's sender-progress pool the same way: a fixed process-wide
+        # default of eight underfeeds multi-D deployments even while all D
+        # workers have destination capacity.  An explicit consumer count is
+        # still honored for experiments and non-agentic deployments.
+        consumers_per_d = max(
+            1,
+            int(os.getenv("SGLANG_PREFILL_TRANSFER_CONSUMERS_PER_D", "8")),
         )
-        self._prefill_transfer_thread.start()
+        decode_workers = max(
+            1,
+            int(os.getenv("SGLANG_AGENTIC_KV_D_WRITERS", "1")),
+        )
+        self._prefill_transfer_consumer_count = max(
+            1,
+            int(
+                os.getenv(
+                    "SGLANG_PREFILL_TRANSFER_CONSUMERS",
+                    str(consumers_per_d * decode_workers),
+                )
+            ),
+        )
+        self._prefill_ready_condition = threading.Condition()
+        self._prefill_ready_queue = deque()
+        self._prefill_ready_queued_rids = set()
+        self._prefill_ready_publish_condition = threading.Condition()
+        self._prefill_ready_next_publish_sequence = 0
+        self._prefill_transfer_async_enabled = True
+        self._prefill_transfer_threads = []
+        for index in range(self._prefill_transfer_consumer_count):
+            thread = threading.Thread(
+                target=self._prefill_transfer_consumer_worker,
+                args=(index,),
+                name=f"sglang-prefill-transfer-{os.getpid()}-{index}",
+                daemon=True,
+            )
+            thread.start()
+            self._prefill_transfer_threads.append(thread)
         logger.info(
-            "Prefill P->D transfer progress worker enabled interval_ms=%.3f",
+            "Prefill producer/ready-buffer/transfer-consumer pipeline enabled "
+            "consumers=%d interval_ms=%.3f",
+            self._prefill_transfer_consumer_count,
             self._prefill_transfer_interval * 1000.0,
         )
 
-    def _prefill_transfer_background_progress(self: Scheduler) -> None:
-        with self._prefill_transfer_poll_lock:
-            candidates = []
-            for req in list(self.disagg_prefill_inflight_queue):
-                if (
-                    getattr(req, "_async_prefill_transfer_poll", None) is None
-                    and not getattr(
-                        req, "_async_prefill_transfer_poll_inflight", False
-                    )
-                    and not getattr(
-                        req, "_async_prefill_transfer_poll_claimed", False
-                    )
-                ):
-                    req._async_prefill_transfer_poll_inflight = True
-                    candidates.append(req)
-        for req in candidates:
-            try:
-                poll = int(req.disagg_kv_sender.poll())
-                if (
-                    poll == int(KVPoll.WaitingForInput)
-                    and getattr(req, "disagg_p_ready_deferred", False)
-                    and not getattr(req, "disagg_p_ready_transfer_started", False)
-                ):
-                    payload = getattr(
-                        req, "_async_prefill_transfer_payload", None
-                    )
-                    if payload is not None:
-                        num_pages, page_indices, state_indices = payload
-                        req.disagg_kv_sender.init(
-                            num_pages, req.metadata_buffer_index
-                        )
-                        req.disagg_kv_sender.send(page_indices, state_indices)
-                        req.disagg_p_ready_transfer_started = True
-                        req.time_stats.set_prefill_transfer_queue_entry_time()
-                        # The NIXL submission is non-blocking.  Do not publish
-                        # the pre-send WaitingForInput state after work has
-                        # already been submitted by this worker.
-                        poll = int(KVPoll.Transferring)
-            except Exception:
-                logger.exception("P->D sender poll failed for rid=%s", req.rid)
-                poll = int(KVPoll.Failed)
-            with self._prefill_transfer_poll_lock:
-                # Transient states must keep being polled by this worker while
-                # the scheduler is inside a long Prefill forward.  Caching a
-                # Bootstrapping state here made the worker wait for the main
-                # loop to consume it before polling again, which accidentally
-                # re-coupled handoff progress to GPU forward completion.
-                if poll in (int(KVPoll.Success), int(KVPoll.Failed)):
-                    req._async_prefill_transfer_poll = poll
-                elif hasattr(req, "_async_prefill_transfer_poll"):
-                    delattr(req, "_async_prefill_transfer_poll")
-                req._async_prefill_transfer_poll_inflight = False
+    def _enqueue_deferred_prefill_transfer(self: Scheduler, req: Req) -> bool:
+        """Append one producer result to the transfer-consumer FIFO.
 
-    def _prefill_transfer_progress_worker(self: Scheduler) -> None:
+        Deferred requests require an immutable payload and are published to
+        the Router by the consumer.  Legacy/bootstrap requests have already
+        called ``send_kv_chunk`` on the scheduler thread; consumers only poll
+        them to terminal so server warmup and compatibility paths remain
+        asynchronous.
+        """
+
+        deferred = getattr(req, "disagg_p_ready_deferred", False)
+        if deferred and getattr(req, "_async_prefill_transfer_payload", None) is None:
+            return False
+        with self._prefill_ready_condition:
+            if (
+                req.rid in self._prefill_ready_queued_rids
+                or getattr(req, "_async_prefill_transfer_consumer_active", False)
+                or getattr(req, "disagg_p_ready_notified", False)
+            ):
+                return True
+            if deferred:
+                req._p_ready_sequence = getattr(
+                    self, "_p_ready_publish_sequence", 0
+                )
+                self._p_ready_publish_sequence = req._p_ready_sequence + 1
+            self._prefill_ready_queue.append(req)
+            self._prefill_ready_queued_rids.add(req.rid)
+            self._prefill_ready_condition.notify()
+        return True
+
+    def _prefill_transfer_progress_req_once(self: Scheduler, req: Req) -> int:
+        """Advance one consumer-owned sender by one transport state."""
+
+        poll = int(req.disagg_kv_sender.poll())
+        if (
+            poll == int(KVPoll.WaitingForInput)
+            and not getattr(req, "disagg_p_ready_transfer_started", False)
+        ):
+            num_pages, page_indices, state_indices = (
+                req._async_prefill_transfer_payload
+            )
+            req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
+            req.disagg_kv_sender.send(page_indices, state_indices)
+            req.disagg_p_ready_transfer_started = True
+            req.time_stats.set_prefill_transfer_queue_entry_time()
+            return int(KVPoll.Transferring)
+        return poll
+
+    def _prefill_transfer_consumer_worker(
+        self: Scheduler, consumer_index: int
+    ) -> None:
         cycles = 0
         total_seconds = 0.0
         max_seconds = 0.0
         last_stats_at = time.monotonic()
         while not self._prefill_transfer_stop.is_set():
-            started_at = time.perf_counter()
-            self._prefill_transfer_background_progress()
-            elapsed = time.perf_counter() - started_at
-            cycles += 1
-            total_seconds += elapsed
-            max_seconds = max(max_seconds, elapsed)
+            with self._prefill_ready_condition:
+                while (
+                    not self._prefill_ready_queue
+                    and not self._prefill_transfer_stop.is_set()
+                ):
+                    self._prefill_ready_condition.wait(timeout=0.1)
+                if self._prefill_transfer_stop.is_set():
+                    return
+                req = self._prefill_ready_queue.popleft()
+                self._prefill_ready_queued_rids.discard(req.rid)
+                req._async_prefill_transfer_consumer_active = True
+
+            poll = int(KVPoll.Failed)
+            try:
+                if getattr(req, "disagg_p_ready_deferred", False):
+                    self._publish_deferred_prefill_ready(req)
+                while not self._prefill_transfer_stop.is_set():
+                    started_at = time.perf_counter()
+                    poll = self._prefill_transfer_progress_req_once(req)
+                    elapsed = time.perf_counter() - started_at
+                    cycles += 1
+                    total_seconds += elapsed
+                    max_seconds = max(max_seconds, elapsed)
+                    if poll in (int(KVPoll.Success), int(KVPoll.Failed)):
+                        break
+                    self._prefill_transfer_stop.wait(
+                        max(0.0, self._prefill_transfer_interval - elapsed)
+                    )
+            except Exception:
+                logger.exception(
+                    "P->D transfer consumer=%d failed rid=%s",
+                    consumer_index,
+                    req.rid,
+                )
+                poll = int(KVPoll.Failed)
+                # A failed marker write must not leave every later FIFO
+                # sequence waiting forever.  Advance exactly this failed head;
+                # out-of-order consumers remain blocked until their turn.
+                with self._prefill_ready_publish_condition:
+                    if (
+                        getattr(req, "_p_ready_sequence", -1)
+                        == self._prefill_ready_next_publish_sequence
+                    ):
+                        self._prefill_ready_next_publish_sequence += 1
+                        self._prefill_ready_publish_condition.notify_all()
+
+            with self._prefill_transfer_poll_lock:
+                req._async_prefill_transfer_poll = poll
+                req._async_prefill_transfer_consumer_active = False
+
             now = time.monotonic()
             if now - last_stats_at >= 30.0:
+                with self._prefill_ready_condition:
+                    buffered = len(self._prefill_ready_queue)
                 logger.info(
-                    "Prefill P->D transfer progress stats cycles=%d avg_us=%.1f "
-                    "max_ms=%.3f pending=%d",
+                    "Prefill P->D consumer stats worker=%d cycles=%d "
+                    "avg_us=%.1f max_ms=%.3f ready_buffer=%d inflight=%d",
+                    consumer_index,
                     cycles,
                     total_seconds * 1e6 / max(1, cycles),
                     max_seconds * 1000.0,
+                    buffered,
                     len(self.disagg_prefill_inflight_queue),
                 )
                 cycles = 0
                 total_seconds = 0.0
                 max_seconds = 0.0
                 last_stats_at = now
-            self._prefill_transfer_wakeup.wait(
-                max(0.0, self._prefill_transfer_interval - elapsed)
-            )
-            self._prefill_transfer_wakeup.clear()
 
     def _prepare_deferred_prefill_transfer(self: Scheduler, req: Req) -> bool:
         """Prepare immutable NIXL submission data on the scheduler thread.
@@ -627,22 +706,59 @@ class SchedulerDisaggregationPrefillMixin:
 
         if getattr(req, "disagg_p_ready_notified", False):
             return
-        ready_path = os.path.join(
-            self.disagg_prefill_bootstrap_queue.p_ready_dir,
-            f"{req.bootstrap_room}.ready",
+        ready_sequence = getattr(req, "_p_ready_sequence", None)
+        if ready_sequence is None:
+            ready_sequence = getattr(self, "_p_ready_publish_sequence", 0)
+            self._p_ready_publish_sequence = ready_sequence + 1
+            req._p_ready_sequence = ready_sequence
+        publish_condition = getattr(
+            self, "_prefill_ready_publish_condition", None
         )
-        tmp_path = f"{ready_path}.{os.getpid()}.tmp"
-        ready_sequence = getattr(self, "_p_ready_publish_sequence", 0)
-        self._p_ready_publish_sequence = ready_sequence + 1
-        ready_metadata = {
-            "rid": req.rid,
-            "num_kv_tokens": len(req.origin_input_ids),
-            "ready_sequence": ready_sequence,
-        }
-        with open(tmp_path, "w", encoding="utf-8") as handle:
-            json.dump(ready_metadata, handle, separators=(",", ":"))
-        os.replace(tmp_path, ready_path)
-        req.disagg_p_ready_notified = True
+        if publish_condition is None:
+            ready_path = os.path.join(
+                self.disagg_prefill_bootstrap_queue.p_ready_dir,
+                f"{req.bootstrap_room}.ready",
+            )
+            tmp_path = f"{ready_path}.{os.getpid()}.{ready_sequence}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "rid": req.rid,
+                        "num_kv_tokens": len(req.origin_input_ids),
+                        "ready_sequence": ready_sequence,
+                    },
+                    handle,
+                    separators=(",", ":"),
+                )
+            os.replace(tmp_path, ready_path)
+            req.disagg_p_ready_notified = True
+            return
+        # Multiple consumers may finish transport control calls out of order,
+        # but the Router must observe the producer's FIFO completion order.
+        with publish_condition:
+            while (
+                ready_sequence != self._prefill_ready_next_publish_sequence
+                and not self._prefill_transfer_stop.is_set()
+            ):
+                publish_condition.wait(timeout=0.1)
+            if self._prefill_transfer_stop.is_set():
+                return
+            ready_path = os.path.join(
+                self.disagg_prefill_bootstrap_queue.p_ready_dir,
+                f"{req.bootstrap_room}.ready",
+            )
+            tmp_path = f"{ready_path}.{os.getpid()}.{ready_sequence}.tmp"
+            ready_metadata = {
+                "rid": req.rid,
+                "num_kv_tokens": len(req.origin_input_ids),
+                "ready_sequence": ready_sequence,
+            }
+            with open(tmp_path, "w", encoding="utf-8") as handle:
+                json.dump(ready_metadata, handle, separators=(",", ":"))
+            os.replace(tmp_path, ready_path)
+            req.disagg_p_ready_notified = True
+            self._prefill_ready_next_publish_sequence += 1
+            publish_condition.notify_all()
 
     def _prefill_transfer_cached_polls(self: Scheduler) -> list[int]:
         with self._prefill_transfer_poll_lock:
@@ -659,10 +775,19 @@ class SchedulerDisaggregationPrefillMixin:
     def _release_prefill_transfer_poll_claims(
         self: Scheduler, undone_reqs: list[Req]
     ) -> None:
+        """Release scheduler claims without discarding a newer terminal poll.
+
+        The consumer can publish ``Success`` after the scheduler snapshots an
+        older ``Transferring`` state but before this cleanup runs.  Deleting
+        ``_async_prefill_transfer_poll`` here loses that terminal transition;
+        because P-ready was already published, the request is never enqueued
+        again and permanently pins its P-side KV.  Terminal results are
+        therefore level-triggered and remain visible until the request leaves
+        ``disagg_prefill_inflight_queue``.
+        """
+
         with self._prefill_transfer_poll_lock:
             for req in undone_reqs:
-                if hasattr(req, "_async_prefill_transfer_poll"):
-                    delattr(req, "_async_prefill_transfer_poll")
                 req._async_prefill_transfer_poll_claimed = False
 
     def _should_throttle_p_ready_compute_ahead(self: Scheduler) -> bool:
@@ -709,9 +834,18 @@ class SchedulerDisaggregationPrefillMixin:
         except ValueError:
             logger.exception("Invalid P-ready compute-ahead backpressure setting")
             raise
+        if mode == "disabled":
+            # Let the native SGLang scheduler admit Prefill work until its
+            # allocator reports that no batch fits.  Agentic Direct/slow/new
+            # priority remains in the waiting queue; only the synthetic
+            # request/token compute-ahead credits are disabled.
+            self._p_ready_compute_credit_tokens = None
+            self._p_ready_compute_ahead_throttled = False
+            return False
         if mode not in {"continuous", "hysteresis"}:
             raise ValueError(
-                "SGLANG_PD_P_READY_BACKPRESSURE_MODE must be continuous or "
+                "SGLANG_PD_P_READY_BACKPRESSURE_MODE must be disabled, "
+                "continuous, or "
                 f"hysteresis (got {mode!r})"
             )
         if not (0.0 < high < 1.0):
@@ -979,12 +1113,16 @@ class SchedulerDisaggregationPrefillMixin:
                     if not getattr(self, "_prefill_transfer_async_enabled", False) or (
                         self._prepare_deferred_prefill_transfer(req)
                     ):
-                        self._publish_deferred_prefill_ready(req)
                         if getattr(self, "_prefill_transfer_async_enabled", False):
-                            self._prefill_transfer_wakeup.set()
+                            self._enqueue_deferred_prefill_transfer(req)
+                        else:
+                            self._publish_deferred_prefill_ready(req)
                 else:
                     self.send_kv_chunk(req, last_chunk=True)
+                    req.disagg_p_ready_transfer_started = True
                     req.time_stats.set_prefill_transfer_queue_entry_time()
+                    if getattr(self, "_prefill_transfer_async_enabled", False):
+                        self._enqueue_deferred_prefill_transfer(req)
 
                 if req.grammar is not None:
                     # FIXME: this try-except block is for handling unexpected xgrammar issue.
@@ -1050,17 +1188,13 @@ class SchedulerDisaggregationPrefillMixin:
             # scheduler thread.  Never publish P-ready before preparation:
             # Decode must not advertise destination pages to a worker that has
             # no immutable, fully-populated metadata payload to send.
-            prepared_any = False
             for req in self.disagg_prefill_inflight_queue:
                 if (
                     getattr(req, "disagg_p_ready_deferred", False)
                     and not getattr(req, "disagg_p_ready_notified", False)
                     and self._prepare_deferred_prefill_transfer(req)
                 ):
-                    self._publish_deferred_prefill_ready(req)
-                    prepared_any = True
-            if prepared_any:
-                self._prefill_transfer_wakeup.set()
+                    self._enqueue_deferred_prefill_transfer(req)
             polls = self._prefill_transfer_cached_polls()
         else:
             polls = poll_and_all_reduce_attn_cp_tp_group(
@@ -1100,7 +1234,7 @@ class SchedulerDisaggregationPrefillMixin:
             ):
                 if getattr(self, "_prefill_transfer_async_enabled", False):
                     if self._prepare_deferred_prefill_transfer(req):
-                        self._prefill_transfer_wakeup.set()
+                        self._enqueue_deferred_prefill_transfer(req)
                     undone_reqs.append(req)
                     continue
                 if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
@@ -1157,7 +1291,10 @@ class SchedulerDisaggregationPrefillMixin:
                             agentic_metadata.current.snapshot_id,
                             source_digest,
                         )
-                release_kv_cache(req, self.tree_cache)  # unlock the tree
+                # A transferred request-generation has left P.  Do not turn
+                # its completed branch into an opportunistic prefix cache:
+                # only live request-generations may own P-side KV.
+                release_kv_cache(req, self.tree_cache, is_insert=False)
                 if agentic_metadata is not None:
                     release_agentic = getattr(
                         self.tree_cache, "release_agentic_request_cache", None

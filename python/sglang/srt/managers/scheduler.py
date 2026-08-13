@@ -33,6 +33,7 @@ from sglang.srt.utils.common import suppress_noisy_warnings
 suppress_noisy_warnings()
 
 import psutil
+import numpy as np
 import setproctitle
 import torch
 import torch.distributed
@@ -266,6 +267,248 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class AgenticDirectCreditAllocation:
+    """One request-generation allocation from the P Direct reserve."""
+
+    allocation_id: int
+    segments: Tuple[Tuple[int, int], ...]
+    page_indices: np.ndarray
+    token_count: int
+    allocated_tokens: int
+    bound: bool = False
+
+
+class AgenticDirectPageCreditPool:
+    """A fixed P-HBM reserve that can be admitted off the scheduler thread.
+
+    The SGLang allocator is intentionally touched only once during startup.
+    Afterwards the ingress worker allocates Python interval metadata and sends
+    precomputed page ids to NIXL, so a long Prefill forward cannot delay a
+    reverse-transfer claim.  Once received KV is bound into Radix, ordinary
+    empty pages replace its reserve slots.  This changes only page ownership --
+    no KV copy is required -- and makes the fixed reserve a transit buffer.
+    """
+
+    def __init__(self, allocator, *, capacity_tokens: int, page_size: int):
+        self.page_size = int(page_size)
+        capacity_tokens = (
+            int(capacity_tokens) // self.page_size * self.page_size
+        )
+        if capacity_tokens <= 0:
+            raise ValueError("Direct page-credit reserve must contain one page")
+        device_indices = allocator.alloc(capacity_tokens)
+        if device_indices is None:
+            raise RuntimeError(
+                f"Could not reserve {capacity_tokens} P KV tokens for Direct ingress"
+            )
+        self.device_indices = device_indices
+        self.capacity_tokens = capacity_tokens
+        self.capacity_pages = capacity_tokens // self.page_size
+        self.page_indices = kv_to_page_indices(
+            device_indices.cpu().numpy(), self.page_size
+        )
+        if len(self.page_indices) != self.capacity_pages:
+            allocator.free(device_indices)
+            raise RuntimeError("Direct reserve page metadata has the wrong size")
+        self._page_to_slot = {
+            int(page): slot for slot, page in enumerate(self.page_indices.tolist())
+        }
+        self._free: List[Tuple[int, int]] = [(0, self.capacity_pages)]
+        self._allocations: Dict[int, AgenticDirectCreditAllocation] = {}
+        self._next_allocation_id = 1
+        self._lock = threading.RLock()
+
+    @property
+    def free_tokens(self) -> int:
+        with self._lock:
+            return sum(count for _, count in self._free) * self.page_size
+
+    @property
+    def unaccounted_tokens(self) -> int:
+        """Reserved pages not already represented by a Radix node."""
+
+        with self._lock:
+            prebind = sum(
+                allocation.allocated_tokens
+                for allocation in self._allocations.values()
+                if not allocation.bound
+            )
+            return self.free_tokens + prebind
+
+    def allocate(self, token_count: int) -> Optional[AgenticDirectCreditAllocation]:
+        token_count = int(token_count)
+        pages_needed = (token_count + self.page_size - 1) // self.page_size
+        with self._lock:
+            if pages_needed > sum(count for _, count in self._free):
+                return None
+            remaining = pages_needed
+            segments: List[Tuple[int, int]] = []
+            next_free: List[Tuple[int, int]] = []
+            for start, count in self._free:
+                take = min(count, remaining)
+                if take:
+                    segments.append((start, take))
+                    start += take
+                    count -= take
+                    remaining -= take
+                if count:
+                    next_free.append((start, count))
+            if remaining:
+                raise RuntimeError("Direct credit interval accounting is inconsistent")
+            self._free = next_free
+            pages = np.concatenate(
+                [self.page_indices[start : start + count] for start, count in segments]
+            ).astype(np.int32, copy=False)
+            allocation = AgenticDirectCreditAllocation(
+                allocation_id=self._next_allocation_id,
+                segments=tuple(segments),
+                page_indices=pages,
+                token_count=token_count,
+                allocated_tokens=pages_needed * self.page_size,
+            )
+            self._next_allocation_id += 1
+            self._allocations[allocation.allocation_id] = allocation
+            return allocation
+
+    def device_view(self, allocation: AgenticDirectCreditAllocation) -> torch.Tensor:
+        pieces = [
+            self.device_indices[
+                start * self.page_size : (start + count) * self.page_size
+            ]
+            for start, count in allocation.segments
+        ]
+        result = pieces[0] if len(pieces) == 1 else torch.cat(pieces)
+        return result[: allocation.token_count]
+
+    def mark_bound(self, allocation: AgenticDirectCreditAllocation) -> None:
+        with self._lock:
+            current = self._allocations.get(allocation.allocation_id)
+            if current is not None:
+                current.bound = True
+
+    def promote_to_ordinary(
+        self,
+        allocation: AgenticDirectCreditAllocation,
+        replacement_indices: torch.Tensor,
+    ) -> None:
+        """Detach received KV pages and replenish their reserve slots.
+
+        ``replacement_indices`` are unused pages from the ordinary allocator.
+        The received pages remain unchanged and are subsequently owned by the
+        Radix branch.  Only this pool's small page-id table is rewritten.
+        """
+
+        if replacement_indices.numel() != allocation.allocated_tokens:
+            raise ValueError("Direct reserve replacement has the wrong size")
+        replacement_pages = kv_to_page_indices(
+            replacement_indices.cpu().numpy(), self.page_size
+        )
+        if len(replacement_pages) != allocation.allocated_tokens // self.page_size:
+            raise ValueError("Direct reserve replacement is not page aligned")
+
+        with self._lock:
+            current = self._allocations.get(allocation.allocation_id)
+            if current is not allocation or current.bound:
+                raise RuntimeError("Direct reserve allocation cannot be promoted")
+            cursor_pages = 0
+            cursor_tokens = 0
+            for start, count in allocation.segments:
+                old_pages = self.page_indices[start : start + count].tolist()
+                for page in old_pages:
+                    self._page_to_slot.pop(int(page), None)
+
+                token_count = count * self.page_size
+                new_indices = replacement_indices[
+                    cursor_tokens : cursor_tokens + token_count
+                ]
+                new_pages = replacement_pages[
+                    cursor_pages : cursor_pages + count
+                ]
+                self.device_indices[
+                    start * self.page_size : (start + count) * self.page_size
+                ] = new_indices
+                self.page_indices[start : start + count] = new_pages
+                for offset, page in enumerate(new_pages.tolist()):
+                    self._page_to_slot[int(page)] = start + offset
+                cursor_pages += count
+                cursor_tokens += token_count
+
+            self._allocations.pop(allocation.allocation_id)
+            self._free.extend(allocation.segments)
+            self._coalesce_free_locked()
+
+    def release(self, allocation: AgenticDirectCreditAllocation) -> None:
+        with self._lock:
+            current = self._allocations.pop(allocation.allocation_id, None)
+            if current is None:
+                return
+            self._free.extend(current.segments)
+            self._coalesce_free_locked()
+
+    def reclaim_node_indices(self, indices: torch.Tensor, allocator) -> int:
+        """Return reserve pages from one released Radix node.
+
+        Agentic branches normally keep the restored parent and newly computed
+        suffix in separate nodes.  The mixed case is still handled explicitly.
+        """
+
+        if indices.numel() == 0:
+            return 0
+        page_ids = torch.unique_consecutive(
+            indices // self.page_size
+        ).cpu().tolist()
+        reserve_slots = [
+            self._page_to_slot[int(page)]
+            for page in page_ids
+            if int(page) in self._page_to_slot
+        ]
+        if not reserve_slots:
+            allocator.free(indices)
+            return 0
+        reserve_pages = {int(self.page_indices[slot]) for slot in reserve_slots}
+        normal_pages = [int(page) for page in page_ids if int(page) not in reserve_pages]
+        if normal_pages:
+            pages = torch.tensor(
+                normal_pages, dtype=torch.int64, device=indices.device
+            )
+            normal_indices = (
+                pages[:, None] * self.page_size
+                + torch.arange(self.page_size, device=indices.device)
+            ).reshape(-1)
+            allocator.free(normal_indices)
+        with self._lock:
+            # Convert arbitrary returned slots into intervals, then merge.
+            for slot in sorted(reserve_slots):
+                self._free.append((slot, 1))
+            self._coalesce_free_locked()
+            free_slots = {
+                slot
+                for start, count in self._free
+                for slot in range(start, start + count)
+            }
+            for allocation_id, allocation in tuple(self._allocations.items()):
+                allocated_slots = {
+                    slot
+                    for start, count in allocation.segments
+                    for slot in range(start, start + count)
+                }
+                if allocated_slots.issubset(free_slots):
+                    self._allocations.pop(allocation_id, None)
+        return len(reserve_slots) * self.page_size
+
+    def _coalesce_free_locked(self) -> None:
+        merged: List[List[int]] = []
+        for start, count in sorted(self._free):
+            if merged and merged[-1][0] + merged[-1][1] == start:
+                merged[-1][1] += count
+            elif merged and start < merged[-1][0] + merged[-1][1]:
+                raise RuntimeError("Direct credit page was released twice")
+            else:
+                merged.append([start, count])
+        self._free = [(start, count) for start, count in merged]
+
+
+@dataclass
 class AgenticEarlyDirectReceive:
     """P-owned reverse transfer that exists before the tokenized Req."""
 
@@ -273,9 +516,10 @@ class AgenticEarlyDirectReceive:
     manifest: Any
     claim_id: str
     receiver: Any
-    device_indices: torch.Tensor
+    device_indices: Optional[torch.Tensor]
     started_at: float
     arrived_at: float
+    credit_allocation: Optional[AgenticDirectCreditAllocation] = None
     completed_at: Optional[float] = None
     # Transport progress is driven by a lightweight worker while a long
     # Prefill kernel owns the scheduler thread.  Lifecycle completion, HBM
@@ -909,7 +1153,9 @@ class Scheduler(
         self.agentic_early_direct_terminal: Dict[str, float] = {}
         self.agentic_early_direct_next_scan_at = 0.0
         self.agentic_early_claim_store = None
+        self.agentic_direct_credit_pool = None
         self.agentic_early_direct_poll_lock = threading.RLock()
+        self.agentic_early_direct_cycle_lock = threading.Lock()
         self.agentic_early_direct_progress_stop = threading.Event()
         self.agentic_early_direct_progress_thread = None
         # The running decoding batch for continuous batching
@@ -1196,6 +1442,24 @@ class Scheduler(
                 if early_claim_dir:
                     self.agentic_early_claim_store = AgenticEarlyClaimStore(
                         early_claim_dir
+                    )
+                if self.agentic_early_claim_store is not None:
+                    direct_reserve_tokens = int(
+                        os.environ.get(
+                            "SGLANG_AGENTIC_KV_P_DIRECT_RESERVE_TOKENS", "40000"
+                        )
+                    )
+                    self.agentic_direct_credit_pool = AgenticDirectPageCreditPool(
+                        self.token_to_kv_pool_allocator,
+                        capacity_tokens=direct_reserve_tokens,
+                        page_size=self.server_args.page_size,
+                    )
+                    logger.info(
+                        "Agentic P Direct page-credit reserve enabled "
+                        "capacity_tokens=%d ordinary_tokens=%d",
+                        self.agentic_direct_credit_pool.capacity_tokens,
+                        self.max_total_num_tokens
+                        - self.agentic_direct_credit_pool.capacity_tokens,
                     )
                 if envs.SGLANG_AGENTIC_KV_HOST_STAGING.get():
                     ledger_base = envs.SGLANG_AGENTIC_KV_LEDGER_PATH.get()
@@ -2201,13 +2465,23 @@ class Scheduler(
         runtime = getattr(self, "agentic_direct_runtime", None)
         if runtime is None or getattr(self.tree_cache, "is_eagle", False):
             return False
-        if not self._agentic_direct_hbm_fits(manifest.token_count):
-            return False
-        device_indices = self.token_to_kv_pool_allocator.alloc(
-            manifest.token_count
+        credit_pool = getattr(self, "agentic_direct_credit_pool", None)
+        credit_allocation = (
+            None if credit_pool is None else credit_pool.allocate(manifest.token_count)
         )
-        if device_indices is None:
+        if credit_pool is not None and credit_allocation is None:
             return False
+        device_indices = None
+        if credit_pool is None:
+            # Compatibility path for focused tests and lifecycle-disabled
+            # deployments. Production agentic serving always owns a reserve.
+            if not self._agentic_direct_hbm_fits(manifest.token_count):
+                return False
+            device_indices = self.token_to_kv_pool_allocator.alloc(
+                manifest.token_count
+            )
+            if device_indices is None:
+                return False
         claim_id = (
             f"direct-early-p:{os.getpid()}:{request.snapshot_id}:"
             f"{time.monotonic_ns()}"
@@ -2228,12 +2502,19 @@ class Scheduler(
             receiver.init(prefill_dp_rank=0)
             if receiver.poll() == KVPoll.Failed:
                 raise SnapshotLifecycleError("reverse receiver init failed")
-            page_indices = kv_to_page_indices(
-                device_indices.cpu().numpy(), self.server_args.page_size
+            page_indices = (
+                credit_allocation.page_indices
+                if credit_allocation is not None
+                else kv_to_page_indices(
+                    device_indices.cpu().numpy(), self.server_args.page_size
+                )
             )
             receiver.send_metadata(page_indices, aux_index=0)
         except Exception as exc:
-            self.token_to_kv_pool_allocator.free(device_indices)
+            if credit_allocation is not None:
+                credit_pool.release(credit_allocation)
+            elif device_indices is not None:
+                self.token_to_kv_pool_allocator.free(device_indices)
             if receiver is not None:
                 try:
                     receiver.clear()
@@ -2272,15 +2553,17 @@ class Scheduler(
             device_indices=device_indices,
             started_at=time.monotonic(),
             arrived_at=arrived_at,
+            credit_allocation=credit_allocation,
         )
         with getattr(self, "agentic_early_direct_poll_lock", nullcontext()):
             self.agentic_early_direct_receives[request.snapshot_id] = entry
         logger.info(
             "AgenticKV early_direct_start snapshot=%s tokens=%d "
-            "arrival_to_start_ms=%.3f",
+            "arrival_to_start_ms=%.3f reserve_free_tokens=%d",
             request.snapshot_id,
             claimed.token_count,
             max(0.0, (time.time() - arrived_at) * 1000.0),
+            -1 if credit_pool is None else credit_pool.free_tokens,
         )
         return True
 
@@ -2303,7 +2586,11 @@ class Scheduler(
                     "Failed to clear early Direct receiver for %s",
                     entry.request.snapshot_id,
                 )
-        self.token_to_kv_pool_allocator.free(entry.device_indices)
+        credit_pool = getattr(self, "agentic_direct_credit_pool", None)
+        if entry.credit_allocation is not None and credit_pool is not None:
+            credit_pool.release(entry.credit_allocation)
+        elif entry.device_indices is not None:
+            self.token_to_kv_pool_allocator.free(entry.device_indices)
         if release_claim:
             try:
                 current = snapshot_store.load(
@@ -2336,12 +2623,11 @@ class Scheduler(
         )
 
     def _agentic_early_direct_progress_worker(self) -> None:
-        """Advance launched Direct transports independently of GPU forward.
+        """Discover, claim, and complete Direct ingress off the GPU scheduler.
 
-        This deliberately does not allocate/free HBM, mutate Radix, or change
-        snapshot lifecycle state.  It only caches the terminal KVPoll value;
-        the scheduler consumes that value in
-        _agentic_poll_early_direct_receives().
+        The worker allocates only from the fixed Direct page-credit reserve;
+        it never touches the shared SGLang allocator or Radix tree.  The
+        scheduler later performs the cheap Req binding step.
         """
 
         try:
@@ -2364,17 +2650,21 @@ class Scheduler(
         while not self.agentic_early_direct_progress_stop.is_set():
             started = time.monotonic()
             try:
+                # Keep transport polling independent even in lightweight
+                # tests where no lifecycle store is installed. Production's
+                # full cycle below consumes the cached terminal state.
                 with getattr(self, "agentic_early_direct_poll_lock", nullcontext()):
                     entries = tuple(self.agentic_early_direct_receives.values())
                     for entry in entries:
                         if (
-                            entry.completed_at is not None
-                            or entry.transport_poll in {KVPoll.Success, KVPoll.Failed}
+                            entry.completed_at is None
+                            and entry.transport_poll
+                            not in {KVPoll.Success, KVPoll.Failed}
                         ):
-                            continue
-                        entry.transport_poll = entry.receiver.poll()
+                            entry.transport_poll = entry.receiver.poll()
+                self._agentic_poll_early_direct_receives()
             except Exception:
-                logger.exception("P Direct transport progress worker failed")
+                logger.exception("P Direct ingress worker failed")
             elapsed = time.monotonic() - started
             cycles += 1
             total_seconds += elapsed
@@ -2390,11 +2680,14 @@ class Scheduler(
                     )
                 logger.info(
                     "Agentic P Direct progress stats cycles=%d avg_us=%.1f "
-                    "max_ms=%.3f active=%d",
+                    "max_ms=%.3f active=%d reserve_free_tokens=%d",
                     cycles,
                     total_seconds / max(cycles, 1) * 1e6,
                     max_seconds * 1e3,
                     active,
+                    -1
+                    if getattr(self, "agentic_direct_credit_pool", None) is None
+                    else self.agentic_direct_credit_pool.free_tokens,
                 )
                 cycles = 0
                 total_seconds = 0.0
@@ -2403,6 +2696,15 @@ class Scheduler(
             self.agentic_early_direct_progress_stop.wait(interval)
 
     def _agentic_poll_early_direct_receives(
+        self, now: Optional[float] = None
+    ) -> None:
+        cycle_lock = getattr(self, "agentic_early_direct_cycle_lock", None)
+        if cycle_lock is None:
+            return self._agentic_poll_early_direct_receives_once(now)
+        with cycle_lock:
+            return self._agentic_poll_early_direct_receives_once(now)
+
+    def _agentic_poll_early_direct_receives_once(
         self, now: Optional[float] = None
     ) -> None:
         """Discover arrival markers and progress async reverse transfers."""
@@ -2478,15 +2780,9 @@ class Scheduler(
                         )
                     snapshot_store.complete_direct(current, entry.claim_id)
                     entry.completed_at = now
-                    restored_digest = debug_kv_digest(
-                        runtime.kv_pool, entry.device_indices
-                    )
-                    if restored_digest is not None:
-                        logger.info(
-                            "AgenticKV p_restored_digest snapshot=%s digest=%s",
-                            snapshot_id,
-                            restored_digest,
-                        )
+                    # Do not launch debug GPU work from the independent
+                    # ingress thread. The token digest is validated when the
+                    # tokenized Req binds on the scheduler thread.
                     entry.receiver.clear()
                     self._agentic_clear_direct_receiver(
                         entry.receiver, entry.manifest
@@ -2540,6 +2836,11 @@ class Scheduler(
         except ValueError:
             logger.exception("Invalid early Direct admission setting")
             raise
+        credit_pool = getattr(self, "agentic_direct_credit_pool", None)
+        if credit_pool is not None:
+            # Token credit is the admission bound. A separate request-count
+            # cap recreates burst head-of-line blocking for small snapshots.
+            direct_io_cap = credit_pool.capacity_pages
         if now < self.agentic_early_direct_next_scan_at:
             return
         self.agentic_early_direct_next_scan_at = now + scan_interval
@@ -2595,6 +2896,32 @@ class Scheduler(
         if entry.completed_at is None:
             return True
 
+        if entry.device_indices is None:
+            credit_pool = getattr(self, "agentic_direct_credit_pool", None)
+            if credit_pool is None or entry.credit_allocation is None:
+                raise RuntimeError("completed Direct receive lost its page credit")
+            # Keep a stable view of the received pages.  The reserve's page-id
+            # table may be replenished immediately after Radix takes ownership.
+            entry.device_indices = credit_pool.device_view(
+                entry.credit_allocation
+            ).clone()
+
+        # The independent ingress worker deliberately avoids launching GPU
+        # diagnostics.  Run the opt-in exact byte digest here, on the
+        # scheduler thread, before reserve page ids can be replenished.
+        direct_runtime = getattr(self, "agentic_direct_runtime", None)
+        restored_digest = (
+            None
+            if direct_runtime is None
+            else debug_kv_digest(direct_runtime.kv_pool, entry.device_indices)
+        )
+        if restored_digest is not None:
+            logger.info(
+                "AgenticKV p_restored_digest snapshot=%s digest=%s",
+                request.snapshot_id,
+                restored_digest,
+            )
+
         parent_tokens = req.origin_input_ids[: entry.manifest.token_count]
         if (
             len(parent_tokens) != entry.manifest.token_count
@@ -2632,21 +2959,60 @@ class Scheduler(
             req._agentic_kv_fallback = "early_direct_radix_insert_failed"
             return False
         if result.prefix_len:
-            self.token_to_kv_pool_allocator.free(
-                entry.device_indices[: result.prefix_len]
+            if entry.credit_allocation is not None:
+                # A trajectory-unique extra_key normally makes this zero. Keep
+                # duplicate handling correct without leaking reserve pages.
+                getattr(self, "agentic_direct_credit_pool").reclaim_node_indices(
+                    entry.device_indices[: result.prefix_len],
+                    self.token_to_kv_pool_allocator,
+                )
+            else:
+                self.token_to_kv_pool_allocator.free(
+                    entry.device_indices[: result.prefix_len]
+                )
+        promoted = False
+        if (
+            entry.credit_allocation is not None
+            and result.prefix_len == 0
+            and entry.credit_allocation.allocated_tokens
+            == entry.credit_allocation.token_count
+        ):
+            replacement = self.token_to_kv_pool_allocator.alloc(
+                entry.credit_allocation.allocated_tokens
             )
+            if replacement is not None:
+                try:
+                    self.agentic_direct_credit_pool.promote_to_ordinary(
+                        entry.credit_allocation, replacement
+                    )
+                    promoted = True
+                except Exception:
+                    self.token_to_kv_pool_allocator.free(replacement)
+                    logger.exception(
+                        "Failed to replenish Direct reserve for %s", req.rid
+                    )
+        if entry.credit_allocation is not None and not promoted:
+            # Near full occupancy there may be no ordinary page available to
+            # replenish the transit reserve.  Keep these pages reserve-owned
+            # until the request's P->D handoff releases its Radix branch.
+            self.agentic_direct_credit_pool.mark_bound(entry.credit_allocation)
+            req._agentic_direct_credit_pool = self.agentic_direct_credit_pool
+            req._agentic_direct_credit_allocation = entry.credit_allocation
         with getattr(self, "agentic_early_direct_poll_lock", nullcontext()):
             self.agentic_early_direct_receives.pop(request.snapshot_id, None)
             self.agentic_early_direct_terminal[request.snapshot_id] = time.monotonic()
         req._agentic_kv_gate_complete = True
         req._agentic_kv_direct_hit_tokens = entry.manifest.token_count
+        credit_pool = getattr(self, "agentic_direct_credit_pool", None)
         logger.info(
             "AgenticKV early_direct_bind snapshot=%s tokens=%d existing_tokens=%d "
-            "arrival_to_bind_ms=%.3f req=%s",
+            "arrival_to_bind_ms=%.3f promoted=%s reserve_free_tokens=%d req=%s",
             request.snapshot_id,
             entry.manifest.token_count,
             result.prefix_len,
             max(0.0, (time.time() - entry.arrived_at) * 1000.0),
+            promoted,
+            credit_pool.free_tokens if credit_pool is not None else 0,
             req.rid,
         )
         return False
@@ -3260,6 +3626,34 @@ class Scheduler(
             return "slow"
         return None
 
+    def _agentic_bind_completed_waiters(self) -> None:
+        """Bind completed Direct ingress independently of Prefill admission.
+
+        The request may remain in the priority queue until a later admission
+        batch.  Binding now moves its received pages out of the 40k transit
+        reserve immediately, so that compute throttling cannot exhaust Direct
+        receive credit.
+        """
+
+        receives = getattr(self, "agentic_early_direct_receives", None)
+        if not receives:
+            return
+        with getattr(self, "agentic_early_direct_poll_lock", nullcontext()):
+            completed = {
+                snapshot_id
+                for snapshot_id, entry in receives.items()
+                if entry.completed_at is not None
+            }
+        if not completed:
+            return
+        for req, _ in self.agentic_kv_waiting_queue:
+            if getattr(req, "_agentic_kv_gate_complete", False):
+                continue
+            metadata = AgenticRequestMetadata.from_req(req)
+            parent = metadata.parent if metadata is not None else None
+            if parent is not None and parent.snapshot_id in completed:
+                self._agentic_bind_early_direct_receive(req, parent)
+
     def _drain_agentic_kv_waiting_queue(self) -> None:
         """Progress active KV I/O and admit bounded fast/slow work.
 
@@ -3272,6 +3666,11 @@ class Scheduler(
         """
         if not self.agentic_kv_waiting_queue:
             return
+
+        # This sweep is intentionally outside admission_batch.  Admission
+        # limits Prefill compute; it must not make the Direct transit reserve
+        # retain already-received KV.
+        self._agentic_bind_completed_waiters()
 
         try:
             scan_limit = max(
@@ -3610,19 +4009,36 @@ class Scheduler(
         ):
             metadata = AgenticRequestMetadata.from_req(req)
             if metadata is not None:
-                # Every P request first enters the same scheduler-owned queue.
-                # Parent turns start as fast and may later be reclassified as
-                # slow after snapshot lookup.  Initial requests are last by
-                # default, with deterministic aging to prevent starvation.
-                # Nothing in this queue owns GPU KV or transfer bandwidth.
-                req._agentic_kv_queue_class = (
-                    "fast" if metadata.parent is not None else "new"
-                )
-                req._agentic_kv_wait_enqueued = True
-                enqueued_at = time.monotonic()
-                req._agentic_kv_wait_started_at = enqueued_at
-                self.agentic_kv_waiting_queue.append((req, enqueued_at))
-                return
+                if metadata.parent is not None:
+                    receives = getattr(
+                        self, "agentic_early_direct_receives", None
+                    )
+                    entry = (
+                        receives.get(metadata.parent.snapshot_id)
+                        if receives
+                        else None
+                    )
+                    if entry is not None and entry.completed_at is not None:
+                        self._agentic_bind_early_direct_receive(
+                            req, metadata.parent
+                        )
+                if not getattr(req, "_agentic_kv_gate_complete", False):
+                    # Every P request first enters the same scheduler-owned
+                    # queue. Parent turns start as fast and may later be
+                    # reclassified as slow after snapshot lookup. Initial
+                    # requests are last, with deterministic aging to prevent
+                    # starvation. This queue owns only metadata.
+                    req._agentic_kv_queue_class = (
+                        "fast" if metadata.parent is not None else "new"
+                    )
+                    req._agentic_kv_wait_enqueued = True
+                    enqueued_at = time.monotonic()
+                    req._agentic_kv_wait_started_at = enqueued_at
+                    self.agentic_kv_waiting_queue.append((req, enqueued_at))
+                    return
+                # Direct is already resident; bypass the metadata-only
+                # lifecycle queue and enter native Prefill admission.
+                self._agentic_publish_p_scheduled(req)
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if not self._set_or_validate_priority(req):
                 return
@@ -4256,6 +4672,7 @@ class Scheduler(
                 running_loras.add(req.lora_id)
 
             if res != AddReqResult.CONTINUE:
+                added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if res == AddReqResult.NO_TOKEN:
                     if self.enable_hierarchical_cache:
                         # Set batch_is_full after making sure there are requests that can be served
@@ -4265,7 +4682,6 @@ class Scheduler(
                     else:
                         self.running_batch.batch_is_full = True
                 # revert matched mamba idx to avoid memory leak, if req is not added
-                added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added and req.mamba_pool_idx is not None:
                     self.tree_cache.req_to_token_pool.mamba_pool.free(
                         req.mamba_pool_idx.unsqueeze(-1)

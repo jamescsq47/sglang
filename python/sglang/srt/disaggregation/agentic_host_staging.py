@@ -19,7 +19,6 @@ import mmap
 import os
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from enum import Enum
 from typing import Any, Optional
@@ -797,9 +796,10 @@ class SharedMHAHostSnapshot:
     ``[K/V, layer, token, head, head_dim]``.  This lets D gather scattered KV
     into a small reusable HBM slot and then use contiguous PCIe DMA into Host.
     The file lives in tmpfs, and the
-    mapping is CUDA-registered independently in each process.  It therefore
-    contains exactly one physical Host copy even though P and D have different
-    virtual addresses.
+    mapping stays pageable.  D and P move bounded chunks through a reusable
+    pinned bounce buffer instead of cudaHostRegister-ing this request-sized
+    mapping.  It therefore contains exactly one physical Host copy without
+    putting multi-GiB registration work on either model process' CUDA context.
     """
 
     def __init__(
@@ -851,25 +851,7 @@ class SharedMHAHostSnapshot:
             self.head_num,
             self.head_dim,
         )
-        result = torch.cuda.cudart().cudaHostRegister(
-            self.kv_buffer.data_ptr(), self.byte_size, 0
-        )
-        if result != torch.cuda.cudart().cudaError.success:
-            self.kv_buffer = None
-            raw = None
-            self.mapping.close()
-            raise RuntimeError(f"cudaHostRegister failed: {result}")
         self._raw = raw
-        self.k_data_ptrs = torch.tensor(
-            [self.kv_buffer[0, layer].data_ptr() for layer in range(self.layer_num)],
-            dtype=torch.uint64,
-            device=self.device_pool.device,
-        )
-        self.v_data_ptrs = torch.tensor(
-            [self.kv_buffer[1, layer].data_ptr() for layer in range(self.layer_num)],
-            dtype=torch.uint64,
-            device=self.device_pool.device,
-        )
         self._closed = False
 
     @property
@@ -880,19 +862,36 @@ class SharedMHAHostSnapshot:
     def v_buffer(self):
         return self.kv_buffer[1]
 
-    def start_backup_from_device(self, source_indices, stream, *, staging=None):
+    def start_backup_from_device(
+        self, source_indices, stream, *, staging=None, host_bounce=None
+    ):
         """Launch D-HBM -> this Host extent on the D GPU's own stream."""
 
         if len(source_indices) != self.token_count:
             raise ValueError("source token count does not match shared Host extent")
         return self.start_backup_range_from_device(
-            source_indices, destination_start=0, stream=stream, staging=staging
+            source_indices,
+            destination_start=0,
+            stream=stream,
+            staging=staging,
+            host_bounce=host_bounce,
         )
 
     def start_backup_range_from_device(
-        self, source_indices, *, destination_start: int, stream, staging=None
+        self,
+        source_indices,
+        *,
+        destination_start: int,
+        stream,
+        staging=None,
+        host_bounce=None,
     ):
-        """Launch one relay staging chunk into a range of this Host extent."""
+        """Launch one D2H chunk into a fixed pinned bounce buffer.
+
+        The caller commits the completed bounce into this pageable mapping on
+        CPU before reusing it.  Keeping that commit outside the CUDA event
+        makes the measured GPU time exactly gather + PCIe DMA.
+        """
 
         from sgl_kernel.kvcacheio import transfer_kv_all_layer
 
@@ -909,6 +908,10 @@ class SharedMHAHostSnapshot:
                 self.device_pool,
                 int(os.getenv("SGLANG_AGENTIC_KV_D2H_STAGING_TOKENS", "1024")),
             )
+        if host_bounce is None:
+            raise ValueError("pageable Host snapshots require a pinned D2H bounce")
+        if len(source_indices) > host_bounce.token_capacity:
+            raise ValueError("D2H chunk is larger than the pinned Host bounce")
         start_event = torch.cuda.Event(enable_timing=True)
         event = torch.cuda.Event(enable_timing=True)
         with torch.cuda.stream(stream):
@@ -935,13 +938,11 @@ class SharedMHAHostSnapshot:
                     block_quota=8,
                     num_warps_per_block=32,
                 )
-                host_start = destination_start + start
-                host_end = host_start + count
                 for layer_id in range(self.layer_num):
-                    self.k_buffer[layer_id, host_start:host_end].copy_(
+                    host_bounce.k_buffer[layer_id, start : start + count].copy_(
                         staging.k_buffer[layer_id][:count], non_blocking=True
                     )
-                    self.v_buffer[layer_id, host_start:host_end].copy_(
+                    host_bounce.v_buffer[layer_id, start : start + count].copy_(
                         staging.v_buffer[layer_id][:count], non_blocking=True
                     )
             event.record(stream)
@@ -949,17 +950,38 @@ class SharedMHAHostSnapshot:
             if hasattr(original_source_indices, "record_stream"):
                 original_source_indices.record_stream(stream)
         self._last_d2h_start_event = start_event
-        return event, (source_indices, original_source_indices, staging, start_event)
+        return event, (
+            source_indices,
+            original_source_indices,
+            staging,
+            host_bounce,
+            start_event,
+        )
 
-    def start_load_to_device(
+    def commit_backup_range_from_bounce(
+        self, host_bounce, *, destination_start: int, token_count: int
+    ) -> None:
+        """Copy a completed pinned D2H chunk into the tmpfs snapshot."""
+
+        destination_start = int(destination_start)
+        token_count = int(token_count)
+        destination_end = destination_start + token_count
+        if destination_start < 0 or destination_end > self.token_count:
+            raise ValueError("D2H bounce commit falls outside shared Host extent")
+        self.kv_buffer[:, :, destination_start:destination_end].copy_(
+            host_bounce.kv_buffer[:, :, :token_count]
+        )
+
+    def start_load_range_to_device(
         self,
         device_indices,
         stream,
         *,
-        chunk_tokens: int = 4096,
+        source_start: int,
         staging=None,
+        host_bounce=None,
     ):
-        """Launch this Host extent -> P-HBM on the P GPU's own stream.
+        """Launch one pageable Host -> pinned bounce -> P-HBM chunk.
 
         Do not let the scatter kernel dereference CUDA-registered mmap
         addresses directly.  That UVA path is fast in an isolated benchmark,
@@ -973,17 +995,29 @@ class SharedMHAHostSnapshot:
 
         from sgl_kernel.kvcacheio import transfer_kv_all_layer
 
-        if len(device_indices) != self.token_count:
-            raise ValueError("destination token count does not match shared Host extent")
+        source_start = int(source_start)
+        token_count = len(device_indices)
+        if source_start < 0 or source_start + token_count > self.token_count:
+            raise ValueError("H2D chunk falls outside shared Host extent")
         original_device_indices = device_indices
-        chunk_tokens = max(1, int(chunk_tokens))
+        if host_bounce is None:
+            raise ValueError("pageable Host snapshots require a pinned H2D bounce")
+        if token_count > host_bounce.token_capacity:
+            raise ValueError("H2D chunk is larger than the pinned Host bounce")
         if staging is None:
-            staging = LayerFirstD2HStaging(self.device_pool, chunk_tokens)
-        if staging.token_capacity < chunk_tokens:
-            raise ValueError("H2D staging buffer is smaller than chunk_tokens")
+            staging = LayerFirstD2HStaging(self.device_pool, token_count)
+        if staging.token_capacity < token_count:
+            raise ValueError("H2D staging buffer is smaller than the chunk")
+        # CPU copy happens before CUDA submission and touches only a bounded,
+        # already-pinned allocation.  No CUDA driver registration is needed.
+        host_bounce.kv_buffer[:, :, :token_count].copy_(
+            self.kv_buffer[
+                :, :, source_start : source_start + token_count
+            ]
+        )
         start_event = torch.cuda.Event(enable_timing=True)
         event = torch.cuda.Event(enable_timing=True)
-        copy_refs = [device_indices, staging]
+        copy_refs = [device_indices, staging, host_bounce]
         with torch.cuda.stream(stream):
             if not device_indices.is_cuda or device_indices.dtype != torch.int64:
                 device_indices = device_indices.to(
@@ -992,36 +1026,28 @@ class SharedMHAHostSnapshot:
                     non_blocking=True,
                 )
             start_event.record(stream)
-            # Bound each DMA/scatter launch while retaining the layer-first
-            # Host layout.  The PCIe leg is contiguous for every layer; only
-            # the device-to-device leg touches scattered KV-pool indices.
-            for start in range(0, self.token_count, chunk_tokens):
-                end = min(start + chunk_tokens, self.token_count)
-                count = end - start
-                source_indices = staging.local_indices[:count]
-                destination_chunk = device_indices[start:end]
-                for layer_id in range(self.layer_num):
-                    staging.k_buffer[layer_id][:count].copy_(
-                        self.k_buffer[layer_id, start:end], non_blocking=True
-                    )
-                    staging.v_buffer[layer_id][:count].copy_(
-                        self.v_buffer[layer_id, start:end], non_blocking=True
-                    )
-                transfer_kv_all_layer(
-                    src_k_layers=staging.k_data_ptrs,
-                    dst_k_layers=self.device_pool.k_data_ptrs,
-                    src_v_layers=staging.v_data_ptrs,
-                    dst_v_layers=self.device_pool.v_data_ptrs,
-                    src_indices=source_indices,
-                    dst_indices=destination_chunk,
-                    item_size=self.item_size,
-                    num_layers=self.layer_num,
-                    block_quota=4,
-                    num_warps_per_block=32,
+            source_indices = staging.local_indices[:token_count]
+            for layer_id in range(self.layer_num):
+                staging.k_buffer[layer_id][:token_count].copy_(
+                    host_bounce.k_buffer[layer_id, :token_count], non_blocking=True
                 )
-                source_indices.record_stream(stream)
-                destination_chunk.record_stream(stream)
-                copy_refs.extend((source_indices, destination_chunk))
+                staging.v_buffer[layer_id][:token_count].copy_(
+                    host_bounce.v_buffer[layer_id, :token_count], non_blocking=True
+                )
+            transfer_kv_all_layer(
+                src_k_layers=staging.k_data_ptrs,
+                dst_k_layers=self.device_pool.k_data_ptrs,
+                src_v_layers=staging.v_data_ptrs,
+                dst_v_layers=self.device_pool.v_data_ptrs,
+                src_indices=source_indices,
+                dst_indices=device_indices,
+                item_size=self.item_size,
+                num_layers=self.layer_num,
+                block_quota=4,
+                num_warps_per_block=32,
+            )
+            source_indices.record_stream(stream)
+            copy_refs.append(source_indices)
             event.record(stream)
             device_indices.record_stream(stream)
             if hasattr(original_device_indices, "record_stream"):
@@ -1049,11 +1075,6 @@ class SharedMHAHostSnapshot:
     def close(self, *, unlink: bool = False) -> None:
         if self._closed:
             return
-        result = torch.cuda.cudart().cudaHostUnregister(self.kv_buffer.data_ptr())
-        if result != torch.cuda.cudart().cudaError.success:
-            raise RuntimeError(f"cudaHostUnregister failed: {result}")
-        self.k_data_ptrs = None
-        self.v_data_ptrs = None
         self.kv_buffer = None
         self._raw = None
         self.mapping.close()
@@ -1063,6 +1084,35 @@ class SharedMHAHostSnapshot:
                 os.unlink(self.path)
             except FileNotFoundError:
                 pass
+
+
+class PinnedMHAHostBounce:
+    """Process-lifetime pinned Host chunk reused by every slow snapshot."""
+
+    def __init__(self, device_pool, token_capacity: int):
+        self.token_capacity = int(token_capacity)
+        if self.token_capacity <= 0:
+            raise ValueError("pinned Host bounce capacity must be positive")
+        self.kv_buffer = torch.empty(
+            (
+                2,
+                int(device_pool.layer_num),
+                self.token_capacity,
+                int(device_pool.head_num),
+                int(device_pool.head_dim),
+            ),
+            dtype=device_pool.store_dtype,
+            device="cpu",
+            pin_memory=True,
+        )
+
+    @property
+    def k_buffer(self):
+        return self.kv_buffer[0]
+
+    @property
+    def v_buffer(self):
+        return self.kv_buffer[1]
 
 
 class LazySharedMHAHostSnapshot:
@@ -1238,17 +1288,30 @@ class AgenticPHostStagingManager:
         self.loads: dict[str, dict[str, Any]] = {}
         self.spills: dict[str, dict[str, Any]] = {}
         self._ledger_entries_cache: dict[str, dict[str, Any]] = {}
-        self.max_h2d_inflight = max(
+        requested_h2d_inflight = max(
             1, int(os.getenv("SGLANG_AGENTIC_KV_P_H2D_MAX_INFLIGHT", "1"))
         )
+        # A single process-lifetime pinned bounce is deliberately reused to
+        # avoid per-snapshot registration.  Its contents cannot safely back
+        # overlapping H2D operations, so serialize slow restores here.
+        self.max_h2d_inflight = 1
+        if requested_h2d_inflight != 1:
+            logger.warning(
+                "AgenticKV pinned H2D bounce serializes restores; ignoring "
+                "SGLANG_AGENTIC_KV_P_H2D_MAX_INFLIGHT=%d",
+                requested_h2d_inflight,
+            )
         self.h2d_chunk_tokens = max(
-            1, int(os.getenv("SGLANG_AGENTIC_KV_P_H2D_CHUNK_TOKENS", "4096"))
+            1, int(os.getenv("SGLANG_AGENTIC_KV_P_H2D_CHUNK_TOKENS", "1024"))
         )
         # Slow ingress is launched by each D on its own CUDA stream.  P owns
         # only the latency-sensitive demand H2D stream.
         current_device = torch.cuda.current_device()
         self._h2d_stream = torch.cuda.Stream(device=current_device, priority=-1)
         self._h2d_staging = LayerFirstD2HStaging(
+            self.device_pool, self.h2d_chunk_tokens
+        )
+        self._h2d_host_bounce = PinnedMHAHostBounce(
             self.device_pool, self.h2d_chunk_tokens
         )
         self._spill_threads: dict[str, threading.Thread] = {}
@@ -1287,18 +1350,6 @@ class AgenticPHostStagingManager:
             1,
             int(os.getenv("SGLANG_AGENTIC_KV_P_HOST_ADMISSION_BATCH", "16")),
         )
-        self._materialize_workers = max(
-            1,
-            int(
-                os.getenv(
-                    "SGLANG_AGENTIC_KV_P_HOST_MATERIALIZE_WORKERS", "4"
-                )
-            ),
-        )
-        self._materialize_pool = ThreadPoolExecutor(
-            max_workers=self._materialize_workers,
-            thread_name_prefix=f"agentic-p-map-{os.getpid()}",
-        )
         self._control_wakeup = threading.Event()
         self._control_cycles = 0
         self._control_errors = 0
@@ -1309,7 +1360,7 @@ class AgenticPHostStagingManager:
         logger.info(
             "Agentic shared Host arena enabled directory=%s capacity_gib=%.1f "
             "reserved_hbm_mib=0 h2d_priority=%d h2d_max_inflight=%d "
-            "h2d_chunk_tokens=%d",
+            "h2d_chunk_tokens=%d host_bounce=preallocated_pinned",
             self.arena.directory,
             self.arena.capacity_bytes / (1024**3),
             self._h2d_stream.priority,
@@ -1325,10 +1376,9 @@ class AgenticPHostStagingManager:
             self._control_thread.start()
             logger.info(
                 "Agentic P async control enabled interval_ms=%.3f "
-                "admission_batch=%d materialize_workers=%d",
+                "admission_batch=%d pageable_snapshot_mmap=true",
                 self._control_interval * 1000.0,
                 self._admission_batch,
-                self._materialize_workers,
             )
 
     def _host_usage(self) -> float:
@@ -1496,32 +1546,13 @@ class AgenticPHostStagingManager:
                 continue
             state = ledger_entry.get("state")
             if state == HostStageState.HOST_READY.value:
-                future = entry.get("materialize_future")
-                if future is None:
-                    entry["materialize_started_at"] = time.monotonic()
-                    entry["materialize_future"] = self._materialize_pool.submit(
-                        entry["snapshot"].materialize
-                    )
-                    logger.info(
-                        "AgenticKV shared_host_materialize_start snapshot=%s "
-                        "tokens=%d bytes=%d",
-                        snapshot_id,
-                        entry["offer"]["token_count"],
-                        entry["offer"]["byte_size"],
-                    )
-                    continue
-                if not future.done():
-                    continue
-                try:
-                    future.result()
-                except Exception:
-                    logger.exception(
-                        "Failed to materialize P Host mapping for %s", snapshot_id
-                    )
-                    self._fail_active(
-                        snapshot_id, "p_host_materialization_failed"
-                    )
-                    continue
+                # HOST_READY means D has finished writing the complete tmpfs
+                # extent; it does *not* mean P needs the snapshot now.  Eagerly
+                # cudaHostRegister-ing every completed extent caused bursts of
+                # multi-GiB registrations to contend with Prefill even while
+                # the corresponding tool was still running.  Keep the extent
+                # lazy and let gate_request() materialize only the selected
+                # slow-recovery request.
                 entry["ready_at"] = time.time()
                 with self._get_state_lock():
                     # gate_request may observe the ledger before this move,
@@ -1530,15 +1561,10 @@ class AgenticPHostStagingManager:
                     self.active.pop(snapshot_id, None)
                 logger.info(
                     "AgenticKV shared_host_ready snapshot=%s tokens=%d bytes=%d "
-                    "materialize_ms=%.3f",
+                    "materialize=deferred_until_selected",
                     snapshot_id,
                     entry["offer"]["token_count"],
                     entry["offer"]["byte_size"],
-                    (
-                        time.monotonic()
-                        - float(entry.get("materialize_started_at", time.monotonic()))
-                    )
-                    * 1000.0,
                 )
             elif state in {
                 HostStageState.REJECTED.value,
@@ -1571,6 +1597,10 @@ class AgenticPHostStagingManager:
         publishing_manifest = None
         fallback_manifest = None
         try:
+            # Normal Host waiting remains unregistered.  Mooncake spill is an
+            # exceptional pressure path that genuinely needs a readable P
+            # mapping, so materialize it here rather than on every HOST_READY.
+            record["snapshot"].materialize()
             if len(logical_hashes) * self.page_size != int(offer["token_count"]):
                 raise ValueError("spill is missing the complete logical hash list")
             spill_indices = self.host_pool.alloc(int(offer["token_count"]))
@@ -1594,7 +1624,12 @@ class AgenticPHostStagingManager:
                 request = RequestGeneration(offer["request_id"], int(offer["generation"]))
                 current = snapshot_store.load(request, require_ready=False)
             if current is None or current.state is not SnapshotState.SLOW_FALLBACK:
-                raise RuntimeError("spill requires an owned SLOW_FALLBACK manifest")
+                state = "missing" if current is None else current.state.value
+                record["spill_blocked_reason"] = f"manifest_state:{state}"
+                raise RuntimeError(
+                    "spill requires an owned SLOW_FALLBACK manifest; "
+                    f"observed={state}"
+                )
             fallback_manifest = current
             manifest = replace(
                 current,
@@ -1607,7 +1642,7 @@ class AgenticPHostStagingManager:
                         "request-level Mooncake capacity could not reserve spill"
                     )
                 reserved_manifest = manifest
-            snapshot_store.update(manifest)
+            snapshot_store.continue_slow_publish(manifest)
             publishing_manifest = manifest
             extra = HiCacheStorageExtraInfo(
                 extra_info={"agentic_page_namespace": namespace}
@@ -1641,7 +1676,9 @@ class AgenticPHostStagingManager:
                         # can be retried after pressure subsides.  Restore the
                         # invisible placeholder instead of leaving a FAILED
                         # generation that would make every retry impossible.
-                        snapshot_store.update(fallback_manifest)
+                        snapshot_store.rollback_slow_publish(
+                            observed, fallback_manifest
+                        )
                 except Exception:
                     logger.exception(
                         "Failed to clean incomplete P Host spill for %s", snapshot_id
@@ -1688,6 +1725,13 @@ class AgenticPHostStagingManager:
                     owner=self.owner,
                     reason=f"spill_failed:{reason}",
                 )
+                if record.get("spill_blocked_reason"):
+                    logger.error(
+                        "AgenticKV spill_quarantined snapshot=%s reason=%s; "
+                        "Shared-Host recovery remains available",
+                        snapshot_id,
+                        record["spill_blocked_reason"],
+                    )
             with self._get_state_lock():
                 self.spills.pop(snapshot_id, None)
 
@@ -1707,6 +1751,7 @@ class AgenticPHostStagingManager:
                 (self._spill_score(record, now), snapshot_id, record)
                 for snapshot_id, record in self.host_ready.items()
                 if not record.get("loading")
+                and not record.get("spill_blocked_reason")
             ]
             if not candidates:
                 return
@@ -1804,6 +1849,26 @@ class AgenticPHostStagingManager:
         with self._get_state_lock():
             return request_generation.snapshot_id in self.host_ready
 
+    def _complete_shared_host_manifest(self, request_generation) -> None:
+        """Release the persistent fallback fence after P owns the full GPU KV."""
+
+        controller = getattr(self, "cache_controller", None)
+        backend = getattr(controller, "storage_backend", None)
+        factory = getattr(backend, "agentic_snapshot_store", None)
+        if factory is None:
+            # Focused unit tests may construct the manager without a storage
+            # backend. Production lifecycle mode always installs one.
+            return
+        snapshot_store = factory()
+        current = snapshot_store.load(request_generation, require_ready=False)
+        if current is None:
+            raise RuntimeError(
+                f"missing slow fallback manifest for {request_generation.snapshot_id}"
+            )
+        if current.state is SnapshotState.CONSUMED:
+            return
+        snapshot_store.complete_slow_fallback(current)
+
     def gate_request(
         self, req, request_generation, *, allow_start: bool = True
     ) -> Optional[bool]:
@@ -1826,12 +1891,37 @@ class AgenticPHostStagingManager:
             h2d_start_event = getattr(
                 record["snapshot"], "_last_h2d_start_event", None
             )
-            h2d_elapsed_ms = (
+            chunk_elapsed_ms = (
                 float("nan")
                 if h2d_start_event is None
                 else h2d_start_event.elapsed_time(load["event"])
             )
             device_indices = load["device_indices"]
+            if "chunk_end" in load:
+                if math.isfinite(chunk_elapsed_ms):
+                    load["gpu_elapsed_ms"] += chunk_elapsed_ms
+                load["offset"] = int(load["chunk_end"])
+                load["event"] = None
+                load["copy_refs"] = None
+                if load["offset"] < len(device_indices):
+                    start = int(load["offset"])
+                    end = min(start + self.h2d_chunk_tokens, len(device_indices))
+                    event, copy_refs = record["snapshot"].start_load_range_to_device(
+                        device_indices[start:end],
+                        self._h2d_stream,
+                        source_start=start,
+                        staging=self._h2d_staging,
+                        host_bounce=self._h2d_host_bounce,
+                    )
+                    load["event"] = event
+                    load["copy_refs"] = copy_refs
+                    load["chunk_end"] = end
+                    return True
+                h2d_elapsed_ms = float(load["gpu_elapsed_ms"])
+            else:
+                # Compatibility with already-started loads during a rolling
+                # upgrade and with focused lifecycle tests.
+                h2d_elapsed_ms = chunk_elapsed_ms
             keys = req.origin_input_ids[: int(record["offer"]["token_count"])]
             try:
                 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -1868,6 +1958,16 @@ class AgenticPHostStagingManager:
             # The complete GPU copy is now explicitly protected in Radix.  The
             # scheduler releases this temporary reference immediately after
             # _prefetch_kvcache rematches and acquires the request's own lock.
+            try:
+                self._complete_shared_host_manifest(request_generation)
+            except Exception:
+                # KV correctness is already guaranteed by the protected GPU
+                # copy. Do not fail serving after a metadata-only ACK error;
+                # retain a clear diagnostic for terminal metadata GC.
+                logger.exception(
+                    "Failed to complete Shared-Host lifecycle for %s",
+                    snapshot_id,
+                )
             self._release_record(record)
             with self._get_state_lock():
                 self.host_ready.pop(snapshot_id, None)
@@ -1917,11 +2017,34 @@ class AgenticPHostStagingManager:
             # Re-read under the ownership lock: the background spill worker
             # may have claimed the record after the first discovery read.
             record = self.host_ready.get(snapshot_id)
-            if record is None or record.get("loading"):
+            if record is None:
+                return True
+            loading = record.get("loading")
+            if loading:
                 return True
             if not allow_start:
                 return True
             if len(self.loads) >= getattr(self, "max_h2d_inflight", 1):
+                return True
+            if getattr(record["snapshot"], "_materialized", record["snapshot"]) is None:
+                # Materialization now only mmaps the pageable tmpfs extent;
+                # the process-lifetime bounce was pinned during manager init.
+                started_at = time.monotonic()
+                record["snapshot"].materialize()
+                logger.info(
+                    "AgenticKV shared_host_materialize_complete snapshot=%s "
+                    "tokens=%d bytes=%d reason=selected_slow_recovery",
+                    snapshot_id,
+                    int(record["offer"]["token_count"]),
+                    int(record["offer"]["byte_size"]),
+                )
+                logger.debug(
+                    "Pageable shared Host mmap elapsed_ms=%.3f snapshot=%s",
+                    (time.monotonic() - started_at) * 1000.0,
+                    snapshot_id,
+                )
+                # Keep one bounded control action per scheduler visit. The
+                # next visit reserves HBM and launches the first H2D chunk.
                 return True
             # Claim before touching the GPU allocator so spill selection and
             # H2D admission can never own the same snapshot concurrently.
@@ -1947,11 +2070,15 @@ class AgenticPHostStagingManager:
                 record["loading"] = False
             return True
         try:
-            event, copy_refs = record["snapshot"].start_load_to_device(
-                device_indices,
+            chunk_tokens = min(
+                getattr(self, "h2d_chunk_tokens", 4096), len(device_indices)
+            )
+            event, copy_refs = record["snapshot"].start_load_range_to_device(
+                device_indices[:chunk_tokens],
                 self._h2d_stream,
-                chunk_tokens=getattr(self, "h2d_chunk_tokens", 4096),
+                source_start=0,
                 staging=self._h2d_staging,
+                host_bounce=self._h2d_host_bounce,
             )
         except Exception:
             self.token_allocator.free(device_indices)
@@ -1965,6 +2092,9 @@ class AgenticPHostStagingManager:
                 "device_indices": device_indices,
                 "event": event,
                 "copy_refs": copy_refs,
+                "offset": 0,
+                "chunk_end": chunk_tokens,
+                "gpu_elapsed_ms": 0.0,
             }
         self.ledger.transition(snapshot_id, HostStageState.H2D_LOADING, owner=self.owner)
         logger.info(
@@ -2072,6 +2202,9 @@ class AgenticDRelayWorker:
         self._d2h_staging = LayerFirstD2HStaging(
             self.device_pool,
             int(os.getenv("SGLANG_AGENTIC_KV_D2H_STAGING_TOKENS", "1024")),
+        )
+        self._d2h_host_bounce = PinnedMHAHostBounce(
+            self.device_pool, self.slot_token_count
         )
         self.active: Optional[dict[str, Any]] = None
         self._last_heartbeat = 0.0
@@ -2263,6 +2396,7 @@ class AgenticDRelayWorker:
                     destination_start=active["chunk_start"],
                     stream=self._d2h_stream,
                     staging=self._d2h_staging,
+                    host_bounce=self._d2h_host_bounce,
                 )
             except Exception:
                 logger.exception("Relay D2H launch failed")
@@ -2275,6 +2409,11 @@ class AgenticDRelayWorker:
         active["event"].synchronize()
         d2h_elapsed_ms = active["snapshot"]._last_d2h_start_event.elapsed_time(
             active["event"]
+        )
+        active["snapshot"].commit_backup_range_from_bounce(
+            self._d2h_host_bounce,
+            destination_start=active["chunk_start"],
+            token_count=active["chunk_count"],
         )
         active.pop("event", None)
         active.pop("copy_refs", None)
@@ -2376,6 +2515,9 @@ class AgenticDHostStagingClient:
         )
         self._d2h_chunk_tokens = (
             self._d2h_chunk_tokens // self.page_size * self.page_size
+        )
+        self._d2h_host_bounce = PinnedMHAHostBounce(
+            self.device_pool, self._d2h_chunk_tokens
         )
         self._active_write_snapshot_id: Optional[str] = None
 
@@ -2590,6 +2732,7 @@ class AgenticDHostStagingClient:
             destination_start=start,
             stream=self._d2h_stream,
             staging=self._d2h_staging,
+            host_bounce=self._d2h_host_bounce,
         )
         write["event"] = event
         write["copy_refs"] = refs
@@ -2700,6 +2843,13 @@ class AgenticDHostStagingClient:
             return "waiting"
         chunk_elapsed_ms = write["snapshot"]._last_d2h_start_event.elapsed_time(
             write["event"]
+        )
+        chunk_start = int(write["offset"])
+        chunk_end = int(write["chunk_end"])
+        write["snapshot"].commit_backup_range_from_bounce(
+            self._d2h_host_bounce,
+            destination_start=chunk_start,
+            token_count=chunk_end - chunk_start,
         )
         write["gpu_elapsed_ms"] += chunk_elapsed_ms
         write["offset"] = int(write["chunk_end"])
