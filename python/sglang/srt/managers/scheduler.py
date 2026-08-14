@@ -519,8 +519,10 @@ class AgenticEarlyDirectReceive:
     device_indices: Optional[torch.Tensor]
     started_at: float
     arrived_at: float
+    prefill_domain: Optional[int] = None
     credit_allocation: Optional[AgenticDirectCreditAllocation] = None
     completed_at: Optional[float] = None
+    route_published: bool = False
     # Transport progress is driven by a lightweight worker while a long
     # Prefill kernel owns the scheduler thread.  Lifecycle completion, HBM
     # ownership, and Radix insertion still happen on the scheduler thread.
@@ -2459,6 +2461,7 @@ class Scheduler(
         snapshot_store,
         *,
         arrived_at: float,
+        prefill_domain: Optional[int] = None,
     ) -> bool:
         """Reserve P pages and start reverse NIXL before a Req exists."""
 
@@ -2553,6 +2556,7 @@ class Scheduler(
             device_indices=device_indices,
             started_at=time.monotonic(),
             arrived_at=arrived_at,
+            prefill_domain=prefill_domain,
             credit_allocation=credit_allocation,
         )
         with getattr(self, "agentic_early_direct_poll_lock", nullcontext()):
@@ -2730,6 +2734,18 @@ class Scheduler(
             receive_entries = tuple(self.agentic_early_direct_receives.items())
         for snapshot_id, entry in receive_entries:
             if entry.completed_at is not None:
+                if entry.prefill_domain is not None and not entry.route_published:
+                    try:
+                        marker_store.publish_route(
+                            entry.request,
+                            route="direct_complete",
+                            prefill_domain=entry.prefill_domain,
+                        )
+                        entry.route_published = True
+                    except OSError:
+                        logger.exception(
+                            "Failed to publish Direct route for %s", snapshot_id
+                        )
                 if now - entry.completed_at >= bind_timeout:
                     self._agentic_drop_early_direct_receive(
                         entry,
@@ -2780,6 +2796,19 @@ class Scheduler(
                         )
                     snapshot_store.complete_direct(current, entry.claim_id)
                     entry.completed_at = now
+                    if entry.prefill_domain is not None:
+                        try:
+                            marker_store.publish_route(
+                                entry.request,
+                                route="direct_complete",
+                                prefill_domain=entry.prefill_domain,
+                            )
+                            entry.route_published = True
+                        except OSError:
+                            logger.exception(
+                                "Failed to publish Direct route for %s; retrying",
+                                snapshot_id,
+                            )
                     # Do not launch debug GPU work from the independent
                     # ingress thread. The token digest is validated when the
                     # tokenized Req binds on the scheduler thread.
@@ -2869,6 +2898,20 @@ class Scheduler(
             manifest = snapshot_store.load(request, require_ready=False)
             if manifest is None or manifest.state is not SnapshotState.DIRECT_READY:
                 continue
+            target_domain = payload.get("target_prefill_domain")
+            dynamic_domains = os.environ.get(
+                "SGLANG_PD_LATE_BIND_DYNAMIC_PREFILL_DOMAINS", ""
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            if dynamic_domains:
+                configured_domain = int(
+                    os.environ.get("SGLANG_AGENTIC_KV_PREFILL_DOMAIN", "-1")
+                )
+                if target_domain is None or int(target_domain) != configured_domain:
+                    continue
+            else:
+                # Preserve the established 1P behavior: its arrival markers
+                # are untargeted and require no route-resolution handshake.
+                target_domain = None
             arrived_at = float(payload["arrived_at"])
             if arrived_at + 0.05 < manifest.created_at:
                 continue
@@ -2877,6 +2920,9 @@ class Scheduler(
                 manifest,
                 snapshot_store,
                 arrived_at=arrived_at,
+                prefill_domain=(
+                    None if target_domain is None else int(target_domain)
+                ),
             ):
                 active_io += 1
 
@@ -4552,6 +4598,25 @@ class Scheduler(
         )
 
         if self.chunked_req is not None:
+            # The native chunk continuation path assumes that finishing the
+            # previous chunk released enough KV for the next one.  A
+            # disaggregated Prefill worker keeps completed/P-ready prompts
+            # resident until P->D finishes, so that assumption is false under
+            # downstream backpressure.  When no page is currently allocatable,
+            # defer the continuation and let the transfer consumer release
+            # some P KV instead of forcing a chunk into an empty allocator.
+            # There is deliberately no percentage watermark here: any real
+            # allocatable capacity remains usable.
+            if (
+                self.disaggregation_mode == DisaggregationMode.PREFILL
+                and adder.rem_total_tokens <= 0
+            ):
+                logger.info(
+                    "Deferring disaggregated Prefill chunk: no allocatable "
+                    "KV tokens (inflight=%d)",
+                    len(self.disagg_prefill_inflight_queue),
+                )
+                return None
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 

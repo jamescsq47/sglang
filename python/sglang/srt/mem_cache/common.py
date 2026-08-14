@@ -465,15 +465,32 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
     # MambaRadixCache may alloc mamba state before alloc KV cache
     if req.req_pool_idx is None:
-        assert (
-            tree_cache.supports_mamba()
-        ), "Only MambaRadixCache allow freeing before alloc"
-        # TODO (csy, hanming): clean up this early allocation logic
-        if req.mamba_pool_idx is not None:
+        # Cleanup can race with an abort/transport-failure notification in
+        # disaggregated serving.  A missing request slot means ownership was
+        # already released, so the operation is idempotently complete.  Keep
+        # the native early-Mamba allocation cleanup when applicable.
+        if tree_cache.supports_mamba() and req.mamba_pool_idx is not None:
             tree_cache.req_to_token_pool.mamba_pool.free(
                 req.mamba_pool_idx.unsqueeze(-1)
             )
             req.mamba_pool_idx = None
+        return
+
+    if req.last_node is None:
+        # A disaggregated Decode request owns destination KV pages before its
+        # P->D transfer is committed into Radix.  If the transfer fails (for
+        # example because P disconnects), there is no Radix lock to drop and
+        # cache_finished_req() must not dereference last_node.  Release the
+        # private preallocation directly.  The freed flags also make an
+        # accidental repeated cleanup fail at the ownership boundary instead
+        # of corrupting the allocator.
+        req.pop_committed_kv_cache()
+        _, allocated_len = req.pop_overallocated_kv_cache()
+        kv_indices = tree_cache.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :allocated_len
+        ]
+        tree_cache.token_to_kv_pool_allocator.free(kv_indices)
+        tree_cache.req_to_token_pool.free(req)
         return
 
     tree_cache.cache_finished_req(req, is_insert=is_insert)

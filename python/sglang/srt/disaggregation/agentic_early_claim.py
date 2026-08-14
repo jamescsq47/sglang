@@ -29,9 +29,11 @@ class AgenticEarlyClaimStore:
         self.marker_directory = self.directory / "arrivals"
         self.final_directory = self.directory / "finals"
         self.tool_directory = self.directory / "tool-valid"
+        self.route_directory = self.directory / "routes"
         self.marker_directory.mkdir(parents=True, exist_ok=True)
         self.final_directory.mkdir(parents=True, exist_ok=True)
         self.tool_directory.mkdir(parents=True, exist_ok=True)
+        self.route_directory.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
     def _digest(request: RequestGeneration) -> str:
@@ -45,6 +47,9 @@ class AgenticEarlyClaimStore:
 
     def tool_path(self, request: RequestGeneration) -> Path:
         return self.tool_directory / f"{self._digest(request)}.json"
+
+    def route_path(self, request: RequestGeneration) -> Path:
+        return self.route_directory / f"{self._digest(request)}.json"
 
     def producer_path(self, request: RequestGeneration) -> Path:
         # Keep producer tombstones at the top level so the run-script's
@@ -72,8 +77,15 @@ class AgenticEarlyClaimStore:
         return True
 
     @staticmethod
-    def _publish(path: Path, request: RequestGeneration, kind: str) -> dict[str, Any]:
-        now = time.time()
+    def _publish(
+        path: Path,
+        request: RequestGeneration,
+        kind: str,
+        *,
+        extra: Optional[dict[str, Any]] = None,
+        published_at: Optional[float] = None,
+    ) -> dict[str, Any]:
+        now = time.time() if published_at is None else float(published_at)
         payload = {
             "version": _VERSION,
             "kind": kind,
@@ -87,6 +99,8 @@ class AgenticEarlyClaimStore:
             "arrived_at": now,
             "publisher_pid": os.getpid(),
         }
+        if extra:
+            payload.update(extra)
         temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}")
         data = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -102,8 +116,93 @@ class AgenticEarlyClaimStore:
                 pass
         return payload
 
-    def publish_arrival(self, request: RequestGeneration) -> dict[str, Any]:
-        return self._publish(self.marker_path(request), request, "arrival")
+    def publish_arrival(
+        self,
+        request: RequestGeneration,
+        *,
+        target_prefill_domain: Optional[int] = None,
+        arrived_at: Optional[float] = None,
+    ) -> dict[str, Any]:
+        payload = self._publish(
+            self.marker_path(request),
+            request,
+            "arrival",
+            extra=(
+                None
+                if target_prefill_domain is None
+                else {"target_prefill_domain": int(target_prefill_domain)}
+            ),
+            published_at=arrived_at,
+        )
+        return payload
+
+    @staticmethod
+    def _publish_payload(path: Path, payload: dict[str, Any]) -> None:
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}")
+        data = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as file_obj:
+                file_obj.write(data)
+                file_obj.flush()
+            os.replace(temporary, path)
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def publish_route(
+        self,
+        request: RequestGeneration,
+        *,
+        route: str,
+        prefill_domain: int,
+        arena_numa_node: Optional[int] = None,
+    ) -> dict[str, Any]:
+        if route not in {
+            "direct_ready",
+            "direct_complete",
+            "host_ready",
+            "recompute",
+        }:
+            raise ValueError(f"unsupported agentic route {route!r}")
+        payload = {
+            "version": _VERSION,
+            "kind": "route",
+            "snapshot_id": request.snapshot_id,
+            "request_id": request.request_id,
+            "generation": request.generation,
+            "route": route,
+            "prefill_domain": int(prefill_domain),
+            "arena_numa_node": (
+                None if arena_numa_node is None else int(arena_numa_node)
+            ),
+            "published_at": time.time(),
+            "publisher_pid": os.getpid(),
+        }
+        self._publish_payload(self.route_path(request), payload)
+        return payload
+
+    def read_route(
+        self,
+        request: RequestGeneration,
+        *,
+        max_age_seconds: float = 3600.0,
+    ) -> Optional[dict[str, Any]]:
+        try:
+            payload = json.loads(self.route_path(request).read_bytes())
+            published_at = float(payload["published_at"])
+        except (FileNotFoundError, OSError, ValueError, KeyError, json.JSONDecodeError):
+            return None
+        if (
+            payload.get("version") != _VERSION
+            or payload.get("kind") != "route"
+            or payload.get("snapshot_id") != request.snapshot_id
+            or published_at + max_age_seconds < time.time()
+        ):
+            return None
+        return payload
 
     def publish_final(self, request: RequestGeneration) -> dict[str, Any]:
         """Confirm that the application consumed this output as terminal."""

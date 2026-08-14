@@ -1433,7 +1433,30 @@ def _get_fastapi_request_path(request) -> Tuple[str, bool]:
     for route in request.app.routes:
         match, child_scope = route.matches(request.scope)
         if match == Match.FULL:
-            return route.path, True
+            # FastAPI >= 0.141 keeps routes added through include_router() in
+            # an internal _IncludedRouter wrapper.  The wrapper implements
+            # matches(), but unlike APIRoute it has no ``path`` attribute.
+            # Prefer the matched route template when it is available so that
+            # metrics keep bounded cardinality, then fall back to the concrete
+            # request path for wrappers that do not expose one.
+            path = getattr(route, "path", None) or getattr(
+                route, "path_format", None
+            )
+            if path is None:
+                for candidate in getattr(route, "_effective_candidates", ()):
+                    path_regex = getattr(candidate, "path_regex", None)
+                    methods = getattr(candidate, "methods", None)
+                    if (
+                        path_regex is not None
+                        and path_regex.match(request.scope["path"])
+                        and (methods is None or request.method in methods)
+                    ):
+                        path = getattr(candidate, "path_format", None) or getattr(
+                            candidate, "path", None
+                        )
+                        if path is not None:
+                            break
+            return path or request.url.path, True
 
     return request.url.path, False
 

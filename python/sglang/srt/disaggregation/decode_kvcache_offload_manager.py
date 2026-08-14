@@ -179,6 +179,7 @@ class DecodeKVCacheOffloadManager:
         self.response_backup_timeout = 120.0
         self.agentic_snapshot_store = None
         self.agentic_direct_runtime = None
+        self.agentic_relay_runtime = None
         self.agentic_direct_candidates = {}
         # Transport, preallocation control, and agentic lifecycle progress have
         # independent workers. A slow ledger/Host operation must never stop
@@ -195,7 +196,8 @@ class DecodeKVCacheOffloadManager:
         self._decode_io_stop = threading.Event()
         self._decode_io_threads = {}
         self._decode_io_wakeups = {
-            name: threading.Event() for name in ("transfer", "prealloc", "agentic")
+            name: threading.Event()
+            for name in ("transfer", "prealloc", "agentic", "relay")
         }
         self._decode_prealloc_queue = None
         self._decode_transfer_queue = None
@@ -222,6 +224,10 @@ class DecodeKVCacheOffloadManager:
             "agentic": max(
                 0.001,
                 float(os.getenv("SGLANG_AGENTIC_KV_D_CONTROL_POLL_SECONDS", "0.02")),
+            ),
+            "relay": max(
+                0.001,
+                float(os.getenv("SGLANG_AGENTIC_KV_RELAY_POLL_SECONDS", "0.005")),
             ),
         }
         self._decode_io_error_count = 0
@@ -409,16 +415,40 @@ class DecodeKVCacheOffloadManager:
         pending = self._agentic_relay_pending
         if pending is None or self.agentic_relay_worker is not None:
             return
-        relay_aux_index = metadata_index_allocator.alloc()
-        if relay_aux_index is None:
-            raise RuntimeError("not enough metadata rows for agentic NUMA relay")
-        runtime = AgenticDirectRuntime(
-            manager=normal_decode_kv_manager,
-            aux_buffer=torch.empty(0),
-            transfer_backend=TransferBackend(
-                self.server_args.disaggregation_transfer_backend
-            ),
-        )
+        isolate_relay = os.getenv(
+            "SGLANG_AGENTIC_KV_ISOLATE_RELAY_PROGRESS", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if isolate_relay:
+            # A relay touches the shared Host ledger before/after its NIXL
+            # receive.  Reusing the normal P->D receiver manager therefore
+            # couples a potentially blocking ledger/relay operation to the
+            # latency-critical P->D notification drain.  Give the relay its
+            # own NIXL agent and one-byte auxiliary mailbox so both progress
+            # domains can run independently.  This is opt-in to preserve the
+            # proven single-P path exactly.
+            kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+            runtime = create_agentic_direct_runtime(
+                role=DisaggregationMode.DECODE,
+                kv_pool=kv_cache,
+                server_args=self.server_args,
+                engine_rank=torch.distributed.get_rank(group=self.tp_group),
+                pp_rank=0,
+                gpu_id=torch.cuda.current_device(),
+                total_kv_heads=getattr(kv_cache, "head_num", 1),
+            )
+            self.agentic_relay_runtime = runtime
+            relay_aux_index = 0
+        else:
+            relay_aux_index = metadata_index_allocator.alloc()
+            if relay_aux_index is None:
+                raise RuntimeError("not enough metadata rows for agentic NUMA relay")
+            runtime = AgenticDirectRuntime(
+                manager=normal_decode_kv_manager,
+                aux_buffer=torch.empty(0),
+                transfer_backend=TransferBackend(
+                    self.server_args.disaggregation_transfer_backend
+                ),
+            )
         self.agentic_relay_worker = AgenticDRelayWorker(
             ledger=pending["ledger"],
             relay_id=pending["relay_id"],
@@ -432,6 +462,7 @@ class DecodeKVCacheOffloadManager:
             d2h_gib_per_second=pending["d2h_gib_per_second"],
             relay_aux_index=relay_aux_index,
         )
+        self._agentic_relay_progress_isolated = isolate_relay
         self._agentic_relay_pending = None
 
     def start_decode_io_progress_worker(self, prealloc_queue, transfer_queue) -> None:
@@ -453,6 +484,11 @@ class DecodeKVCacheOffloadManager:
             "prealloc": prealloc_queue.background_progress,
             "agentic": self._decode_agentic_progress,
         }
+        if (
+            self.agentic_relay_worker is not None
+            and getattr(self, "_agentic_relay_progress_isolated", False)
+        ):
+            steps["relay"] = self.agentic_relay_worker.poll
         for name, step in steps.items():
             thread = threading.Thread(
                 target=self._decode_progress_loop,
@@ -464,20 +500,25 @@ class DecodeKVCacheOffloadManager:
             thread.start()
         logger.info(
             "Decode I/O async progress enabled transfer_ms=%.3f "
-            "prealloc_ms=%.3f agentic_ms=%.3f tp=1",
+            "prealloc_ms=%.3f agentic_ms=%.3f relay_isolated=%s tp=1",
             self._decode_io_intervals["transfer"] * 1000.0,
             self._decode_io_intervals["prealloc"] * 1000.0,
             self._decode_io_intervals["agentic"] * 1000.0,
+            "relay" in steps,
         )
 
     def _decode_transfer_progress(self) -> None:
-        """Advance the shared stock/relay NIXL manager on one thread."""
+        """Advance the stock P->D receiver without unrelated control work."""
 
         transfer_queue = self._decode_transfer_queue
         if transfer_queue is not None:
             transfer_queue.background_progress()
         relay_worker = self.agentic_relay_worker
-        if relay_worker is not None:
+        if relay_worker is not None and not getattr(
+            self, "_agentic_relay_progress_isolated", False
+        ):
+            # Compatibility path for the proven 1P setup, where relay and
+            # stock P->D intentionally share one NIXL manager.
             relay_worker.poll()
 
     def _decode_agentic_progress(self) -> None:
@@ -490,6 +531,9 @@ class DecodeKVCacheOffloadManager:
             return len(getattr(self._decode_prealloc_queue, "queue", ())) + int(
                 getattr(self._decode_prealloc_queue, "_async_metadata_pending_count", 0)
             )
+        if name == "relay":
+            worker = getattr(self, "agentic_relay_worker", None)
+            return int(worker is not None and worker.active is not None)
         return len(self.agentic_direct_candidates)
 
     def _decode_progress_loop(self, name: str, step) -> None:
@@ -852,6 +896,13 @@ class DecodeKVCacheOffloadManager:
             direct_bootstrap_addr=self.agentic_direct_runtime.bootstrap_addr,
             direct_room=room,
         )
+        # Multi-P routing is fixed by the D worker's NUMA domain.  Publish the
+        # destination together with DIRECT_READY so Router ingress never waits
+        # on a P load query before acknowledging the next turn.
+        if not self._publish_agentic_route(
+            metadata.current, route="direct_ready"
+        ):
+            return False
         self.agentic_snapshot_store.publish_direct_offer(manifest)
         source_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(all_tokens)
@@ -1306,6 +1357,38 @@ class DecodeKVCacheOffloadManager:
                 metadata.current.snapshot_id,
                 reason,
             )
+        self._publish_agentic_route(metadata.current, route="recompute")
+
+    def _publish_agentic_route(self, request, *, route: str) -> bool:
+        # Route markers are a multi-P coordination primitive.  Keeping this
+        # behind the explicit 2P+ feature flag preserves the proven 1P path
+        # byte-for-byte at runtime (no extra filesystem writes or fences).
+        if os.environ.get(
+            "SGLANG_PD_LATE_BIND_DYNAMIC_PREFILL_DOMAINS", ""
+        ).strip().lower() not in {"1", "true", "yes", "on"}:
+            return True
+        store = getattr(self, "agentic_early_claim_store", None)
+        if store is None:
+            return True
+        try:
+            prefill_domain = int(
+                os.environ.get("SGLANG_AGENTIC_KV_PREFILL_DOMAIN", "0")
+            )
+            arena_numa = envs.SGLANG_AGENTIC_KV_ARENA_NUMA_NODE.get()
+            store.publish_route(
+                request,
+                route=route,
+                prefill_domain=prefill_domain,
+                arena_numa_node=(arena_numa if route == "host_ready" else None),
+            )
+            return True
+        except (OSError, TypeError, ValueError):
+            logger.exception(
+                "Failed to publish agentic route snapshot=%s route=%s",
+                request.snapshot_id,
+                route,
+            )
+            return False
 
     def _agentic_reserve(self, manifest: SnapshotManifest) -> bool:
         if self.agentic_eviction_controller is None:
@@ -1509,6 +1592,13 @@ class DecodeKVCacheOffloadManager:
                 if outcome == "host_ready":
                     # This is the only slow-path release point: P has ACKed all
                     # chunk D2H events and committed the complete Host snapshot.
+                    if not self._publish_agentic_route(
+                        metadata.current, route="host_ready"
+                    ):
+                        # In multi-P mode this marker commits the P-domain
+                        # destination.  Retain D KV and retry if publishing it
+                        # fails instead of routing the next turn incorrectly.
+                        continue
                     self._enqueue_agentic_release(req, 0)
                     self._cleanup_agentic_direct_sender(candidate)
                     self._agentic_release_early_claim(candidate, "host_ready")

@@ -726,6 +726,9 @@ class SchedulerDisaggregationPrefillMixin:
                         "rid": req.rid,
                         "num_kv_tokens": len(req.origin_input_ids),
                         "ready_sequence": ready_sequence,
+                        "prefill_domain": int(
+                            os.environ.get("SGLANG_AGENTIC_KV_PREFILL_DOMAIN", "0")
+                        ),
                     },
                     handle,
                     separators=(",", ":"),
@@ -752,6 +755,9 @@ class SchedulerDisaggregationPrefillMixin:
                 "rid": req.rid,
                 "num_kv_tokens": len(req.origin_input_ids),
                 "ready_sequence": ready_sequence,
+                "prefill_domain": int(
+                    os.environ.get("SGLANG_AGENTIC_KV_PREFILL_DOMAIN", "0")
+                ),
             }
             with open(tmp_path, "w", encoding="utf-8") as handle:
                 json.dump(ready_metadata, handle, separators=(",", ":"))
