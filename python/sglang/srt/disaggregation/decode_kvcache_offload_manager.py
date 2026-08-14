@@ -900,7 +900,9 @@ class DecodeKVCacheOffloadManager:
         # destination together with DIRECT_READY so Router ingress never waits
         # on a P load query before acknowledging the next turn.
         if not self._publish_agentic_route(
-            metadata.current, route="direct_ready"
+            metadata.current,
+            route="direct_ready",
+            snapshot_tokens=len(all_tokens),
         ):
             return False
         self.agentic_snapshot_store.publish_direct_offer(manifest)
@@ -1359,7 +1361,9 @@ class DecodeKVCacheOffloadManager:
             )
         self._publish_agentic_route(metadata.current, route="recompute")
 
-    def _publish_agentic_route(self, request, *, route: str) -> bool:
+    def _publish_agentic_route(
+        self, request, *, route: str, snapshot_tokens: Optional[int] = None
+    ) -> bool:
         # Route markers are a multi-P coordination primitive.  Keeping this
         # behind the explicit 2P+ feature flag preserves the proven 1P path
         # byte-for-byte at runtime (no extra filesystem writes or fences).
@@ -1379,7 +1383,12 @@ class DecodeKVCacheOffloadManager:
                 request,
                 route=route,
                 prefill_domain=prefill_domain,
-                arena_numa_node=(arena_numa if route == "host_ready" else None),
+                arena_numa_node=(
+                    arena_numa
+                    if route in {"host_writing", "host_ready"}
+                    else None
+                ),
+                snapshot_tokens=snapshot_tokens,
             )
             return True
         except (OSError, TypeError, ValueError):
@@ -1593,7 +1602,9 @@ class DecodeKVCacheOffloadManager:
                     # This is the only slow-path release point: P has ACKed all
                     # chunk D2H events and committed the complete Host snapshot.
                     if not self._publish_agentic_route(
-                        metadata.current, route="host_ready"
+                        metadata.current,
+                        route="host_ready",
+                        snapshot_tokens=candidate["manifest"].token_count,
                     ):
                         # In multi-P mode this marker commits the P-domain
                         # destination.  Retain D KV and retry if publishing it
@@ -1826,6 +1837,15 @@ class DecodeKVCacheOffloadManager:
                 if started is None:
                     continue
                 if started and candidate.get("staging"):
+                    # Shared-Arena now owns the slow-path lifecycle.  Publish
+                    # its NUMA-local P immediately so Router can redirect an
+                    # already-submitted request while D2H continues.  D still
+                    # retains source HBM until the later HOST_READY ACK.
+                    self._publish_agentic_route(
+                        metadata.current,
+                        route="host_writing",
+                        snapshot_tokens=candidate["manifest"].token_count,
+                    )
                     # The original reverse-NIXL room is reused by relay chunk
                     # zero.  It is cleaned after HOST_READY or direct fallback.
                     continue

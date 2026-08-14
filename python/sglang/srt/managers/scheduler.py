@@ -2740,6 +2740,7 @@ class Scheduler(
                             entry.request,
                             route="direct_complete",
                             prefill_domain=entry.prefill_domain,
+                            snapshot_tokens=entry.manifest.token_count,
                         )
                         entry.route_published = True
                     except OSError:
@@ -2802,6 +2803,7 @@ class Scheduler(
                                 entry.request,
                                 route="direct_complete",
                                 prefill_domain=entry.prefill_domain,
+                                snapshot_tokens=entry.manifest.token_count,
                             )
                             entry.route_published = True
                         except OSError:

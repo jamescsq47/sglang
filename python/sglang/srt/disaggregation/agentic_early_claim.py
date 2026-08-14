@@ -159,10 +159,12 @@ class AgenticEarlyClaimStore:
         route: str,
         prefill_domain: int,
         arena_numa_node: Optional[int] = None,
+        snapshot_tokens: Optional[int] = None,
     ) -> dict[str, Any]:
         if route not in {
             "direct_ready",
             "direct_complete",
+            "host_writing",
             "host_ready",
             "recompute",
         }:
@@ -177,6 +179,9 @@ class AgenticEarlyClaimStore:
             "prefill_domain": int(prefill_domain),
             "arena_numa_node": (
                 None if arena_numa_node is None else int(arena_numa_node)
+            ),
+            "snapshot_tokens": (
+                None if snapshot_tokens is None else int(snapshot_tokens)
             ),
             "published_at": time.time(),
             "publisher_pid": os.getpid(),
