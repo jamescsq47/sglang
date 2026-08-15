@@ -7,9 +7,12 @@ slow one.  It allocates no P HBM and carries no global capacity/credit policy.
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import os
+import select
+import struct
 import time
 import uuid
 from pathlib import Path
@@ -19,6 +22,160 @@ from sglang.srt.disaggregation.agentic_kv_lifecycle import RequestGeneration
 
 
 _VERSION = 1
+
+# Linux inotify values from <sys/inotify.h>.  Agentic PD V1 already requires
+# P and Router to share the same node-local /dev/shm directory, so using
+# inotify here avoids adding another control-plane dependency.
+_IN_CLOSE_WRITE = 0x00000008
+_IN_MOVED_TO = 0x00000080
+_IN_CREATE = 0x00000100
+_IN_DELETE_SELF = 0x00000400
+_IN_MOVE_SELF = 0x00000800
+_IN_Q_OVERFLOW = 0x00004000
+_IN_IGNORED = 0x00008000
+_INOTIFY_EVENT = struct.Struct("iIII")
+_LIBC = ctypes.CDLL(None, use_errno=True)
+_INOTIFY_INIT1 = getattr(_LIBC, "inotify_init1", None)
+_INOTIFY_ADD_WATCH = getattr(_LIBC, "inotify_add_watch", None)
+if _INOTIFY_INIT1 is not None:
+    _INOTIFY_INIT1.argtypes = [ctypes.c_int]
+    _INOTIFY_INIT1.restype = ctypes.c_int
+if _INOTIFY_ADD_WATCH is not None:
+    _INOTIFY_ADD_WATCH.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+    _INOTIFY_ADD_WATCH.restype = ctypes.c_int
+
+
+def _inotify_init() -> int:
+    if _INOTIFY_INIT1 is None:
+        raise RuntimeError("agentic Direct arrival watching requires Linux inotify")
+    fd = _INOTIFY_INIT1(os.O_NONBLOCK | os.O_CLOEXEC)
+    if fd < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return fd
+
+
+def _inotify_add_watch(fd: int, path: Path, mask: int) -> int:
+    if _INOTIFY_ADD_WATCH is None:
+        raise RuntimeError("agentic Direct arrival watching requires Linux inotify")
+    descriptor = _INOTIFY_ADD_WATCH(fd, os.fsencode(path), mask)
+    if descriptor < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), path)
+    return descriptor
+
+
+class AgenticArrivalWatcher:
+    """Event-driven reader for Router arrival markers.
+
+    The watch is installed before the one-time startup scan, so a marker
+    created concurrently with startup is either found by that scan or remains
+    queued in the inotify fd.  Normal operation reads only paths named by
+    inotify; a full scan is used again solely after kernel queue overflow.
+    """
+
+    def __init__(self, store: "AgenticEarlyClaimStore", max_age_seconds: float):
+        self.store = store
+        self.max_age_seconds = float(max_age_seconds)
+        self.fd = _inotify_init()
+        try:
+            self.watch_descriptor = _inotify_add_watch(
+                self.fd,
+                store.marker_directory,
+                _IN_CLOSE_WRITE
+                | _IN_MOVED_TO
+                | _IN_CREATE
+                | _IN_DELETE_SELF
+                | _IN_MOVE_SELF,
+            )
+        except Exception:
+            os.close(self.fd)
+            raise
+        self.poller = select.poll()
+        self.poller.register(self.fd, select.POLLIN | select.POLLERR)
+        self._startup = store.iter_arrivals(max_age_seconds=self.max_age_seconds)
+        self._closed = False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.poller.unregister(self.fd)
+        except (KeyError, OSError):
+            pass
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+    def poll(
+        self, timeout_seconds: float = 0.0
+    ) -> list[tuple[RequestGeneration, dict[str, Any]]]:
+        """Return newly published arrivals without rescanning the directory."""
+
+        if self._closed:
+            return []
+        arrivals = self._startup
+        self._startup = []
+        timeout_ms = max(0, int(float(timeout_seconds) * 1000.0))
+        try:
+            ready = self.poller.poll(timeout_ms)
+        except OSError:
+            return arrivals
+        if not ready:
+            return arrivals
+
+        paths: set[Path] = set()
+        overflow = False
+        while True:
+            try:
+                data = os.read(self.fd, 256 * 1024)
+            except BlockingIOError:
+                break
+            except OSError:
+                return arrivals
+            if not data:
+                break
+            offset = 0
+            while offset + _INOTIFY_EVENT.size <= len(data):
+                _, mask, _, name_length = _INOTIFY_EVENT.unpack_from(data, offset)
+                offset += _INOTIFY_EVENT.size
+                raw_name = data[offset : offset + name_length]
+                offset += name_length
+                if mask & _IN_Q_OVERFLOW:
+                    overflow = True
+                    continue
+                if mask & (_IN_IGNORED | _IN_DELETE_SELF | _IN_MOVE_SELF):
+                    continue
+                name = raw_name.split(b"\0", 1)[0].decode(errors="surrogateescape")
+                if (
+                    name
+                    and not name.startswith(".")
+                    and name.endswith(".json")
+                    and mask & (_IN_CLOSE_WRITE | _IN_MOVED_TO | _IN_CREATE)
+                ):
+                    paths.add(self.store.marker_directory / name)
+
+        if overflow:
+            arrivals.extend(
+                self.store.iter_arrivals(max_age_seconds=self.max_age_seconds)
+            )
+        else:
+            for path in paths:
+                item = self.store.read_arrival_path(
+                    path, max_age_seconds=self.max_age_seconds
+                )
+                if item is not None:
+                    arrivals.append(item)
+        arrivals.sort(key=lambda item: float(item[1]["arrived_at"]))
+        return arrivals
+
+    def __enter__(self) -> "AgenticArrivalWatcher":
+        return self
+
+    def __exit__(self, *_args) -> None:
+        self.close()
 
 
 class AgenticEarlyClaimStore:
@@ -266,38 +423,49 @@ class AgenticEarlyClaimStore:
         with Decode's fast-tool-window check.
         """
 
-        now = time.time()
         arrivals: list[tuple[RequestGeneration, dict[str, Any]]] = []
         try:
             paths = tuple(self.marker_directory.glob("*.json"))
         except OSError:
             return arrivals
         for path in paths:
-            try:
-                payload = json.loads(path.read_bytes())
-                request = RequestGeneration(
-                    str(payload["request_id"]), int(payload["generation"])
-                )
-                arrived_at = float(payload["arrived_at"])
-            except (
-                FileNotFoundError,
-                OSError,
-                TypeError,
-                ValueError,
-                KeyError,
-                json.JSONDecodeError,
-            ):
-                continue
-            if (
-                payload.get("version") != _VERSION
-                or payload.get("kind") != "arrival"
-                or payload.get("snapshot_id") != request.snapshot_id
-                or arrived_at + max_age_seconds < now
-            ):
-                continue
-            arrivals.append((request, payload))
+            item = self.read_arrival_path(path, max_age_seconds=max_age_seconds)
+            if item is not None:
+                arrivals.append(item)
         arrivals.sort(key=lambda item: float(item[1]["arrived_at"]))
         return arrivals
+
+    def read_arrival_path(
+        self, path: Path, *, max_age_seconds: float
+    ) -> Optional[tuple[RequestGeneration, dict[str, Any]]]:
+        """Validate one path delivered by :class:`AgenticArrivalWatcher`."""
+
+        try:
+            payload = json.loads(path.read_bytes())
+            request = RequestGeneration(
+                str(payload["request_id"]), int(payload["generation"])
+            )
+            arrived_at = float(payload["arrived_at"])
+        except (
+            FileNotFoundError,
+            OSError,
+            TypeError,
+            ValueError,
+            KeyError,
+            json.JSONDecodeError,
+        ):
+            return None
+        if (
+            payload.get("version") != _VERSION
+            or payload.get("kind") != "arrival"
+            or payload.get("snapshot_id") != request.snapshot_id
+            or arrived_at + max_age_seconds < time.time()
+        ):
+            return None
+        return request, payload
+
+    def watch_arrivals(self, *, max_age_seconds: float) -> AgenticArrivalWatcher:
+        return AgenticArrivalWatcher(self, max_age_seconds)
 
     def read_final(
         self,

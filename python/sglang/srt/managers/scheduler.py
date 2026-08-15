@@ -1153,10 +1153,21 @@ class Scheduler(
             str, AgenticEarlyDirectReceive
         ] = {}
         self.agentic_early_direct_terminal: Dict[str, float] = {}
-        self.agentic_early_direct_next_scan_at = 0.0
+        # Router arrivals are delivered by inotify into a FIFO admission
+        # queue.  Transport completion has a separate queue consumed by the
+        # GPU scheduler; neither path scans all marker files or all receivers.
+        self.agentic_early_direct_admission_queue: Deque[
+            Tuple[RequestGeneration, dict, Optional[Any]]
+        ] = deque()
+        self.agentic_early_direct_admission_ids: set[str] = set()
+        self.agentic_early_direct_completion_queue: Deque[str] = deque()
+        self.agentic_early_direct_arrival_watcher = None
         self.agentic_early_claim_store = None
         self.agentic_direct_credit_pool = None
         self.agentic_early_direct_poll_lock = threading.RLock()
+        # Direct transport progress is owned exclusively by the background
+        # worker. The GPU scheduler only inspects/binds completed entries and
+        # must never wait for NIXL progress.
         self.agentic_early_direct_cycle_lock = threading.Lock()
         self.agentic_early_direct_progress_stop = threading.Event()
         self.agentic_early_direct_progress_thread = None
@@ -1446,6 +1457,17 @@ class Scheduler(
                         early_claim_dir
                     )
                 if self.agentic_early_claim_store is not None:
+                    marker_max_age = max(
+                        5.0,
+                        envs.SGLANG_AGENTIC_KV_FAST_TOOL_THRESHOLD.get()
+                        + envs.SGLANG_AGENTIC_KV_DIRECT_HANDSHAKE_TIMEOUT.get()
+                        + 1.0,
+                    )
+                    self.agentic_early_direct_arrival_watcher = (
+                        self.agentic_early_claim_store.watch_arrivals(
+                            max_age_seconds=marker_max_age
+                        )
+                    )
                     direct_reserve_tokens = int(
                         os.environ.get(
                             "SGLANG_AGENTIC_KV_P_DIRECT_RESERVE_TOKENS", "40000"
@@ -1526,12 +1548,11 @@ class Scheduler(
                         expected_tool_seconds=expected_tool_seconds,
                         eviction_controller=eviction_controller,
                     )
-                # receiver.poll() must continue while the scheduler is inside
-                # a long Prefill forward.  Otherwise an already-launched
-                # D->P transfer occupies a Direct credit until the next
-                # scheduler tick and fast requests spuriously fall back to
-                # Host staging.  The worker only advances NIXL transport; all
-                # allocator/cache/lifecycle mutations remain scheduler-owned.
+                # Direct marker discovery and NIXL transport must continue
+                # while the scheduler is inside a long Prefill forward. The
+                # worker exclusively owns transport progress; the scheduler
+                # only binds completed pages into Radix. This prevents a slow
+                # transport operation from delaying the next GPU forward.
                 if self.agentic_early_claim_store is not None:
                     self.agentic_early_direct_progress_thread = threading.Thread(
                         target=self._agentic_early_direct_progress_worker,
@@ -2039,10 +2060,6 @@ class Scheduler(
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
-        # Progress D->P Direct independently of request tokenization and the
-        # normal Prefill queue.  NIXL copies launched here continue
-        # asynchronously while the scheduler launches the next GPU forward.
-        self._agentic_poll_early_direct_receives(now)
         for recv_req in recv_reqs:
             # Skip health check when server is busy — ongoing requests already carry health info.
             if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
@@ -2627,11 +2644,11 @@ class Scheduler(
         )
 
     def _agentic_early_direct_progress_worker(self) -> None:
-        """Discover, claim, and complete Direct ingress off the GPU scheduler.
+        """Own Direct discovery and transport progress off the GPU scheduler.
 
         The worker allocates only from the fixed Direct page-credit reserve;
-        it never touches the shared SGLang allocator or Radix tree.  The
-        scheduler later performs the cheap Req binding step.
+        it never touches the shared SGLang allocator or Radix tree. The
+        scheduler later performs only the cheap completed-Req binding step.
         """
 
         try:
@@ -2654,18 +2671,6 @@ class Scheduler(
         while not self.agentic_early_direct_progress_stop.is_set():
             started = time.monotonic()
             try:
-                # Keep transport polling independent even in lightweight
-                # tests where no lifecycle store is installed. Production's
-                # full cycle below consumes the cached terminal state.
-                with getattr(self, "agentic_early_direct_poll_lock", nullcontext()):
-                    entries = tuple(self.agentic_early_direct_receives.values())
-                    for entry in entries:
-                        if (
-                            entry.completed_at is None
-                            and entry.transport_poll
-                            not in {KVPoll.Success, KVPoll.Failed}
-                        ):
-                            entry.transport_poll = entry.receiver.poll()
                 self._agentic_poll_early_direct_receives()
             except Exception:
                 logger.exception("P Direct ingress worker failed")
@@ -2682,13 +2687,23 @@ class Scheduler(
                         not in {KVPoll.Success, KVPoll.Failed}
                         for entry in self.agentic_early_direct_receives.values()
                     )
+                    ready = sum(
+                        entry.completed_at is not None
+                        for entry in self.agentic_early_direct_receives.values()
+                    )
+                    admission_pending = len(
+                        self.agentic_early_direct_admission_queue
+                    )
                 logger.info(
                     "Agentic P Direct progress stats cycles=%d avg_us=%.1f "
-                    "max_ms=%.3f active=%d reserve_free_tokens=%d",
+                    "max_ms=%.3f admission_pending=%d active=%d ready=%d "
+                    "reserve_free_tokens=%d",
                     cycles,
                     total_seconds / max(cycles, 1) * 1e6,
                     max_seconds * 1e3,
+                    admission_pending,
                     active,
+                    ready,
                     -1
                     if getattr(self, "agentic_direct_credit_pool", None) is None
                     else self.agentic_direct_credit_pool.free_tokens,
@@ -2707,6 +2722,131 @@ class Scheduler(
             return self._agentic_poll_early_direct_receives_once(now)
         with cycle_lock:
             return self._agentic_poll_early_direct_receives_once(now)
+
+    def _agentic_collect_direct_arrivals(self, poll_lock) -> None:
+        """Move paths reported by inotify into the Direct admission FIFO."""
+
+        watcher = getattr(self, "agentic_early_direct_arrival_watcher", None)
+        if watcher is None:
+            return
+        arrivals = watcher.poll(0.0)
+        if not arrivals:
+            return
+        with poll_lock:
+            queue = self.agentic_early_direct_admission_queue
+            pending = self.agentic_early_direct_admission_ids
+            for request, payload in arrivals:
+                snapshot_id = request.snapshot_id
+                if (
+                    snapshot_id in pending
+                    or snapshot_id in self.agentic_early_direct_receives
+                    or snapshot_id in self.agentic_early_direct_terminal
+                ):
+                    continue
+                queue.append((request, payload, None))
+                pending.add(snapshot_id)
+
+    def _agentic_admit_queued_direct_receives(
+        self,
+        snapshot_store,
+        direct_timeout: float,
+        poll_lock,
+    ) -> None:
+        """Claim queued arrivals immediately when exact-size credit is free."""
+
+        queue = getattr(self, "agentic_early_direct_admission_queue", None)
+        pending = getattr(self, "agentic_early_direct_admission_ids", None)
+        if queue is None or pending is None:
+            return
+        marker_max_age = max(
+            5.0,
+            envs.SGLANG_AGENTIC_KV_FAST_TOOL_THRESHOLD.get()
+            + direct_timeout
+            + 1.0,
+        )
+        dynamic_domains = os.environ.get(
+            "SGLANG_PD_LATE_BIND_DYNAMIC_PREFILL_DOMAINS", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        configured_domain = int(
+            os.environ.get("SGLANG_AGENTIC_KV_PREFILL_DOMAIN", "-1")
+        )
+
+        # Examine each currently queued request once.  A large snapshot with
+        # insufficient credit is rotated behind smaller requests instead of
+        # causing head-of-line blocking; FIFO order is otherwise preserved.
+        with poll_lock:
+            attempts = len(queue)
+        for _ in range(attempts):
+            with poll_lock:
+                if not queue:
+                    break
+                request, payload, manifest = queue.popleft()
+                pending.discard(request.snapshot_id)
+                if (
+                    request.snapshot_id in self.agentic_early_direct_receives
+                    or request.snapshot_id in self.agentic_early_direct_terminal
+                ):
+                    continue
+
+            arrived_at = float(payload["arrived_at"])
+            if arrived_at + marker_max_age < time.time():
+                continue
+            target_domain = payload.get("target_prefill_domain")
+            if dynamic_domains:
+                if target_domain is None or int(target_domain) != configured_domain:
+                    continue
+            else:
+                # Preserve the established 1P behavior: its arrival markers
+                # are untargeted and require no route-resolution handshake.
+                target_domain = None
+
+            if manifest is None:
+                manifest = snapshot_store.load(request, require_ready=False)
+            if manifest is None:
+                # The marker and lifecycle manifest are written by different
+                # processes.  Retain the event briefly if publication order is
+                # observed in reverse; no directory rescan is required.
+                with poll_lock:
+                    queue.append((request, payload, None))
+                    pending.add(request.snapshot_id)
+                continue
+            if manifest.state is not SnapshotState.DIRECT_READY:
+                continue
+            if arrived_at + 0.05 < manifest.created_at:
+                continue
+            credit_pool = getattr(self, "agentic_direct_credit_pool", None)
+            if credit_pool is not None:
+                required_tokens = (
+                    (manifest.token_count + self.server_args.page_size - 1)
+                    // self.server_args.page_size
+                    * self.server_args.page_size
+                )
+            if (
+                credit_pool is not None
+                and credit_pool.free_tokens < required_tokens
+            ):
+                with poll_lock:
+                    queue.append((request, payload, manifest))
+                    pending.add(request.snapshot_id)
+                continue
+            if self._agentic_start_early_direct_receive(
+                request,
+                manifest,
+                snapshot_store,
+                arrived_at=arrived_at,
+                prefill_domain=(
+                    None if target_domain is None else int(target_domain)
+                ),
+            ):
+                continue
+
+            # Credit exhaustion and transient bootstrap setup both leave the
+            # manifest DIRECT_READY. Requeue only while D still offers it.
+            current = snapshot_store.load(request, require_ready=False)
+            if current is not None and current.state is SnapshotState.DIRECT_READY:
+                with poll_lock:
+                    queue.append((request, payload, current))
+                    pending.add(request.snapshot_id)
 
     def _agentic_poll_early_direct_receives_once(
         self, now: Optional[float] = None
@@ -2730,8 +2870,72 @@ class Scheduler(
             envs.SGLANG_AGENTIC_KV_READY_TIMEOUT.get(),
             120.0,
         )
-        with getattr(self, "agentic_early_direct_poll_lock", nullcontext()):
+        poll_lock = getattr(self, "agentic_early_direct_poll_lock", nullcontext())
+        # Event ingestion and admission precede transport completion work, so
+        # an older completion burst cannot consume a fast tool's two-second
+        # claim window.
+        self._agentic_collect_direct_arrivals(poll_lock)
+        self._agentic_admit_queued_direct_receives(
+            snapshot_store, direct_timeout, poll_lock
+        )
+        with poll_lock:
             receive_entries = tuple(self.agentic_early_direct_receives.items())
+
+        # NIXL notifications are manager-wide. Polling every active receiver
+        # separately drains and parses the same notification queue once per
+        # request, which becomes expensive during a Direct burst. Reuse the
+        # transport's batch API so each manager is progressed once per cycle;
+        # receivers without a batch API retain their original behavior.
+        batched_groups = {}
+        for snapshot_id, entry in receive_entries:
+            if (
+                entry.completed_at is not None
+                or entry.transport_poll in {KVPoll.Success, KVPoll.Failed}
+            ):
+                continue
+            poll_many = getattr(type(entry.receiver), "poll_many", None)
+            if not callable(poll_many):
+                continue
+            group_key = (type(entry.receiver), id(getattr(entry.receiver, "kv_mgr", None)))
+            batched_groups.setdefault(group_key, []).append(
+                (snapshot_id, entry, poll_many)
+            )
+
+        batched_polls = {}
+        for grouped_entries in batched_groups.values():
+            batch_started = time.monotonic()
+            try:
+                polls = grouped_entries[0][2](
+                    [entry.receiver for _, entry, _ in grouped_entries]
+                )
+                if len(polls) != len(grouped_entries):
+                    raise RuntimeError(
+                        "Direct transport batch poll returned the wrong result count"
+                    )
+            except Exception:
+                logger.exception(
+                    "Early Direct batch poll failed for %d receivers",
+                    len(grouped_entries),
+                )
+                polls = [KVPoll.Failed] * len(grouped_entries)
+            batch_elapsed = time.monotonic() - batch_started
+            if batch_elapsed >= 0.25:
+                logger.warning(
+                    "Agentic P Direct batch poll slow elapsed_ms=%.3f "
+                    "active_receivers=%d",
+                    batch_elapsed * 1000.0,
+                    len(grouped_entries),
+                )
+            for (snapshot_id, entry, _), poll in zip(grouped_entries, polls):
+                batched_polls[snapshot_id] = (entry, poll)
+
+        # A burst can complete dozens of rooms together. Ledger publication,
+        # route publication and receiver teardown are request-local but not
+        # free; processing the whole burst before the next arrival scan caused
+        # multi-second admission gaps. Time-slice terminal bookkeeping while
+        # continuing to poll every transport room each cycle.
+        terminal_commit_budget = 8
+        terminal_commits = 0
         for snapshot_id, entry in receive_entries:
             if entry.completed_at is not None:
                 if entry.prefill_domain is not None and not entry.route_published:
@@ -2756,10 +2960,22 @@ class Scheduler(
                     )
                 continue
             try:
-                with getattr(self, "agentic_early_direct_poll_lock", nullcontext()):
-                    poll = entry.transport_poll
-                    if poll not in {KVPoll.Success, KVPoll.Failed}:
+                poll = entry.transport_poll
+                if poll not in {KVPoll.Success, KVPoll.Failed}:
+                    # NIXL polling can occasionally take seconds under a
+                    # burst. Never hold the state lock across transport calls;
+                    # the scheduler needs it to inspect completed entries.
+                    batched = batched_polls.get(snapshot_id)
+                    if batched is not None and batched[0] is entry:
+                        poll = batched[1]
+                    else:
                         poll = entry.receiver.poll()
+                    with poll_lock:
+                        if (
+                            self.agentic_early_direct_receives.get(snapshot_id)
+                            is not entry
+                        ):
+                            continue
                         entry.transport_poll = poll
             except Exception:
                 logger.exception(
@@ -2771,8 +2987,12 @@ class Scheduler(
                 and now - entry.started_at >= direct_timeout
             ):
                 poll = KVPoll.Failed
-                with getattr(self, "agentic_early_direct_poll_lock", nullcontext()):
+                with poll_lock:
                     entry.transport_poll = poll
+            if poll in {KVPoll.Success, KVPoll.Failed}:
+                if terminal_commits >= terminal_commit_budget:
+                    continue
+                terminal_commits += 1
             if poll == KVPoll.Success:
                 try:
                     debug_settle = float(
@@ -2796,7 +3016,6 @@ class Scheduler(
                             "early Direct claim disappeared before completion"
                         )
                     snapshot_store.complete_direct(current, entry.claim_id)
-                    entry.completed_at = now
                     if entry.prefill_domain is not None:
                         try:
                             marker_store.publish_route(
@@ -2818,12 +3037,23 @@ class Scheduler(
                     self._agentic_clear_direct_receiver(
                         entry.receiver, entry.manifest
                     )
+                    completed_at = time.monotonic()
+                    with poll_lock:
+                        if (
+                            self.agentic_early_direct_receives.get(snapshot_id)
+                            is not entry
+                        ):
+                            continue
+                        entry.completed_at = completed_at
+                        self.agentic_early_direct_completion_queue.append(
+                            snapshot_id
+                        )
                     logger.info(
                         "AgenticKV early_direct_complete snapshot=%s tokens=%d "
                         "transfer_ms=%.3f",
                         snapshot_id,
                         entry.manifest.token_count,
-                        (now - entry.started_at) * 1000.0,
+                        (completed_at - entry.started_at) * 1000.0,
                     )
                 except Exception:
                     logger.exception(
@@ -2846,87 +3076,12 @@ class Scheduler(
 
         # Retain short-lived terminal ids only to avoid repeatedly reopening a
         # marker while Decode is about to remove it.
-        for snapshot_id, terminal_at in tuple(
-            self.agentic_early_direct_terminal.items()
-        ):
-            if now - terminal_at >= 10.0:
-                self.agentic_early_direct_terminal.pop(snapshot_id, None)
-
-        try:
-            scan_interval = max(
-                0.001,
-                float(
-                    os.environ.get(
-                        "SGLANG_AGENTIC_KV_EARLY_DIRECT_SCAN_INTERVAL", "0.01"
-                    )
-                ),
-            )
-            direct_io_cap = max(
-                1, int(os.environ.get("SGLANG_AGENTIC_KV_DIRECT_IO_CAP", "4"))
-            )
-        except ValueError:
-            logger.exception("Invalid early Direct admission setting")
-            raise
-        credit_pool = getattr(self, "agentic_direct_credit_pool", None)
-        if credit_pool is not None:
-            # Token credit is the admission bound. A separate request-count
-            # cap recreates burst head-of-line blocking for small snapshots.
-            direct_io_cap = credit_pool.capacity_pages
-        if now < self.agentic_early_direct_next_scan_at:
-            return
-        self.agentic_early_direct_next_scan_at = now + scan_interval
-        active_io = sum(
-            entry.completed_at is None
-            for entry in self.agentic_early_direct_receives.values()
-        )
-        if active_io >= direct_io_cap:
-            return
-        marker_max_age = max(
-            5.0,
-            envs.SGLANG_AGENTIC_KV_FAST_TOOL_THRESHOLD.get()
-            + direct_timeout
-            + 1.0,
-        )
-        for request, payload in marker_store.iter_arrivals(
-            max_age_seconds=marker_max_age
-        ):
-            if active_io >= direct_io_cap:
-                break
-            if (
-                request.snapshot_id in self.agentic_early_direct_receives
-                or request.snapshot_id in self.agentic_early_direct_terminal
+        with poll_lock:
+            for snapshot_id, terminal_at in tuple(
+                self.agentic_early_direct_terminal.items()
             ):
-                continue
-            manifest = snapshot_store.load(request, require_ready=False)
-            if manifest is None or manifest.state is not SnapshotState.DIRECT_READY:
-                continue
-            target_domain = payload.get("target_prefill_domain")
-            dynamic_domains = os.environ.get(
-                "SGLANG_PD_LATE_BIND_DYNAMIC_PREFILL_DOMAINS", ""
-            ).strip().lower() in {"1", "true", "yes", "on"}
-            if dynamic_domains:
-                configured_domain = int(
-                    os.environ.get("SGLANG_AGENTIC_KV_PREFILL_DOMAIN", "-1")
-                )
-                if target_domain is None or int(target_domain) != configured_domain:
-                    continue
-            else:
-                # Preserve the established 1P behavior: its arrival markers
-                # are untargeted and require no route-resolution handshake.
-                target_domain = None
-            arrived_at = float(payload["arrived_at"])
-            if arrived_at + 0.05 < manifest.created_at:
-                continue
-            if self._agentic_start_early_direct_receive(
-                request,
-                manifest,
-                snapshot_store,
-                arrived_at=arrived_at,
-                prefill_domain=(
-                    None if target_domain is None else int(target_domain)
-                ),
-            ):
-                active_io += 1
+                if now - terminal_at >= 10.0:
+                    self.agentic_early_direct_terminal.pop(snapshot_id, None)
 
     def _agentic_bind_early_direct_receive(
         self, req: Req, request: RequestGeneration
@@ -2937,7 +3092,8 @@ class Scheduler(
         snapshot_id = getattr(request, "snapshot_id", None)
         if not receives or snapshot_id is None:
             return None
-        entry = receives.get(snapshot_id)
+        with getattr(self, "agentic_early_direct_poll_lock", nullcontext()):
+            entry = receives.get(snapshot_id)
         if entry is None:
             return None
         req._agentic_kv_queue_class = "fast"
@@ -3516,7 +3672,6 @@ class Scheduler(
                 )
                 if marker is not None:
                     if allow_start_io:
-                        self._agentic_poll_early_direct_receives()
                         early_direct = self._agentic_bind_early_direct_receive(
                             req, metadata.parent
                         )
@@ -3684,23 +3839,36 @@ class Scheduler(
         """
 
         receives = getattr(self, "agentic_early_direct_receives", None)
+        completions = getattr(self, "agentic_early_direct_completion_queue", None)
         if not receives:
             return
         with getattr(self, "agentic_early_direct_poll_lock", nullcontext()):
-            completed = {
-                snapshot_id
-                for snapshot_id, entry in receives.items()
-                if entry.completed_at is not None
-            }
+            if completions is None:
+                # Compatibility for embedders/tests constructing Scheduler
+                # without init_running_status(). Production always uses the
+                # completion queue and never scans all receivers here.
+                completed = {
+                    snapshot_id
+                    for snapshot_id, entry in receives.items()
+                    if entry.completed_at is not None
+                }
+            else:
+                completed = set(completions)
+                completions.clear()
         if not completed:
             return
+        waiting_by_parent = {}
         for req, _ in self.agentic_kv_waiting_queue:
             if getattr(req, "_agentic_kv_gate_complete", False):
                 continue
             metadata = AgenticRequestMetadata.from_req(req)
             parent = metadata.parent if metadata is not None else None
-            if parent is not None and parent.snapshot_id in completed:
-                self._agentic_bind_early_direct_receive(req, parent)
+            if parent is not None:
+                waiting_by_parent[parent.snapshot_id] = (req, parent)
+        for snapshot_id in completed:
+            waiter = waiting_by_parent.get(snapshot_id)
+            if waiter is not None:
+                self._agentic_bind_early_direct_receive(*waiter)
 
     def _drain_agentic_kv_waiting_queue(self) -> None:
         """Progress active KV I/O and admit bounded fast/slow work.
@@ -4518,10 +4686,6 @@ class Scheduler(
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
     ) -> Optional[ScheduleBatch]:
-        # Arrival markers are the highest-priority P work.  Discover and start
-        # exact-size Direct receives at every scheduling boundary, not only
-        # when the tokenizer happens to deliver another HTTP request.
-        self._agentic_poll_early_direct_receives(time.monotonic())
         host_staging = getattr(self, "agentic_host_staging_manager", None)
         if host_staging is not None:
             host_staging.poll()
