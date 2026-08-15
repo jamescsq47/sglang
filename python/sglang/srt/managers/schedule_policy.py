@@ -565,6 +565,10 @@ class PrefillAdder:
 
     def _req_inc_lock_ref(self, req: Req):
         result = self.tree_cache.inc_lock_ref(req.last_node)
+        direct_parent_pin = getattr(req, "_agentic_direct_parent_pin_node", None)
+        if direct_parent_pin is not None:
+            self.tree_cache.dec_lock_ref(direct_parent_pin)
+            del req._agentic_direct_parent_pin_node
         if self.is_hybrid_swa:
             req.swa_uuid_for_lock = result.swa_uuid_for_lock
 

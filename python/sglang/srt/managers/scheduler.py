@@ -1165,6 +1165,15 @@ class Scheduler(
         self.agentic_early_claim_store = None
         self.agentic_direct_credit_pool = None
         self.agentic_early_direct_poll_lock = threading.RLock()
+        # P->D sender completion polling and reverse D->P Direct progress use
+        # the same NIXL agent.  The Python binding performs manager-wide
+        # control work, so allowing every P->D worker to enter it concurrently
+        # can starve get_new_notifs() for seconds under a sustained burst.
+        # Serialize only those short NIXL control calls; DMA itself remains
+        # asynchronous and fully concurrent.  Direct sets the event before
+        # taking the lock so P->D workers yield at the next progress step.
+        self.agentic_nixl_control_lock = threading.Lock()
+        self.agentic_direct_poll_requested = threading.Event()
         # Direct transport progress is owned exclusively by the background
         # worker. The GPU scheduler only inspects/binds completed entries and
         # must never wait for NIXL progress.
@@ -2508,28 +2517,33 @@ class Scheduler(
         )
         receiver = None
         claimed = None
+        direct_requested = getattr(self, "agentic_direct_poll_requested", None)
+        nixl_lock = getattr(self, "agentic_nixl_control_lock", nullcontext())
         try:
             claimed = snapshot_store.claim_direct(request, claim_id)
-            if not runtime.manager.try_ensure_parallel_info(
-                claimed.direct_bootstrap_addr
-            ):
-                raise SnapshotNotReadyError("reverse bootstrap is not ready")
-            receiver = runtime.receiver_class(
-                mgr=runtime.manager,
-                bootstrap_addr=claimed.direct_bootstrap_addr,
-                bootstrap_room=claimed.direct_room,
-            )
-            receiver.init(prefill_dp_rank=0)
-            if receiver.poll() == KVPoll.Failed:
-                raise SnapshotLifecycleError("reverse receiver init failed")
-            page_indices = (
-                credit_allocation.page_indices
-                if credit_allocation is not None
-                else kv_to_page_indices(
-                    device_indices.cpu().numpy(), self.server_args.page_size
+            if direct_requested is not None:
+                direct_requested.set()
+            with nixl_lock:
+                if not runtime.manager.try_ensure_parallel_info(
+                    claimed.direct_bootstrap_addr
+                ):
+                    raise SnapshotNotReadyError("reverse bootstrap is not ready")
+                receiver = runtime.receiver_class(
+                    mgr=runtime.manager,
+                    bootstrap_addr=claimed.direct_bootstrap_addr,
+                    bootstrap_room=claimed.direct_room,
                 )
-            )
-            receiver.send_metadata(page_indices, aux_index=0)
+                receiver.init(prefill_dp_rank=0)
+                if receiver.poll() == KVPoll.Failed:
+                    raise SnapshotLifecycleError("reverse receiver init failed")
+                page_indices = (
+                    credit_allocation.page_indices
+                    if credit_allocation is not None
+                    else kv_to_page_indices(
+                        device_indices.cpu().numpy(), self.server_args.page_size
+                    )
+                )
+                receiver.send_metadata(page_indices, aux_index=0)
         except Exception as exc:
             if credit_allocation is not None:
                 credit_pool.release(credit_allocation)
@@ -2564,6 +2578,9 @@ class Scheduler(
                     request.snapshot_id,
                 )
             return False
+        finally:
+            if direct_requested is not None:
+                direct_requested.clear()
 
         entry = AgenticEarlyDirectReceive(
             request=request,
@@ -2904,10 +2921,17 @@ class Scheduler(
         batched_polls = {}
         for grouped_entries in batched_groups.values():
             batch_started = time.monotonic()
+            direct_requested = getattr(
+                self, "agentic_direct_poll_requested", nullcontext()
+            )
+            nixl_lock = getattr(self, "agentic_nixl_control_lock", nullcontext())
             try:
-                polls = grouped_entries[0][2](
-                    [entry.receiver for _, entry, _ in grouped_entries]
-                )
+                if hasattr(direct_requested, "set"):
+                    direct_requested.set()
+                with nixl_lock:
+                    polls = grouped_entries[0][2](
+                        [entry.receiver for _, entry, _ in grouped_entries]
+                    )
                 if len(polls) != len(grouped_entries):
                     raise RuntimeError(
                         "Direct transport batch poll returned the wrong result count"
@@ -2918,6 +2942,9 @@ class Scheduler(
                     len(grouped_entries),
                 )
                 polls = [KVPoll.Failed] * len(grouped_entries)
+            finally:
+                if hasattr(direct_requested, "clear"):
+                    direct_requested.clear()
             batch_elapsed = time.monotonic() - batch_started
             if batch_elapsed >= 0.25:
                 logger.warning(
@@ -3202,6 +3229,24 @@ class Scheduler(
             self.agentic_direct_credit_pool.mark_bound(entry.credit_allocation)
             req._agentic_direct_credit_pool = self.agentic_direct_credit_pool
             req._agentic_direct_credit_allocation = entry.credit_allocation
+
+        # insert() makes the restored parent visible to the Radix LRU.  Pin the
+        # exact request-generation before returning to the queue.  Native
+        # Prefill acquires its ordinary request lock first and only then drops
+        # this temporary pin, so there is no evictable gap between ownerships.
+        parent_match = self.tree_cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(parent_tokens, req.extra_key),
+                req=req,
+            )
+        )
+        if len(parent_match.device_indices) != len(parent_tokens):
+            raise RuntimeError(
+                "Early Direct parent disappeared before request protection"
+            )
+        self.tree_cache.inc_lock_ref(parent_match.last_device_node)
+        req._agentic_direct_parent_pin_node = parent_match.last_device_node
+        req._agentic_direct_parent_token_count = len(parent_tokens)
         with getattr(self, "agentic_early_direct_poll_lock", nullcontext()):
             self.agentic_early_direct_receives.pop(request.snapshot_id, None)
             self.agentic_early_direct_terminal[request.snapshot_id] = time.monotonic()
@@ -3453,6 +3498,13 @@ class Scheduler(
             immediate_match = self.tree_cache.match_prefix(
                 MatchPrefixParams(key=RadixKey(keys, req.extra_key), req=req)
             )
+            if len(immediate_match.device_indices) != len(keys):
+                raise RuntimeError(
+                    "Direct parent disappeared before request protection"
+                )
+            self.tree_cache.inc_lock_ref(immediate_match.last_device_node)
+            req._agentic_direct_parent_pin_node = immediate_match.last_device_node
+            req._agentic_direct_parent_token_count = len(keys)
             logger.info(
                 "AgenticKV direct_radix_verify snapshot=%s device_tokens=%d "
                 "host_tokens=%d",
@@ -3738,9 +3790,30 @@ class Scheduler(
             )
             return False
 
+        timeout = max(0.0, envs.SGLANG_AGENTIC_KV_READY_TIMEOUT.get())
         if manifest is not None and manifest.state in {
             SnapshotState.DIRECT_LOADING,
             SnapshotState.P_LOADING,
+        }:
+            # These are producer/receiver progress states, not evidence that
+            # the parent KV is unavailable.  Under c640 the Direct manager can
+            # remain in one of them for several seconds; admitting the child
+            # here silently turns transport congestion into a full recompute.
+            if time.monotonic() - started_at < timeout:
+                return True
+            logger.warning(
+                "Timed out waiting %.1fs for in-progress parent snapshot %s "
+                "of req %s (state=%s); falling back to recompute",
+                timeout,
+                metadata.parent.snapshot_id,
+                req.rid,
+                manifest.state.value,
+            )
+            req._agentic_kv_gate_complete = True
+            req._agentic_kv_fallback = f"timeout:{manifest.state.value}"
+            return False
+
+        if manifest is not None and manifest.state in {
             SnapshotState.P_HOST,
             SnapshotState.P_GPU,
             SnapshotState.TO_DECODE,
@@ -3752,24 +3825,20 @@ class Scheduler(
         }:
             req._agentic_kv_gate_complete = True
             req._agentic_kv_fallback = manifest.state.value
+            logger.info(
+                "AgenticKV parent_snapshot_terminal_fallback snapshot=%s "
+                "state=%s req=%s",
+                metadata.parent.snapshot_id,
+                manifest.state.value,
+                req.rid,
+            )
             return False
 
-        timeout = max(0.0, envs.SGLANG_AGENTIC_KV_READY_TIMEOUT.get())
-        # With no manifest and no terminal ACK, cover both the Direct offer
-        # window and the bounded Direct->shared-Host transition.  D switches
-        # paths at the Direct timeout, so timing P out at the exact same edge
-        # can start recompute milliseconds before HOST_WRITING becomes visible.
-        # Keep this bounded independently of the generic ready timeout; a truly
-        # absent parent still must not block P for minutes.
-        if manifest is None:
-            timeout = min(
-                timeout,
-                max(
-                    0.1,
-                    envs.SGLANG_AGENTIC_KV_DIRECT_HANDSHAKE_TIMEOUT.get()
-                    + envs.SGLANG_AGENTIC_KV_HOST_TRANSITION_GRACE.get(),
-                ),
-            )
+        # A missing manifest is normal while D changes ownership from Direct
+        # to Shared Host.  That transition can exceed the old 2s+8s shortcut
+        # when several D workers publish concurrently.  The child must wait
+        # for the request-level ready timeout instead of racing the producer
+        # and recomputing an otherwise recoverable parent snapshot.
         if time.monotonic() - started_at >= timeout:
             state = "missing" if manifest is None else manifest.state.value
             logger.warning(
@@ -4123,6 +4192,21 @@ class Scheduler(
 
     def _agentic_abort_cleanup(self, req: Req) -> None:
         """Release a P load claim and its complete snapshot on cancellation."""
+
+        direct_parent_pin = getattr(req, "_agentic_direct_parent_pin_node", None)
+        if direct_parent_pin is not None:
+            self.tree_cache.dec_lock_ref(direct_parent_pin)
+            del req._agentic_direct_parent_pin_node
+
+        direct_parent_tokens = getattr(
+            req, "_agentic_direct_parent_token_count", 0
+        )
+        release_agentic_cache = getattr(
+            self.tree_cache, "release_agentic_request_cache", None
+        )
+        if direct_parent_tokens and release_agentic_cache is not None:
+            release_agentic_cache(req, committed_len=direct_parent_tokens)
+            del req._agentic_direct_parent_token_count
 
         release_prefetch = getattr(self.tree_cache, "release_aborted_request", None)
         if release_prefetch is not None:

@@ -406,14 +406,15 @@ class SchedulerDisaggregationPrefillMixin:
                 prefetch(room)
 
     def start_prefill_transfer_progress_worker(self: Scheduler) -> None:
-        """Start the P-ready FIFO and independent P->D transfer consumers.
+        """Start the P-ready FIFO and independent P->D progress workers.
 
         The scheduler is only the producer: after Prefill it snapshots an
         immutable transfer payload and appends the request to
-        ``_prefill_ready_queue``.  Consumers publish P-ready in FIFO order and
-        independently drive one sender through poll/init/send/terminal.  A
-        slow transport operation therefore occupies one consumer instead of
-        serializing every ready request or the Prefill scheduler.
+        ``_prefill_ready_queue``.  Workers publish P-ready in FIFO order, make
+        one non-blocking progress step, and put non-terminal requests back at
+        the tail.  No request may own a finite worker until completion:
+        otherwise enough receivers waiting for metadata can exhaust the pool
+        and permanently strand every later P result.
 
         Request/KV cleanup remains scheduler-owned after a consumer publishes
         a terminal cached poll.
@@ -462,6 +463,7 @@ class SchedulerDisaggregationPrefillMixin:
         self._prefill_ready_condition = threading.Condition()
         self._prefill_ready_queue = deque()
         self._prefill_ready_queued_rids = set()
+        self._prefill_transfer_active_reqs = {}
         self._prefill_ready_publish_condition = threading.Condition()
         self._prefill_ready_next_publish_sequence = 0
         self._prefill_transfer_async_enabled = True
@@ -533,6 +535,8 @@ class SchedulerDisaggregationPrefillMixin:
     def _prefill_transfer_consumer_worker(
         self: Scheduler, consumer_index: int
     ) -> None:
+        """Round-robin P->D progress without per-request worker ownership."""
+
         cycles = 0
         total_seconds = 0.0
         max_seconds = 0.0
@@ -548,24 +552,50 @@ class SchedulerDisaggregationPrefillMixin:
                     return
                 req = self._prefill_ready_queue.popleft()
                 self._prefill_ready_queued_rids.discard(req.rid)
-                req._async_prefill_transfer_consumer_active = True
+                if not getattr(req, "_async_prefill_transfer_consumer_active", False):
+                    req._async_prefill_transfer_consumer_active = True
+                    req._async_prefill_transfer_active_at = time.monotonic()
+                    self._prefill_transfer_active_reqs[req.rid] = req
 
             poll = int(KVPoll.Failed)
             try:
                 if getattr(req, "disagg_p_ready_deferred", False):
                     self._publish_deferred_prefill_ready(req)
-                while not self._prefill_transfer_stop.is_set():
-                    started_at = time.perf_counter()
+                started_at = time.perf_counter()
+                direct_requested = getattr(
+                    self, "agentic_direct_poll_requested", None
+                )
+                nixl_lock = getattr(self, "agentic_nixl_control_lock", None)
+                # Reverse Direct is bounded by the fast-path deadline, whereas
+                # P->D completion polling is not: the DMA is already in flight
+                # and a later status check is harmless.  Yield before entering
+                # the shared NIXL manager whenever reverse progress is queued.
+                if direct_requested is not None and direct_requested.is_set():
+                    poll = int(KVPoll.Transferring)
+                elif nixl_lock is None:
                     poll = self._prefill_transfer_progress_req_once(req)
-                    elapsed = time.perf_counter() - started_at
-                    cycles += 1
-                    total_seconds += elapsed
-                    max_seconds = max(max_seconds, elapsed)
-                    if poll in (int(KVPoll.Success), int(KVPoll.Failed)):
-                        break
-                    self._prefill_transfer_stop.wait(
-                        max(0.0, self._prefill_transfer_interval - elapsed)
-                    )
+                else:
+                    with nixl_lock:
+                        # Do not rely only on the check before acquiring the
+                        # lock. Under a sustained P->D burst, workers may
+                        # already be queued when reverse Direct asks priority.
+                        if (
+                            direct_requested is not None
+                            and direct_requested.is_set()
+                        ):
+                            poll = int(KVPoll.Transferring)
+                        else:
+                            poll = self._prefill_transfer_progress_req_once(req)
+                elapsed = time.perf_counter() - started_at
+                cycles += 1
+                total_seconds += elapsed
+                max_seconds = max(max_seconds, elapsed)
+                now = time.monotonic()
+                previous_poll = getattr(req, "_async_prefill_transfer_last_poll", None)
+                req._async_prefill_transfer_last_poll = poll
+                req._async_prefill_transfer_last_poll_at = now
+                if previous_poll != poll:
+                    req._async_prefill_transfer_last_progress_at = now
             except Exception:
                 logger.exception(
                     "P->D transfer consumer=%d failed rid=%s",
@@ -584,22 +614,53 @@ class SchedulerDisaggregationPrefillMixin:
                         self._prefill_ready_next_publish_sequence += 1
                         self._prefill_ready_publish_condition.notify_all()
 
-            with self._prefill_transfer_poll_lock:
-                req._async_prefill_transfer_poll = poll
-                req._async_prefill_transfer_consumer_active = False
+            terminal = poll in (int(KVPoll.Success), int(KVPoll.Failed))
+            if terminal:
+                with self._prefill_transfer_poll_lock:
+                    req._async_prefill_transfer_poll = poll
+                    req._async_prefill_transfer_consumer_active = False
+                with self._prefill_ready_condition:
+                    self._prefill_transfer_active_reqs.pop(req.rid, None)
+            elif not self._prefill_transfer_stop.is_set():
+                # Keep the transfer active but relinquish this worker after
+                # one step, so later P results cannot be starved by waiters.
+                self._prefill_transfer_stop.wait(
+                    max(0.0, self._prefill_transfer_interval - elapsed)
+                )
+                if not self._prefill_transfer_stop.is_set():
+                    with self._prefill_ready_condition:
+                        self._prefill_ready_queue.append(req)
+                        self._prefill_ready_queued_rids.add(req.rid)
+                        self._prefill_ready_condition.notify()
 
             now = time.monotonic()
             if now - last_stats_at >= 30.0:
                 with self._prefill_ready_condition:
                     buffered = len(self._prefill_ready_queue)
+                    active = len(self._prefill_transfer_active_reqs)
+                    oldest_active_seconds = max(
+                        (
+                            now
+                            - getattr(
+                                active_req,
+                                "_async_prefill_transfer_active_at",
+                                now,
+                            )
+                            for active_req in self._prefill_transfer_active_reqs.values()
+                        ),
+                        default=0.0,
+                    )
                 logger.info(
                     "Prefill P->D consumer stats worker=%d cycles=%d "
-                    "avg_us=%.1f max_ms=%.3f ready_buffer=%d inflight=%d",
+                    "avg_us=%.1f max_ms=%.3f ready_buffer=%d active=%d "
+                    "oldest_active_s=%.3f inflight=%d",
                     consumer_index,
                     cycles,
                     total_seconds * 1e6 / max(1, cycles),
                     max_seconds * 1000.0,
                     buffered,
+                    active,
+                    oldest_active_seconds,
                     len(self.disagg_prefill_inflight_queue),
                 )
                 cycles = 0

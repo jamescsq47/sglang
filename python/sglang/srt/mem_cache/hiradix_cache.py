@@ -926,6 +926,7 @@ class HiRadixCache(RadixCache):
                 for name in (
                     "_agentic_direct_credit_pool",
                     "_agentic_direct_credit_allocation",
+                    "_agentic_direct_parent_token_count",
                 ):
                     if hasattr(req, name):
                         delattr(req, name)
