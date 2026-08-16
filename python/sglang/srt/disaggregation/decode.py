@@ -38,6 +38,12 @@ from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.agentic_host_staging import SharedHostStagingLedger
+from sglang.srt.disaggregation.p2d_host_staging import (
+    AgenticPToDHostLoadManager,
+    AgenticPToDHostReceiver,
+    p2d_snapshot_from_req,
+)
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -382,6 +388,30 @@ class DecodePreallocQueue:
         self._ensure_retry_interval: float = 1.0  # seconds
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.kv_manager = self._init_kv_manager()
+        self.p2d_host_load_manager = None
+        if os.getenv("SGLANG_AGENTIC_KV_P2D_HOST_STAGING", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            p2d_ledger_path = os.getenv(
+                "SGLANG_AGENTIC_KV_P2D_STAGING_LEDGER_PATH",
+                f"{os.getenv('SGLANG_AGENTIC_KV_STAGING_LEDGER_PATH', '')}.p2d",
+            )
+            if not p2d_ledger_path or p2d_ledger_path == ".p2d":
+                raise ValueError("P->D Host staging requires a ledger path")
+            self.p2d_host_load_manager = AgenticPToDHostLoadManager(
+                ledger=SharedHostStagingLedger(p2d_ledger_path),
+                device_pool=self.token_to_kv_pool,
+                page_size=self.token_to_kv_pool_allocator.page_size,
+                decode_domain=int(
+                    os.getenv("SGLANG_AGENTIC_KV_PREFILL_DOMAIN", "0")
+                ),
+                numa_node=int(
+                    os.getenv("SGLANG_AGENTIC_KV_GPU_NUMA_NODE", "-1")
+                ),
+            )
         if self.enable_staging:
             self.transfer_queue._init_staging_handler(self.kv_manager)
 
@@ -500,6 +530,19 @@ class DecodePreallocQueue:
         """CPU index preparation and NIXL metadata publication (no allocation)."""
 
         origin_input_len = len(decode_req.req.origin_input_ids)
+        if isinstance(decode_req.kv_receiver, AgenticPToDHostReceiver):
+            destination_indices = self.req_to_token_pool.req_to_token[
+                decode_req.req.req_pool_idx, :origin_input_len
+            ]
+            decode_req.kv_receiver.bind(destination_indices)
+            ready_path = getattr(decode_req, "_async_p_ready_path", None)
+            if ready_path:
+                try:
+                    os.unlink(ready_path)
+                except FileNotFoundError:
+                    pass
+            decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
+            return
         if self.scheduler.enable_hisparse:
             dst_kv_indices = self.req_to_token_pool.req_to_token[
                 decode_req.req.req_pool_idx, :origin_input_len
@@ -667,6 +710,11 @@ class DecodePreallocQueue:
         else:
             decode_req = self._create_receiver_and_enqueue(req)
 
+            if isinstance(decode_req.kv_receiver, AgenticPToDHostReceiver):
+                decode_req.waiting_for_input = True
+                decode_req.req.time_stats.set_bootstrap_done_time()
+                return
+
             # NOTE: fake transfer does not need to resolve prefill dp rank in the pending queue
             if _is_fake_transfer(req, self.scheduler.server_args):
                 decode_req.kv_receiver.init(0)
@@ -698,6 +746,21 @@ class DecodePreallocQueue:
         return None
 
     def _create_receiver_and_enqueue(self, req: Req) -> DecodeRequest:
+        p2d_snapshot = p2d_snapshot_from_req(req)
+        if p2d_snapshot is not None:
+            if self.p2d_host_load_manager is None:
+                raise RuntimeError(
+                    "request selected P->D Host staging but D loader is disabled"
+                )
+            decode_req = DecodeRequest(
+                req=req,
+                kv_receiver=AgenticPToDHostReceiver(
+                    self.p2d_host_load_manager, p2d_snapshot
+                ),
+                waiting_for_input=True,
+            )
+            self.queue.append(decode_req)
+            return decode_req
         backend = (
             TransferBackend.FAKE
             if _is_fake_transfer(req, self.scheduler.server_args)
@@ -1385,7 +1448,14 @@ class DecodeTransferQueue:
                         polls[i] = int(KVPoll.Transferring)
             else:
                 receivers = [req.kv_receiver for req in queue_snapshot]
-                poll_many = getattr(type(receivers[0]), "poll_many", None)
+                poll_many = (
+                    None
+                    if any(
+                        isinstance(receiver, AgenticPToDHostReceiver)
+                        for receiver in receivers
+                    )
+                    else getattr(type(receivers[0]), "poll_many", None)
+                )
                 if poll_many is None:
                     polls = [int(receiver.poll()) for receiver in receivers]
                 else:
@@ -1416,6 +1486,13 @@ class DecodeTransferQueue:
             True if the request should be removed from the queue (success or corruption)
             False if metadata not ready yet (keep in queue for next poll)
         """
+        if isinstance(decode_req.kv_receiver, AgenticPToDHostReceiver):
+            decode_req.kv_receiver.commit_req(decode_req.req)
+            decode_req.kv_receiver.clear()
+            decode_req.kv_receiver = None
+            decode_req.req.time_stats.set_wait_queue_entry_time()
+            return True
+
         idx = decode_req.metadata_buffer_index
         (
             output_id,

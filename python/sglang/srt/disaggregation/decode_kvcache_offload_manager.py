@@ -365,6 +365,9 @@ class DecodeKVCacheOffloadManager:
                     relay_enabled = envs.SGLANG_AGENTIC_KV_RELAY_ENABLED.get()
                     source_numa = envs.SGLANG_AGENTIC_KV_GPU_NUMA_NODE.get()
                     arena_numa = envs.SGLANG_AGENTIC_KV_ARENA_NUMA_NODE.get()
+                    arena_domain = int(
+                        os.environ.get("SGLANG_AGENTIC_KV_PREFILL_DOMAIN", "-1")
+                    )
                     self.agentic_host_staging_client = AgenticDHostStagingClient(
                         staging_ledger,
                         kv_cache,
@@ -373,6 +376,7 @@ class DecodeKVCacheOffloadManager:
                         relay_enabled=relay_enabled,
                         source_numa_node=source_numa,
                         arena_numa_node=arena_numa,
+                        arena_domain=arena_domain,
                         direct_cross_numa_gib_per_second=(
                             envs.SGLANG_AGENTIC_KV_DIRECT_CROSS_NUMA_GIBPS.get()
                         ),

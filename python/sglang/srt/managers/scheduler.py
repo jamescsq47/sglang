@@ -62,6 +62,9 @@ from sglang.srt.disaggregation.agentic_host_staging import (
     AgenticPHostStagingManager,
     SharedHostStagingLedger,
 )
+from sglang.srt.disaggregation.p2d_host_staging import (
+    AgenticPToDHostStagingManager,
+)
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.agentic_kv_lifecycle import (
     AgenticRequestMetadata,
@@ -1438,6 +1441,7 @@ class Scheduler(
             )
             self.agentic_direct_runtime = None
             self.agentic_host_staging_manager = None
+            self.agentic_p2d_host_staging_manager = None
             if (
                 envs.SGLANG_AGENTIC_KV_LIFECYCLE.get()
                 and envs.SGLANG_AGENTIC_KV_FAST_TOOL_THRESHOLD.get() > 0
@@ -1554,8 +1558,51 @@ class Scheduler(
                         arena_numa_node=int(
                             os.environ.get("SGLANG_AGENTIC_KV_ARENA_NUMA_NODE", "-1")
                         ),
+                        arena_domain=int(
+                            os.environ.get("SGLANG_AGENTIC_KV_PREFILL_DOMAIN", "-1")
+                        ),
                         expected_tool_seconds=expected_tool_seconds,
                         eviction_controller=eviction_controller,
+                    )
+                if os.getenv(
+                    "SGLANG_AGENTIC_KV_P2D_HOST_STAGING", "0"
+                ).lower() in {"1", "true", "yes", "on"}:
+                    p2d_ledger_path = os.getenv(
+                        "SGLANG_AGENTIC_KV_P2D_STAGING_LEDGER_PATH",
+                        f"{envs.SGLANG_AGENTIC_KV_STAGING_LEDGER_PATH.get()}.p2d",
+                    )
+                    p2d_arena_directory = os.getenv(
+                        "SGLANG_AGENTIC_KV_P2D_SHARED_HOST_ARENA_DIR",
+                        f"{envs.SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_DIR.get()}.p2d",
+                    )
+                    self.agentic_p2d_host_staging_manager = (
+                        AgenticPToDHostStagingManager(
+                            ledger=SharedHostStagingLedger(p2d_ledger_path),
+                            device_pool=kv_pool,
+                            page_size=self.server_args.page_size,
+                            arena_directory=p2d_arena_directory,
+                            arena_capacity_bytes=int(
+                                float(
+                                    os.getenv(
+                                        "SGLANG_AGENTIC_KV_P2D_SHARED_HOST_ARENA_GIB",
+                                        "32",
+                                    )
+                                )
+                                * 1024**3
+                            ),
+                            prefill_domain=int(
+                                os.getenv("SGLANG_AGENTIC_KV_PREFILL_DOMAIN", "0")
+                            ),
+                            numa_node=int(
+                                os.getenv("SGLANG_AGENTIC_KV_ARENA_NUMA_NODE", "-1")
+                            ),
+                            hard_watermark=float(
+                                os.getenv(
+                                    "SGLANG_AGENTIC_KV_P2D_HOST_HARD_WATERMARK",
+                                    "0.90",
+                                )
+                            ),
+                        )
                     )
                 # Direct marker discovery and NIXL transport must continue
                 # while the scheduler is inside a long Prefill forward. The
@@ -2842,6 +2889,27 @@ class Scheduler(
                 credit_pool is not None
                 and credit_pool.free_tokens < required_tokens
             ):
+                if os.environ.get(
+                    "SGLANG_AGENTIC_KV_RECOMPUTE_ON_DIRECT_CAPACITY", "0"
+                ).strip().lower() in {"1", "true", "yes", "on"}:
+                    failed = snapshot_store.fail_direct_offer(
+                        manifest,
+                        owner_id=f"p-capacity:{os.getpid()}:{configured_domain}",
+                        reason="p_direct_capacity",
+                    )
+                    if failed is not None:
+                        self.agentic_early_direct_terminal[
+                            request.snapshot_id
+                        ] = time.monotonic()
+                        logger.info(
+                            "AgenticKV direct_capacity_recompute snapshot=%s "
+                            "tokens=%d required_tokens=%d reserve_free_tokens=%d",
+                            request.snapshot_id,
+                            manifest.token_count,
+                            required_tokens,
+                            credit_pool.free_tokens,
+                        )
+                        continue
                 with poll_lock:
                     queue.append((request, payload, manifest))
                     pending.add(request.snapshot_id)
@@ -3825,6 +3893,15 @@ class Scheduler(
         }:
             req._agentic_kv_gate_complete = True
             req._agentic_kv_fallback = manifest.state.value
+            if (
+                manifest.state is SnapshotState.FAILED
+                and manifest.failure_reason == "p_direct_capacity"
+            ):
+                # This experimental fail-open path deliberately discards the
+                # parent KV when P cannot admit a Direct receive.  The child
+                # must compete with fresh work, below Direct and slow recovery,
+                # rather than retaining its former fast-parent priority.
+                req._agentic_kv_queue_class = "new"
             logger.info(
                 "AgenticKV parent_snapshot_terminal_fallback snapshot=%s "
                 "state=%s req=%s",

@@ -1255,6 +1255,7 @@ class AgenticPHostStagingManager:
         low_watermark: float = 0.70,
         hard_watermark: float = 0.90,
         arena_numa_node: int = -1,
+        arena_domain: int = -1,
         expected_tool_seconds: Optional[dict[str, float]] = None,
         eviction_controller: Optional[SharedSnapshotEvictionController] = None,
     ):
@@ -1273,6 +1274,7 @@ class AgenticPHostStagingManager:
         self.low_watermark = float(low_watermark)
         self.hard_watermark = float(hard_watermark)
         self.arena_numa_node = int(arena_numa_node)
+        self.arena_domain = int(arena_domain)
         self.expected_tool_seconds = expected_tool_seconds or {}
         self.eviction_controller = eviction_controller
         self.arena = SharedHostSnapshotArena(
@@ -1350,6 +1352,18 @@ class AgenticPHostStagingManager:
             1,
             int(os.getenv("SGLANG_AGENTIC_KV_P_HOST_ADMISSION_BATCH", "16")),
         )
+        # Storage pressure must not be allowed to pin finished generations in
+        # D HBM forever.  Keep the historical wait-forever behavior by
+        # default, but let deployments bound that wait and fail open to a
+        # correct full-Prefill recompute when every lower tier is saturated.
+        self._capacity_wait_timeout_seconds = max(
+            0.0,
+            float(
+                os.getenv(
+                    "SGLANG_AGENTIC_KV_HOST_CAPACITY_WAIT_TIMEOUT_SECONDS", "0"
+                )
+            ),
+        )
         self._control_wakeup = threading.Event()
         self._control_cycles = 0
         self._control_errors = 0
@@ -1376,9 +1390,11 @@ class AgenticPHostStagingManager:
             self._control_thread.start()
             logger.info(
                 "Agentic P async control enabled interval_ms=%.3f "
-                "admission_batch=%d pageable_snapshot_mmap=true",
+                "admission_batch=%d capacity_wait_timeout_s=%.3f "
+                "pageable_snapshot_mmap=true",
                 self._control_interval * 1000.0,
                 self._admission_batch,
+                self._capacity_wait_timeout_seconds,
             )
 
     def _host_usage(self) -> float:
@@ -1393,6 +1409,27 @@ class AgenticPHostStagingManager:
         )
         logger.warning("Agentic host staging rejected %s: %s", offer["snapshot_id"], reason)
 
+    def _offer_targets_this_arena(self, offer: dict[str, Any]) -> bool:
+        """Return whether an offer belongs to this P-owned Host arena.
+
+        NUMA identifies the physical memory locality, while arena_domain
+        identifies the P owner within that NUMA node.  Older single-P-per-NUMA
+        offers do not contain arena_domain; retain their NUMA-only behavior so
+        existing 1P and 2P launch configurations remain compatible.
+        """
+
+        if self.arena_numa_node >= 0 and int(
+            offer.get("arena_numa_node", -1)
+        ) != self.arena_numa_node:
+            return False
+        offer_domain = int(offer.get("arena_domain", -1))
+        configured_domain = int(getattr(self, "arena_domain", -1))
+        return not (
+            configured_domain >= 0
+            and offer_domain >= 0
+            and offer_domain != configured_domain
+        )
+
     def _admit_one(self, ledger_entries=None) -> bool:
         if ledger_entries is None:
             offers = self.ledger.list_state(HostStageState.OFFERED)
@@ -1405,15 +1442,35 @@ class AgenticPHostStagingManager:
             offers.sort(
                 key=lambda item: (item.get("created_at", 0.0), item["snapshot_id"])
             )
-        if self.arena_numa_node >= 0:
-            offers = [
-                offer
-                for offer in offers
-                if int(offer.get("arena_numa_node", -1)) == self.arena_numa_node
-            ]
+        offers = [offer for offer in offers if self._offer_targets_this_arena(offer)]
         if not offers:
             return False
         offer = offers[0]
+        # Capacity is a transient condition.  Leave the offer unclaimed so a
+        # later control cycle can admit it after older snapshots are consumed.
+        # Claiming first would turn ordinary backpressure into a rejection and
+        # force the D side to abandon an otherwise valid host fallback.
+        offered_byte_size = int(offer.get("byte_size", 0))
+        if offered_byte_size > 0 and not self._can_admit(offered_byte_size):
+            timeout = float(
+                getattr(self, "_capacity_wait_timeout_seconds", 0.0)
+            )
+            age = max(0.0, time.time() - float(offer.get("created_at", time.time())))
+            if timeout > 0.0 and age >= timeout:
+                claimed = self.ledger.claim(offer["snapshot_id"], self.owner)
+                if claimed is None:
+                    return False
+                self._reject(claimed, "p_host_capacity_wait_timeout")
+                logger.warning(
+                    "Agentic host staging capacity timeout snapshot=%s "
+                    "waited_s=%.3f bytes=%d; D will release and next P turn "
+                    "will recompute",
+                    offer["snapshot_id"],
+                    age,
+                    offered_byte_size,
+                )
+                return True
+            return False
         claimed = self.ledger.claim(offer["snapshot_id"], self.owner)
         if claimed is None:
             return False
@@ -1477,12 +1534,7 @@ class AgenticPHostStagingManager:
             offers.sort(
                 key=lambda item: (item.get("created_at", 0.0), item["snapshot_id"])
             )
-        if self.arena_numa_node >= 0:
-            offers = [
-                offer
-                for offer in offers
-                if int(offer.get("arena_numa_node", -1)) == self.arena_numa_node
-            ]
+        offers = [offer for offer in offers if self._offer_targets_this_arena(offer)]
         admitted = 0
         # Pass a single-entry view so _admit_one preserves its validation and
         # atomic claim/publish behavior without repeatedly sorting the ledger.
@@ -2478,6 +2530,7 @@ class AgenticDHostStagingClient:
         relay_enabled: bool = False,
         source_numa_node: int = -1,
         arena_numa_node: int = -1,
+        arena_domain: int = -1,
         direct_cross_numa_gib_per_second: float = 7.45,
         nvlink_gib_per_second: float = 220.0,
         relay_stale_seconds: float = 5.0,
@@ -2489,6 +2542,7 @@ class AgenticDHostStagingClient:
         self.relay_enabled = bool(relay_enabled and direct_runtime is not None)
         self.source_numa_node = int(source_numa_node)
         self.arena_numa_node = int(arena_numa_node)
+        self.arena_domain = int(arena_domain)
         self.direct_cross_numa_gib_per_second = float(
             direct_cross_numa_gib_per_second
         )
@@ -2546,6 +2600,7 @@ class AgenticDHostStagingClient:
                 "d_pid": os.getpid(),
                 "source_numa_node": self.source_numa_node,
                 "arena_numa_node": self.arena_numa_node,
+                "arena_domain": self.arena_domain,
                 "source_bootstrap_addr": (
                     None
                     if self.direct_runtime is None

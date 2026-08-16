@@ -517,6 +517,14 @@ class SchedulerDisaggregationPrefillMixin:
     def _prefill_transfer_progress_req_once(self: Scheduler, req: Req) -> int:
         """Advance one consumer-owned sender by one transport state."""
 
+        p2d_host = getattr(self, "agentic_p2d_host_staging_manager", None)
+        if getattr(req, "_agentic_p2d_host_terminal", False):
+            return int(KVPoll.Success)
+        if p2d_host is not None and p2d_host.is_active(req):
+            # The direction-specific Host worker exclusively owns this source
+            # snapshot.  Do not let the normal NIXL consumer race it.
+            return int(KVPoll.Transferring)
+
         poll = int(req.disagg_kv_sender.poll())
         if (
             poll == int(KVPoll.WaitingForInput)
@@ -1249,6 +1257,18 @@ class SchedulerDisaggregationPrefillMixin:
 
         done_reqs = []
 
+        p2d_host = getattr(self, "agentic_p2d_host_staging_manager", None)
+        if p2d_host is not None:
+            for req in self.disagg_prefill_inflight_queue:
+                if p2d_host.is_active(req) or not p2d_host.has_offer(req):
+                    continue
+                # Clone only the compact page-index vector.  KV bytes stay in
+                # their scheduler-owned pages until the async D2H completes.
+                source_indices = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, : len(req.origin_input_ids)
+                ].clone()
+                p2d_host.try_submit(req, source_indices)
+
         if getattr(self, "_prefill_transfer_async_enabled", False):
             # Metadata-buffer slots are bounded.  If none was available when
             # the Prefill result was finalized, retry preparation here on the
@@ -1269,6 +1289,12 @@ class SchedulerDisaggregationPrefillMixin:
                 self.attn_cp_cpu_group,
                 self.attn_tp_cpu_group,
             )
+        if p2d_host is not None:
+            polls = [
+                host_poll if host_poll is not None else poll
+                for req, poll in zip(self.disagg_prefill_inflight_queue, polls)
+                for host_poll in [p2d_host.poll(req)]
+            ]
 
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
@@ -1326,6 +1352,10 @@ class SchedulerDisaggregationPrefillMixin:
             ]:
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
+                staged_p2d = bool(
+                    p2d_host is not None
+                    and getattr(req, "_agentic_p2d_host_snapshot_id", None)
+                )
                 agentic_metadata = (
                     AgenticRequestMetadata.from_req(req)
                     if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get()
@@ -1380,6 +1410,13 @@ class SchedulerDisaggregationPrefillMixin:
                 # FIXME: clean up req's data in transfer engine
                 if hasattr(req.disagg_kv_sender, "clear"):
                     req.disagg_kv_sender.clear()
+                if staged_p2d:
+                    p2d_host.mark_scheduler_consumed(req)
+                    logger.info(
+                        "AgenticKV p2d_host_prefill_release snapshot=%s req=%s",
+                        getattr(req, "_agentic_p2d_host_snapshot_id", ""),
+                        req.rid,
+                    )
                 if hasattr(req, "_async_prefill_transfer_payload"):
                     delattr(req, "_async_prefill_transfer_payload")
                 done_reqs.append(req)
