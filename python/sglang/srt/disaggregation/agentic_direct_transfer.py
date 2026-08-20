@@ -41,6 +41,20 @@ class AgenticDirectRuntime:
     def receiver_class(self):
         return get_kv_class(self.transfer_backend, KVClassType.RECEIVER)
 
+    @property
+    def layout_hash(self) -> str:
+        """Stable, address-independent fingerprint of one TP KV shard."""
+
+        args = self.manager.kv_args
+        fields = (
+            int(getattr(args, "page_size", 1)),
+            int(getattr(args, "kv_head_num", 1)),
+            int(getattr(args, "total_kv_head_num", 1)),
+            tuple(int(value) for value in getattr(args, "kv_item_lens", ())),
+            len(getattr(args, "kv_data_ptrs", ())),
+        )
+        return hashlib.sha256(repr(fields).encode("ascii")).hexdigest()[:24]
+
 
 def debug_kv_digest(kv_pool, token_indices) -> str | None:
     """Return an exact KV digest when the opt-in diagnostic is enabled."""
@@ -140,19 +154,34 @@ def create_agentic_direct_runtime(
 
     direct_args = copy.copy(server_args)
     bootstrap_server = None
+    tp_size = max(1, int(getattr(server_args, "tp_size", 1)))
+    tp_rank = int(engine_rank) % tp_size
     if role is DisaggregationMode.PREFILL:
         direct_args.disaggregation_bootstrap_port = int(bootstrap_port)
-        bootstrap_class = get_kv_class(
-            transfer_backend, KVClassType.BOOTSTRAP_SERVER
-        )
-        bootstrap_server = bootstrap_class(
-            host=direct_args.host,
-            port=direct_args.disaggregation_bootstrap_port,
-        )
+        # One logical TP engine owns one bootstrap rank table.  Creating a
+        # server in every scheduler process makes rank 1 collide with rank 0's
+        # TCP port; only rank 0 listens while every rank registers its own KV
+        # shard in that common table.
+        if tp_rank == 0:
+            bootstrap_class = get_kv_class(
+                transfer_backend, KVClassType.BOOTSTRAP_SERVER
+            )
+            bootstrap_server = bootstrap_class(
+                host=direct_args.host,
+                port=direct_args.disaggregation_bootstrap_port,
+            )
         health_url = (
             f"http://127.0.0.1:{direct_args.disaggregation_bootstrap_port}/health"
         )
-        deadline = time.monotonic() + 5.0
+        # TP scheduler ranks initialize independently.  In particular, rank 0
+        # may still be constructing HiCache/Mooncake state while a follower
+        # is already ready to register.  A five-second deadline made startup
+        # nondeterministic for large models even though the listener came up
+        # immediately afterwards.
+        bootstrap_timeout = float(
+            os.getenv("SGLANG_AGENTIC_KV_DIRECT_BOOTSTRAP_TIMEOUT_SECONDS", "60")
+        )
+        deadline = time.monotonic() + max(5.0, bootstrap_timeout)
         while time.monotonic() < deadline:
             try:
                 if requests.get(health_url, timeout=0.2).status_code == 200:
@@ -182,14 +211,29 @@ def create_agentic_direct_runtime(
     )
     bootstrap_addr = None
     if role is DisaggregationMode.PREFILL:
-        # Registration is HTTP and the bootstrap thread starts asynchronously;
-        # retry until the in-process server reports the complete rank table.
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline and not bootstrap_server._is_ready():
-            manager.register_to_bootstrap()
+        # Registration is HTTP and all TP scheduler processes start
+        # independently.  Rank 0 can inspect the in-process table; followers
+        # repeatedly register until the common endpoint is reachable and then
+        # return without trying to own the listener.
+        deadline = time.monotonic() + 10.0
+        registered = False
+        while time.monotonic() < deadline:
+            try:
+                manager.register_to_bootstrap()
+                registered = True
+            except Exception:
+                time.sleep(0.02)
+                continue
+            if bootstrap_server is None or bootstrap_server._is_ready():
+                break
             time.sleep(0.02)
-        if not bootstrap_server._is_ready():
-            raise RuntimeError("reverse NIXL rank registration did not complete")
+        if not registered or (
+            bootstrap_server is not None and not bootstrap_server._is_ready()
+        ):
+            raise RuntimeError(
+                "reverse NIXL TP rank registration did not complete "
+                f"rank={tp_rank}/{tp_size}"
+            )
         bootstrap_addr = f"{manager.local_ip}:{direct_args.disaggregation_bootstrap_port}"
 
     return AgenticDirectRuntime(

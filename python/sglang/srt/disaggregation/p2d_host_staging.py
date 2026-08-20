@@ -84,6 +84,8 @@ class AgenticPToDHostStagingManager:
         arena_capacity_bytes: int,
         prefill_domain: int,
         numa_node: int,
+        tp_rank: int = 0,
+        tp_size: int = 1,
         hard_watermark: float = 0.90,
     ):
         if not (0.0 < hard_watermark <= 1.0):
@@ -93,8 +95,14 @@ class AgenticPToDHostStagingManager:
         self.page_size = int(page_size)
         self.prefill_domain = int(prefill_domain)
         self.numa_node = int(numa_node)
+        self.tp_rank = int(tp_rank)
+        self.tp_size = int(tp_size)
         self.hard_watermark = float(hard_watermark)
-        self.owner = f"p2d-p:{os.getpid()}"
+        self.owner = (
+            f"p2d-p:{os.getpid()}"
+            if self.tp_size == 1
+            else f"p2d-p-group:{os.getenv('SGLANG_AGENTIC_KV_ENGINE_ID', 'prefill')}"
+        )
         self.arena = SharedHostSnapshotArena(
             arena_directory, int(arena_capacity_bytes)
         )
@@ -150,8 +158,34 @@ class AgenticPToDHostStagingManager:
         entry = self.ledger.get(snapshot_id)
         return bool(
             entry is not None
-            and entry.get("state") == HostStageState.OFFERED.value
+            and entry.get("state")
+            in {HostStageState.OFFERED.value, HostStageState.HOST_RESERVED.value}
             and self._targets_this_p(entry)
+        )
+
+    def group_claimed(self, req) -> bool:
+        """Return whether any TP rank committed this request to Host staging.
+
+        The Router publishes one request-level offer.  Once one rank claims
+        it, every peer must keep its Prefill result alive until it has joined
+        the same snapshot; otherwise a rank-local native NIXL completion can
+        split one logical TP request across two transfer paths.
+        """
+
+        if self.tp_size <= 1:
+            return False
+        entry = self.ledger.get(p2d_snapshot_id(req.bootstrap_room))
+        return bool(
+            entry is not None
+            and self._targets_this_p(entry)
+            and entry.get("p_owner") == self.owner
+            and entry.get("state")
+            in {
+                HostStageState.HOST_RESERVED.value,
+                HostStageState.HOST_WRITING.value,
+                HostStageState.HOST_READY.value,
+                HostStageState.H2D_LOADING.value,
+            }
         )
 
     def try_submit(self, req, source_indices) -> bool:
@@ -168,7 +202,8 @@ class AgenticPToDHostStagingManager:
         entry = self.ledger.get(snapshot_id)
         if (
             entry is None
-            or entry.get("state") != HostStageState.OFFERED.value
+            or entry.get("state")
+            not in {HostStageState.OFFERED.value, HostStageState.HOST_RESERVED.value}
             or not self._targets_this_p(entry)
         ):
             return False
@@ -186,7 +221,12 @@ class AgenticPToDHostStagingManager:
                 > int(self.arena.capacity_bytes * self.hard_watermark)
             ):
                 return False
-        claimed = self.ledger.claim(snapshot_id, self.owner)
+        claimed = self.ledger.claim_rank(
+            snapshot_id,
+            self.owner,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+        )
         if claimed is None:
             return False
         try:
@@ -234,7 +274,9 @@ class AgenticPToDHostStagingManager:
     def poll(self, req) -> Optional[int]:
         snapshot_id = getattr(req, "_agentic_p2d_host_snapshot_id", None)
         if snapshot_id is None:
-            return None
+            return (
+                int(KVPoll.Transferring) if self.group_claimed(req) else None
+            )
         with self._lock:
             result = self._results.get(snapshot_id)
             active = snapshot_id in self._active
@@ -294,9 +336,14 @@ class AgenticPToDHostStagingManager:
                     "prefill_domain": self.prefill_domain,
                     "arena_numa_node": self.numa_node,
                     "prefill_metadata": record["prefill_metadata"],
+                    "tp_rank": self.tp_rank,
                 }
-                if not self.ledger.publish_grants(
-                    snapshot_id, self.owner, [grant]
+                if not self.ledger.publish_rank_grant(
+                    snapshot_id,
+                    self.owner,
+                    grant,
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
                 ):
                     raise RuntimeError("P->D grant publication was rejected")
                 snapshot = record["snapshot"].materialize()
@@ -317,10 +364,23 @@ class AgenticPToDHostStagingManager:
                         destination_start=start,
                         token_count=end - start,
                     )
-                if not self.ledger.ack_chunk(snapshot_id, self.owner, 0):
-                    raise RuntimeError("P->D Host write ACK was rejected")
-                if not self.ledger.mark_host_ready(snapshot_id, self.owner, 1):
+                if not self.ledger.complete_p2d_host_write_rank(
+                    snapshot_id,
+                    self.owner,
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
+                ):
                     raise RuntimeError("P->D HOST_READY publication was rejected")
+                while not self._stop.is_set():
+                    current = self.ledger.get(snapshot_id)
+                    if (
+                        current is not None
+                        and current.get("state") == HostStageState.HOST_READY.value
+                    ):
+                        break
+                    time.sleep(0.005)
+                if self._stop.is_set():
+                    raise RuntimeError("P->D TP group stopped before HOST_READY")
                 elapsed = time.monotonic() - float(record["started_at"])
                 with self._lock:
                     self._active.pop(snapshot_id, None)
@@ -389,12 +449,16 @@ class AgenticPToDHostLoadManager:
         page_size: int,
         decode_domain: int,
         numa_node: int,
+        tp_rank: int = 0,
+        tp_size: int = 1,
     ):
         self.ledger = ledger
         self.device_pool = device_pool
         self.page_size = int(page_size)
         self.decode_domain = int(decode_domain)
         self.numa_node = int(numa_node)
+        self.tp_rank = int(tp_rank)
+        self.tp_size = int(tp_size)
         self.chunk_tokens = max(
             self.page_size,
             int(os.getenv("SGLANG_AGENTIC_KV_P2D_H2D_CHUNK_TOKENS", "1024")),
@@ -424,12 +488,23 @@ class AgenticPToDHostLoadManager:
         if receiver._submitted:
             return
         entry = self.ledger.get(receiver.snapshot_id)
-        if entry is None or entry.get("state") != HostStageState.HOST_READY.value:
+        if entry is None or entry.get("state") not in {
+            HostStageState.HOST_READY.value,
+            HostStageState.H2D_LOADING.value,
+        }:
             raise RuntimeError("P->D Host snapshot is not ready")
         grants = entry.get("grants", [])
-        if len(grants) != 1 or grants[0].get("kind") != "shared_host_extent":
-            raise RuntimeError("P->D Host snapshot has no complete extent")
-        grant = grants[0]
+        matching = [
+            grant
+            for grant in grants
+            if grant.get("kind") == "shared_host_extent"
+            and int(grant.get("tp_rank", 0)) == int(getattr(self, "tp_rank", 0))
+        ]
+        if len(matching) != 1:
+            raise RuntimeError(
+                f"P->D Host snapshot has no TP rank {getattr(self, 'tp_rank', 0)} extent"
+            )
+        grant = matching[0]
         if int(grant.get("arena_numa_node", -1)) != self.numa_node:
             raise RuntimeError(
                 "P->D slow path crossed NUMA: "
@@ -438,8 +513,11 @@ class AgenticPToDHostLoadManager:
         if int(grant["token_count"]) != len(device_indices):
             raise RuntimeError("P->D Host destination token count mismatch")
         owner = entry.get("p_owner")
-        if not self.ledger.transition(
-            receiver.snapshot_id, HostStageState.H2D_LOADING, owner=owner
+        if not self.ledger.begin_host_load_rank(
+            receiver.snapshot_id,
+            owner,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
         ):
             raise RuntimeError("P->D H2D ownership transition was rejected")
         receiver._submitted = True
@@ -475,12 +553,23 @@ class AgenticPToDHostLoadManager:
                         host_bounce=self._bounce,
                     )
                     event.synchronize()
-                if not self.ledger.transition(
+                if not self.ledger.complete_host_load_rank(
                     receiver.snapshot_id,
-                    HostStageState.CONSUMED,
-                    owner=receiver._owner,
+                    receiver._owner,
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
                 ):
                     raise RuntimeError("P->D CONSUMED publication was rejected")
+                while not self._stop.is_set():
+                    current = self.ledger.get(receiver.snapshot_id)
+                    if (
+                        current is not None
+                        and current.get("state") == HostStageState.CONSUMED.value
+                    ):
+                        break
+                    time.sleep(0.005)
+                if self._stop.is_set():
+                    raise RuntimeError("P->D TP group stopped before CONSUMED")
                 receiver._poll = int(KVPoll.Success)
                 elapsed = time.monotonic() - started_at
                 logger.info(

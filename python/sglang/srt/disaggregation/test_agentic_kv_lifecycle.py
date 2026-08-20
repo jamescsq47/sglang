@@ -225,6 +225,171 @@ def test_manifest_roundtrip_and_transition_guards():
         manifest.transition(SnapshotState.TO_DECODE)
 
 
+def test_tp_direct_completion_is_group_atomic():
+    raw = FakeMooncakeStore()
+    rank0 = MooncakeSnapshotStore(raw)
+    rank1 = MooncakeSnapshotStore(raw)
+    offer = make_manifest(
+        state=SnapshotState.DIRECT_READY,
+        page_keys=(),
+        direct_bootstrap_addr="127.0.0.1:45501",
+        direct_room=123,
+        token_digest="abc",
+        tp_size=2,
+        kv_layout_hash="layout",
+    )
+    rank0.publish_direct_offer(offer)
+    claim_id = "direct-early-tp:p0:req-a:2"
+    claimed0 = rank0.claim_direct(offer.request, claim_id)
+    claimed1 = rank1.claim_direct(offer.request, claim_id)
+    assert claimed0 == claimed1
+
+    incomplete = rank0.complete_direct_rank(
+        claimed0, claim_id, tp_rank=0, tp_size=2
+    )
+    assert incomplete.state is SnapshotState.DIRECT_LOADING
+    assert (
+        rank0.load(offer.request, require_ready=False).state
+        is SnapshotState.DIRECT_LOADING
+    )
+
+    complete = rank1.complete_direct_rank(
+        claimed1, claim_id, tp_rank=1, tp_size=2
+    )
+    assert complete.state is SnapshotState.CONSUMED
+    assert (
+        rank0.load(offer.request, require_ready=False).state
+        is SnapshotState.CONSUMED
+    )
+
+
+def test_tp_direct_completion_uses_node_local_group_fence(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("SGLANG_PD_P_READY_DIR", str(tmp_path))
+    raw = FakeMooncakeStore()
+    rank0 = MooncakeSnapshotStore(raw)
+    rank1 = MooncakeSnapshotStore(raw)
+    offer = make_manifest(
+        state=SnapshotState.DIRECT_READY,
+        page_keys=(),
+        direct_bootstrap_addr="127.0.0.1:45501",
+        direct_room=123,
+        token_digest="abc",
+        tp_size=2,
+        kv_layout_hash="layout",
+    )
+    rank0.publish_direct_offer(offer)
+    claim_id = "direct-early-tp:p0:req-a:2"
+    claimed0 = rank0.claim_direct(offer.request, claim_id)
+    claimed1 = rank1.claim_direct(offer.request, claim_id)
+
+    assert rank0.complete_direct_rank(
+        claimed0, claim_id, tp_rank=0, tp_size=2
+    ).state is SnapshotState.DIRECT_LOADING
+    terminal = rank1.complete_direct_rank(
+        claimed1, claim_id, tp_rank=1, tp_size=2
+    )
+    assert terminal.state is SnapshotState.CONSUMED
+    # A client with a stale DIRECT_LOADING object observes the local done
+    # marker without attempting a second manifest finalization.
+    assert rank0.complete_direct_rank(
+        claimed0, claim_id, tp_rank=0, tp_size=2
+    ).state is SnapshotState.CONSUMED
+
+
+def test_tp_direct_join_tolerates_duplicate_claim_put_success():
+    """Separate Mooncake clients may both accept the same logical TP claim."""
+
+    raw = FakeMooncakeStore()
+    rank0 = MooncakeSnapshotStore(raw)
+    rank1 = MooncakeSnapshotStore(raw)
+    offer = make_manifest(
+        state=SnapshotState.DIRECT_READY,
+        page_keys=(),
+        direct_bootstrap_addr="127.0.0.1:45501",
+        direct_room=123,
+        token_digest="abc",
+        tp_size=2,
+        kv_layout_hash="layout",
+    )
+    rank0.publish_direct_offer(offer)
+    claim_id = "direct-early-tp:p0:req-a:2"
+    claimed0 = rank0.claim_direct(offer.request, claim_id)
+
+    original_put = raw.put
+
+    def duplicate_claim_put_succeeds(key, value):
+        if key == offer.request.claim_key and key in raw.objects:
+            raw.events.append(("put", key))
+            return 0
+        return original_put(key, value)
+
+    raw.put = duplicate_claim_put_succeeds
+    claimed1 = rank1.claim_direct(offer.request, claim_id)
+    assert claimed1 == claimed0
+    assert raw.get(offer.request.claim_key) == f"direct:{claim_id}".encode()
+
+
+def test_tp_direct_join_retries_transient_manifest_miss(monkeypatch, tmp_path):
+    """A transient rank-local read miss must not drop one TP shard."""
+
+    monkeypatch.setenv("SGLANG_PD_P_READY_DIR", str(tmp_path))
+    raw = FakeMooncakeStore()
+    rank0 = MooncakeSnapshotStore(raw)
+    rank1 = MooncakeSnapshotStore(raw)
+    offer = make_manifest(
+        state=SnapshotState.DIRECT_READY,
+        page_keys=(),
+        direct_bootstrap_addr="127.0.0.1:45501",
+        direct_room=123,
+        token_digest="abc",
+        tp_size=2,
+        kv_layout_hash="layout",
+    )
+    rank0.publish_direct_offer(offer)
+    claim_id = "direct-early-tp:p0:req-a:2"
+    claimed0 = rank0.claim_direct(offer.request, claim_id)
+
+    original_get = raw.get
+    missed = False
+
+    def miss_joiner_manifest_once(key):
+        nonlocal missed
+        if key == offer.request.manifest_key and not missed:
+            missed = True
+            return b""
+        return original_get(key)
+
+    monkeypatch.setattr(raw, "get", miss_joiner_manifest_once)
+    claimed1 = rank1.claim_direct(offer.request, claim_id)
+
+    monkeypatch.setattr(raw, "get", original_get)
+    assert claimed1 == claimed0
+    assert rank0._local_claim_owner(offer.request) == claim_id
+    assert raw.get(offer.request.claim_key) == f"direct:{claim_id}".encode()
+    assert rank0.load(offer.request, require_ready=False) == claimed0
+
+
+def test_tp_direct_rejects_wrong_receiver_size():
+    raw = FakeMooncakeStore()
+    store = MooncakeSnapshotStore(raw)
+    offer = make_manifest(
+        state=SnapshotState.DIRECT_READY,
+        page_keys=(),
+        direct_bootstrap_addr="127.0.0.1:45501",
+        direct_room=123,
+        token_digest="abc",
+        tp_size=2,
+    )
+    store.publish_direct_offer(offer)
+    claimed = store.claim_direct(offer.request, "tp-claim")
+    with pytest.raises(SnapshotLifecycleError, match="TP size mismatch"):
+        store.complete_direct_rank(
+            claimed, "tp-claim", tp_rank=0, tp_size=1
+        )
+
+
 def test_direct_ready_can_be_confirmed_final_by_application():
     manifest = make_manifest(
         state=SnapshotState.DIRECT_READY,
@@ -393,6 +558,72 @@ def test_node_local_claim_fences_direct_from_fallback_when_store_claim_is_lost(
     fallback = d_store.begin_slow_fallback(ready, owner_id="d0")
     assert fallback is not None
     assert fallback.state is SnapshotState.SLOW_FALLBACK
+
+
+def test_tp_slow_fallback_rank_joins_request_group(monkeypatch, tmp_path):
+    monkeypatch.setenv("SGLANG_PD_P_READY_DIR", str(tmp_path))
+    raw = FakeMooncakeStore()
+    rank0 = MooncakeSnapshotStore(raw)
+    rank1 = MooncakeSnapshotStore(raw)
+    offer = SnapshotManifest(
+        request=RequestGeneration("tp-fallback-join", 0),
+        page_keys=(),
+        token_count=128,
+        byte_size=0,
+        state=SnapshotState.DIRECT_READY,
+        token_digest="abc",
+        direct_bootstrap_addr="127.0.0.1:45501",
+        direct_room=458,
+        tp_size=2,
+    )
+    rank0.publish_direct_offer(offer)
+    fallback0 = rank0.begin_slow_fallback(offer, owner_id="d-group")
+    fallback1 = rank1.begin_slow_fallback(offer, owner_id="d-group")
+
+    assert fallback0 is not None
+    assert fallback1 == fallback0
+    assert fallback1.state is SnapshotState.SLOW_FALLBACK
+    assert rank0._local_claim_owner(offer.request) == "fallback:d-group"
+
+
+def test_tp_slow_fallback_completion_is_node_local_and_idempotent(
+    monkeypatch, tmp_path
+):
+    """Two P ranks must not race the one request-level terminal transition."""
+
+    monkeypatch.setenv("SGLANG_PD_P_READY_DIR", str(tmp_path))
+    raw = FakeMooncakeStore()
+    rank0 = MooncakeSnapshotStore(raw)
+    rank1 = MooncakeSnapshotStore(raw)
+    offer = SnapshotManifest(
+        request=RequestGeneration("tp-fallback-complete", 0),
+        page_keys=(),
+        token_count=128,
+        byte_size=0,
+        state=SnapshotState.DIRECT_READY,
+        token_digest="abc",
+        direct_bootstrap_addr="127.0.0.1:45501",
+        direct_room=459,
+        tp_size=2,
+    )
+    rank0.publish_direct_offer(offer)
+    fallback0 = rank0.begin_slow_fallback(offer, owner_id="d-group")
+    fallback1 = rank1.begin_slow_fallback(offer, owner_id="d-group")
+    assert fallback0 is not None and fallback1 is not None
+
+    assert rank0.complete_slow_fallback_group(offer.request)
+    # The peer sees the tmpfs completion marker even after the first rank
+    # released the shared lifecycle claim.
+    assert rank1.complete_slow_fallback_group(offer.request)
+    assert rank0.load(offer.request, require_ready=False).state is SnapshotState.CONSUMED
+    transitions = [
+        event
+        for event in raw.events
+        if event == ("upsert", offer.request.manifest_key)
+    ]
+    # DIRECT_READY -> SLOW_FALLBACK -> CONSUMED: only the final transition is
+    # relevant here and must not be duplicated by rank1.
+    assert len(transitions) == 2
 
 
 def test_fallback_never_takes_over_orphaned_direct_loading(monkeypatch, tmp_path):

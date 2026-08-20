@@ -297,11 +297,23 @@ class SchedulerRuntimeCheckerMixin:
             req_total_size = self.req_to_token_pool.size
 
         session_req_count = self._session_held_req_count()
-        if len(self.req_to_token_pool.free_slots) + session_req_count != req_total_size:
+        decode_offload = getattr(self, "decode_offload_manager", None)
+        pending_release_req_count = (
+            0
+            if decode_offload is None
+            else int(decode_offload.agentic_pending_release_req_count)
+        )
+        if (
+            len(self.req_to_token_pool.free_slots)
+            + session_req_count
+            + pending_release_req_count
+            != req_total_size
+        ):
             msg = (
                 "req_to_token_pool memory leak detected!"
                 f"available_size={len(self.req_to_token_pool.free_slots)}, "
                 f"session_held={session_req_count}, "
+                f"pending_release={pending_release_req_count}, "
                 f"total_size={self.req_to_token_pool.size}\n"
             )
             raise_error_or_warn(

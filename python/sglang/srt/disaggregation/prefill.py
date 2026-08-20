@@ -69,6 +69,27 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class _P2DHostOrNativePoller:
+    """Expose one rank-local status to the existing TP poll collective.
+
+    P->D Host completion is asynchronous on every TP rank.  Selecting it only
+    after the native collective lets one rank remove an inflight request one
+    scheduler iteration before its peer, changing the next collective's
+    vector length.  Making the selection inside the existing poller preserves
+    the normal PD invariant: one request, one collective slot, all ranks.
+    """
+
+    def __init__(self, host_manager, req: Req):
+        self.host_manager = host_manager
+        self.req = req
+
+    def poll(self):
+        host_poll = self.host_manager.poll(self.req)
+        if host_poll is not None:
+            return host_poll
+        return self.req.disagg_kv_sender.poll()
+
+
 def release_req_to_metadata_buffer(
     req: Req, allocator: ReqToMetadataIdxAllocator
 ) -> None:
@@ -520,10 +541,13 @@ class SchedulerDisaggregationPrefillMixin:
         p2d_host = getattr(self, "agentic_p2d_host_staging_manager", None)
         if getattr(req, "_agentic_p2d_host_terminal", False):
             return int(KVPoll.Success)
-        if p2d_host is not None and p2d_host.is_active(req):
-            # The direction-specific Host worker exclusively owns this source
-            # snapshot.  Do not let the normal NIXL consumer race it.
-            return int(KVPoll.Transferring)
+        if p2d_host is not None:
+            host_poll = p2d_host.poll(req)
+            if host_poll is not None:
+                # A local worker, or a peer rank's request-level Host claim,
+                # exclusively owns this logical snapshot.  Do not let the
+                # normal NIXL consumer race it.
+                return int(host_poll)
 
         poll = int(req.disagg_kv_sender.poll())
         if (
@@ -762,6 +786,26 @@ class SchedulerDisaggregationPrefillMixin:
         )
         return True
 
+    def _write_p_ready_marker(
+        self: Scheduler,
+        req: Req,
+        ready_path: str,
+        ready_sequence: int,
+        ready_metadata: dict,
+    ) -> bool:
+        """Let TP0 publish the logical P-ready event for the whole TP group."""
+
+        tp_size = int(getattr(self, "tp_size", 1))
+        tp_rank = int(getattr(self, "tp_rank", 0))
+        if tp_size > 1 and tp_rank != 0:
+            return True
+
+        tmp_path = f"{ready_path}.{os.getpid()}.{ready_sequence}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(ready_metadata, handle, separators=(",", ":"))
+        os.replace(tmp_path, ready_path)
+        return True
+
     def _publish_deferred_prefill_ready(self: Scheduler, req: Req) -> None:
         """Publish P-ready only after the complete transfer payload exists.
 
@@ -783,27 +827,22 @@ class SchedulerDisaggregationPrefillMixin:
         publish_condition = getattr(
             self, "_prefill_ready_publish_condition", None
         )
+        ready_path = os.path.join(
+            self.disagg_prefill_bootstrap_queue.p_ready_dir,
+            f"{req.bootstrap_room}.ready",
+        )
+        ready_metadata = {
+            "rid": req.rid,
+            "num_kv_tokens": len(req.origin_input_ids),
+            "ready_sequence": ready_sequence,
+            "prefill_domain": int(
+                os.environ.get("SGLANG_AGENTIC_KV_PREFILL_DOMAIN", "0")
+            ),
+        }
         if publish_condition is None:
-            ready_path = os.path.join(
-                self.disagg_prefill_bootstrap_queue.p_ready_dir,
-                f"{req.bootstrap_room}.ready",
+            req.disagg_p_ready_notified = self._write_p_ready_marker(
+                req, ready_path, ready_sequence, ready_metadata
             )
-            tmp_path = f"{ready_path}.{os.getpid()}.{ready_sequence}.tmp"
-            with open(tmp_path, "w", encoding="utf-8") as handle:
-                json.dump(
-                    {
-                        "rid": req.rid,
-                        "num_kv_tokens": len(req.origin_input_ids),
-                        "ready_sequence": ready_sequence,
-                        "prefill_domain": int(
-                            os.environ.get("SGLANG_AGENTIC_KV_PREFILL_DOMAIN", "0")
-                        ),
-                    },
-                    handle,
-                    separators=(",", ":"),
-                )
-            os.replace(tmp_path, ready_path)
-            req.disagg_p_ready_notified = True
             return
         # Multiple consumers may finish transport control calls out of order,
         # but the Router must observe the producer's FIFO completion order.
@@ -815,30 +854,24 @@ class SchedulerDisaggregationPrefillMixin:
                 publish_condition.wait(timeout=0.1)
             if self._prefill_transfer_stop.is_set():
                 return
-            ready_path = os.path.join(
-                self.disagg_prefill_bootstrap_queue.p_ready_dir,
-                f"{req.bootstrap_room}.ready",
+            req.disagg_p_ready_notified = self._write_p_ready_marker(
+                req, ready_path, ready_sequence, ready_metadata
             )
-            tmp_path = f"{ready_path}.{os.getpid()}.{ready_sequence}.tmp"
-            ready_metadata = {
-                "rid": req.rid,
-                "num_kv_tokens": len(req.origin_input_ids),
-                "ready_sequence": ready_sequence,
-                "prefill_domain": int(
-                    os.environ.get("SGLANG_AGENTIC_KV_PREFILL_DOMAIN", "0")
-                ),
-            }
-            with open(tmp_path, "w", encoding="utf-8") as handle:
-                json.dump(ready_metadata, handle, separators=(",", ":"))
-            os.replace(tmp_path, ready_path)
-            req.disagg_p_ready_notified = True
+            if not req.disagg_p_ready_notified:
+                return
             self._prefill_ready_next_publish_sequence += 1
             publish_condition.notify_all()
 
-    def _prefill_transfer_cached_polls(self: Scheduler) -> list[int]:
+    def _prefill_transfer_cached_polls(
+        self: Scheduler, requests: Optional[List[Req]] = None
+    ) -> list[int]:
         with self._prefill_transfer_poll_lock:
             polls = []
-            for req in self.disagg_prefill_inflight_queue:
+            for req in (
+                self.disagg_prefill_inflight_queue
+                if requests is None
+                else requests
+            ):
                 poll = getattr(
                     req, "_async_prefill_transfer_poll", int(KVPoll.Transferring)
                 )
@@ -1255,11 +1288,35 @@ class SchedulerDisaggregationPrefillMixin:
         if len(self.disagg_prefill_inflight_queue) == 0:
             return []
 
+        full_inflight_queue = self.disagg_prefill_inflight_queue
+        inflight_queue = full_inflight_queue
+        if self.tp_size > 1:
+            for req in full_inflight_queue:
+                if (
+                    getattr(req, "disagg_p_ready_deferred", False)
+                    and not getattr(req, "disagg_p_ready_notified", False)
+                ):
+                    self._publish_deferred_prefill_ready(req)
+            selected_keys = getattr(
+                self, "_agentic_tp_prefill_transfer_keys", ()
+            )
+            if not selected_keys:
+                return []
+            by_key = {
+                (str(req.rid), int(req.bootstrap_room)): req
+                for req in full_inflight_queue
+            }
+            inflight_queue = [
+                by_key[key] for key in selected_keys if key in by_key
+            ]
+            if not inflight_queue:
+                return []
+
         done_reqs = []
 
         p2d_host = getattr(self, "agentic_p2d_host_staging_manager", None)
         if p2d_host is not None:
-            for req in self.disagg_prefill_inflight_queue:
+            for req in inflight_queue:
                 if p2d_host.is_active(req) or not p2d_host.has_offer(req):
                     continue
                 # Clone only the compact page-index vector.  KV bytes stay in
@@ -1275,30 +1332,44 @@ class SchedulerDisaggregationPrefillMixin:
             # scheduler thread.  Never publish P-ready before preparation:
             # Decode must not advertise destination pages to a worker that has
             # no immutable, fully-populated metadata payload to send.
-            for req in self.disagg_prefill_inflight_queue:
+            for req in inflight_queue:
                 if (
                     getattr(req, "disagg_p_ready_deferred", False)
                     and not getattr(req, "disagg_p_ready_notified", False)
                     and self._prepare_deferred_prefill_transfer(req)
                 ):
                     self._enqueue_deferred_prefill_transfer(req)
-            polls = self._prefill_transfer_cached_polls()
+            # TP mode polls one TP0-selected request.  Read the cached status
+            # for that exact request rather than the first entry of the full
+            # rank-local queue; otherwise a terminal result can be attributed
+            # to a different request and permanently strand both endpoints.
+            polls = self._prefill_transfer_cached_polls(inflight_queue)
         else:
+            pollers = [
+                (
+                    _P2DHostOrNativePoller(p2d_host, req)
+                    if p2d_host is not None
+                    else req.disagg_kv_sender
+                )
+                for req in inflight_queue
+            ]
             polls = poll_and_all_reduce_attn_cp_tp_group(
-                [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
+                pollers,
                 self.attn_cp_cpu_group,
                 self.attn_tp_cpu_group,
             )
-        if p2d_host is not None:
+        if p2d_host is not None and getattr(
+            self, "_prefill_transfer_async_enabled", False
+        ):
             polls = [
                 host_poll if host_poll is not None else poll
-                for req, poll in zip(self.disagg_prefill_inflight_queue, polls)
+                for req, poll in zip(inflight_queue, polls)
                 for host_poll in [p2d_host.poll(req)]
             ]
 
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
-        for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+        for req, poll in zip(inflight_queue, polls):
 
             if rids_to_check is not None:
                 if req.rid not in rids_to_check:
@@ -1482,7 +1553,13 @@ class SchedulerDisaggregationPrefillMixin:
 
         if getattr(self, "_prefill_transfer_async_enabled", False):
             self._release_prefill_transfer_poll_claims(undone_reqs)
-        self.disagg_prefill_inflight_queue = undone_reqs
+        if self.tp_size > 1:
+            done_ids = {id(req) for req in done_reqs}
+            self.disagg_prefill_inflight_queue = [
+                req for req in full_inflight_queue if id(req) not in done_ids
+            ]
+        else:
+            self.disagg_prefill_inflight_queue = undone_reqs
 
         return done_reqs
 

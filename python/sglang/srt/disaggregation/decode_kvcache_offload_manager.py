@@ -22,6 +22,7 @@ from sglang.srt.disaggregation.agentic_host_staging import (
     AgenticDRelayWorker,
     SharedHostStagingLedger,
 )
+from sglang.srt.disaggregation.agentic_tp import rank_env_int
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.kv_events import OffloadedState
 from sglang.srt.disaggregation.agentic_kv_lifecycle import (
@@ -95,6 +96,7 @@ class DecodeKVCacheOffloadManager:
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
+        self.tp_rank = torch.distributed.get_rank(group=self.tp_group)
 
         hicache_storage_backend_extra_config = {}
         if server_args.hicache_storage_backend_extra_config:
@@ -276,11 +278,6 @@ class DecodeKVCacheOffloadManager:
                 self.agentic_early_claim_post_timeout,
             )
         if self.agentic_enabled:
-            if self.tp_world_size != 1:
-                raise ValueError(
-                    "SGLANG_AGENTIC_KV_LIFECYCLE V1 requires TP=1 so one manifest "
-                    "owns a complete physical snapshot"
-                )
             backend = (
                 self.agentic_metadata_backend
                 if self.agentic_hostless
@@ -345,10 +342,12 @@ class DecodeKVCacheOffloadManager:
                     role=DisaggregationMode.PREFILL,
                     kv_pool=kv_cache,
                     server_args=server_args,
-                    engine_rank=torch.distributed.get_rank(group=tp_group),
+                    engine_rank=self.tp_rank,
                     pp_rank=0,
                     gpu_id=torch.cuda.current_device(),
-                    total_kv_heads=getattr(kv_cache, "head_num", 1),
+                    total_kv_heads=(
+                        getattr(kv_cache, "head_num", 1) * self.tp_world_size
+                    ),
                     bootstrap_port=direct_port,
                 )
                 if envs.SGLANG_AGENTIC_KV_HOST_STAGING.get():
@@ -363,8 +362,16 @@ class DecodeKVCacheOffloadManager:
                         )
                     staging_ledger = SharedHostStagingLedger(staging_ledger_path)
                     relay_enabled = envs.SGLANG_AGENTIC_KV_RELAY_ENABLED.get()
-                    source_numa = envs.SGLANG_AGENTIC_KV_GPU_NUMA_NODE.get()
-                    arena_numa = envs.SGLANG_AGENTIC_KV_ARENA_NUMA_NODE.get()
+                    source_numa = rank_env_int(
+                        "SGLANG_AGENTIC_KV_GPU_NUMA_NODE",
+                        "SGLANG_AGENTIC_KV_TP_NUMA_NODES",
+                        tp_rank=self.tp_rank,
+                    )
+                    arena_numa = rank_env_int(
+                        "SGLANG_AGENTIC_KV_ARENA_NUMA_NODE",
+                        "SGLANG_AGENTIC_KV_TP_ARENA_NUMA_NODES",
+                        tp_rank=self.tp_rank,
+                    )
                     arena_domain = int(
                         os.environ.get("SGLANG_AGENTIC_KV_PREFILL_DOMAIN", "-1")
                     )
@@ -377,6 +384,8 @@ class DecodeKVCacheOffloadManager:
                         source_numa_node=source_numa,
                         arena_numa_node=arena_numa,
                         arena_domain=arena_domain,
+                        tp_rank=self.tp_rank,
+                        tp_size=self.tp_world_size,
                         direct_cross_numa_gib_per_second=(
                             envs.SGLANG_AGENTIC_KV_DIRECT_CROSS_NUMA_GIBPS.get()
                         ),
@@ -589,6 +598,17 @@ class DecodeKVCacheOffloadManager:
         """Queue the only scheduler-owned mutation needed by D->P progress."""
 
         if not getattr(self, "_decode_io_async_enabled", False):
+            if self.tp_world_size > 1:
+                metadata = AgenticRequestMetadata.from_req(req)
+                if metadata is None:
+                    raise RuntimeError("TP agentic release lost request metadata")
+                pending = getattr(self, "_agentic_tp_pending_releases", None)
+                if pending is None:
+                    pending = self._agentic_tp_pending_releases = {}
+                pending.setdefault(
+                    metadata.current.snapshot_id, (req, int(start_offset))
+                )
+                return
             self._release_finished_req(req, start_offset)
             return
         start_offset = int(start_offset)
@@ -609,6 +629,93 @@ class DecodeKVCacheOffloadManager:
             self._decode_commit_ready_at = (
                 time.monotonic() + getattr(self, "_decode_commit_interval", 0.0)
             )
+
+    def tp_pending_release_snapshot(self):
+        """Return TP0's oldest release ready for the native recv broadcast."""
+
+        pending = getattr(self, "_agentic_tp_pending_releases", None)
+        if not pending:
+            return None
+        return next(iter(pending))
+
+    def tp_candidate_commands(self) -> list[dict]:
+        """Return TP0's authoritative D->P command for each live generation.
+
+        These commands describe logical lifecycle decisions only.  Every TP
+        rank owns a different KV-head shard, but followers must never infer a
+        route from markers or manifests.  They merely execute the command
+        selected here by rank 0 against their local shard.
+        """
+
+        if self.tp_world_size <= 1 or self.tp_rank != 0:
+            return []
+        commands = []
+        for snapshot_id, candidate in self.agentic_direct_candidates.items():
+            manifest = candidate.get("manifest")
+            if candidate.get("staging"):
+                action = "slow"
+            elif candidate.get("sent") or (
+                manifest is not None
+                and manifest.state is SnapshotState.DIRECT_LOADING
+            ):
+                action = "direct"
+            else:
+                action = "wait"
+            if candidate.get("tp_announced_action") == action:
+                continue
+            candidate["tp_announced_action"] = action
+            command = {"snapshot_id": str(snapshot_id), "action": action}
+            if action == "slow" and manifest is not None:
+                command["manifest"] = manifest.to_bytes()
+            commands.append(command)
+        return commands
+
+    def apply_tp_candidate_commands(self, commands) -> None:
+        """Install rank-0 lifecycle commands on this rank's physical shards."""
+
+        if self.tp_world_size <= 1:
+            return
+        for command in commands or ():
+            snapshot_id = str(command["snapshot_id"])
+            candidate = self.agentic_direct_candidates.get(snapshot_id)
+            if candidate is None:
+                continue
+            candidate["tp_command"] = str(command["action"])
+            manifest_bytes = command.get("manifest")
+            if manifest_bytes is not None:
+                candidate["manifest"] = SnapshotManifest.from_bytes(manifest_bytes)
+
+    def commit_tp_release(self, snapshot_id: str) -> None:
+        """Apply a TP release selected by the scheduler's native broadcast.
+
+        No collective is introduced here: ``Scheduler.recv_requests`` already
+        delivered the same snapshot id to every TP rank before this method is
+        called.  A peer that has not locally polled the group-visible terminal
+        manifest yet can still resolve the request from its live candidate.
+        """
+
+        snapshot_id = str(snapshot_id)
+        pending = getattr(self, "_agentic_tp_pending_releases", None)
+        item = None if not pending else pending.pop(snapshot_id, None)
+        candidate = self.agentic_direct_candidates.pop(snapshot_id, None)
+        req = item[0] if item is not None else (
+            None if candidate is None else candidate.get("req")
+        )
+        start_offset = int(item[1]) if item is not None else 0
+        if req is None:
+            raise RuntimeError(
+                f"TP Decode release {snapshot_id} has no local request"
+            )
+        if req.req_pool_idx != -1:
+            self._release_finished_req(req, start_offset)
+        if candidate is not None:
+            self._cleanup_agentic_direct_sender(candidate)
+            self._agentic_release_early_claim(candidate, "tp_release_commit")
+        logger.info(
+            "AgenticKV tp_decode_release_commit snapshot=%s req=%s",
+            snapshot_id,
+            req.rid,
+        )
 
     def _drain_decode_io_events(self) -> None:
         """Apply bounded, allocator-safe commits without doing transport work."""
@@ -686,7 +793,30 @@ class DecodeKVCacheOffloadManager:
     def agentic_pending_release_token_count(self) -> int:
         """Completed-request KV waiting for a scheduler-owned free commit."""
 
-        return int(getattr(self, "_decode_pending_release_tokens", 0))
+        reserved = int(getattr(self, "_decode_pending_release_tokens", 0))
+        # TP>1 uses the scheduler's existing native broadcast to commit a
+        # release on every rank in lockstep.  Between local I/O completion and
+        # that broadcast, the request's protected prefix is already accounted
+        # by Radix, but its uncached/overallocated tail is owned by neither the
+        # active batch nor Radix.  Include only that tail here so the idle
+        # memory checker does not mistake the short hand-off window for a leak.
+        pending = getattr(self, "_agentic_tp_pending_releases", None) or {}
+        for req, _start_offset in pending.values():
+            allocated_len = int(
+                getattr(req, "kv_allocated_len", getattr(req, "kv_committed_len", 0))
+            )
+            if self.page_size > 1:
+                allocated_len = ceil_align(allocated_len, self.page_size)
+            protected_len = int(getattr(req, "cache_protected_len", 0))
+            reserved += max(0, allocated_len - protected_len)
+        return reserved
+
+    @property
+    def agentic_pending_release_req_count(self) -> int:
+        """Request slots awaiting the same native TP release broadcast."""
+
+        pending = getattr(self, "_agentic_tp_pending_releases", None) or {}
+        return sum(1 for req, _ in pending.values() if req.req_pool_idx != -1)
 
     def offload_kv_cache(self, req) -> bool:
         """Offload incremental KV cache for decode side."""
@@ -847,10 +977,25 @@ class DecodeKVCacheOffloadManager:
             return False
         all_tokens = all_tokens[:aligned_len]
         producer_store = getattr(self, "agentic_early_claim_store", None)
-        if (
-            producer_store is not None
-            and not producer_store.claim_generation_producer(metadata.current)
-        ):
+        producer_id = None
+        if int(getattr(self, "tp_world_size", 1)) > 1:
+            engine_id = os.getenv("SGLANG_AGENTIC_KV_ENGINE_ID", "decode")
+            producer_id = f"{engine_id}:{req.rid}"
+        owns_generation = True
+        if producer_store is not None:
+            if int(getattr(self, "tp_world_size", 1)) > 1 and self.tp_rank != 0:
+                # Logical producer election belongs to rank 0.  Followers wait
+                # for its atomically-published decision, then only pin and
+                # transfer their local KV-head shard when the same D engine won.
+                owns_generation = producer_store.wait_generation_producer(
+                    metadata.current,
+                    producer_id,
+                )
+            else:
+                owns_generation = producer_store.claim_generation_producer(
+                    metadata.current, producer_id=producer_id
+                )
+        if not owns_generation:
             # The original execution remains authoritative. This duplicate
             # still returns its deterministic model response to unblock the
             # retrying caller, but must not mutate lifecycle state owned by
@@ -899,17 +1044,20 @@ class DecodeKVCacheOffloadManager:
             token_digest=token_ids_digest(all_tokens),
             direct_bootstrap_addr=self.agentic_direct_runtime.bootstrap_addr,
             direct_room=room,
+            tp_size=self.tp_world_size,
+            kv_layout_hash=self.agentic_direct_runtime.layout_hash,
         )
         # Multi-P routing is fixed by the D worker's NUMA domain.  Publish the
         # destination together with DIRECT_READY so Router ingress never waits
         # on a P load query before acknowledging the next turn.
-        if not self._publish_agentic_route(
-            metadata.current,
-            route="direct_ready",
-            snapshot_tokens=len(all_tokens),
-        ):
-            return False
-        self.agentic_snapshot_store.publish_direct_offer(manifest)
+        if self.tp_rank == 0:
+            if not self._publish_agentic_route(
+                metadata.current,
+                route="direct_ready",
+                snapshot_tokens=len(all_tokens),
+            ):
+                return False
+            self.agentic_snapshot_store.publish_direct_offer(manifest)
         source_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(all_tokens)
         ]
@@ -926,7 +1074,7 @@ class DecodeKVCacheOffloadManager:
             mgr=self.agentic_direct_runtime.manager,
             bootstrap_addr=self.agentic_direct_runtime.bootstrap_addr,
             bootstrap_room=room,
-            dest_tp_ranks=[0],
+            dest_tp_ranks=[self.tp_rank],
             pp_rank=0,
         )
         self.agentic_direct_candidates[manifest.snapshot_id] = {
@@ -1017,6 +1165,19 @@ class DecodeKVCacheOffloadManager:
         if manifest is None:
             return
         was_seen = bool(candidate.pop("fast_arrival_seen", False))
+        if getattr(self, "tp_world_size", 1) > 1:
+            # The marker is a level-trigger shared by every D rank.  Removing
+            # it when the first shard changes state makes later ranks misread
+            # the same generation as an unconfirmed tool call.  Generation
+            # ids are unique and the run-owned ready directory is deleted at
+            # shutdown, so retaining these tiny files is bounded and safe.
+            if was_seen:
+                logger.info(
+                    "AgenticKV fast_arrival_retained_tp snapshot=%s reason=%s",
+                    manifest.snapshot_id,
+                    reason,
+                )
+            return
         try:
             store.remove_arrival(manifest.request)
             store.remove_tool(manifest.request)
@@ -1076,6 +1237,8 @@ class DecodeKVCacheOffloadManager:
     def _agentic_release_final_confirmation(self, candidate) -> None:
         store = getattr(self, "agentic_early_claim_store", None)
         if store is None:
+            return
+        if getattr(self, "tp_world_size", 1) > 1:
             return
         try:
             store.remove_final(candidate["manifest"].request)
@@ -1218,6 +1381,7 @@ class DecodeKVCacheOffloadManager:
                 # The Agent receives the response immediately after this method;
                 # use the same boundary for remaining-tool-time accounting.
                 tool_started_at=time.time(),
+                tp_size=self.tp_world_size,
             )
             if direct_manifest is not None:
                 manifest = SnapshotManifest(
@@ -1231,6 +1395,8 @@ class DecodeKVCacheOffloadManager:
                     tool_started_at=direct_manifest.tool_started_at,
                     claim_id=direct_manifest.claim_id,
                     token_digest=token_ids_digest(all_tokens),
+                    tp_size=direct_manifest.tp_size,
+                    kv_layout_hash=direct_manifest.kv_layout_hash,
                 ).transition(SnapshotState.OFFLOADING)
         except Exception:
             logger.exception("Failed to describe agentic snapshot %s", req.rid)
@@ -1559,6 +1725,9 @@ class DecodeKVCacheOffloadManager:
         return manifest
 
     def _check_agentic_direct_progress(self, *, progress_relay: bool = True) -> None:
+        if self.tp_world_size > 1 and self.tp_rank != 0:
+            self._check_agentic_tp_follower_progress(progress_relay=progress_relay)
+            return
         relay_worker = getattr(self, "agentic_relay_worker", None)
         if progress_relay and relay_worker is not None:
             try:
@@ -1676,20 +1845,27 @@ class DecodeKVCacheOffloadManager:
 
             if candidate["sent"]:
                 if poll == KVPoll.Success:
-                    logger.info(
-                        "AgenticKV direct_send_complete snapshot=%s elapsed_s=%.6f",
-                        snapshot_id,
-                        now - candidate["created_at"],
-                    )
+                    if not candidate.get("local_send_complete"):
+                        candidate["local_send_complete"] = True
+                        logger.info(
+                            "AgenticKV direct_rank_send_complete snapshot=%s "
+                            "rank=%d/%d elapsed_s=%.6f",
+                            snapshot_id,
+                            self.tp_rank,
+                            self.tp_world_size,
+                            now - candidate["created_at"],
+                        )
+                elif poll == KVPoll.Failed:
+                    should_fallback = True
+                # TP=1 retains the old zero-metadata completion path.  TP>1
+                # keeps every source shard pinned until the logical manifest
+                # records ACKs from all destination ranks, so a late rank
+                # failure can still fall back without losing half a snapshot.
+                if not should_fallback and self.tp_world_size == 1:
                     self._enqueue_agentic_release(req, 0)
                     self._cleanup_agentic_direct_sender(candidate)
                     self._agentic_release_early_claim(candidate, "direct_complete")
                     self.agentic_direct_candidates.pop(snapshot_id, None)
-                elif poll == KVPoll.Failed:
-                    should_fallback = True
-                # Once DMA has started, sender progress is authoritative and
-                # no manifest lookup is needed on the hot Decode loop.
-                if not should_fallback:
                     continue
 
             manifest = self._agentic_direct_manifest(candidate, metadata, now)
@@ -1759,6 +1935,32 @@ class DecodeKVCacheOffloadManager:
                 self._cleanup_agentic_direct_sender(candidate)
                 self._agentic_release_early_claim(candidate, "consumed")
                 self.agentic_direct_candidates.pop(snapshot_id, None)
+
+            elif (
+                manifest.state is SnapshotState.SLOW_FALLBACK
+                and getattr(self, "tp_world_size", 1) > 1
+                and self.agentic_host_staging_client is not None
+                and not candidate.get("staging")
+            ):
+                # Another D rank won the request-level fallback transition.
+                # This rank still owns its physical KV-head shard and must
+                # join the same Shared-Arena group before releasing D HBM.
+                try:
+                    started = self._start_agentic_host_staging(candidate, manifest)
+                except Exception:
+                    candidate["fallback_retry_at"] = now + 0.1
+                    logger.exception(
+                        "Agentic TP fallback join failed for %s; retrying",
+                        snapshot_id,
+                    )
+                    continue
+                if started:
+                    self._publish_agentic_route(
+                        metadata.current,
+                        route="host_writing",
+                        snapshot_tokens=candidate["manifest"].token_count,
+                    )
+                    continue
             elif manifest.state not in {
                 SnapshotState.DIRECT_READY,
                 SnapshotState.DIRECT_LOADING,
@@ -1857,6 +2059,52 @@ class DecodeKVCacheOffloadManager:
                     self._enqueue_agentic_release(req, 0)
                 self._cleanup_agentic_direct_sender(candidate)
                 self.agentic_direct_candidates.pop(snapshot_id, None)
+
+    def _check_agentic_tp_follower_progress(
+        self, *, progress_relay: bool = True
+    ) -> None:
+        """Execute TP0 commands without making route or lifecycle decisions."""
+
+        relay_worker = getattr(self, "agentic_relay_worker", None)
+        if progress_relay and relay_worker is not None:
+            relay_worker.poll()
+        for candidate in list(self.agentic_direct_candidates.values()):
+            action = candidate.get("tp_command", "wait")
+            if action == "wait":
+                continue
+            if action == "slow":
+                manifest = candidate.get("manifest")
+                if not candidate.get("staging"):
+                    if (
+                        manifest is None
+                        or manifest.state is not SnapshotState.SLOW_FALLBACK
+                    ):
+                        continue
+                    if not self._start_agentic_host_staging(candidate, manifest):
+                        continue
+                client = self.agentic_host_staging_client
+                if client is not None:
+                    client.progress(candidate, candidate["source_token_indices"])
+                continue
+
+            # DIRECT means rank 0 observed the group-visible P claim.  The
+            # follower performs only its local NIXL send and never times out,
+            # falls back, publishes a route, or frees KV independently.
+            sender = candidate["sender"]
+            poll = sender.poll()
+            if not candidate.get("sent") and poll == KVPoll.WaitingForInput:
+                req = candidate["req"]
+                token_indices = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, : len(candidate["tokens"])
+                ]
+                page_indices = kv_to_page_indices(
+                    token_indices.cpu().numpy(), self.page_size
+                )
+                sender.init(len(page_indices), aux_index=0)
+                sender.send(page_indices)
+                candidate["sent"] = True
+            elif candidate.get("sent") and poll == KVPoll.Success:
+                candidate["local_send_complete"] = True
 
     def _cleanup_agentic_direct_sender(self, candidate) -> None:
         runtime = getattr(self, "agentic_direct_runtime", None)

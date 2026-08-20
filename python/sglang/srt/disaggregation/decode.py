@@ -20,6 +20,7 @@ Life cycle of a request in the decode server
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import queue as thread_queue
@@ -39,6 +40,9 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
 from sglang.srt.disaggregation.agentic_host_staging import SharedHostStagingLedger
+from sglang.srt.disaggregation.agentic_tp import (
+    rank_env_int,
+)
 from sglang.srt.disaggregation.p2d_host_staging import (
     AgenticPToDHostLoadManager,
     AgenticPToDHostReceiver,
@@ -408,9 +412,13 @@ class DecodePreallocQueue:
                 decode_domain=int(
                     os.getenv("SGLANG_AGENTIC_KV_PREFILL_DOMAIN", "0")
                 ),
-                numa_node=int(
-                    os.getenv("SGLANG_AGENTIC_KV_GPU_NUMA_NODE", "-1")
+                numa_node=rank_env_int(
+                    "SGLANG_AGENTIC_KV_GPU_NUMA_NODE",
+                    "SGLANG_AGENTIC_KV_TP_NUMA_NODES",
+                    tp_rank=self.tp_rank,
                 ),
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
             )
         if self.enable_staging:
             self.transfer_queue._init_staging_handler(self.kv_manager)
@@ -464,8 +472,28 @@ class DecodePreallocQueue:
                 self.p_ready_dir, f"{decode_req.req.bootstrap_room}.ready"
             )
             if os.path.exists(ready_path):
+                self._record_p_ready_domain(decode_req, ready_path)
                 decode_req._async_p_ready = True
                 decode_req._async_p_ready_path = ready_path
+
+    def _record_p_ready_domain(
+        self, decode_req: DecodeRequest, ready_path: str
+    ) -> None:
+        """Record the P group that produced this wire request."""
+
+        try:
+            with open(ready_path, encoding="utf-8") as ready_file:
+                metadata = json.load(ready_file)
+            decode_req.req._agentic_prefill_domain = int(
+                metadata.get(
+                    "prefill_domain",
+                    os.environ.get("SGLANG_AGENTIC_KV_PREFILL_DOMAIN", "0"),
+                )
+            )
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            decode_req.req._agentic_prefill_domain = int(
+                os.environ.get("SGLANG_AGENTIC_KV_PREFILL_DOMAIN", "0")
+            )
 
     def _background_prepare_metadata(self) -> None:
         # Metadata setup includes CPU index conversion and NIXL publication.
@@ -489,6 +517,44 @@ class DecodePreallocQueue:
                     decode_req.req.rid,
                 )
             self._async_metadata_done.put((decode_req, error))
+
+    def _consume_p_ready_marker(self, ready_path: Optional[str]) -> None:
+        """Acknowledge P-ready only after every local TP rank admitted it.
+
+        The marker is a group-level latch: deleting it on the first rank can
+        make a peer miss the request, while retaining it forever prevents the
+        Router from releasing its Decode reservation.  Rank-scoped ACK files
+        let the last observer remove the shared marker without adding another
+        distributed collective to the scheduler path.
+        """
+
+        if not ready_path:
+            return
+        if self.tp_size == 1:
+            try:
+                os.unlink(ready_path)
+            except FileNotFoundError:
+                pass
+            return
+
+        ack_paths = [
+            f"{ready_path}.tp-rank-{rank}.admitted"
+            for rank in range(self.tp_size)
+        ]
+        ack_path = ack_paths[self.tp_rank]
+        fd = os.open(ack_path, os.O_CREAT | os.O_WRONLY, 0o600)
+        os.close(fd)
+        if not all(os.path.exists(path) for path in ack_paths):
+            return
+        try:
+            os.unlink(ready_path)
+        except FileNotFoundError:
+            pass
+        for path in ack_paths:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
 
     def _drain_background_metadata(self):
         ready = []
@@ -536,11 +602,7 @@ class DecodePreallocQueue:
             ]
             decode_req.kv_receiver.bind(destination_indices)
             ready_path = getattr(decode_req, "_async_p_ready_path", None)
-            if ready_path:
-                try:
-                    os.unlink(ready_path)
-                except FileNotFoundError:
-                    pass
+            self._consume_p_ready_marker(ready_path)
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
             return
         if self.scheduler.enable_hisparse:
@@ -594,11 +656,7 @@ class DecodePreallocQueue:
             page_indices, decode_req.metadata_buffer_index, state_indices
         )
         ready_path = getattr(decode_req, "_async_p_ready_path", None)
-        if ready_path:
-            try:
-                os.unlink(ready_path)
-            except FileNotFoundError:
-                pass
+        self._consume_p_ready_marker(ready_path)
         if self.transfer_queue.enable_staging and decode_req.kv_receiver.require_staging:
             self.transfer_queue.staging_handler.register_decode_req(
                 decode_req.req.bootstrap_room, decode_req
@@ -973,12 +1031,27 @@ class DecodePreallocQueue:
             decode_req.kv_receiver.init(prefill_dp_rank)
 
     def pop_preallocated(
-        self, rids_to_check: Optional[List[str]] = None
+        self, request_keys_to_check: Optional[List[tuple[str, int]]] = None
     ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
         """Pop the preallocated requests from the pending queue (FIFO)."""
+        selected_keys = (
+            None
+            if request_keys_to_check is None
+            else {(str(rid), int(room)) for rid, room in request_keys_to_check}
+        )
+
+        def selected(decode_req) -> bool:
+            return selected_keys is None or (
+                str(decode_req.req.rid), int(decode_req.req.bootstrap_room)
+            ) in selected_keys
+
         if not self._async_progress_enabled:
             self._resolve_pending_reqs()
-            self._update_handshake_waiters(rids_to_check)
+            # Handshake progress is group-wide. ``request_keys_to_check`` is TP0's
+            # exact page-admission decision and must gate allocation only;
+            # applying it here would leave every not-yet-selected request
+            # permanently unable to become selectable.
+            self._update_handshake_waiters()
 
         if self._async_progress_enabled:
             preallocated_reqs, failed_reqs = self._drain_background_metadata()
@@ -1001,7 +1074,7 @@ class DecodePreallocQueue:
         blocked_required_tokens = 0
         # First, remove all failed requests from the queue
         for i, decode_req in enumerate(self.queue):
-            if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
+            if not selected(decode_req):
                 continue
             if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
                 self.scheduler.stream_output(
@@ -1020,7 +1093,7 @@ class DecodePreallocQueue:
                 >= self.max_transfer_inflight
             ):
                 break
-            if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
+            if not selected(decode_req):
                 continue
 
             if i in indices_to_remove:
@@ -1049,6 +1122,7 @@ class DecodePreallocQueue:
                     )
                     if not os.path.exists(ready_path):
                         continue
+                    self._record_p_ready_domain(decode_req, ready_path)
 
             if self.req_to_token_pool.available_size() <= 0:
                 blocked_reason = "request_slots"
@@ -1175,15 +1249,22 @@ class DecodePreallocQueue:
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
             assert decode_req.metadata_buffer_index is not None
-            page_indices = kv_to_page_indices(kv_indices, page_size)
-            decode_req.kv_receiver.send_metadata(
-                page_indices, decode_req.metadata_buffer_index, state_indices
-            )
+            if isinstance(decode_req.kv_receiver, AgenticPToDHostReceiver):
+                # This receiver restores an already materialized Host snapshot
+                # directly into the pages allocated above.  It carries its
+                # small sampling metadata in the snapshot manifest, so the
+                # native NIXL send_metadata handshake does not apply.
+                destination_indices = self.req_to_token_pool.req_to_token[
+                    decode_req.req.req_pool_idx, :origin_input_len
+                ]
+                decode_req.kv_receiver.bind(destination_indices)
+            else:
+                page_indices = kv_to_page_indices(kv_indices, page_size)
+                decode_req.kv_receiver.send_metadata(
+                    page_indices, decode_req.metadata_buffer_index, state_indices
+                )
             if require_p_ready:
-                try:
-                    os.unlink(ready_path)
-                except FileNotFoundError:
-                    pass
+                self._consume_p_ready_marker(ready_path)
             if (
                 self.transfer_queue.enable_staging
                 and decode_req.kv_receiver.require_staging
@@ -1587,16 +1668,36 @@ class DecodeTransferQueue:
         )
         kv_manager._staging_handler = self.staging_handler
 
-    def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
+    def pop_transferred(
+        self, rids_to_check: Optional[List[object]] = None
+    ) -> List[Req]:
         if not self.queue:
             return []
+
+        selected_indices = list(range(len(self.queue)))
+        selected_queue = self.queue
+        if rids_to_check is not None:
+            selected_keys = set(rids_to_check)
+            selected_indices = [
+                index
+                for index, decode_req in enumerate(self.queue)
+                if decode_req.req.rid in selected_keys
+                or (
+                    str(decode_req.req.rid),
+                    int(decode_req.req.bootstrap_room),
+                )
+                in selected_keys
+            ]
+            selected_queue = [self.queue[index] for index in selected_indices]
+            if not selected_queue:
+                return []
 
         if self._async_progress_enabled:
             # No transport call is allowed here.  Missing cached status simply
             # means the background worker has not completed its next poll.
             with self._async_poll_lock:
                 polls = []
-                for dr in self.queue:
+                for dr in selected_queue:
                     poll = getattr(
                         dr, "_async_transfer_poll", int(KVPoll.Transferring)
                     )
@@ -1604,18 +1705,17 @@ class DecodeTransferQueue:
                         dr._async_transfer_poll_claimed = True
                     polls.append(poll)
         elif self.enable_staging:
-            polls = self._poll_with_staging()
+            polls = poll_and_all_reduce_with_staging(
+                selected_queue, self.staging_handler, self.gloo_group
+            )
         else:
             polls = poll_and_all_reduce(
-                [dr.kv_receiver for dr in self.queue], self.gloo_group
+                [dr.kv_receiver for dr in selected_queue], self.gloo_group
             )
 
         transferred_reqs = []
         indices_to_remove = set()
-        for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
-            if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
-                continue
-
+        for i, decode_req, poll in zip(selected_indices, selected_queue, polls):
             if poll == KVPoll.Failed:
                 error_message = f"Decode transfer failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 try:
@@ -1888,11 +1988,30 @@ class SchedulerDisaggregationDecodeMixin:
         self.polling_count = (self.polling_count + 1) % self.polling_interval
 
         if self.polling_count % self.polling_interval == 0:
-            req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
+            tp_admit_keys = (
+                getattr(self, "_agentic_tp_decode_admit_keys", [])
+                if self.tp_size > 1
+                else None
+            )
+            req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated(
+                tp_admit_keys
+            )
             self.disagg_decode_transfer_queue.extend(req_conns)
-            transferred_reqs = (
-                self.disagg_decode_transfer_queue.pop_transferred()
-            )  # the requests which kv has arrived
+            if self.tp_size > 1:
+                transfer_keys = getattr(
+                    self, "_agentic_tp_decode_transfer_keys", ()
+                )
+                transferred_reqs = (
+                    []
+                    if not transfer_keys
+                    else self.disagg_decode_transfer_queue.pop_transferred(
+                        transfer_keys
+                    )
+                )
+            else:
+                transferred_reqs = (
+                    self.disagg_decode_transfer_queue.pop_transferred()
+                )  # the requests which kv has arrived
             if self.enable_hisparse:
                 for req in transferred_reqs:
                     # Direct-to-host: KV data already in host pool, skip staging

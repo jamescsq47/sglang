@@ -295,6 +295,14 @@ class RequestGeneration:
     def claim_key(self) -> str:
         return f"{self.manifest_key}:claim"
 
+    def direct_rank_ack_key(self, claim_id: str, tp_rank: int) -> str:
+        claim_digest = hashlib.sha256(claim_id.encode()).hexdigest()[:16]
+        return f"{self.manifest_key}:direct-ack:{claim_digest}:{int(tp_rank)}"
+
+    def direct_finalize_key(self, claim_id: str) -> str:
+        claim_digest = hashlib.sha256(claim_id.encode()).hexdigest()[:16]
+        return f"{self.manifest_key}:direct-finalize:{claim_digest}"
+
 
 @dataclass(frozen=True, slots=True)
 class AgenticRequestMetadata:
@@ -473,6 +481,11 @@ class SnapshotManifest:
     token_digest: Optional[str] = None
     direct_bootstrap_addr: Optional[str] = None
     direct_room: Optional[int] = None
+    # One logical request-generation can comprise several physical TP KV
+    # shards.  TP=1 remains the wire default so old manifests and every
+    # existing experiment retain their exact behavior.
+    tp_size: int = 1
+    kv_layout_hash: Optional[str] = None
     version: int = MANIFEST_VERSION
 
     def __post_init__(self) -> None:
@@ -484,6 +497,8 @@ class SnapshotManifest:
             raise ValueError("token_count must be non-negative")
         if self.byte_size < 0:
             raise ValueError("byte_size must be non-negative")
+        if self.tp_size <= 0:
+            raise ValueError("tp_size must be positive")
         if not self.page_keys and self.state not in {
             SnapshotState.FAILED,
             SnapshotState.FINAL,
@@ -570,6 +585,8 @@ class SnapshotManifest:
             "token_digest": self.token_digest,
             "direct_bootstrap_addr": self.direct_bootstrap_addr,
             "direct_room": self.direct_room,
+            "tp_size": self.tp_size,
+            "kv_layout_hash": self.kv_layout_hash,
         }
         raw = json.dumps(body, separators=(",", ":"), ensure_ascii=True).encode()
         return zlib.compress(raw, level=1)
@@ -598,6 +615,8 @@ class SnapshotManifest:
             token_digest=body.get("token_digest"),
             direct_bootstrap_addr=body.get("direct_bootstrap_addr"),
             direct_room=body.get("direct_room"),
+            tp_size=int(body.get("tp_size", 1)),
+            kv_layout_hash=body.get("kv_layout_hash"),
             version=int(body["version"]),
         )
 
@@ -657,25 +676,43 @@ class MooncakeSnapshotStore:
         return os.path.join(directory, f"lifecycle-claim-{digest}")
 
     @classmethod
-    def _acquire_local_claim(
+    def _acquire_local_claim_with_ownership(
         cls, request: RequestGeneration, claim_id: str
-    ) -> bool:
+    ) -> tuple[bool, bool]:
+        """Acquire a node-local claim and report whether this caller created it.
+
+        TP ranks intentionally join the same deterministic logical claim.  A
+        joining rank must not unlink the owner fence if its own storage-client
+        operation fails, because the rank that created the fence may still be
+        transferring its shard.
+        """
+
         path = cls._local_claim_path(request)
         if path is None:
             # Lightweight tests and non-node-local storage configurations keep
             # the original Mooncake-only behavior.
-            return True
+            return True, False
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError:
-            return False
+            # All TP ranks use the same deterministic logical claim.  Treat
+            # that owner as idempotent while still excluding a different P or
+            # the D slow-fallback owner.
+            return cls._local_claim_owner(request) == claim_id, False
         try:
             os.write(fd, claim_id.encode("utf-8"))
             os.fsync(fd)
         finally:
             os.close(fd)
-        return True
+        return True, True
+
+    @classmethod
+    def _acquire_local_claim(
+        cls, request: RequestGeneration, claim_id: str
+    ) -> bool:
+        acquired, _ = cls._acquire_local_claim_with_ownership(request, claim_id)
+        return acquired
 
     @classmethod
     def _release_local_claim(
@@ -710,6 +747,33 @@ class MooncakeSnapshotStore:
             return None
         except (OSError, UnicodeDecodeError):
             return None
+
+    @classmethod
+    def _local_tp_direct_path(
+        cls,
+        request: RequestGeneration,
+        claim_id: str,
+        suffix: str,
+    ) -> Optional[str]:
+        claim_path = cls._local_claim_path(request)
+        if claim_path is None:
+            return None
+        claim_digest = hashlib.sha256(claim_id.encode("utf-8")).hexdigest()[:16]
+        return f"{claim_path}.tp-{claim_digest}.{suffix}"
+
+    @staticmethod
+    def _create_local_marker(path: str, value: bytes = b"1") -> bool:
+        """Create one tiny tmpfs marker and report O_EXCL ownership."""
+
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            return False
+        try:
+            os.write(fd, value)
+        finally:
+            os.close(fd)
+        return True
 
     @classmethod
     def _require_local_claim_owner(
@@ -828,18 +892,77 @@ class MooncakeSnapshotStore:
     ) -> SnapshotManifest:
         if not claim_id:
             raise ValueError("claim_id must be non-empty")
-        if not self._acquire_local_claim(request, claim_id):
+        acquired, created_local_claim = self._acquire_local_claim_with_ownership(
+            request, claim_id
+        )
+        owns_claim_cleanup = (
+            created_local_claim or self._local_claim_path(request) is None
+        )
+        if not acquired:
             raise SnapshotNotReadyError(
                 f"direct snapshot {request.snapshot_id} is locally claimed"
             )
+        if not created_local_claim and self._local_claim_path(request) is not None:
+            # Another rank in this node-local TP group created the same
+            # deterministic logical claim.  Mooncake metadata visibility is
+            # not instantaneous across its per-rank clients, so the joiner
+            # must wait for the owner to publish DIRECT_LOADING instead of
+            # issuing a second create-only claim and silently dropping its KV
+            # shard on a transient read miss.
+            deadline = time.monotonic() + 0.5
+            while True:
+                manifest = self.load(request, require_ready=False)
+                if (
+                    manifest is not None
+                    and manifest.state is SnapshotState.DIRECT_LOADING
+                    and manifest.claim_id == claim_id
+                ):
+                    return manifest
+                if manifest is not None and manifest.state not in {
+                    SnapshotState.DIRECT_READY,
+                    SnapshotState.DIRECT_LOADING,
+                }:
+                    raise SnapshotNotReadyError(
+                        f"direct snapshot {request.snapshot_id} advanced to "
+                        f"{manifest.state.value} while joining TP claim"
+                    )
+                if time.monotonic() >= deadline:
+                    state = "missing" if manifest is None else manifest.state.value
+                    raise SnapshotNotReadyError(
+                        f"direct snapshot {request.snapshot_id} remained {state} "
+                        "while joining TP claim"
+                    )
+                time.sleep(0.005)
         claim_code = self.store.put(request.claim_key, f"direct:{claim_id}".encode())
         if claim_code != 0:
-            self._release_local_claim(request, claim_id)
+            existing_claim = self.store.get(request.claim_key)
+            manifest = self.load(request, require_ready=False)
+            if (
+                existing_claim == f"direct:{claim_id}".encode()
+                and manifest is not None
+                and manifest.state is SnapshotState.DIRECT_LOADING
+                and manifest.claim_id == claim_id
+            ):
+                return manifest
+            if owns_claim_cleanup:
+                self._release_local_claim(request, claim_id)
             raise SnapshotNotReadyError(
                 f"direct snapshot {request.snapshot_id} is already claimed"
             )
         try:
             manifest = self.load(request, require_ready=False)
+            # Mooncake's create-only claim is observed through separate TP
+            # clients.  During a near-simultaneous group claim a peer can
+            # report a successful Put even though rank 0 has already moved
+            # the manifest to DIRECT_LOADING.  The deterministic logical
+            # claim id is the fence: joining that same in-progress claim is
+            # idempotent, while any different owner remains excluded.
+            if (
+                manifest is not None
+                and manifest.state is SnapshotState.DIRECT_LOADING
+                and manifest.claim_id == claim_id
+            ):
+                return manifest
             if manifest is None or manifest.state is not SnapshotState.DIRECT_READY:
                 state = "missing" if manifest is None else manifest.state.value
                 raise SnapshotNotReadyError(
@@ -853,8 +976,12 @@ class MooncakeSnapshotStore:
             )
             return claimed
         except Exception:
-            self.store.remove(request.claim_key, force=False)
-            self._release_local_claim(request, claim_id)
+            # A TP peer can already own the same deterministic logical claim.
+            # This rank is only a joiner in that case, so tearing down either
+            # shared fence here would invalidate the peer's in-flight shard.
+            if owns_claim_cleanup:
+                self.store.remove(request.claim_key, force=False)
+                self._release_local_claim(request, claim_id)
             raise
 
     def complete_direct(
@@ -870,6 +997,194 @@ class MooncakeSnapshotStore:
         terminal = replace(
             manifest.transition(SnapshotState.CONSUMED),
             terminal_at=time.time(),
+        )
+        self._update_claimed_transition(
+            terminal,
+            expected_states=(SnapshotState.DIRECT_LOADING,),
+            owner_claim_id=claim_id,
+        )
+        self.store.remove(terminal.request.claim_key, force=False)
+        self._release_local_claim(terminal.request, claim_id)
+        _discard_shared_ledger_snapshot(terminal.snapshot_id)
+        return terminal
+
+    def complete_direct_rank(
+        self,
+        manifest: SnapshotManifest,
+        claim_id: str,
+        *,
+        tp_rank: int,
+        tp_size: int,
+    ) -> SnapshotManifest:
+        """ACK one TP shard and atomically expose only the complete group.
+
+        KV transfer is rank-local, but lifecycle visibility is request-local.
+        The source D therefore remains pinned until every matching P rank has
+        acknowledged its shard.  Tiny rank keys avoid serializing large
+        descriptors into the manifest and make duplicate completion harmless.
+        """
+
+        tp_size = int(tp_size)
+        tp_rank = int(tp_rank)
+        if tp_size <= 0 or not 0 <= tp_rank < tp_size:
+            raise ValueError("invalid TP rank completion")
+        if manifest.tp_size != tp_size:
+            raise SnapshotLifecycleError(
+                f"TP size mismatch for {manifest.snapshot_id}: "
+                f"manifest={manifest.tp_size} receiver={tp_size}"
+            )
+        if tp_size == 1:
+            return self.complete_direct(manifest, claim_id)
+        if (
+            manifest.state is not SnapshotState.DIRECT_LOADING
+            or manifest.claim_id != claim_id
+        ):
+            current = self.load(manifest.request, require_ready=False)
+            if current is not None and current.state is SnapshotState.CONSUMED:
+                return current
+            raise SnapshotLifecycleError(
+                f"invalid TP direct completion for {manifest.snapshot_id}"
+            )
+
+        # The V1 Direct path is node-local.  Use its existing tmpfs owner
+        # fence as the TP completion coordinator instead of Mooncake
+        # create-only metadata keys: separate Mooncake clients can both
+        # transiently accept the same key under a burst, electing two
+        # finalizers and releasing the group claim after only one shard.
+        # These markers are a few bytes, request-generation scoped and fully
+        # nonblocking.  Only the elected writer touches the shared manifest;
+        # peer ranks observe ``done`` on a later progress tick.
+        local_claim_path = self._local_claim_path(manifest.request)
+        if local_claim_path is not None:
+            ack_paths = [
+                self._local_tp_direct_path(
+                    manifest.request, claim_id, f"rank-{rank}.ack"
+                )
+                for rank in range(tp_size)
+            ]
+            ack_path = ack_paths[tp_rank]
+            if ack_path is None:
+                raise RuntimeError("local TP Direct ACK path disappeared")
+            self._create_local_marker(ack_path, f"{tp_rank}/{tp_size}".encode())
+            if not all(path is not None and os.path.exists(path) for path in ack_paths):
+                return manifest
+
+            done_path = self._local_tp_direct_path(
+                manifest.request, claim_id, "done"
+            )
+            finalize_path = self._local_tp_direct_path(
+                manifest.request, claim_id, "finalizer"
+            )
+            if done_path is None or finalize_path is None:
+                raise RuntimeError("local TP Direct completion path disappeared")
+            terminal = replace(
+                manifest.transition(SnapshotState.CONSUMED),
+                terminal_at=time.time(),
+            )
+            if os.path.exists(done_path):
+                return terminal
+            if not self._create_local_marker(
+                finalize_path, str(tp_rank).encode()
+            ):
+                return manifest
+            try:
+                self._update_claimed_transition(
+                    terminal,
+                    expected_states=(SnapshotState.DIRECT_LOADING,),
+                    owner_claim_id=claim_id,
+                )
+                self._create_local_marker(done_path)
+                self.store.remove(terminal.request.claim_key, force=False)
+                self._release_local_claim(terminal.request, claim_id)
+                _discard_shared_ledger_snapshot(terminal.snapshot_id)
+                return terminal
+            except Exception:
+                try:
+                    os.unlink(finalize_path)
+                except FileNotFoundError:
+                    pass
+                raise
+
+        ack_key = manifest.request.direct_rank_ack_key(claim_id, tp_rank)
+        ack_value = f"{tp_rank}/{tp_size}".encode()
+        ack_code = self.store.put(ack_key, ack_value)
+        if ack_code != 0 and self.store.get(ack_key) != ack_value:
+            raise SnapshotLifecycleError(
+                f"could not publish TP rank {tp_rank} ACK for {manifest.snapshot_id}"
+            )
+        ack_keys = [
+            manifest.request.direct_rank_ack_key(claim_id, rank)
+            for rank in range(tp_size)
+        ]
+        if any(value != 1 for value in self.store.batch_is_exist(ack_keys)):
+            return manifest
+
+        # Several ranks may observe the final ACK together.  A create-only
+        # finalizer key elects exactly one manifest writer; all others observe
+        # the terminal state on their next read.
+        finalize_key = manifest.request.direct_finalize_key(claim_id)
+        if self.store.put(finalize_key, str(tp_rank).encode()) != 0:
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                current = self.load(manifest.request, require_ready=False)
+                if current is not None and current.state is SnapshotState.CONSUMED:
+                    return current
+                time.sleep(0.005)
+            return manifest
+
+        try:
+            current = self.load(manifest.request, require_ready=False)
+            if current is not None and current.state is SnapshotState.CONSUMED:
+                return current
+            if (
+                current is None
+                or current.state is not SnapshotState.DIRECT_LOADING
+                or current.claim_id != claim_id
+            ):
+                raise SnapshotLifecycleError(
+                    f"lost TP direct group claim for {manifest.snapshot_id}"
+                )
+            terminal = replace(
+                current.transition(SnapshotState.CONSUMED),
+                terminal_at=time.time(),
+            )
+            self._update_claimed_transition(
+                terminal,
+                expected_states=(SnapshotState.DIRECT_LOADING,),
+                owner_claim_id=claim_id,
+            )
+            self.store.remove(terminal.request.claim_key, force=False)
+            self._release_local_claim(terminal.request, claim_id)
+            _discard_shared_ledger_snapshot(terminal.snapshot_id)
+            return terminal
+        finally:
+            self.store.batch_remove(ack_keys + [finalize_key], force=False)
+
+    def complete_direct_group(
+        self, manifest: SnapshotManifest, claim_id: str
+    ) -> SnapshotManifest:
+        """Expose a TP snapshot after rank 0 has fenced all physical shards.
+
+        Physical completion is reduced through the native TP control plane.
+        Consequently only rank 0 mutates the request-level manifest; follower
+        ranks never create ACK markers or compete to finalize it.
+        """
+
+        if manifest.tp_size <= 1:
+            return self.complete_direct(manifest, claim_id)
+        current = self.load(manifest.request, require_ready=False)
+        if current is not None and current.state is SnapshotState.CONSUMED:
+            return current
+        if (
+            current is None
+            or current.state is not SnapshotState.DIRECT_LOADING
+            or current.claim_id != claim_id
+        ):
+            raise SnapshotLifecycleError(
+                f"invalid TP direct group completion for {manifest.snapshot_id}"
+            )
+        terminal = replace(
+            current.transition(SnapshotState.CONSUMED), terminal_at=time.time()
         )
         self._update_claimed_transition(
             terminal,
@@ -926,8 +1241,32 @@ class MooncakeSnapshotStore:
         """
 
         claim_id = f"fallback:{owner_id}"
-        if not self._acquire_local_claim(manifest.request, claim_id):
+        acquired, created_local_claim = self._acquire_local_claim_with_ownership(
+            manifest.request, claim_id
+        )
+        if not acquired:
             return None
+        if not created_local_claim and self._local_claim_path(manifest.request) is not None:
+            # A peer D rank owns the same deterministic fallback group.  Join
+            # its request-generation transition instead of treating the
+            # already-visible SLOW_FALLBACK state as foreign ownership.
+            deadline = time.monotonic() + 0.5
+            while True:
+                current = self.load(manifest.request, require_ready=False)
+                if (
+                    current is not None
+                    and current.state is SnapshotState.SLOW_FALLBACK
+                    and current.claim_id == claim_id
+                ):
+                    return current
+                if current is not None and current.state not in {
+                    SnapshotState.DIRECT_READY,
+                    SnapshotState.SLOW_FALLBACK,
+                }:
+                    return None
+                if time.monotonic() >= deadline:
+                    return None
+                time.sleep(0.005)
         if self.store.put(manifest.request.claim_key, claim_id.encode()) != 0:
             self._release_local_claim(manifest.request, claim_id)
             return None
@@ -998,6 +1337,65 @@ class MooncakeSnapshotStore:
         self.store.remove(manifest.request.claim_key, force=False)
         self._release_local_claim(manifest.request, manifest.claim_id)
         return terminal
+
+    @classmethod
+    def _local_tp_slow_path(
+        cls, request: RequestGeneration, suffix: str
+    ) -> Optional[str]:
+        """Return a request-generation scoped TP slow-finalization marker.
+
+        Unlike Direct completion, Shared-Host recovery already has a
+        flock-protected group ledger which proves that every TP shard reached
+        P HBM.  The remaining operation is only one request-level manifest
+        transition, so its fence does not need rank ACKs or a claim-id in the
+        filename.
+        """
+
+        claim_path = cls._local_claim_path(request)
+        if claim_path is None:
+            return None
+        return f"{claim_path}.tp-slow.{suffix}"
+
+    def complete_slow_fallback_group(
+        self, request: RequestGeneration
+    ) -> bool:
+        """Idempotently finalize one node-local TP Shared-Host recovery.
+
+        The caller must first establish, through the Shared-Host ledger, that
+        all TP ranks completed their rank-local H2D copy.  Exactly one rank is
+        then elected with an O_EXCL tmpfs marker to update the request-level
+        Mooncake manifest.  Peers never wait: they retry on a later scheduler
+        tick and return True only after the elected rank published ``done``.
+
+        A missing manifest after election is success rather than corruption:
+        it means another storage client already completed the same terminal
+        cleanup.  The GPU copies are authoritative at this point.
+        """
+
+        done_path = self._local_tp_slow_path(request, "done")
+        finalizer_path = self._local_tp_slow_path(request, "finalizer")
+        if done_path is None or finalizer_path is None:
+            current = self.load(request, require_ready=False)
+            if current is None or current.state is SnapshotState.CONSUMED:
+                return True
+            self.complete_slow_fallback(current)
+            return True
+        if os.path.exists(done_path):
+            return True
+        if not self._create_local_marker(finalizer_path):
+            return False
+        try:
+            current = self.load(request, require_ready=False)
+            if current is not None and current.state is not SnapshotState.CONSUMED:
+                self.complete_slow_fallback(current)
+            self._create_local_marker(done_path)
+            return True
+        except Exception:
+            try:
+                os.unlink(finalizer_path)
+            except FileNotFoundError:
+                pass
+            raise
 
     def publish_failure(
         self,

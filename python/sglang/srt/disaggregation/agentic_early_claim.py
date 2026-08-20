@@ -213,7 +213,9 @@ class AgenticEarlyClaimStore:
         # bounded /dev/shm cleanup removes them without a recursive scan.
         return self.directory / f"producer-{self._digest(request)}"
 
-    def claim_generation_producer(self, request: RequestGeneration) -> bool:
+    def claim_generation_producer(
+        self, request: RequestGeneration, producer_id: Optional[str] = None
+    ) -> bool:
         """Elect exactly one D producer for a request-generation.
 
         Long model calls can outlive an HTTP client's retry timeout.  A retry
@@ -223,15 +225,62 @@ class AgenticEarlyClaimStore:
         """
 
         path = self.producer_path(request)
+        owner = str(producer_id or os.getpid())
+        # Publish a fully-written tombstone atomically.  Creating ``path`` and
+        # then writing its owner leaves a short empty-file window in which a
+        # sibling TP rank can incorrectly conclude that it belongs to a
+        # different producer.  A hard link makes the completed temporary file
+        # visible at the final name in one filesystem operation.
+        temporary = path.with_name(
+            f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        )
         try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                os.write(fd, f"{owner}\n".encode())
+            finally:
+                os.close(fd)
+            os.link(temporary, path)
         except FileExistsError:
-            return False
-        try:
-            os.write(fd, f"{os.getpid()}\n".encode())
+            if producer_id is None:
+                return False
+            try:
+                return path.read_text(encoding="utf-8").strip() == owner
+            except OSError:
+                return False
         finally:
-            os.close(fd)
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
         return True
+
+    def wait_generation_producer(
+        self,
+        request: RequestGeneration,
+        producer_id: str,
+        *,
+        timeout_seconds: float = 1.0,
+    ) -> bool:
+        """Wait for TP rank 0's producer election and mirror its result.
+
+        Only rank 0 is allowed to create the tombstone.  Followers call this
+        method after the same generation finishes and therefore normally
+        observe the atomically-published owner immediately.
+        """
+
+        path = self.producer_path(request)
+        owner = str(producer_id)
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        while True:
+            try:
+                return path.read_text(encoding="utf-8").strip() == owner
+            except FileNotFoundError:
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.001)
+            except OSError:
+                return False
 
     @staticmethod
     def _publish(
