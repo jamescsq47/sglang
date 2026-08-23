@@ -65,7 +65,9 @@ from sglang.srt.disaggregation.agentic_host_staging import (
 from sglang.srt.disaggregation.agentic_tp import (
     rank_env_int,
     rank_scoped_arena_directory,
+    request_generation_key,
 )
+from sglang.srt.disaggregation.agentic_tp_control import TPGroupMailbox
 from sglang.srt.disaggregation.p2d_host_staging import (
     AgenticPToDHostStagingManager,
 )
@@ -429,9 +431,7 @@ class AgenticDirectPageCreditPool:
                 new_indices = replacement_indices[
                     cursor_tokens : cursor_tokens + token_count
                 ]
-                new_pages = replacement_pages[
-                    cursor_pages : cursor_pages + count
-                ]
+                new_pages = replacement_pages[cursor_pages : cursor_pages + count]
                 self.device_indices[
                     start * self.page_size : (start + count) * self.page_size
                 ] = new_indices
@@ -530,10 +530,17 @@ class AgenticEarlyDirectReceive:
     prefill_domain: Optional[int] = None
     credit_allocation: Optional[AgenticDirectCreditAllocation] = None
     completed_at: Optional[float] = None
+    group_committed: bool = False
     route_published: bool = False
+    # TP binds are two-phase.  A scheduler tick may install and pin the
+    # received shard in the local Radix tree, but the request is not admitted
+    # until every rank reports the same prepared state.  Keeping the Req here
+    # also gives group abort a precise object whose branch must be rolled back.
+    prepared_req: Optional[Any] = None
     # Transport progress is driven by a lightweight worker while a long
-    # Prefill kernel owns the scheduler thread.  Lifecycle completion, HBM
-    # ownership, and Radix insertion still happen on the scheduler thread.
+    # Prefill kernel owns the scheduler thread.  Group lifecycle completion is
+    # metadata-only and also progresses there; HBM ownership and Radix
+    # insertion remain scheduler-owned.
     transport_poll: Optional[Any] = None
 
 # Test retract decode for debugging purposes
@@ -1169,11 +1176,11 @@ class Scheduler(
         ] = deque()
         self.agentic_early_direct_admission_ids: set[str] = set()
         self.agentic_early_direct_completion_queue: Deque[str] = deque()
-        # TP rank 0 owns one ordered set of Direct admissions.  Every native
-        # scheduler broadcast carries the same bounded set to all ranks; each
-        # rank receives only its physical KV-head shard.  The Direct reserve
-        # is the bound, so TP does not serialize unrelated snapshots behind a
-        # complete transfer/bind cycle.
+        # TP rank 0 owns one ordered set of Direct admissions.  A dedicated
+        # tmpfs mailbox grants the same request-generation to every rank's
+        # background progress worker; each receives only its physical KV-head
+        # shard.  Native scheduler broadcast is retained only for the final
+        # synchronized Radix bind/clear boundary.
         self.agentic_tp_direct_admission_active: Dict[
             str, Tuple[RequestGeneration, float, Optional[int], int]
         ] = {}
@@ -1183,9 +1190,39 @@ class Scheduler(
         self.agentic_tp_direct_local_admitted: set[str] = set()
         self.agentic_tp_direct_local_failed: set[str] = set()
         self.agentic_tp_host_active = None
+        self.agentic_tp_host_active_since = 0.0
         self.agentic_tp_host_command_visible = False
         self.agentic_tp_host_group_status = 0
         self.agentic_tp_host_local_admitted: set[str] = set()
+        if self.tp_size > 1 and envs.SGLANG_AGENTIC_KV_LIFECYCLE.get():
+            mailbox_dir = os.getenv("SGLANG_PD_P_READY_DIR", "/dev/shm")
+            common = {
+                "tp_rank": self.tp_rank,
+                "tp_size": self.tp_size,
+                "directory": mailbox_dir,
+            }
+            # Snapshot/room identities are globally unique within one run, so
+            # namespaces need not encode a rank-local engine id.  This lets P
+            # and D exchange one logical receipt without another collective.
+            self.agentic_tp_direct_mailbox = TPGroupMailbox(
+                "d2p-direct", **common
+            )
+            self.agentic_tp_host_mailbox = TPGroupMailbox("d2p-host", **common)
+            self.agentic_tp_p2d_sender_mailbox = TPGroupMailbox(
+                "p2d-sender", **common
+            )
+            self.agentic_tp_p2d_receiver_mailbox = TPGroupMailbox(
+                "p2d-receiver", **common
+            )
+            self.agentic_tp_p2d_admission_mailbox = TPGroupMailbox(
+                "p2d-admission", **common
+            )
+        else:
+            self.agentic_tp_direct_mailbox = None
+            self.agentic_tp_host_mailbox = None
+            self.agentic_tp_p2d_sender_mailbox = None
+            self.agentic_tp_p2d_receiver_mailbox = None
+            self.agentic_tp_p2d_admission_mailbox = None
         self.agentic_early_direct_arrival_watcher = None
         self.agentic_early_claim_store = None
         self.agentic_direct_credit_pool = None
@@ -1498,12 +1535,16 @@ class Scheduler(
                         + envs.SGLANG_AGENTIC_KV_DIRECT_HANDSHAKE_TIMEOUT.get()
                         + 1.0,
                     )
-                    if self.tp_size == 1 or self.tp_rank == 0:
-                        self.agentic_early_direct_arrival_watcher = (
-                            self.agentic_early_claim_store.watch_arrivals(
-                                max_age_seconds=marker_max_age
-                            )
+                    # Every TP rank watches the same node-local arrival
+                    # stream.  TP0 is still the only admission authority, but
+                    # followers must be able to consume its background grant
+                    # without waiting for the model scheduler's next native
+                    # request broadcast.
+                    self.agentic_early_direct_arrival_watcher = (
+                        self.agentic_early_claim_store.watch_arrivals(
+                            max_age_seconds=marker_max_age
                         )
+                    )
                     direct_reserve_tokens = int(
                         os.environ.get(
                             "SGLANG_AGENTIC_KV_P_DIRECT_RESERVE_TOKENS", "40000"
@@ -2699,8 +2740,15 @@ class Scheduler(
                         request.snapshot_id,
                     )
             current = snapshot_store.load(request, require_ready=False)
+            # In TP mode the deterministic claim is group-owned.  A follower
+            # that fails to initialize its local receiver must only roll back
+            # its own pages/transport; releasing the shared claim here would
+            # invalidate TP0 and every already-started peer.  TP0 (or TP=1)
+            # Only TP=1 can release here; TP groups use the unified abort path.
+            owns_group_claim = self.tp_size == 1
             if (
-                current is not None
+                owns_group_claim
+                and current is not None
                 and current.state is SnapshotState.DIRECT_LOADING
                 and current.claim_id == claim_id
             ):
@@ -2712,6 +2760,10 @@ class Scheduler(
                         request.snapshot_id,
                     )
             if not isinstance(exc, SnapshotNotReadyError):
+                if self.tp_size > 1:
+                    failed = getattr(self, "agentic_tp_direct_local_failed", None)
+                    if failed is not None:
+                        failed.add(request.snapshot_id)
                 logger.exception(
                     "Could not start early Direct D->P receive for %s",
                     request.snapshot_id,
@@ -2800,6 +2852,32 @@ class Scheduler(
         logger.warning(
             "AgenticKV early_direct_drop snapshot=%s reason=%s",
             entry.request.snapshot_id,
+            reason,
+        )
+
+    def _agentic_mark_tp_direct_failed(
+        self,
+        entry: AgenticEarlyDirectReceive,
+        *,
+        reason: str,
+    ) -> None:
+        """Defer TP Direct teardown to the scheduler-owner abort command.
+
+        The ingress worker may poll NIXL while a long Prefill forward is in
+        flight, but it must never mutate the SGLang GPU allocator or Radix
+        tree.  Rank-local failure is reduced through the TP mailbox; rank 0
+        then broadcasts one abort command and every rank tears down the same
+        request-generation at its next scheduler-safe boundary.
+        """
+
+        snapshot_id = entry.request.snapshot_id
+        failed = getattr(self, "agentic_tp_direct_local_failed", None)
+        if failed is None or snapshot_id in failed:
+            return
+        failed.add(snapshot_id)
+        logger.warning(
+            "AgenticKV tp_direct_defer_abort snapshot=%s reason=%s",
+            snapshot_id,
             reason,
         )
 
@@ -2935,13 +3013,6 @@ class Scheduler(
         tp_rank = int(getattr(self, "tp_rank", 0))
         if tp_size > 1 and marker_store is None:
             raise RuntimeError("TP Direct admission lost its early-claim store")
-        if tp_size > 1:
-            # Only TP0 observes Router arrivals and selects the FIFO head.
-            # Followers start their physical receiver only after the native
-            # scheduler broadcast carries this generation.
-            if tp_rank != 0:
-                return
-
         tp_active = getattr(self, "agentic_tp_direct_admission_active", None)
         if not isinstance(tp_active, dict):
             tp_active = {}
@@ -2951,7 +3022,6 @@ class Scheduler(
             for snapshot_id, active in tp_active.items()
             if snapshot_id not in self.agentic_early_direct_receives
         )
-
         # Examine each currently queued request once.  A large snapshot with
         # insufficient credit is rotated behind smaller requests instead of
         # causing head-of-line blocking; FIFO order is otherwise preserved.
@@ -2991,21 +3061,64 @@ class Scheduler(
                     queue.append((request, payload, None))
                     pending.add(request.snapshot_id)
                 continue
-            if manifest.state is not SnapshotState.DIRECT_READY:
-                continue
             if arrived_at + 0.05 < manifest.created_at:
                 continue
             credit_pool = getattr(self, "agentic_direct_credit_pool", None)
+            required_tokens = 0
             if credit_pool is not None:
                 required_tokens = (
                     (manifest.token_count + self.server_args.page_size - 1)
                     // self.server_args.page_size
                     * self.server_args.page_size
                 )
+            if tp_size > 1 and tp_rank != 0:
+                # TP0 publishes one exact request-generation grant through
+                # the dedicated tmpfs mailbox.  Followers never choose work
+                # independently; they merely mirror that grant and let their
+                # background progress worker start the local KV-head shard.
+                receipt = self.agentic_tp_direct_mailbox.receipt(
+                    request.snapshot_id
+                )
+                if receipt is None:
+                    if manifest.state not in {
+                        SnapshotState.DIRECT_READY,
+                        SnapshotState.DIRECT_LOADING,
+                    }:
+                        continue
+                    with poll_lock:
+                        queue.append((request, payload, manifest))
+                        pending.add(request.snapshot_id)
+                    continue
+                if int(receipt) < 0 or int(receipt) >= 4:
+                    self.agentic_early_direct_terminal[
+                        request.snapshot_id
+                    ] = time.monotonic()
+                    continue
+                if manifest.state not in {
+                    SnapshotState.DIRECT_READY,
+                    SnapshotState.DIRECT_LOADING,
+                }:
+                    self.agentic_tp_direct_local_failed.add(
+                        request.snapshot_id
+                    )
+                    continue
+                tp_active[request.snapshot_id] = (
+                    request,
+                    arrived_at,
+                    None if target_domain is None else int(target_domain),
+                    required_tokens,
+                )
+                continue
+            if manifest.state is not SnapshotState.DIRECT_READY:
+                continue
             if credit_pool is not None and (
                 credit_pool.free_tokens - pending_credit_tokens < required_tokens
             ):
-                if os.environ.get(
+                may_fail_for_capacity = self.tp_size == 1 or (
+                    tp_rank == 0
+                    and manifest.state is SnapshotState.DIRECT_READY
+                )
+                if may_fail_for_capacity and os.environ.get(
                     "SGLANG_AGENTIC_KV_RECOMPUTE_ON_DIRECT_CAPACITY", "0"
                 ).strip().lower() in {"1", "true", "yes", "on"}:
                     failed = snapshot_store.fail_direct_offer(
@@ -3031,16 +3144,41 @@ class Scheduler(
                     pending.add(request.snapshot_id)
                 continue
             if tp_size > 1:
-                # Rank 0 selects every generation that fits the fixed Direct
-                # reserve.  The next native TP broadcast starts all physical
-                # shards in this exact insertion order.
-                self.agentic_tp_direct_admission_active[request.snapshot_id] = (
+                # TP0 owns admission order and publishes the grant before any
+                # model-scheduler interaction.  All ranks then start their
+                # physical shards from their independent progress workers.
+                active_item = (
                     request,
                     arrived_at,
                     None if target_domain is None else int(target_domain),
                     required_tokens,
                 )
+                self.agentic_tp_direct_admission_active[request.snapshot_id] = (
+                    active_item
+                )
                 pending_credit_tokens += required_tokens
+                try:
+                    self.agentic_tp_direct_mailbox.publish_receipt(
+                        request.snapshot_id, 1
+                    )
+                except Exception:
+                    # No rank may start before the receipt is visible.  Undo
+                    # the logical reservation and retain the exact arrival in
+                    # FIFO order instead of stranding Direct page credit.
+                    logger.exception(
+                        "AgenticKV failed to publish TP Direct grant snapshot=%s",
+                        request.snapshot_id,
+                    )
+                    with poll_lock:
+                        if self.agentic_tp_direct_admission_active.get(
+                            request.snapshot_id
+                        ) == active_item:
+                            self.agentic_tp_direct_admission_active.pop(
+                                request.snapshot_id, None
+                            )
+                        queue.appendleft((request, payload, manifest))
+                        pending.add(request.snapshot_id)
+                    pending_credit_tokens -= required_tokens
                 continue
 
             if self._agentic_start_early_direct_receive(
@@ -3092,6 +3230,8 @@ class Scheduler(
         self._agentic_admit_queued_direct_receives(
             snapshot_store, direct_timeout, poll_lock
         )
+        if self.tp_size > 1:
+            self._agentic_progress_tp_direct_grants(snapshot_store)
         with poll_lock:
             receive_entries = tuple(self.agentic_early_direct_receives.items())
 
@@ -3180,12 +3320,25 @@ class Scheduler(
                             "Failed to publish Direct route for %s", snapshot_id
                         )
                 if now - entry.completed_at >= bind_timeout:
-                    self._agentic_drop_early_direct_receive(
-                        entry,
-                        snapshot_store,
-                        release_claim=False,
-                        reason="request_bind_timeout",
-                    )
+                    if self.tp_size > 1:
+                        self._agentic_mark_tp_direct_failed(
+                            entry, reason="request_bind_timeout"
+                        )
+                    else:
+                        self._agentic_drop_early_direct_receive(
+                            entry,
+                            snapshot_store,
+                            release_claim=False,
+                            reason="request_bind_timeout",
+                        )
+                continue
+            if (
+                self.tp_size > 1
+                and snapshot_id in self.agentic_tp_direct_local_failed
+            ):
+                # The owner scheduler will apply the group abort.  Keeping
+                # the entry intact preserves its page ownership until both TP
+                # ranks reach the same safe boundary.
                 continue
             try:
                 poll = entry.transport_poll
@@ -3320,19 +3473,32 @@ class Scheduler(
                         "Could not complete early Direct receive for %s",
                         snapshot_id,
                     )
+                    if self.tp_size > 1:
+                        self._agentic_mark_tp_direct_failed(
+                            entry, reason="completion_failed"
+                        )
+                    else:
+                        self._agentic_drop_early_direct_receive(
+                            entry,
+                            snapshot_store,
+                            release_claim=True,
+                            reason="completion_failed",
+                        )
+            elif poll == KVPoll.Failed:
+                if self.tp_size > 1:
+                    self._agentic_mark_tp_direct_failed(
+                        entry, reason="transfer_failed_or_timeout"
+                    )
+                else:
                     self._agentic_drop_early_direct_receive(
                         entry,
                         snapshot_store,
-                        release_claim=self.tp_size == 1,
-                        reason="completion_failed",
+                        release_claim=True,
+                        reason="transfer_failed_or_timeout",
                     )
-            elif poll == KVPoll.Failed:
-                self._agentic_drop_early_direct_receive(
-                    entry,
-                    snapshot_store,
-                    release_claim=self.tp_size == 1,
-                    reason="transfer_failed_or_timeout",
-                )
+
+        if self.tp_size > 1:
+            self._agentic_commit_tp_direct_groups(snapshot_store)
 
         # Retain short-lived terminal ids only to avoid repeatedly reopening a
         # marker while Decode is about to remove it.
@@ -3342,6 +3508,242 @@ class Scheduler(
             ):
                 if now - terminal_at >= 10.0:
                     self.agentic_early_direct_terminal.pop(snapshot_id, None)
+
+    def _agentic_progress_tp_direct_grants(self, snapshot_store) -> None:
+        """Start TP Direct shards from TP0's background mailbox grant.
+
+        This path intentionally uses no distributed collective and never
+        waits for a Prefill scheduler iteration.  TP0 publishes an exact
+        request-generation receipt in tmpfs; every rank independently starts
+        only that granted shard.  The existing per-rank mailbox statuses form
+        the completion barrier.
+        """
+
+        mailbox = getattr(self, "agentic_tp_direct_mailbox", None)
+        if mailbox is None:
+            return
+        poll_lock = getattr(self, "agentic_early_direct_poll_lock", nullcontext())
+        with poll_lock:
+            active = tuple(self.agentic_tp_direct_admission_active.items())
+        for snapshot_id, active_item in active:
+            request, arrived_at, prefill_domain, _ = active_item
+            receipt = mailbox.receipt(snapshot_id)
+            if receipt is None:
+                continue
+            receipt = int(receipt)
+            if receipt < 0:
+                # A peer can fail after this rank has already inserted and
+                # pinned its received pages in Radix.  The background worker
+                # must not return those pages to the transit pool while the
+                # branch still references them.  The next native TP control
+                # boundary applies one ordered rollback+drop on every rank.
+                self.agentic_tp_direct_local_failed.add(snapshot_id)
+                continue
+            if receipt >= 3:
+                entry = self.agentic_early_direct_receives.get(snapshot_id)
+                if entry is not None:
+                    entry.group_committed = True
+                continue
+            start_timeout = max(
+                0.1, envs.SGLANG_AGENTIC_KV_DIRECT_HANDSHAKE_TIMEOUT.get()
+            )
+            if (
+                self.tp_rank == 0
+                and time.time() - arrived_at >= start_timeout
+            ):
+                # A worker may have completed its last local DMA immediately
+                # before this timeout observation.  The rank files are the
+                # physical truth; never roll back a fully received group just
+                # because TP0 has not published the logical receipt yet.
+                group_status = mailbox.group_status(snapshot_id)
+                if group_status is not None and int(group_status) >= 3:
+                    continue
+                self._agentic_abort_tp_direct_grant(
+                    request,
+                    snapshot_store,
+                    reason="background_start_timeout",
+                )
+                # Whether the lifecycle was released, already CONSUMED, or
+                # temporarily unreadable, never start a new receiver from the
+                # same stale timeout observation.  A store error is retried
+                # from a fresh authoritative read on the next worker cycle.
+                continue
+            if (
+                snapshot_id in self.agentic_early_direct_receives
+                or snapshot_id in self.agentic_tp_direct_local_failed
+                or snapshot_id in self.agentic_tp_direct_local_admitted
+            ):
+                continue
+            self._agentic_tp_start_direct_shard(
+                request,
+                arrived_at=arrived_at,
+                prefill_domain=prefill_domain,
+            )
+
+    def _agentic_abort_tp_direct_grant(
+        self,
+        request: RequestGeneration,
+        snapshot_store,
+        *,
+        reason: str,
+    ) -> bool:
+        """Publish one TP-wide abort without involving the model scheduler.
+
+        Return ``False`` only when the authoritative lifecycle already says
+        the complete TP group was consumed; that state must never be rolled
+        back by a delayed timeout observation.
+        """
+
+        snapshot_id = request.snapshot_id
+        mailbox = self.agentic_tp_direct_mailbox
+        poll_lock = getattr(self, "agentic_early_direct_poll_lock", nullcontext())
+        with poll_lock:
+            active_item = self.agentic_tp_direct_admission_active.get(snapshot_id)
+        if active_item is None:
+            return False
+        try:
+            current = snapshot_store.load(request, require_ready=False)
+        except Exception:
+            logger.exception(
+                "AgenticKV could not reload background Direct grant snapshot=%s",
+                snapshot_id,
+            )
+            return False
+        if current is not None and current.state is SnapshotState.CONSUMED:
+            entry = self.agentic_early_direct_receives.get(snapshot_id)
+            if entry is not None:
+                entry.group_committed = True
+            mailbox.publish_receipt(snapshot_id, 3)
+            return False
+
+        expected_claim_id = (
+            "direct-early-tp:"
+            f"{os.getenv('SGLANG_AGENTIC_KV_ENGINE_ID', 'prefill')}:"
+            f"{snapshot_id}"
+        )
+        if (
+            current is not None
+            and current.state is SnapshotState.DIRECT_LOADING
+            and current.claim_id == expected_claim_id
+        ):
+            try:
+                snapshot_store.release_direct_claim(current, expected_claim_id)
+            except Exception:
+                logger.exception(
+                    "AgenticKV failed to release background Direct claim "
+                    "snapshot=%s claim=%s",
+                    snapshot_id,
+                    expected_claim_id,
+                )
+        self.agentic_tp_direct_local_failed.add(snapshot_id)
+        mailbox.publish_local_progress(snapshot_id, -1)
+        mailbox.publish_receipt(snapshot_id, -1)
+        logger.warning(
+            "AgenticKV tp_direct_background_abort snapshot=%s reason=%s "
+            "age_seconds=%.3f",
+            snapshot_id,
+            reason,
+            max(0.0, time.time() - active_item[1]),
+        )
+        return True
+
+    def _agentic_commit_tp_direct_groups(self, snapshot_store) -> None:
+        """Publish completed TP Direct groups without waiting for P compute.
+
+        Physical NIXL completion is rank-local.  Each background worker
+        reports READY through the exact generation mailbox; rank zero commits
+        the request-level lifecycle only after every shard is ready.  This is
+        metadata-only and wakes Router/P even when the model scheduler is idle.
+        Final Radix insertion remains scheduler-owned.
+        """
+
+        mailbox = getattr(self, "agentic_tp_direct_mailbox", None)
+        if mailbox is None:
+            return
+        poll_lock = getattr(self, "agentic_early_direct_poll_lock", nullcontext())
+        with poll_lock:
+            active = tuple(self.agentic_tp_direct_admission_active.items())
+            receives = dict(self.agentic_early_direct_receives)
+        for snapshot_id, active_item in active:
+            with poll_lock:
+                if snapshot_id not in self.agentic_tp_direct_admission_active:
+                    continue
+                entry = receives.get(snapshot_id)
+                if snapshot_id in getattr(
+                    self, "agentic_tp_direct_local_failed", ()
+                ):
+                    mailbox.publish_local_progress(snapshot_id, -1)
+                elif snapshot_id in getattr(
+                    self, "agentic_tp_direct_local_admitted", ()
+                ):
+                    mailbox.publish_local_progress(snapshot_id, 5)
+                elif entry is not None:
+                    mailbox.publish_local_progress(
+                        snapshot_id, 3 if entry.completed_at is not None else 2
+                    )
+        if self.tp_rank != 0:
+            return
+        for snapshot_id, active_item in active:
+            with poll_lock:
+                if snapshot_id not in self.agentic_tp_direct_admission_active:
+                    continue
+            entry = receives.get(snapshot_id)
+            group_status = mailbox.group_status(snapshot_id)
+            if group_status is None:
+                continue
+            group_status = int(group_status)
+            if group_status < 0:
+                receipt = mailbox.receipt(snapshot_id)
+                if receipt is not None and int(receipt) < 0:
+                    # The authoritative claim was already released and the
+                    # native scheduler only needs to consume this abort once.
+                    # Avoid repeating ledger I/O and warning logs every 5 ms
+                    # while a long Prefill forward delays that control tick.
+                    continue
+                Scheduler._agentic_abort_tp_direct_grant(
+                    self,
+                    active_item[0],
+                    snapshot_store,
+                    reason="rank_failure",
+                )
+                continue
+            if group_status >= 5:
+                with poll_lock:
+                    if snapshot_id in self.agentic_tp_direct_admission_active:
+                        mailbox.publish_receipt(snapshot_id, 5)
+                continue
+            if group_status >= 4:
+                with poll_lock:
+                    if snapshot_id in self.agentic_tp_direct_admission_active:
+                        mailbox.publish_receipt(snapshot_id, 4)
+                continue
+            if group_status < 3 or entry is None or entry.group_committed:
+                continue
+            completed = snapshot_store.complete_direct_group(
+                entry.manifest, entry.claim_id
+            )
+            if completed.state is not SnapshotState.CONSUMED:
+                continue
+            if entry.prefill_domain is not None and not entry.route_published:
+                self.agentic_early_claim_store.publish_route(
+                    entry.request,
+                    route="direct_complete",
+                    prefill_domain=entry.prefill_domain,
+                    snapshot_tokens=entry.manifest.token_count,
+                )
+                entry.route_published = True
+            entry.group_committed = True
+            with poll_lock:
+                if snapshot_id not in self.agentic_tp_direct_admission_active:
+                    continue
+                mailbox.publish_receipt(snapshot_id, 3)
+            logger.info(
+                "AgenticKV early_direct_group_complete snapshot=%s tokens=%d "
+                "arrival_to_group_ms=%.3f",
+                snapshot_id,
+                entry.manifest.token_count,
+                max(0.0, (time.time() - entry.arrived_at) * 1000.0),
+            )
 
     def _agentic_bind_early_direct_receive(
         self,
@@ -3368,22 +3770,36 @@ class Scheduler(
         marker_store = None
         if tp_size > 1:
             direct_actions = getattr(self, "_agentic_tp_direct_actions", {})
-            if direct_actions.get(request.snapshot_id) != "bind":
+            action = direct_actions.get(request.snapshot_id)
+            if action == "commit_bind":
+                if entry.prepared_req is not req:
+                    return True
+                entry.prepared_req = None
+                return self._agentic_admit_early_direct_bind(
+                    req,
+                    request,
+                    entry,
+                    tp_size=tp_size,
+                    marker_store=marker_store,
+                )
+            if action != "prepare_bind":
+                return True
+            if entry.prepared_req is req:
                 return True
 
         if entry.device_indices is None:
             credit_pool = getattr(self, "agentic_direct_credit_pool", None)
             if credit_pool is None or entry.credit_allocation is None:
                 raise RuntimeError("completed Direct receive lost its page credit")
-            # Keep a stable view of the received pages.  The reserve's page-id
-            # table may be replenished immediately after Radix takes ownership.
+            # Keep a stable view of the received reserve pages while Radix
+            # takes request-generation ownership.
             entry.device_indices = credit_pool.device_view(
                 entry.credit_allocation
             ).clone()
 
         # The independent ingress worker deliberately avoids launching GPU
         # diagnostics.  Run the opt-in exact byte digest here, on the
-        # scheduler thread, before reserve page ids can be replenished.
+        # scheduler thread, before the restored parent enters model work.
         direct_runtime = getattr(self, "agentic_direct_runtime", None)
         restored_digest = (
             None
@@ -3402,6 +3818,12 @@ class Scheduler(
             len(parent_tokens) != entry.manifest.token_count
             or token_ids_digest(parent_tokens) != entry.manifest.token_digest
         ):
+            if tp_size > 1:
+                return self._agentic_fail_tp_direct_bind(
+                    entry,
+                    req,
+                    reason="token_digest_mismatch",
+                )
             self._agentic_drop_early_direct_receive(
                 entry,
                 self._agentic_snapshot_store(),
@@ -3412,6 +3834,14 @@ class Scheduler(
             req._agentic_kv_fallback = "early_direct_token_digest_mismatch"
             return False
 
+        if tp_size > 1:
+            # Record ownership before the first Radix mutation so every
+            # exception path can remove the exact request-generation branch.
+            entry.prepared_req = req
+            req._agentic_direct_parent_token_count = len(parent_tokens)
+            if entry.credit_allocation is not None:
+                req._agentic_direct_credit_pool = self.agentic_direct_credit_pool
+                req._agentic_direct_credit_allocation = entry.credit_allocation
         try:
             result = self.tree_cache.insert(
                 InsertParams(
@@ -3424,6 +3854,12 @@ class Scheduler(
             logger.exception(
                 "Failed to bind early Direct KV for %s", req.rid
             )
+            if tp_size > 1:
+                return self._agentic_fail_tp_direct_bind(
+                    entry,
+                    req,
+                    reason="radix_insert_failed",
+                )
             self._agentic_drop_early_direct_receive(
                 entry,
                 self._agentic_snapshot_store(),
@@ -3437,27 +3873,38 @@ class Scheduler(
         # exact request-generation before returning to the queue.  Native
         # Prefill acquires its ordinary request lock first and only then drops
         # this temporary pin, so there is no evictable gap between ownerships.
-        parent_match = self.tree_cache.match_prefix(
-            MatchPrefixParams(
-                key=RadixKey(parent_tokens, req.extra_key),
-                req=req,
+        try:
+            parent_match = self.tree_cache.match_prefix(
+                MatchPrefixParams(
+                    key=RadixKey(parent_tokens, req.extra_key),
+                    req=req,
+                )
             )
-        )
-        if len(parent_match.device_indices) != len(parent_tokens):
-            raise RuntimeError(
-                "Early Direct parent disappeared before request protection"
+            if len(parent_match.device_indices) != len(parent_tokens):
+                raise RuntimeError(
+                    "Early Direct parent disappeared before request protection"
+                )
+            self.tree_cache.inc_lock_ref(parent_match.last_device_node)
+            req._agentic_direct_parent_pin_node = parent_match.last_device_node
+            req._agentic_direct_parent_token_count = len(parent_tokens)
+            return self._agentic_finalize_early_direct_bind(
+                req,
+                request,
+                entry,
+                existing_tokens=int(result.prefix_len),
+                tp_size=tp_size,
+                marker_store=marker_store,
+                admit=tp_size == 1,
             )
-        self.tree_cache.inc_lock_ref(parent_match.last_device_node)
-        req._agentic_direct_parent_pin_node = parent_match.last_device_node
-        req._agentic_direct_parent_token_count = len(parent_tokens)
-        return self._agentic_finalize_early_direct_bind(
-            req,
-            request,
-            entry,
-            existing_tokens=int(result.prefix_len),
-            tp_size=tp_size,
-            marker_store=marker_store,
-        )
+        except Exception:
+            if tp_size <= 1:
+                raise
+            logger.exception("Failed to prepare TP Direct bind for %s", req.rid)
+            return self._agentic_fail_tp_direct_bind(
+                entry,
+                req,
+                reason="radix_prepare_failed",
+            )
 
     def _agentic_finalize_early_direct_bind(
         self,
@@ -3468,6 +3915,7 @@ class Scheduler(
         existing_tokens: int,
         tp_size: int,
         marker_store,
+        admit: bool = True,
     ) -> bool:
         """Commit one prepared Direct shard after every TP rank is ready."""
 
@@ -3506,7 +3954,7 @@ class Scheduler(
                     )
         if entry.credit_allocation is not None and not promoted:
             # Near full occupancy there may be no ordinary page available to
-            # replenish the transit reserve.  Keep these pages reserve-owned
+            # replenish the transit reserve. Keep these pages reserve-owned
             # until the request's P->D handoff releases its Radix branch.
             self.agentic_direct_credit_pool.mark_bound(entry.credit_allocation)
             req._agentic_direct_credit_pool = self.agentic_direct_credit_pool
@@ -3524,6 +3972,17 @@ class Scheduler(
             credit_pool.free_tokens if credit_pool is not None else 0,
             req.rid,
         )
+        if not admit:
+            entry.prepared_req = req
+            self.agentic_tp_direct_mailbox.publish_local_progress(
+                request.snapshot_id, 4
+            )
+            logger.info(
+                "AgenticKV early_direct_bind_prepared snapshot=%s req=%s",
+                request.snapshot_id,
+                req.rid,
+            )
+            return True
         return self._agentic_admit_early_direct_bind(
             req,
             request,
@@ -3557,6 +4016,59 @@ class Scheduler(
             req.rid,
         )
         return False
+
+    def _agentic_rollback_prepared_direct_bind(
+        self, entry: AgenticEarlyDirectReceive
+    ) -> None:
+        """Remove one locally prepared TP Radix branch before group abort."""
+
+        req = entry.prepared_req
+        if req is None:
+            return
+        pin = getattr(req, "_agentic_direct_parent_pin_node", None)
+        if pin is not None:
+            self.tree_cache.dec_lock_ref(pin)
+            del req._agentic_direct_parent_pin_node
+        committed_len = int(
+            getattr(req, "_agentic_direct_parent_token_count", 0)
+        )
+        release = getattr(self.tree_cache, "release_agentic_request_cache", None)
+        if committed_len and release is not None:
+            release(
+                req,
+                committed_len=committed_len,
+                _defer_if_blocked=False,
+            )
+        entry.prepared_req = None
+
+    def _agentic_fail_tp_direct_bind(
+        self,
+        entry: AgenticEarlyDirectReceive,
+        req: Req,
+        *,
+        reason: str,
+    ) -> bool:
+        """Roll back a local prepare and force one TP-wide abort decision."""
+
+        try:
+            self._agentic_rollback_prepared_direct_bind(entry)
+        except Exception:
+            logger.exception(
+                "Failed to roll back TP Direct bind snapshot=%s req=%s",
+                entry.request.snapshot_id,
+                req.rid,
+            )
+        self.agentic_tp_direct_local_failed.add(entry.request.snapshot_id)
+        self.agentic_tp_direct_mailbox.publish_local_progress(
+            entry.request.snapshot_id, -1
+        )
+        logger.error(
+            "AgenticKV tp_direct_bind_failed snapshot=%s req=%s reason=%s",
+            entry.request.snapshot_id,
+            req.rid,
+            reason,
+        )
+        return True
 
     def _agentic_start_direct_load(
         self, req: Req, snapshot_store, manifest
@@ -4032,13 +4544,29 @@ class Scheduler(
                     self, "_agentic_tp_host_selected_snapshot", None
                 )
                 host_action = getattr(self, "_agentic_tp_host_action", None)
+                allow_prepare_io = bool(
+                    allow_start_io
+                    and selected_host == metadata.parent.snapshot_id
+                    and host_action in {"prepare", "start", "bind", "commit"}
+                )
                 allow_start_io = bool(
                     allow_start_io
                     and selected_host == metadata.parent.snapshot_id
-                    and host_action in {"load", "commit"}
+                    and host_action in {"start", "bind", "commit"}
                 )
+                allow_bind_io = bool(
+                    selected_host == metadata.parent.snapshot_id
+                    and host_action in {"bind", "commit"}
+                )
+            else:
+                allow_prepare_io = allow_start_io
+                allow_bind_io = True
             host_gate = host_staging.gate_request(
-                req, metadata.parent, allow_start=allow_start_io
+                req,
+                metadata.parent,
+                allow_prepare=allow_prepare_io,
+                allow_start=allow_start_io,
+                allow_bind=allow_bind_io,
             )
             if host_gate is not None:
                 req._agentic_kv_queue_class = "slow"
@@ -4094,7 +4622,7 @@ class Scheduler(
             and not getattr(req, "_agentic_direct_disabled", False)
         ):
             req._agentic_kv_queue_class = "fast"
-            if self.tp_size > 1:
+            if getattr(self, "tp_size", 1) > 1:
                 # TP Direct admission is exclusively driven by rank 0's
                 # inotify FIFO and native broadcast command.  Never let an
                 # individual rank enter the legacy request-owned receiver.
@@ -4362,12 +4890,7 @@ class Scheduler(
     _AGENTIC_TP_CONTROL_KEY = "__sglang_agentic_tp_admission_v1__"
 
     def _agentic_tp_reduce_direct_status(self) -> None:
-        """Reduce leader-issued Direct commands to group completion states.
-
-        The vector order comes from the native TP broadcast, so every rank
-        enters one collective with identical snapshot ordering.  Followers
-        report physical progress; only TP0 advances lifecycle phases.
-        """
+        """Report local Direct progress; TP0 derives logical completion."""
 
         if not getattr(self, "agentic_tp_direct_command_visible", False):
             return
@@ -4378,12 +4901,12 @@ class Scheduler(
         if not visible_order:
             self.agentic_tp_direct_command_visible = False
             return
-        local_statuses = []
+        mailbox = self.agentic_tp_direct_mailbox
         for snapshot_id in visible_order:
             item = active.get(snapshot_id)
             local_status = 0
             if item is None:
-                local_statuses.append(-1)
+                mailbox.publish_local_progress(snapshot_id, -1)
                 continue
             request = item[0]
             if request.snapshot_id in getattr(
@@ -4393,63 +4916,89 @@ class Scheduler(
             if request.snapshot_id in getattr(
                 self, "agentic_tp_direct_local_admitted", ()
             ) and local_status >= 0:
-                local_status = 3
+                local_status = 5
             entry = getattr(self, "agentic_early_direct_receives", {}).get(
                 request.snapshot_id
             )
-            if entry is not None and 0 <= local_status < 3:
-                local_status = 1
+            if entry is not None and 0 <= local_status < 5:
+                local_status = 2
                 if entry.completed_at is not None:
-                    local_status = 2
+                    local_status = 3
+                if entry.prepared_req is not None:
+                    local_status = 4
             for req, _ in getattr(self, "agentic_kv_waiting_queue", ()):
                 metadata = AgenticRequestMetadata.from_req(req)
                 parent = metadata.parent if metadata is not None else None
                 if parent == request and getattr(
                     req, "_agentic_kv_gate_complete", False
                 ):
-                    local_status = 3
+                    local_status = 5
                     break
-            local_statuses.append(local_status)
-        status = torch.tensor(local_statuses, dtype=torch.int32)
-        torch.distributed.all_reduce(
-            status, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group
-        )
-        self.agentic_tp_direct_group_status = {
-            snapshot_id: int(value)
-            for snapshot_id, value in zip(visible_order, status.tolist())
-        }
+            mailbox.publish_local_progress(snapshot_id, local_status)
+        if self.tp_rank == 0:
+            self.agentic_tp_direct_group_status = {
+                snapshot_id: int(status)
+                for snapshot_id in visible_order
+                if (status := mailbox.group_status(snapshot_id)) is not None
+            }
 
     def _agentic_tp_reduce_host_status(self) -> None:
-        """Reduce execution progress for TP0's selected slow-path restore."""
+        """Report one rank's slow restore; TP0 reads the complete shard set."""
 
         if not getattr(self, "agentic_tp_host_command_visible", False):
             return
         active = getattr(self, "agentic_tp_host_active", None)
+        snapshot_id = (
+            active.snapshot_id
+            if active is not None
+            else getattr(self, "_agentic_tp_host_selected_snapshot", None)
+        )
+        if snapshot_id is None:
+            return
         local_status = 0
         if active is not None:
             request = active
             if request.snapshot_id in getattr(
                 self, "agentic_tp_host_local_admitted", ()
             ):
-                local_status = 3
+                local_status = 4
             for req, _ in getattr(self, "agentic_kv_waiting_queue", ()):
                 metadata = AgenticRequestMetadata.from_req(req)
                 parent = metadata.parent if metadata is not None else None
                 if parent != request:
                     continue
                 if getattr(req, "_agentic_host_rank_loaded", False):
-                    local_status = max(local_status, 2)
+                    local_status = max(local_status, 3)
                 host_staging = getattr(self, "agentic_host_staging_manager", None)
                 if host_staging is not None and req.rid in host_staging.loads:
-                    local_status = max(local_status, 1)
+                    load = host_staging.loads[req.rid]
+                    local_status = max(
+                        local_status,
+                        2 if load.get("io_complete") else 1,
+                    )
                 if getattr(req, "_agentic_kv_gate_complete", False):
                     local_status = 3
                 break
-        status = torch.tensor([local_status], dtype=torch.int32)
-        torch.distributed.all_reduce(
-            status, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group
-        )
-        self.agentic_tp_host_group_status = int(status.item())
+        mailbox = self.agentic_tp_host_mailbox
+        mailbox.publish_local(snapshot_id, local_status)
+        if self.tp_rank == 0:
+            status = mailbox.group_status(snapshot_id)
+            if status is not None:
+                self.agentic_tp_host_group_status = int(status)
+
+    @staticmethod
+    def _agentic_tp_host_next_action(group_status: int) -> str:
+        """Map the all-rank minimum status to one group-owned transition."""
+
+        if int(group_status) >= 4:
+            return "clear"
+        if int(group_status) >= 3:
+            return "commit"
+        if int(group_status) >= 2:
+            return "bind"
+        if int(group_status) >= 1:
+            return "start"
+        return "prepare"
 
     def _agentic_tp_prepare_admission_control(self):
         """Build TP0's admission command for the native request broadcast."""
@@ -4484,6 +5033,19 @@ class Scheduler(
                     (str(entry.req.rid), int(entry.req.bootstrap_room))
                     for entry in transfer_queue.queue
                 ]
+            decode_transfer_statuses = []
+            receiver_mailbox = self.agentic_tp_p2d_receiver_mailbox
+            for rid, room in decode_transfer_keys:
+                key = request_generation_key(rid, room)
+                status = receiver_mailbox.group_status(key)
+                logical_status = (
+                    int(KVPoll.Transferring)
+                    if status is None
+                    else int(status)
+                )
+                decode_transfer_statuses.append(logical_status)
+                if logical_status in (int(KVPoll.Success), int(KVPoll.Failed)):
+                    receiver_mailbox.publish_receipt(key, logical_status)
             decode_transfer_rid = (
                 None if not decode_transfer_keys else decode_transfer_keys[0][0]
             )
@@ -4531,6 +5093,18 @@ class Scheduler(
                         )
                     ):
                         continue
+                    admission_mailbox = getattr(
+                        self, "agentic_tp_p2d_admission_mailbox", None
+                    )
+                    if admission_mailbox is not None:
+                        key = request_generation_key(
+                            decode_req.req.rid,
+                            decode_req.req.bootstrap_room,
+                        )
+                        if admission_mailbox.group_status(key) != int(
+                            KVPoll.Success
+                        ):
+                            continue
                     decode_admit_keys.append(
                         (
                             str(decode_req.req.rid),
@@ -4544,6 +5118,7 @@ class Scheduler(
                 ),
                 "decode_admit_keys": decode_admit_keys,
                 "decode_transfer_keys": decode_transfer_keys,
+                "decode_transfer_statuses": decode_transfer_statuses,
                 "decode_transfer_rid": decode_transfer_rid,
                 "decode_transfer_room": decode_transfer_room,
                 "decode_agentic_commands": (
@@ -4558,45 +5133,36 @@ class Scheduler(
         if self.disaggregation_mode is not DisaggregationMode.PREFILL:
             return None
         active_direct = getattr(self, "agentic_tp_direct_admission_active", {})
-        group_status = getattr(self, "agentic_tp_direct_group_status", {})
         direct_commands = []
-        store = self._agentic_snapshot_store()
+        direct_mailbox = getattr(self, "agentic_tp_direct_mailbox", None)
         for snapshot_id, active in tuple(active_direct.items()):
             direct_request, direct_arrived_at, direct_domain, _ = active
-            status = int(group_status.get(snapshot_id, 0))
-            direct_action = "start"
-            if status < 0:
-                # A physical shard failed.  Only TP0 rolls the logical claim
-                # back; the abort command clears rank-local transport state.
-                current = store.load(direct_request, require_ready=False)
-                if (
-                    current is not None
-                    and current.state is SnapshotState.DIRECT_LOADING
-                    and current.claim_id
-                ):
-                    store.release_direct_claim(current, current.claim_id)
+            receipt = (
+                None
+                if direct_mailbox is None
+                else direct_mailbox.receipt(snapshot_id)
+            )
+            entry = self.agentic_early_direct_receives.get(snapshot_id)
+            if receipt is not None and int(receipt) < 0:
                 direct_action = "abort"
-            elif status >= 3:
+            elif receipt is not None and int(receipt) >= 5:
                 direct_action = "clear"
-            elif status >= 2:
-                entry = self.agentic_early_direct_receives.get(snapshot_id)
-                if entry is not None:
-                    completed = store.complete_direct_group(
-                        entry.manifest, entry.claim_id
-                    )
-                    if completed.state is SnapshotState.CONSUMED:
-                        if (
-                            entry.prefill_domain is not None
-                            and not entry.route_published
-                        ):
-                            self.agentic_early_claim_store.publish_route(
-                                entry.request,
-                                route="direct_complete",
-                                prefill_domain=entry.prefill_domain,
-                                snapshot_tokens=entry.manifest.token_count,
-                            )
-                            entry.route_published = True
-                        direct_action = "bind"
+            elif (
+                receipt is not None
+                and int(receipt) >= 4
+                and entry is not None
+                and entry.prepared_req is not None
+            ):
+                direct_action = "commit_bind"
+            elif (
+                receipt is not None
+                and int(receipt) >= 3
+                and entry is not None
+                and entry.group_committed
+            ):
+                direct_action = "prepare_bind"
+            else:
+                direct_action = "poll"
             direct_commands.append(
                 {
                     "snapshot": snapshot_id,
@@ -4605,6 +5171,7 @@ class Scheduler(
                     "action": direct_action,
                     "arrived_at": direct_arrived_at,
                     "domain": direct_domain,
+                    "required_tokens": int(active[3]),
                 }
             )
         prefill_transfer_keys = []
@@ -4619,6 +5186,74 @@ class Scheduler(
                 (str(req.rid), int(req.bootstrap_room))
                 for req in prefill_inflight
             ]
+        prefill_transfer_statuses = []
+        prefill_submit_keys = []
+        submit_limit = max(
+            1, int(os.getenv("SGLANG_PREFILL_TRANSFER_TP_SUBMIT_BATCH", "24"))
+        )
+        sender_mailbox = self.agentic_tp_p2d_sender_mailbox
+        receiver_mailbox = self.agentic_tp_p2d_receiver_mailbox
+        p2d_host = getattr(self, "agentic_p2d_host_staging_manager", None)
+        for index, (rid, room) in enumerate(prefill_transfer_keys):
+            req = prefill_inflight[index]
+            key = request_generation_key(rid, room)
+            sender_status = sender_mailbox.group_status(key)
+            # Every TP rank has prepared an immutable local sender payload.
+            # Only now may TP0 expose one logical P-ready marker to Router/D.
+            # This ordering prevents a transient rank-local preparation delay
+            # from permanently splitting the TP group.
+            if (
+                sender_status is not None
+                and not getattr(req, "disagg_p_ready_notified", False)
+            ):
+                self._publish_deferred_prefill_ready(req)
+            host_path = bool(
+                getattr(req, "_agentic_p2d_host_snapshot_id", None)
+                or (p2d_host is not None and p2d_host.group_claimed(req))
+            )
+            receipt_status = receiver_mailbox.receipt(key)
+            if index == 0:
+                head_state = (
+                    key,
+                    sender_status,
+                    receipt_status,
+                    bool(getattr(req, "disagg_p_ready_transfer_started", False)),
+                    host_path,
+                )
+                if head_state != getattr(
+                    self, "_agentic_tp_debug_prefill_head_state", None
+                ):
+                    logger.info(
+                        "AgenticKV tp_p2d_prefill_head key=%s sender=%s "
+                        "receipt=%s started=%s host=%s",
+                        *head_state,
+                    )
+                    self._agentic_tp_debug_prefill_head_state = head_state
+            if sender_status == int(KVPoll.Failed):
+                logical_status = int(KVPoll.Failed)
+            elif req.bootstrap_host == FAKE_BOOTSTRAP_HOST or host_path:
+                # A complete Host snapshot is already an authoritative copy;
+                # P may release before D finishes its later H2D restore.
+                logical_status = (
+                    int(KVPoll.Transferring)
+                    if sender_status is None
+                    else int(sender_status)
+                )
+            else:
+                # Native Direct success is destination-authored.  A stale
+                # sender handle can never pin P once all D shards have ACKed.
+                logical_status = (
+                    int(KVPoll.Transferring)
+                    if receipt_status is None
+                    else int(receipt_status)
+                )
+                if (
+                    len(prefill_submit_keys) < submit_limit
+                    and sender_status == int(KVPoll.WaitingForInput)
+                    and not getattr(req, "disagg_p_ready_transfer_started", False)
+                ):
+                    prefill_submit_keys.append((rid, room))
+            prefill_transfer_statuses.append(logical_status)
         prefill_transfer_rid = (
             None if not prefill_transfer_keys else prefill_transfer_keys[0][0]
         )
@@ -4637,6 +5272,17 @@ class Scheduler(
                 0 if prefill_inflight is None else len(prefill_inflight),
             )
             self._agentic_tp_debug_prefill_transfer_rid = prefill_transfer_rid
+        previous_submit_keys = getattr(
+            self, "_agentic_tp_debug_prefill_submit_keys", None
+        )
+        if prefill_submit_keys != previous_submit_keys:
+            logger.info(
+                "AgenticKV tp_p2d_prefill_submit_select old=%s new=%s statuses=%s",
+                previous_submit_keys,
+                prefill_submit_keys,
+                prefill_transfer_statuses,
+            )
+            self._agentic_tp_debug_prefill_submit_keys = list(prefill_submit_keys)
         host_snapshot = None
         host_request = None
         host_action = None
@@ -4653,23 +5299,24 @@ class Scheduler(
                     if parent is not None and host_staging.snapshot_ready(parent):
                         host_request = parent
                         self.agentic_tp_host_active = parent
+                        self.agentic_tp_host_active_since = time.monotonic()
                         break
             if host_request is not None:
                 host_snapshot = host_request.snapshot_id
                 host_status = int(
                     getattr(self, "agentic_tp_host_group_status", 0)
                 )
-                if host_status >= 3:
+                host_action = self._agentic_tp_host_next_action(host_status)
+                if host_action == "clear":
                     self.agentic_tp_host_active = None
-                    host_action = "clear"
-                elif host_status >= 2:
+                    self.agentic_tp_host_active_since = 0.0
+                elif host_action == "commit":
                     # Every rank has restored its physical shard. TP0 alone
                     # closes the logical slow-path manifest before the group
                     # admission command is broadcast.
                     host_staging._complete_shared_host_manifest(host_request)
-                    host_action = "commit"
-                else:
-                    host_action = "load"
+                # PREPARE is a true TP barrier: START is emitted only after the
+                # all-rank minimum reaches prepared (status 1).
             elif getattr(self, "agentic_tp_host_command_visible", False):
                 host_action = "clear"
             # Timeout is also a TP admission decision.  Rank 0 chooses one
@@ -4710,6 +5357,8 @@ class Scheduler(
                 None if not direct_commands else direct_commands[0]["action"]
             ),
             "prefill_transfer_keys": prefill_transfer_keys,
+            "prefill_transfer_statuses": prefill_transfer_statuses,
+            "prefill_submit_keys": prefill_submit_keys,
             "prefill_transfer_rid": prefill_transfer_rid,
             "prefill_transfer_room": prefill_transfer_room,
             "host_snapshot": host_snapshot,
@@ -4773,6 +5422,13 @@ class Scheduler(
             self._agentic_tp_decode_transfer_keys = [
                 (str(rid), int(room)) for rid, room in transfer_keys
             ]
+            self._agentic_tp_decode_transfer_group_status = {
+                (str(rid), int(room)): int(status)
+                for (rid, room), status in zip(
+                    self._agentic_tp_decode_transfer_keys,
+                    control.get("decode_transfer_statuses", ()),
+                )
+            }
             return ordinary
         direct_commands = control.get("direct_commands")
         if direct_commands is None:
@@ -4795,29 +5451,45 @@ class Scheduler(
         visible_order = []
         active_direct = self.agentic_tp_direct_admission_active
         group_status = self.agentic_tp_direct_group_status
+        direct_poll_lock = getattr(
+            self, "agentic_early_direct_poll_lock", nullcontext()
+        )
         for command in direct_commands:
             snapshot_id = str(command["snapshot"])
             direct_action = command.get("action")
             if direct_action in {"clear", "abort"}:
                 if direct_action == "abort":
-                    entry = self.agentic_early_direct_receives.get(snapshot_id)
+                    with direct_poll_lock:
+                        entry = self.agentic_early_direct_receives.get(snapshot_id)
                     if entry is not None:
+                        self._agentic_rollback_prepared_direct_bind(entry)
                         self._agentic_drop_early_direct_receive(
                             entry,
                             self._agentic_snapshot_store(),
                             release_claim=False,
                             reason="tp_group_abort",
                         )
-                self.agentic_tp_direct_local_admitted.discard(snapshot_id)
-                self.agentic_tp_direct_local_failed.discard(snapshot_id)
-                active_direct.pop(snapshot_id, None)
-                group_status.pop(snapshot_id, None)
+                with direct_poll_lock:
+                    self.agentic_tp_direct_local_admitted.discard(snapshot_id)
+                    self.agentic_tp_direct_local_failed.discard(snapshot_id)
+                    active_direct.pop(snapshot_id, None)
+                    group_status.pop(snapshot_id, None)
+                    mailbox = getattr(self, "agentic_tp_direct_mailbox", None)
+                    if mailbox is not None:
+                        mailbox.clear_local(snapshot_id)
+                        if self.tp_rank == 0:
+                            mailbox.clear_group(snapshot_id)
                 continue
             request = RequestGeneration(
                 str(command["request_id"]), int(command["generation"])
             )
             current = active_direct.get(snapshot_id)
-            required_tokens = 0 if current is None else int(current[3])
+            required_tokens = int(
+                command.get(
+                    "required_tokens",
+                    0 if current is None else int(current[3]),
+                )
+            )
             active_direct[snapshot_id] = (
                 request,
                 float(command.get("arrived_at", 0.0)),
@@ -4826,12 +5498,6 @@ class Scheduler(
             )
             visible_order.append(snapshot_id)
             direct_actions[snapshot_id] = direct_action
-            if direct_action == "start":
-                self._agentic_tp_start_direct_shard(
-                    request,
-                    arrived_at=float(command.get("arrived_at", 0.0)),
-                    prefill_domain=command.get("domain"),
-                )
         self.agentic_tp_direct_visible_order = visible_order
         self.agentic_tp_direct_command_visible = bool(visible_order)
         self._agentic_tp_selected_snapshots = set(visible_order)
@@ -4856,12 +5522,35 @@ class Scheduler(
         self._agentic_tp_prefill_transfer_keys = [
             (str(rid), int(room)) for rid, room in prefill_transfer_keys
         ]
+        self._agentic_tp_prefill_transfer_group_status = {
+            (str(rid), int(room)): int(status)
+            for (rid, room), status in zip(
+                self._agentic_tp_prefill_transfer_keys,
+                control.get("prefill_transfer_statuses", ()),
+            )
+        }
+        submit_keys = control.get("prefill_submit_keys")
+        if submit_keys is None:
+            submit_key = control.get("prefill_submit_key")
+            submit_keys = [] if submit_key is None else [submit_key]
+        self._agentic_tp_prefill_submit_keys = [
+            (str(rid), int(room)) for rid, room in submit_keys
+        ]
         host_snapshot = control.get("host_snapshot")
         host_action = control.get("host_action")
         if host_action == "clear":
             if host_snapshot is not None:
                 self.agentic_tp_host_local_admitted.discard(str(host_snapshot))
+                mailbox = getattr(self, "agentic_tp_host_mailbox", None)
+                if mailbox is not None:
+                    # Each rank removes its own report. TP0 additionally clears
+                    # the logical receipt after the native broadcast made the
+                    # CLEAR command visible to the complete group.
+                    mailbox.clear_local(str(host_snapshot))
+                    if self.tp_rank == 0:
+                        mailbox.clear_group(str(host_snapshot))
             self.agentic_tp_host_active = None
+            self.agentic_tp_host_active_since = 0.0
             self.agentic_tp_host_command_visible = False
             self.agentic_tp_host_group_status = 0
         elif host_snapshot is not None:
@@ -4869,6 +5558,8 @@ class Scheduler(
                 str(control["host_request_id"]),
                 int(control["host_generation"]),
             )
+            if not getattr(self, "agentic_tp_host_active_since", 0.0):
+                self.agentic_tp_host_active_since = time.monotonic()
             self.agentic_tp_host_command_visible = True
         self._agentic_tp_host_selected_snapshot = (
             None
@@ -4901,6 +5592,10 @@ class Scheduler(
     ) -> bool:
         """Execute TP0's Direct-start command for this rank's KV-head shard."""
 
+        if request.snapshot_id in getattr(
+            self, "agentic_tp_direct_local_admitted", ()
+        ):
+            return True
         receives = getattr(self, "agentic_early_direct_receives", {})
         if request.snapshot_id in receives:
             return True
@@ -4941,14 +5636,13 @@ class Scheduler(
         return bool(started)
 
     def _drain_agentic_kv_waiting_queue(self) -> None:
-        """Progress active KV I/O and admit bounded fast/slow work.
+        """Progress active KV I/O and admit pending work in arrival order.
 
         A request in this queue owns metadata only.  Each scheduler iteration
-        first polls already-started transfers, then examines fast requests,
-        then slow requests.  A small admission batch amortizes scheduler ticks
-        that contain long Prefill kernels; each member is still selected and
-        allocated independently.  Unready fast requests never block ready
-        slow requests or ordinary Prefill compute.
+        first polls already-started transfers. New Direct, Slow, and initial
+        requests then share one arrival-ordered compute-admission queue; their
+        I/O engines and credits remain independent. A small admission batch
+        amortizes scheduler ticks that contain long Prefill kernels.
         """
         # This sweep is intentionally outside admission_batch.  Admission
         # limits Prefill compute; it must not make the Direct transit reserve
@@ -4962,7 +5656,7 @@ class Scheduler(
                 for snapshot_id, action in getattr(
                     self, "_agentic_tp_direct_actions", {}
                 ).items()
-                if action == "bind"
+                if action in {"prepare_bind", "commit_bind"}
             ]
             if getattr(self, "tp_size", 1) > 1
             else []
@@ -4971,7 +5665,8 @@ class Scheduler(
             getattr(self, "tp_size", 1) > 1
             and not tp_bind_snapshots
             and getattr(self, "_agentic_tp_selected_snapshot", None) is not None
-            and getattr(self, "_agentic_tp_direct_action", "bind") == "bind"
+            and getattr(self, "_agentic_tp_direct_action", "prepare_bind")
+            in {"prepare_bind", "commit_bind"}
         ):
             tp_bind_snapshots = [self._agentic_tp_selected_snapshot]
         tp_host_timeout_snapshot = (
@@ -5025,26 +5720,22 @@ class Scheduler(
             else:
                 fast.append(entry)
 
-        # Rotate the inactive queues on every pass.  This prevents a group of
-        # not-yet-published fast markers from hiding a runnable request beyond
-        # the scan window.
-        # Keep the data-path contract strict: a returned fast-tool request is
-        # always considered before Host/Mooncake recovery, and recovery is
-        # considered before a new request.  We still include every class in
-        # the bounded scan, so an unready fast request cannot make P idle.
-        forced_tp_snapshots = tp_bind_snapshots
-        forced_tp_snapshot = (
-            # Direct remains ahead of an unstarted slow recovery.  Once one
-            # TP rank has launched Host H2D, however, that group transaction
-            # must finish before a newer Direct bind can overtake it.  Leaving
-            # one rank inside H2D while its peer repeatedly admits Direct work
-            # eventually makes their model-forward collectives diverge.
-            (None if tp_bind_snapshots else tp_host_commit_snapshot)
-            or tp_host_snapshot
-            or tp_host_timeout_snapshot
-        )
-        if not forced_tp_snapshots and forced_tp_snapshot is not None:
-            forced_tp_snapshots = [forced_tp_snapshot]
+        # I/O ownership is independent, but Prefill admission is ordinary FIFO
+        # across request classes. Already-active I/O remains first so a ready
+        # Slow load can bind and immediately enter incremental Prefill.
+        # Direct and Slow have independent I/O engines and neither class may
+        # starve the other. Carry every exact TP group command visible on this
+        # scheduler boundary; ordinary FIFO admission resumes after these
+        # ownership transitions. The exact-snapshot filter still guarantees
+        # that both ranks mutate the same request generations.
+        forced_tp_snapshots = list(tp_bind_snapshots)
+        for snapshot_id in (
+            tp_host_commit_snapshot,
+            tp_host_snapshot,
+            tp_host_timeout_snapshot,
+        ):
+            if snapshot_id is not None and snapshot_id not in forced_tp_snapshots:
+                forced_tp_snapshots.append(snapshot_id)
         if forced_tp_snapshots:
             # The two TP ranks can receive tokenized HTTP requests in a
             # different order.  While one group bind is active, both queues
@@ -5074,17 +5765,12 @@ class Scheduler(
                 for snapshot_id in forced_tp_snapshots
             ]
         else:
+            inactive = sorted(fast + slow + new, key=lambda entry: entry[1])
             selected = (
                 active
-                + fast[:scan_limit]
-                + slow[:scan_limit]
-                + new[:scan_limit]
+                + inactive[:scan_limit]
             )
-            untouched = (
-                fast[scan_limit:]
-                + slow[scan_limit:]
-                + new[scan_limit:]
-            )
+            untouched = inactive[scan_limit:]
         still_waiting = []
         new_io_started = 0
         newly_admitted = 0
@@ -6018,9 +6704,12 @@ class Scheduler(
             # tokens sent through the model.  This is deliberately conservative
             # when two requests share a prefix; V1 values smooth bounded
             # admission over squeezing the final few cache pages from a batch.
+            p_ready_is_new = (
+                getattr(req, "_agentic_kv_queue_class", "new") == "new"
+            )
             p_ready_protected_tokens = (
                 -(-len(req.fill_ids) // self.page_size) * self.page_size
-                if p_ready_credit is not None
+                if p_ready_credit is not None and p_ready_is_new
                 else 0
             )
             if (

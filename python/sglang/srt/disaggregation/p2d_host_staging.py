@@ -230,8 +230,21 @@ class AgenticPToDHostStagingManager:
         if claimed is None:
             return False
         try:
+            # ``source_indices`` is cloned by the scheduler on its current
+            # CUDA stream.  The D2H worker uses a private stream, so retaining
+            # the tensor alone is not a visibility dependency: under load the
+            # gather could race the clone (and the preceding Prefill writes).
+            # Record, but do not synchronize, at the scheduler boundary.  The
+            # worker inserts the corresponding stream wait before touching KV.
+            source_ready_event = None
+            if torch.is_tensor(source_indices) and source_indices.is_cuda:
+                source_ready_event = torch.cuda.Event()
+                source_ready_event.record(
+                    torch.cuda.current_stream(device=source_indices.device)
+                )
             record = {
                 "source_indices": source_indices,
+                "source_ready_event": source_ready_event,
                 "token_count": token_count,
                 "byte_size": byte_size,
                 "prefill_metadata": _prefill_metadata(req),
@@ -283,12 +296,12 @@ class AgenticPToDHostStagingManager:
         if result == int(KVPoll.Success):
             return result
         if result == int(KVPoll.Failed):
-            # The Router observes FAILED and resumes the normal direct path.
-            # Keep the already-computed P snapshot alive for that retry.
-            with self._lock:
-                self._results.pop(snapshot_id, None)
-            delattr(req, "_agentic_p2d_host_snapshot_id")
-            return None
+            # Host ownership is exclusive once any TP rank claims the offer.
+            # Reusing the already-prepared native sender after a Host failure
+            # can resurrect stale NIXL metadata and split one logical request
+            # across transfer modes.  Fail this generation closed; the caller
+            # may retry it as a fresh request-generation.
+            return result
         return int(KVPoll.Transferring) if active else None
 
     def mark_scheduler_consumed(self, req) -> None:
@@ -348,6 +361,9 @@ class AgenticPToDHostStagingManager:
                     raise RuntimeError("P->D grant publication was rejected")
                 snapshot = record["snapshot"].materialize()
                 source_indices = record["source_indices"]
+                source_ready_event = record.get("source_ready_event")
+                if source_ready_event is not None:
+                    self._stream.wait_event(source_ready_event)
                 token_count = int(record["token_count"])
                 for start in range(0, token_count, self.chunk_tokens):
                     end = min(start + self.chunk_tokens, token_count)
@@ -411,6 +427,7 @@ class AgenticPToDHostStagingManager:
                 logger.exception("P->D Host D2H failed for %s", snapshot_id)
             finally:
                 record["source_indices"] = None
+                record["source_ready_event"] = None
             self._cleanup_consumed()
 
     def _cleanup_consumed(self) -> None:

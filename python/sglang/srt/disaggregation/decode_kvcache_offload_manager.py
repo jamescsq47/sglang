@@ -7,7 +7,7 @@ import os
 import queue
 import threading
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -183,16 +183,27 @@ class DecodeKVCacheOffloadManager:
         self.agentic_direct_runtime = None
         self.agentic_relay_runtime = None
         self.agentic_direct_candidates = {}
+        # TP0's native scheduler broadcast can arrive a few microseconds before
+        # a follower has published the matching rank-local candidate.  Keep the
+        # latest command by request-generation instead of dropping that edge;
+        # candidate publication below consumes it immediately.  This remains a
+        # metadata-only handoff and adds no collective or transport polling.
+        self._agentic_tp_pending_candidate_commands = {}
         # Transport, preallocation control, and agentic lifecycle progress have
         # independent workers. A slow ledger/Host operation must never stop
         # the P->D receiver that feeds Decode. Scheduler-owned allocator,
         # Radix, and running-batch mutations still arrive as small commit
         # events and remain on the scheduler thread.
-        self._decode_io_async_enabled = (
+        self._decode_transport_async_enabled = (
             self.agentic_enabled
-            and self.tp_world_size == 1
             and os.getenv("SGLANG_DECODE_IO_ASYNC_PROGRESS", "1").lower()
             in {"1", "true", "yes", "on"}
+        )
+        # TP1 keeps the proven fully asynchronous lifecycle.  TP>1 moves only
+        # P->D handshake/polling off the scheduler; D->P path selection and
+        # allocator mutation remain rank0-broadcast scheduler commands.
+        self._decode_io_async_enabled = (
+            self._decode_transport_async_enabled and self.tp_world_size == 1
         )
         self._decode_io_events: queue.SimpleQueue = queue.SimpleQueue()
         self._decode_io_stop = threading.Event()
@@ -486,7 +497,12 @@ class DecodeKVCacheOffloadManager:
         scheduler thread and arrive through ``_decode_io_events``.
         """
 
-        if not self._decode_io_async_enabled or self._decode_io_threads:
+        transport_async = getattr(
+            self,
+            "_decode_transport_async_enabled",
+            getattr(self, "_decode_io_async_enabled", False),
+        )
+        if not transport_async or self._decode_io_threads:
             return
         self._decode_prealloc_queue = prealloc_queue
         self._decode_transfer_queue = transfer_queue
@@ -495,8 +511,9 @@ class DecodeKVCacheOffloadManager:
         steps = {
             "transfer": self._decode_transfer_progress,
             "prealloc": prealloc_queue.background_progress,
-            "agentic": self._decode_agentic_progress,
         }
+        if getattr(self, "tp_world_size", 1) == 1:
+            steps["agentic"] = self._decode_agentic_progress
         if (
             self.agentic_relay_worker is not None
             and getattr(self, "_agentic_relay_progress_isolated", False)
@@ -513,11 +530,12 @@ class DecodeKVCacheOffloadManager:
             thread.start()
         logger.info(
             "Decode I/O async progress enabled transfer_ms=%.3f "
-            "prealloc_ms=%.3f agentic_ms=%.3f relay_isolated=%s tp=1",
+            "prealloc_ms=%.3f agentic_ms=%.3f relay_isolated=%s tp=%d",
             self._decode_io_intervals["transfer"] * 1000.0,
             self._decode_io_intervals["prealloc"] * 1000.0,
             self._decode_io_intervals["agentic"] * 1000.0,
             "relay" in steps,
+            getattr(self, "tp_world_size", 1),
         )
 
     def _decode_transfer_progress(self) -> None:
@@ -667,8 +685,47 @@ class DecodeKVCacheOffloadManager:
             command = {"snapshot_id": str(snapshot_id), "action": action}
             if action == "slow" and manifest is not None:
                 command["manifest"] = manifest.to_bytes()
+                command["prefill_domain"] = int(
+                    candidate.get(
+                        "selected_prefill_domain",
+                        self.agentic_host_staging_client.arena_domain,
+                    )
+                )
+                command["arena_numa_nodes"] = list(
+                    candidate.get(
+                        "selected_arena_numa_nodes",
+                        self._prefill_domain_numa_nodes(
+                            int(command["prefill_domain"])
+                        ),
+                    )
+                )
             commands.append(command)
         return commands
+
+    def _apply_tp_candidate_command(self, command) -> bool:
+        """Apply one TP0 command, or retain it until the local shard exists."""
+
+        snapshot_id = str(command["snapshot_id"])
+        candidate = self.agentic_direct_candidates.get(snapshot_id)
+        if candidate is None:
+            pending = getattr(self, "_agentic_tp_pending_candidate_commands", None)
+            if pending is None:
+                pending = self._agentic_tp_pending_candidate_commands = {}
+            pending[snapshot_id] = dict(command)
+            return False
+        candidate["tp_command"] = str(command["action"])
+        if command.get("prefill_domain") is not None:
+            domain = int(command["prefill_domain"])
+            numa_nodes = [int(value) for value in command["arena_numa_nodes"]]
+            candidate["selected_prefill_domain"] = domain
+            candidate["selected_arena_numa_nodes"] = numa_nodes
+        manifest_bytes = command.get("manifest")
+        if manifest_bytes is not None:
+            candidate["manifest"] = SnapshotManifest.from_bytes(manifest_bytes)
+        pending = getattr(self, "_agentic_tp_pending_candidate_commands", None)
+        if pending is not None:
+            pending.pop(snapshot_id, None)
+        return True
 
     def apply_tp_candidate_commands(self, commands) -> None:
         """Install rank-0 lifecycle commands on this rank's physical shards."""
@@ -676,14 +733,80 @@ class DecodeKVCacheOffloadManager:
         if self.tp_world_size <= 1:
             return
         for command in commands or ():
-            snapshot_id = str(command["snapshot_id"])
-            candidate = self.agentic_direct_candidates.get(snapshot_id)
-            if candidate is None:
-                continue
-            candidate["tp_command"] = str(command["action"])
-            manifest_bytes = command.get("manifest")
-            if manifest_bytes is not None:
-                candidate["manifest"] = SnapshotManifest.from_bytes(manifest_bytes)
+            DecodeKVCacheOffloadManager._apply_tp_candidate_command(self, command)
+
+    def _prefill_domain_numa_nodes(self, domain: int) -> list[int]:
+        raw = os.getenv("SGLANG_AGENTIC_KV_PREFILL_TP_NUMA_DOMAINS", "").strip()
+        domains = [value for value in raw.split(";") if value]
+        if 0 <= int(domain) < len(domains):
+            nodes = [int(value) for value in domains[int(domain)].split(",")]
+            if len(nodes) == self.tp_world_size:
+                return nodes
+        return [
+            int(self.agentic_host_staging_client.arena_numa_node)
+            for _ in range(self.tp_world_size)
+        ]
+
+    def _select_slow_prefill_domain(self) -> tuple[int, list[int]]:
+        """Choose a logical P from the Router's cached pressure snapshot.
+
+        This is a tiny /dev/shm read performed only when a request actually
+        falls back.  It never queries P synchronously and therefore cannot
+        block Decode or the fast path.
+        """
+
+        fallback = int(self.agentic_host_staging_client.arena_domain)
+        if os.getenv(
+            "SGLANG_PD_LATE_BIND_DYNAMIC_PREFILL_DOMAINS", ""
+        ).strip().lower() not in {"1", "true", "yes", "on"}:
+            return fallback, self._prefill_domain_numa_nodes(fallback)
+        path = os.getenv("SGLANG_AGENTIC_KV_PREFILL_LOAD_PATH", "").strip()
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            if time.time() - float(payload.get("published_at", 0.0)) > 2.0:
+                raise ValueError("stale Prefill pressure snapshot")
+            scored = []
+            for item in payload.get("domains", ()):
+                domain = int(item["domain"])
+                hbm_capacity = max(1, int(item.get("hbm_capacity_tokens", 0)))
+                arena_capacity = max(1, int(item.get("arena_capacity_bytes", 0)))
+                pending_tokens = max(0, int(item.get("pending_tokens", 0)))
+                hbm_used = max(0, int(item.get("hbm_used_tokens", 0)))
+                arena_used = max(0, int(item.get("arena_used_bytes", 0)))
+                pending_requests = max(0, int(item.get("pending_requests", 0)))
+                scheduler_waiting = max(0, int(item.get("scheduler_waiting", 0)))
+                score = (
+                    pending_tokens / hbm_capacity
+                    + hbm_used / hbm_capacity
+                    + 2.0 * arena_used / arena_capacity
+                    + 0.01 * (pending_requests + scheduler_waiting)
+                )
+                scored.append((score, domain))
+            if not scored:
+                raise ValueError("empty Prefill pressure snapshot")
+            scored.sort()
+            selected = int(scored[0][1])
+            logger.info(
+                "AgenticKV slow_prefill_select P=%d scores=%s",
+                selected,
+                [(domain, round(score, 4)) for score, domain in scored],
+            )
+            return selected, self._prefill_domain_numa_nodes(selected)
+        except (OSError, TypeError, ValueError, KeyError):
+            logger.warning(
+                "AgenticKV slow_prefill_select_fallback P=%d path=%s",
+                fallback,
+                path,
+            )
+            return fallback, self._prefill_domain_numa_nodes(fallback)
+
+    def _assign_slow_prefill_target(self, candidate) -> None:
+        if "selected_prefill_domain" in candidate:
+            return
+        domain, numa_nodes = self._select_slow_prefill_domain()
+        candidate["selected_prefill_domain"] = domain
+        candidate["selected_arena_numa_nodes"] = numa_nodes
 
     def commit_tp_release(self, snapshot_id: str) -> None:
         """Apply a TP release selected by the scheduler's native broadcast.
@@ -1096,6 +1219,11 @@ class DecodeKVCacheOffloadManager:
             "fast_arrival_seen": False,
             "fast_arrival_seen_at": None,
         }
+        pending_command = self._agentic_tp_pending_candidate_commands.pop(
+            manifest.snapshot_id, None
+        )
+        if pending_command is not None:
+            self._apply_tp_candidate_command(pending_command)
         self.wake_decode_io_progress()
         logger.info(
             "AgenticKV direct_offer snapshot=%s tokens=%d room=%d threshold_s=%.3f",
@@ -1458,6 +1586,7 @@ class DecodeKVCacheOffloadManager:
     def _start_agentic_host_staging(self, candidate, manifest) -> bool | None:
         """Offer a complete D-GPU snapshot to P; D ownership is retained."""
 
+        self._assign_slow_prefill_target(candidate)
         metadata = candidate["metadata"]
         if manifest.state in {SnapshotState.DIRECT_READY, SnapshotState.DIRECT_LOADING}:
             fallback = self.agentic_snapshot_store.begin_slow_fallback(
@@ -1493,6 +1622,19 @@ class DecodeKVCacheOffloadManager:
             token_digest=token_ids_digest(candidate["tokens"]),
             logical_hashes=logical_hashes,
             byte_size=bytes_per_page * len(source_pages),
+            arena_domain=int(
+                candidate.get(
+                    "selected_prefill_domain",
+                    self.agentic_host_staging_client.arena_domain,
+                )
+            ),
+            arena_numa_node=int(
+                candidate.get(
+                    "selected_arena_numa_nodes",
+                    [self.agentic_host_staging_client.arena_numa_node]
+                    * self.tp_world_size,
+                )[self.tp_rank]
+            ),
         )
         candidate["staging"] = True
         candidate["source_token_indices"] = token_indices
@@ -1532,7 +1674,12 @@ class DecodeKVCacheOffloadManager:
         self._publish_agentic_route(metadata.current, route="recompute")
 
     def _publish_agentic_route(
-        self, request, *, route: str, snapshot_tokens: Optional[int] = None
+        self,
+        request,
+        *,
+        route: str,
+        snapshot_tokens: Optional[int] = None,
+        prefill_domain: Optional[int] = None,
     ) -> bool:
         # Route markers are a multi-P coordination primitive.  Keeping this
         # behind the explicit 2P+ feature flag preserves the proven 1P path
@@ -1545,14 +1692,20 @@ class DecodeKVCacheOffloadManager:
         if store is None:
             return True
         try:
-            prefill_domain = int(
-                os.environ.get("SGLANG_AGENTIC_KV_PREFILL_DOMAIN", "0")
+            selected_domain = (
+                int(prefill_domain)
+                if prefill_domain is not None
+                else int(os.environ.get("SGLANG_AGENTIC_KV_PREFILL_DOMAIN", "0"))
             )
-            arena_numa = envs.SGLANG_AGENTIC_KV_ARENA_NUMA_NODE.get()
+            arena_numa = (
+                self._prefill_domain_numa_nodes(selected_domain)[self.tp_rank]
+                if prefill_domain is not None
+                else envs.SGLANG_AGENTIC_KV_ARENA_NUMA_NODE.get()
+            )
             store.publish_route(
                 request,
                 route=route,
-                prefill_domain=prefill_domain,
+                prefill_domain=selected_domain,
                 arena_numa_node=(
                     arena_numa
                     if route in {"host_writing", "host_ready"}
@@ -1778,6 +1931,7 @@ class DecodeKVCacheOffloadManager:
                         metadata.current,
                         route="host_ready",
                         snapshot_tokens=candidate["manifest"].token_count,
+                        prefill_domain=candidate.get("selected_prefill_domain"),
                     ):
                         # In multi-P mode this marker commits the P-domain
                         # destination.  Retain D KV and retry if publishing it
@@ -1959,6 +2113,7 @@ class DecodeKVCacheOffloadManager:
                         metadata.current,
                         route="host_writing",
                         snapshot_tokens=candidate["manifest"].token_count,
+                        prefill_domain=candidate.get("selected_prefill_domain"),
                     )
                     continue
             elif manifest.state not in {
@@ -2051,6 +2206,7 @@ class DecodeKVCacheOffloadManager:
                         metadata.current,
                         route="host_writing",
                         snapshot_tokens=candidate["manifest"].token_count,
+                        prefill_domain=candidate.get("selected_prefill_domain"),
                     )
                     # The original reverse-NIXL room is reused by relay chunk
                     # zero.  It is cleaned after HOST_READY or direct fallback.

@@ -42,6 +42,7 @@ from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVRecei
 from sglang.srt.disaggregation.agentic_host_staging import SharedHostStagingLedger
 from sglang.srt.disaggregation.agentic_tp import (
     rank_env_int,
+    request_generation_key,
 )
 from sglang.srt.disaggregation.p2d_host_staging import (
     AgenticPToDHostLoadManager,
@@ -431,8 +432,10 @@ class DecodePreallocQueue:
             )
 
     def enable_async_progress(self) -> None:
-        if self.tp_size != 1:
-            raise ValueError("Decode I/O async progress V1 requires TP=1")
+        # Each TP rank owns a distinct KV shard but receives the same logical
+        # admission command from rank 0.  Background work is rank-local only:
+        # filesystem discovery, receiver polling, and metadata publication.
+        # Allocator commits remain on each rank's scheduler thread.
         self._async_progress_enabled = True
 
     def background_progress(self) -> None:
@@ -451,7 +454,35 @@ class DecodePreallocQueue:
             self._resolve_pending_reqs()
             self._update_handshake_waiters()
             self._background_update_p_ready()
+            self._publish_tp_admission_readiness()
         self._background_prepare_metadata()
+
+    def _publish_tp_admission_readiness(self) -> None:
+        """Report shard-local readiness; TP0 alone chooses admission order."""
+
+        if getattr(self, "tp_size", 1) <= 1:
+            return
+        mailbox = getattr(
+            self.scheduler, "agentic_tp_p2d_admission_mailbox", None
+        )
+        if mailbox is None:
+            return
+        for decode_req in list(self.queue):
+            p_ready = (
+                decode_req.req.bootstrap_host == FAKE_BOOTSTRAP_HOST
+                or getattr(decode_req, "_async_p_ready", False)
+            )
+            status = (
+                KVPoll.Success
+                if decode_req.waiting_for_input and p_ready
+                else KVPoll.Transferring
+            )
+            mailbox.publish_local(
+                request_generation_key(
+                    decode_req.req.rid, decode_req.req.bootstrap_room
+                ),
+                int(status),
+            )
 
     def _background_update_p_ready(self) -> None:
         if not self.p_ready_dir:
@@ -1174,7 +1205,7 @@ class DecodePreallocQueue:
             allocatable_tokens -= required_tokens_for_request
             dst_kv_indices = self._pre_alloc(decode_req.req)
 
-            if self._async_progress_enabled:
+            if self._async_progress_enabled and self.tp_size == 1:
                 decode_req.metadata_buffer_index = (
                     self.req_to_metadata_buffer_idx_allocator.alloc()
                 )
@@ -1189,6 +1220,15 @@ class DecodePreallocQueue:
                 self._async_metadata_work.put((decode_req, page_size))
                 indices_to_remove.add(i)
                 continue
+
+            # TP rank0 selects one logical admission and broadcasts it through
+            # SGLang's native scheduler control path.  Every physical rank
+            # must publish its receiver metadata from that same scheduler
+            # boundary: NIXL/ZeroMQ control objects are thread-affine, so a
+            # background-thread send can complete locally without making the
+            # corresponding P shard observable.  Only this small metadata
+            # commit stays on the scheduler; KV DMA and completion polling
+            # remain asynchronous.
 
             origin_input_len = len(decode_req.req.origin_input_ids)
             if self.scheduler.enable_hisparse:
@@ -1499,6 +1539,10 @@ class DecodeTransferQueue:
 
         if not self._async_progress_enabled:
             return
+        # kv_receiver is owned jointly by this background poller and the
+        # scheduler-side commit path.  Keep selection, receiver lookup and
+        # the non-blocking poll under one lifecycle lock so commit cannot
+        # clear the receiver between lookup and poll.
         with self._async_poll_lock:
             queue_snapshot = []
             for decode_req in list(self.queue):
@@ -1509,47 +1553,67 @@ class DecodeTransferQueue:
                 ):
                     decode_req._async_transfer_poll_inflight = True
                     queue_snapshot.append(decode_req)
-        if not queue_snapshot:
-            return
-        try:
-            if self.enable_staging:
-                # Async agentic V1 is TP=1, so perform the staging advancement and
-                # local receiver polls without entering a background collective.
-                for decode_req in queue_snapshot:
-                    if decode_req.kv_receiver.require_staging and not self.staging_handler.is_done(
-                        decode_req
-                    ):
-                        self.staging_handler.advance_scatter(decode_req)
-                polls = [int(req.kv_receiver.poll()) for req in queue_snapshot]
-                for i, decode_req in enumerate(queue_snapshot):
-                    if polls[i] == int(KVPoll.Success) and (
-                        decode_req.kv_receiver.require_staging
-                        and not self.staging_handler.is_done(decode_req)
-                    ):
-                        polls[i] = int(KVPoll.Transferring)
-            else:
-                receivers = [req.kv_receiver for req in queue_snapshot]
-                poll_many = (
-                    None
-                    if any(
-                        isinstance(receiver, AgenticPToDHostReceiver)
-                        for receiver in receivers
-                    )
-                    else getattr(type(receivers[0]), "poll_many", None)
-                )
-                if poll_many is None:
-                    polls = [int(receiver.poll()) for receiver in receivers]
+            if not queue_snapshot:
+                return
+            try:
+                if self.enable_staging:
+                    # Staging advancement and receiver polling share the same
+                    # receiver lifetime as the native Direct path.
+                    for decode_req in queue_snapshot:
+                        receiver = decode_req.kv_receiver
+                        if receiver is None:
+                            continue
+                        if receiver.require_staging and not self.staging_handler.is_done(
+                            decode_req
+                        ):
+                            self.staging_handler.advance_scatter(decode_req)
+                    polls = [
+                        int(decode_req.kv_receiver.poll())
+                        for decode_req in queue_snapshot
+                    ]
+                    for i, decode_req in enumerate(queue_snapshot):
+                        receiver = decode_req.kv_receiver
+                        if polls[i] == int(KVPoll.Success) and (
+                            receiver.require_staging
+                            and not self.staging_handler.is_done(decode_req)
+                        ):
+                            polls[i] = int(KVPoll.Transferring)
                 else:
-                    polls = [int(poll) for poll in poll_many(receivers)]
-        except Exception:
-            with self._async_poll_lock:
+                    receivers = [req.kv_receiver for req in queue_snapshot]
+                    if any(receiver is None for receiver in receivers):
+                        # This should now be impossible because every clear
+                        # takes this lock.  Treat it as a lifecycle invariant,
+                        # not as an AttributeError from receiver.poll().
+                        raise RuntimeError(
+                            "P->D receiver disappeared while async poll owned it"
+                        )
+                    poll_many = (
+                        None
+                        if any(
+                            isinstance(receiver, AgenticPToDHostReceiver)
+                            for receiver in receivers
+                        )
+                        else getattr(type(receivers[0]), "poll_many", None)
+                    )
+                    if poll_many is None:
+                        polls = [int(receiver.poll()) for receiver in receivers]
+                    else:
+                        polls = [int(poll) for poll in poll_many(receivers)]
+            except Exception:
                 for decode_req in queue_snapshot:
                     decode_req._async_transfer_poll_inflight = False
-            raise
-        with self._async_poll_lock:
+                raise
             for decode_req, poll in zip(queue_snapshot, polls):
                 decode_req._async_transfer_poll = int(poll)
                 decode_req._async_transfer_poll_inflight = False
+                scheduler = getattr(self, "scheduler", None)
+                if scheduler is not None and getattr(scheduler, "tp_size", 1) > 1:
+                    scheduler.agentic_tp_p2d_receiver_mailbox.publish_local(
+                        request_generation_key(
+                            decode_req.req.rid, decode_req.req.bootstrap_room
+                        ),
+                        int(poll),
+                    )
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -1567,6 +1631,14 @@ class DecodeTransferQueue:
             True if the request should be removed from the queue (success or corruption)
             False if metadata not ready yet (keep in queue for next poll)
         """
+        if self._async_progress_enabled:
+            with self._async_poll_lock:
+                return self._commit_transfer_to_req_locked(decode_req)
+        return self._commit_transfer_to_req_locked(decode_req)
+
+    def _commit_transfer_to_req_locked(self, decode_req: DecodeRequest) -> bool:
+        """Commit while owning ``kv_receiver``'s lifecycle lock."""
+
         if isinstance(decode_req.kv_receiver, AgenticPToDHostReceiver):
             decode_req.kv_receiver.commit_req(decode_req.req)
             decode_req.kv_receiver.clear()
@@ -1671,6 +1743,27 @@ class DecodeTransferQueue:
     def pop_transferred(
         self, rids_to_check: Optional[List[object]] = None
     ) -> List[Req]:
+        """Commit cached transfer progress without ever stalling Decode.
+
+        The async poller and every receiver lifecycle mutation share one lock.
+        Decode takes it non-blockingly and, once acquired, retains it through
+        status consumption, commit/clear and queue removal.  Thus a poll can
+        neither race receiver teardown nor begin on another queue entry midway
+        through this scheduler transaction.
+        """
+
+        if not self._async_progress_enabled:
+            return self._pop_transferred_locked(rids_to_check)
+        if not self._async_poll_lock.acquire(blocking=False):
+            return []
+        try:
+            return self._pop_transferred_locked(rids_to_check)
+        finally:
+            self._async_poll_lock.release()
+
+    def _pop_transferred_locked(
+        self, rids_to_check: Optional[List[object]] = None
+    ) -> List[Req]:
         if not self.queue:
             return []
 
@@ -1695,15 +1788,27 @@ class DecodeTransferQueue:
         if self._async_progress_enabled:
             # No transport call is allowed here.  Missing cached status simply
             # means the background worker has not completed its next poll.
-            with self._async_poll_lock:
-                polls = []
-                for dr in selected_queue:
-                    poll = getattr(
-                        dr, "_async_transfer_poll", int(KVPoll.Transferring)
+            polls = []
+            for dr in selected_queue:
+                poll = getattr(
+                    dr, "_async_transfer_poll", int(KVPoll.Transferring)
+                )
+                if getattr(dr, "_async_transfer_poll", None) is not None:
+                    dr._async_transfer_poll_claimed = True
+                polls.append(poll)
+            if getattr(getattr(self, "scheduler", None), "tp_size", 1) > 1:
+                group_status = getattr(
+                    self.scheduler,
+                    "_agentic_tp_decode_transfer_group_status",
+                    {},
+                )
+                polls = [
+                    group_status.get(
+                        (str(dr.req.rid), int(dr.req.bootstrap_room)),
+                        int(KVPoll.Transferring),
                     )
-                    if getattr(dr, "_async_transfer_poll", None) is not None:
-                        dr._async_transfer_poll_claimed = True
-                    polls.append(poll)
+                    for dr in selected_queue
+                ]
         elif self.enable_staging:
             polls = poll_and_all_reduce_with_staging(
                 selected_queue, self.staging_handler, self.gloo_group
@@ -1717,11 +1822,31 @@ class DecodeTransferQueue:
         indices_to_remove = set()
         for i, decode_req, poll in zip(selected_indices, selected_queue, polls):
             if poll == KVPoll.Failed:
+                if (
+                    self.tp_rank == 0
+                    and getattr(self.scheduler, "tp_size", 1) > 1
+                ):
+                    self.scheduler.agentic_tp_p2d_receiver_mailbox.publish_receipt(
+                        request_generation_key(
+                            decode_req.req.rid,
+                            decode_req.req.bootstrap_room,
+                        ),
+                        int(KVPoll.Failed),
+                    )
                 error_message = f"Decode transfer failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
-                try:
-                    decode_req.kv_receiver.failure_exception()
-                except Exception as e:
-                    error_message += f" with exception {e}"
+                receiver = decode_req.kv_receiver
+                if receiver is not None:
+                    try:
+                        receiver.failure_exception()
+                    except Exception as e:
+                        error_message += f" with exception {e}"
+                    finally:
+                        try:
+                            receiver.clear()
+                        except Exception as e:
+                            error_message += f"; receiver clear failed: {e}"
+                        finally:
+                            decode_req.kv_receiver = None
                 logger.error(error_message)
                 prepare_abort(
                     decode_req.req,
@@ -1740,8 +1865,30 @@ class DecodeTransferQueue:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:
-                should_remove = self._commit_transfer_to_req(decode_req)
+                should_remove = (
+                    self._commit_transfer_to_req_locked(decode_req)
+                    if self._async_progress_enabled
+                    else self._commit_transfer_to_req(decode_req)
+                )
                 if should_remove:
+                    # Persist the destination-authored TP receipt before this
+                    # entry leaves the D transfer queue.  Otherwise a fast D
+                    # commit can remove the only entry inspected by
+                    # _agentic_tp_prepare_admission_control, leaving P pinned
+                    # forever on a transfer that D has already consumed.
+                    # This does not change P->D ordering or staging policy; it
+                    # only closes the completion-notification race.
+                    if (
+                        self.tp_rank == 0
+                        and getattr(self.scheduler, "tp_size", 1) > 1
+                    ):
+                        self.scheduler.agentic_tp_p2d_receiver_mailbox.publish_receipt(
+                            request_generation_key(
+                                decode_req.req.rid,
+                                decode_req.req.bootstrap_room,
+                            ),
+                            int(KVPoll.Success),
+                        )
                     indices_to_remove.add(i)
                     # Check if request was aborted due to corruption
                     if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
@@ -1780,13 +1927,12 @@ class DecodeTransferQueue:
             self.req_to_metadata_buffer_idx_allocator.free(idx)
 
         if self._async_progress_enabled:
-            with self._async_poll_lock:
-                for i, decode_req in enumerate(self.queue):
-                    if i in indices_to_remove:
-                        continue
-                    if hasattr(decode_req, "_async_transfer_poll"):
-                        delattr(decode_req, "_async_transfer_poll")
-                    decode_req._async_transfer_poll_claimed = False
+            for i, decode_req in enumerate(self.queue):
+                if i in indices_to_remove:
+                    continue
+                if hasattr(decode_req, "_async_transfer_poll"):
+                    delattr(decode_req, "_async_transfer_poll")
+                decode_req._async_transfer_poll_claimed = False
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove

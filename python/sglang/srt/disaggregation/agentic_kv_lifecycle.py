@@ -1165,9 +1165,9 @@ class MooncakeSnapshotStore:
     ) -> SnapshotManifest:
         """Expose a TP snapshot after rank 0 has fenced all physical shards.
 
-        Physical completion is reduced through the native TP control plane.
-        Consequently only rank 0 mutates the request-level manifest; follower
-        ranks never create ACK markers or compete to finalize it.
+        Physical completion is reduced through the dedicated node-local TP
+        mailbox.  Consequently only rank 0 mutates the request-level manifest;
+        follower ranks never create ACK markers or compete to finalize it.
         """
 
         if manifest.tp_size <= 1:

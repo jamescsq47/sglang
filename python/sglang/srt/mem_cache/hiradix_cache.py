@@ -646,6 +646,15 @@ class HiRadixCache(RadixCache):
         return len(host_indices)
 
     def write_backup_storage(self, node: TreeNode):
+        # Agentic request-generation snapshots have their own bounded
+        # Direct/Shared-Arena lifecycle.  Sending these transient P branches
+        # to generic HiCache storage duplicates ownership and can retain them
+        # long after P->D handoff.
+        extra_key = getattr(getattr(node, "key", None), "extra_key", None)
+        if isinstance(extra_key, str) and extra_key.startswith(
+            "agentic-v1:snapshot:"
+        ):
+            return
         prefix_keys = (
             node.get_prefix_hash_values(node.parent)
             if self.hicache_storage_pass_prefix_keys
@@ -1101,22 +1110,31 @@ class HiRadixCache(RadixCache):
             if not x.backuped:
                 if self.cache_controller.write_policy == "write_back":
                     # write to host if the node is not backuped
-                    num_evicted += self.write_backup(x, write_back=True)
-                    write_back_nodes.append(x)
+                    written = self.write_backup(x, write_back=True)
+                    if written:
+                        num_evicted += written
+                        write_back_nodes.append(x)
+                    else:
+                        # Host pressure must not make GPU eviction stop making
+                        # progress.  This leaf has no durable Host copy, so
+                        # evict it through the normal device-only path.
+                        num_evicted += self._evict_regular(x)
                 else:
                     num_evicted += self._evict_regular(x)
             else:
                 num_evicted += self._evict_backuped(x)
 
-            for child in x.parent.children.values():
+            parent = x.parent
+            for child in parent.children.values():
                 if child in write_back_nodes:
                     continue
                 if not child.evicted:
                     break
             else:
                 # all children are evicted or no children
-                new_priority = self.eviction_strategy.get_priority(x.parent)
-                heapq.heappush(eviction_heap, (new_priority, x.parent))
+                if getattr(parent, "lock_ref", 0) == 0:
+                    new_priority = self.eviction_strategy.get_priority(parent)
+                    heapq.heappush(eviction_heap, (new_priority, parent))
 
         if self.cache_controller.write_policy == "write_back":
             self.writing_check(write_back=True)

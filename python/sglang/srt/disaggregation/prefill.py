@@ -56,6 +56,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.disaggregation.agentic_kv_lifecycle import AgenticRequestMetadata
 from sglang.srt.disaggregation.agentic_direct_transfer import debug_kv_digest
+from sglang.srt.disaggregation.agentic_tp import request_generation_key
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
@@ -441,8 +442,6 @@ class SchedulerDisaggregationPrefillMixin:
         a terminal cached poll.
         """
 
-        if self.tp_size != 1:
-            return
         default_enabled = "1" if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get() else "0"
         enabled = os.getenv(
             "SGLANG_PREFILL_TRANSFER_ASYNC_PROGRESS", default_enabled
@@ -481,9 +480,14 @@ class SchedulerDisaggregationPrefillMixin:
                 )
             ),
         )
+        if self.tp_size > 1:
+            # TP senders are scheduler-owned.  Rank0 broadcasts one ordered
+            # batch and every rank submits its shard at the same scheduler
+            # boundary; background threads must not race CUDA/NIXL state.
+            self._prefill_transfer_consumer_count = 0
         self._prefill_ready_condition = threading.Condition()
         self._prefill_ready_queue = deque()
-        self._prefill_ready_queued_rids = set()
+        self._prefill_ready_queued_keys = set()
         self._prefill_transfer_active_reqs = {}
         self._prefill_ready_publish_condition = threading.Condition()
         self._prefill_ready_next_publish_sequence = 0
@@ -499,11 +503,83 @@ class SchedulerDisaggregationPrefillMixin:
             thread.start()
             self._prefill_transfer_threads.append(thread)
         logger.info(
-            "Prefill producer/ready-buffer/transfer-consumer pipeline enabled "
-            "consumers=%d interval_ms=%.3f",
+            "Prefill producer/ready-buffer/transfer pipeline enabled "
+            "background_consumers=%d interval_ms=%.3f tp_owner=%s",
             self._prefill_transfer_consumer_count,
             self._prefill_transfer_interval * 1000.0,
+            "scheduler" if self.tp_size > 1 else "worker",
         )
+
+    @staticmethod
+    def _prefill_transfer_key(req: Req) -> str:
+        room = getattr(req, "bootstrap_room", None)
+        # Legacy warmup/test requests predate bootstrap rooms.  Real serving
+        # generations always carry one and therefore use the collision-free
+        # request-generation identity below.
+        return str(req.rid) if room is None else request_generation_key(req.rid, room)
+
+    def _clear_tp_prefill_transfer_mailboxes(self: Scheduler, req: Req) -> None:
+        """Retire rank reports after one TP P->D result was broadcast."""
+
+        if self.tp_size <= 1:
+            return
+        key = self._prefill_transfer_key(req)
+        for mailbox in (
+            self.agentic_tp_p2d_sender_mailbox,
+            self.agentic_tp_p2d_receiver_mailbox,
+        ):
+            mailbox.clear_local(key)
+            if self.tp_rank == 0:
+                mailbox.clear_group(key)
+
+    def _cleanup_failed_prefill_transfer(
+        self: Scheduler,
+        req: Req,
+        p2d_host,
+        agentic_metadata: Optional[AgenticRequestMetadata],
+    ) -> None:
+        """Release one failed P->D generation back to its owning pools."""
+
+        if agentic_metadata is None:
+            release_kv_cache(req, self.tree_cache)
+        else:
+            committed_len = len(req.origin_input_ids)
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+            release_agentic = getattr(
+                self.tree_cache, "release_agentic_request_cache", None
+            )
+            if release_agentic is not None:
+                release_agentic(req, committed_len=committed_len)
+        if hasattr(req.disagg_kv_sender, "clear"):
+            req.disagg_kv_sender.clear()
+        if (
+            p2d_host is not None
+            and getattr(req, "_agentic_p2d_host_snapshot_id", None)
+        ):
+            p2d_host.mark_scheduler_consumed(req)
+        if hasattr(req, "_async_prefill_transfer_payload"):
+            delattr(req, "_async_prefill_transfer_payload")
+        self._clear_tp_prefill_transfer_mailboxes(req)
+
+    def _prefill_queued_keys(self: Scheduler) -> set[str]:
+        keys = getattr(self, "_prefill_ready_queued_keys", None)
+        if keys is None:
+            keys = getattr(self, "_prefill_ready_queued_rids", None)
+        if keys is None:
+            keys = set()
+            self._prefill_ready_queued_keys = keys
+        return keys
+
+    def _report_tp_prefill_producer_ready(self: Scheduler, req: Req) -> None:
+        """Report that this rank's immutable P->D payload is available."""
+
+        if (
+            getattr(self, "tp_size", 1) > 1
+            and getattr(req, "_async_prefill_transfer_payload", None) is not None
+        ):
+            self.agentic_tp_p2d_sender_mailbox.publish_local(
+                self._prefill_transfer_key(req), int(KVPoll.Bootstrapping)
+            )
 
     def _enqueue_deferred_prefill_transfer(self: Scheduler, req: Req) -> bool:
         """Append one producer result to the transfer-consumer FIFO.
@@ -518,20 +594,32 @@ class SchedulerDisaggregationPrefillMixin:
         deferred = getattr(req, "disagg_p_ready_deferred", False)
         if deferred and getattr(req, "_async_prefill_transfer_payload", None) is None:
             return False
+        key = self._prefill_transfer_key(req)
+        if deferred:
+            self._report_tp_prefill_producer_ready(req)
         with self._prefill_ready_condition:
+            queued_keys = self._prefill_queued_keys()
             if (
-                req.rid in self._prefill_ready_queued_rids
+                key in queued_keys
                 or getattr(req, "_async_prefill_transfer_consumer_active", False)
-                or getattr(req, "disagg_p_ready_notified", False)
+                or (
+                    getattr(self, "tp_size", 1) == 1
+                    and getattr(req, "disagg_p_ready_notified", False)
+                )
             ):
                 return True
             if deferred:
-                req._p_ready_sequence = getattr(
-                    self, "_p_ready_publish_sequence", 0
-                )
-                self._p_ready_publish_sequence = req._p_ready_sequence + 1
+                # A generation receives exactly one producer sequence.  TP0
+                # may publish its logical P-ready marker before the bounded
+                # data-plane worker is activated; activating it must not
+                # overwrite that sequence and create a permanent FIFO gap.
+                if getattr(req, "_p_ready_sequence", None) is None:
+                    req._p_ready_sequence = getattr(
+                        self, "_p_ready_publish_sequence", 0
+                    )
+                    self._p_ready_publish_sequence = req._p_ready_sequence + 1
             self._prefill_ready_queue.append(req)
-            self._prefill_ready_queued_rids.add(req.rid)
+            queued_keys.add(key)
             self._prefill_ready_condition.notify()
         return True
 
@@ -554,6 +642,11 @@ class SchedulerDisaggregationPrefillMixin:
             poll == int(KVPoll.WaitingForInput)
             and not getattr(req, "disagg_p_ready_transfer_started", False)
         ):
+            if getattr(self, "tp_size", 1) > 1:
+                self.agentic_tp_p2d_sender_mailbox.publish_local(
+                    self._prefill_transfer_key(req), poll
+                )
+                return poll
             num_pages, page_indices, state_indices = (
                 req._async_prefill_transfer_payload
             )
@@ -563,6 +656,42 @@ class SchedulerDisaggregationPrefillMixin:
             req.time_stats.set_prefill_transfer_queue_entry_time()
             return int(KVPoll.Transferring)
         return poll
+
+    def _submit_tp_prefill_transfer(self: Scheduler, req: Req) -> bool:
+        """Submit one physical P->D shard at a native TP scheduler boundary."""
+
+        if self.tp_size <= 1 or getattr(
+            req, "disagg_p_ready_transfer_started", False
+        ):
+            return False
+        payload = getattr(req, "_async_prefill_transfer_payload", None)
+        if payload is None:
+            return False
+        num_pages, page_indices, state_indices = payload
+        try:
+            req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
+            req.disagg_kv_sender.send(page_indices, state_indices)
+            req.disagg_p_ready_transfer_started = True
+            req.time_stats.set_prefill_transfer_queue_entry_time()
+            logger.info(
+                "AgenticKV tp_p2d_submit key=%s rank=%d/%d pages=%d",
+                self._prefill_transfer_key(req),
+                self.tp_rank,
+                self.tp_size,
+                num_pages,
+            )
+            return True
+        except Exception:
+            logger.exception(
+                "TP P->D shard submission failed key=%s rank=%d/%d",
+                self._prefill_transfer_key(req),
+                self.tp_rank,
+                self.tp_size,
+            )
+            self.agentic_tp_p2d_sender_mailbox.publish_local(
+                self._prefill_transfer_key(req), int(KVPoll.Failed)
+            )
+            return False
 
     def _prefill_transfer_consumer_worker(
         self: Scheduler, consumer_index: int
@@ -583,15 +712,19 @@ class SchedulerDisaggregationPrefillMixin:
                 if self._prefill_transfer_stop.is_set():
                     return
                 req = self._prefill_ready_queue.popleft()
-                self._prefill_ready_queued_rids.discard(req.rid)
+                key = self._prefill_transfer_key(req)
+                self._prefill_queued_keys().discard(key)
                 if not getattr(req, "_async_prefill_transfer_consumer_active", False):
                     req._async_prefill_transfer_consumer_active = True
                     req._async_prefill_transfer_active_at = time.monotonic()
-                    self._prefill_transfer_active_reqs[req.rid] = req
+                    self._prefill_transfer_active_reqs[key] = req
 
             poll = int(KVPoll.Failed)
             try:
-                if getattr(req, "disagg_p_ready_deferred", False):
+                if (
+                    getattr(req, "disagg_p_ready_deferred", False)
+                    and getattr(self, "tp_size", 1) == 1
+                ):
                     self._publish_deferred_prefill_ready(req)
                 started_at = time.perf_counter()
                 direct_requested = getattr(
@@ -647,12 +780,14 @@ class SchedulerDisaggregationPrefillMixin:
                         self._prefill_ready_publish_condition.notify_all()
 
             terminal = poll in (int(KVPoll.Success), int(KVPoll.Failed))
+            if getattr(self, "tp_size", 1) > 1 and terminal:
+                self.agentic_tp_p2d_sender_mailbox.publish_local(key, poll)
             if terminal:
                 with self._prefill_transfer_poll_lock:
                     req._async_prefill_transfer_poll = poll
                     req._async_prefill_transfer_consumer_active = False
                 with self._prefill_ready_condition:
-                    self._prefill_transfer_active_reqs.pop(req.rid, None)
+                    self._prefill_transfer_active_reqs.pop(key, None)
             elif not self._prefill_transfer_stop.is_set():
                 # Keep the transfer active but relinquish this worker after
                 # one step, so later P results cannot be starved by waiters.
@@ -662,7 +797,7 @@ class SchedulerDisaggregationPrefillMixin:
                 if not self._prefill_transfer_stop.is_set():
                     with self._prefill_ready_condition:
                         self._prefill_ready_queue.append(req)
-                        self._prefill_ready_queued_rids.add(req.rid)
+                        self._prefill_queued_keys().add(key)
                         self._prefill_ready_condition.notify()
 
             now = time.monotonic()
@@ -711,6 +846,7 @@ class SchedulerDisaggregationPrefillMixin:
         """
 
         if getattr(req, "_async_prefill_transfer_payload", None) is not None:
+            self._report_tp_prefill_producer_ready(req)
             return True
         if req.return_logprob:
             # The client reconstructs generated token ids from the returned
@@ -784,6 +920,7 @@ class SchedulerDisaggregationPrefillMixin:
             page_indices,
             state_indices,
         )
+        self._report_tp_prefill_producer_ready(req)
         return True
 
     def _write_p_ready_marker(
@@ -847,6 +984,15 @@ class SchedulerDisaggregationPrefillMixin:
         # Multiple consumers may finish transport control calls out of order,
         # but the Router must observe the producer's FIFO completion order.
         with publish_condition:
+            if (
+                getattr(self, "tp_size", 1) > 1
+                and ready_sequence != self._prefill_ready_next_publish_sequence
+            ):
+                # TP rank0 revisits the scheduler-owned inflight FIFO on the
+                # next iteration.  Never block its native TP broadcast while
+                # waiting for an earlier producer marker: followers and model
+                # execution both depend on that broadcast making progress.
+                return
             while (
                 ready_sequence != self._prefill_ready_next_publish_sequence
                 and not self._prefill_transfer_stop.is_set()
@@ -943,10 +1089,10 @@ class SchedulerDisaggregationPrefillMixin:
             logger.exception("Invalid P-ready compute-ahead backpressure setting")
             raise
         if mode == "disabled":
-            # Let the native SGLang scheduler admit Prefill work until its
-            # allocator reports that no batch fits.  Agentic Direct/slow/new
-            # priority remains in the waiting queue; only the synthetic
-            # request/token compute-ahead credits are disabled.
+            # The fixed Direct area was removed from the ordinary allocator at
+            # startup and remains reserve-owned through the next P->D handoff.
+            # With page exchange disabled, reserving a second 40k ordinary
+            # headroom would only reduce useful Prefill capacity.
             self._p_ready_compute_credit_tokens = None
             self._p_ready_compute_ahead_throttled = False
             return False
@@ -1222,7 +1368,8 @@ class SchedulerDisaggregationPrefillMixin:
                         self._prepare_deferred_prefill_transfer(req)
                     ):
                         if getattr(self, "_prefill_transfer_async_enabled", False):
-                            self._enqueue_deferred_prefill_transfer(req)
+                            if self.tp_size == 1:
+                                self._enqueue_deferred_prefill_transfer(req)
                         else:
                             self._publish_deferred_prefill_ready(req)
                 else:
@@ -1291,12 +1438,6 @@ class SchedulerDisaggregationPrefillMixin:
         full_inflight_queue = self.disagg_prefill_inflight_queue
         inflight_queue = full_inflight_queue
         if self.tp_size > 1:
-            for req in full_inflight_queue:
-                if (
-                    getattr(req, "disagg_p_ready_deferred", False)
-                    and not getattr(req, "disagg_p_ready_notified", False)
-                ):
-                    self._publish_deferred_prefill_ready(req)
             selected_keys = getattr(
                 self, "_agentic_tp_prefill_transfer_keys", ()
             )
@@ -1335,15 +1476,41 @@ class SchedulerDisaggregationPrefillMixin:
             for req in inflight_queue:
                 if (
                     getattr(req, "disagg_p_ready_deferred", False)
-                    and not getattr(req, "disagg_p_ready_notified", False)
                     and self._prepare_deferred_prefill_transfer(req)
                 ):
-                    self._enqueue_deferred_prefill_transfer(req)
-            # TP mode polls one TP0-selected request.  Read the cached status
-            # for that exact request rather than the first entry of the full
-            # rank-local queue; otherwise a terminal result can be attributed
-            # to a different request and permanently strand both endpoints.
-            polls = self._prefill_transfer_cached_polls(inflight_queue)
+                    if self.tp_size == 1 and not getattr(
+                        req, "disagg_p_ready_notified", False
+                    ):
+                        self._enqueue_deferred_prefill_transfer(req)
+            if self.tp_size > 1:
+                submit_keys = set(
+                    getattr(self, "_agentic_tp_prefill_submit_keys", ())
+                )
+                for req in inflight_queue:
+                    request_key = (str(req.rid), int(req.bootstrap_room))
+                    if (
+                        request_key in submit_keys
+                        and not getattr(
+                            req, "disagg_p_ready_transfer_started", False
+                        )
+                    ):
+                        self._submit_tp_prefill_transfer(req)
+                    local_poll = self._prefill_transfer_progress_req_once(req)
+                    self.agentic_tp_p2d_sender_mailbox.publish_local(
+                        self._prefill_transfer_key(req), int(local_poll)
+                    )
+                group_status = getattr(
+                    self, "_agentic_tp_prefill_transfer_group_status", {}
+                )
+                polls = [
+                    group_status.get(
+                        (str(req.rid), int(req.bootstrap_room)),
+                        int(KVPoll.Transferring),
+                    )
+                    for req in inflight_queue
+                ]
+            else:
+                polls = self._prefill_transfer_cached_polls(inflight_queue)
         else:
             pollers = [
                 (
@@ -1358,8 +1525,10 @@ class SchedulerDisaggregationPrefillMixin:
                 self.attn_cp_cpu_group,
                 self.attn_tp_cpu_group,
             )
-        if p2d_host is not None and getattr(
-            self, "_prefill_transfer_async_enabled", False
+        if (
+            self.tp_size == 1
+            and p2d_host is not None
+            and getattr(self, "_prefill_transfer_async_enabled", False)
         ):
             polls = [
                 host_poll if host_poll is not None else poll
@@ -1490,6 +1659,7 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                 if hasattr(req, "_async_prefill_transfer_payload"):
                     delattr(req, "_async_prefill_transfer_payload")
+                self._clear_tp_prefill_transfer_mailboxes(req)
                 done_reqs.append(req)
                 req.time_stats.set_prefill_kv_transfer_finish_time()
             elif poll == KVPoll.Failed:
@@ -1500,7 +1670,14 @@ class SchedulerDisaggregationPrefillMixin:
                     error_message += f" with exception {e}"
                 logger.warning(error_message)
                 req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-                release_kv_cache(req, self.tree_cache)  # unlock the tree
+                agentic_metadata = (
+                    AgenticRequestMetadata.from_req(req)
+                    if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get()
+                    else None
+                )
+                self._cleanup_failed_prefill_transfer(
+                    req, p2d_host, agentic_metadata
+                )
                 prepare_abort(
                     req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
                 )
@@ -1551,7 +1728,10 @@ class SchedulerDisaggregationPrefillMixin:
                 req, self.req_to_metadata_buffer_idx_allocator
             )
 
-        if getattr(self, "_prefill_transfer_async_enabled", False):
+        if (
+            self.tp_size == 1
+            and getattr(self, "_prefill_transfer_async_enabled", False)
+        ):
             self._release_prefill_transfer_poll_claims(undone_reqs)
         if self.tp_size > 1:
             done_ids = {id(req) for req in done_reqs}
