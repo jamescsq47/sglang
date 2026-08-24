@@ -480,11 +480,13 @@ class SchedulerDisaggregationPrefillMixin:
                 )
             ),
         )
-        if self.tp_size > 1:
-            # TP senders are scheduler-owned.  Rank0 broadcasts one ordered
-            # batch and every rank submits its shard at the same scheduler
-            # boundary; background threads must not race CUDA/NIXL state.
-            self._prefill_transfer_consumer_count = 0
+        self._prefill_transfer_tp_background_enabled = self.tp_size > 1
+        if self._prefill_transfer_tp_background_enabled:
+            # Each process owns one physical TP shard.  One FIFO worker per
+            # rank is sufficient: rank0 publishes the logical command through
+            # the tmpfs mailbox and every rank advances the same generation in
+            # the background.  No CUDA allocator mutation happens here.
+            self._prefill_transfer_consumer_count = 1
         self._prefill_ready_condition = threading.Condition()
         self._prefill_ready_queue = deque()
         self._prefill_ready_queued_keys = set()
@@ -502,12 +504,22 @@ class SchedulerDisaggregationPrefillMixin:
             )
             thread.start()
             self._prefill_transfer_threads.append(thread)
+        self._prefill_transfer_cleanup_pending = set()
+        self._prefill_transfer_cleanup_lock = threading.Lock()
+        self._prefill_transfer_cleanup_thread = None
+        if self._prefill_transfer_tp_background_enabled and self.tp_rank == 0:
+            self._prefill_transfer_cleanup_thread = threading.Thread(
+                target=self._prefill_transfer_cleanup_worker,
+                name=f"sglang-prefill-transfer-cleanup-{os.getpid()}",
+                daemon=True,
+            )
+            self._prefill_transfer_cleanup_thread.start()
         logger.info(
             "Prefill producer/ready-buffer/transfer pipeline enabled "
             "background_consumers=%d interval_ms=%.3f tp_owner=%s",
             self._prefill_transfer_consumer_count,
             self._prefill_transfer_interval * 1000.0,
-            "scheduler" if self.tp_size > 1 else "worker",
+            "tp-rank0" if self.tp_size > 1 else "worker",
         )
 
     @staticmethod
@@ -519,27 +531,75 @@ class SchedulerDisaggregationPrefillMixin:
         return str(req.rid) if room is None else request_generation_key(req.rid, room)
 
     def _clear_tp_prefill_transfer_mailboxes(self: Scheduler, req: Req) -> None:
-        """Retire rank reports after one TP P->D result was broadcast."""
+        """Acknowledge scheduler release; TP0 later retires group state."""
 
         if self.tp_size <= 1:
             return
         key = self._prefill_transfer_key(req)
-        for mailbox in (
-            self.agentic_tp_p2d_sender_mailbox,
-            self.agentic_tp_p2d_receiver_mailbox,
+        if not getattr(self, "_prefill_transfer_tp_background_enabled", False):
+            for mailbox in (
+                self.agentic_tp_p2d_sender_mailbox,
+                self.agentic_tp_p2d_receiver_mailbox,
+            ):
+                mailbox.clear_local(key)
+                if self.tp_rank == 0:
+                    mailbox.clear_group(key)
+            return
+        cleanup_mailbox = self.agentic_tp_p2d_cleanup_mailbox
+        cleanup_mailbox.publish_local(key, int(KVPoll.Success))
+        if self.tp_rank == 0:
+            with self._prefill_transfer_cleanup_lock:
+                self._prefill_transfer_cleanup_pending.add(key)
+
+    def _prefill_transfer_cleanup_worker(self: Scheduler) -> None:
+        """Clear TP control files only after every scheduler released pages."""
+
+        while not self._prefill_transfer_stop.wait(
+            self._prefill_transfer_interval
         ):
-            mailbox.clear_local(key)
-            if self.tp_rank == 0:
-                mailbox.clear_group(key)
+            self._prefill_transfer_cleanup_once()
+
+    def _prefill_transfer_cleanup_once(self: Scheduler) -> int:
+        """Run one non-blocking TP0 cleanup scan; return cleared groups."""
+
+        with self._prefill_transfer_cleanup_lock:
+            pending = tuple(self._prefill_transfer_cleanup_pending)
+        cleared = 0
+        for key in pending:
+            if self.agentic_tp_p2d_cleanup_mailbox.group_status(key) != int(
+                KVPoll.Success
+            ):
+                continue
+            # Sender state/command and destination receipt remain visible
+            # until every producer rank has cached the terminal result and
+            # completed allocator cleanup on its scheduler thread.
+            self.agentic_tp_p2d_sender_mailbox.clear_group(key)
+            self.agentic_tp_p2d_receiver_mailbox.clear_group(key)
+            self.agentic_tp_p2d_cleanup_mailbox.clear_group(key)
+            with self._prefill_transfer_cleanup_lock:
+                self._prefill_transfer_cleanup_pending.discard(key)
+            cleared += 1
+        return cleared
 
     def _cleanup_failed_prefill_transfer(
         self: Scheduler,
         req: Req,
         p2d_host,
         agentic_metadata: Optional[AgenticRequestMetadata],
-    ) -> None:
+    ) -> bool:
         """Release one failed P->D generation back to its owning pools."""
 
+        if p2d_host is not None:
+            # Invalidate even an unclaimed watcher candidate before returning
+            # its source pages to the allocator.
+            cancel_watch = getattr(
+                p2d_host, "cancel_watch", p2d_host.mark_scheduler_consumed
+            )
+            if cancel_watch(req) is False:
+                # A local or peer TP rank already committed this generation
+                # to Host staging.  Keep the source pages alive and let the
+                # group finish that path before cleanup.
+                return False
         if agentic_metadata is None:
             release_kv_cache(req, self.tree_cache)
         else:
@@ -552,14 +612,10 @@ class SchedulerDisaggregationPrefillMixin:
                 release_agentic(req, committed_len=committed_len)
         if hasattr(req.disagg_kv_sender, "clear"):
             req.disagg_kv_sender.clear()
-        if (
-            p2d_host is not None
-            and getattr(req, "_agentic_p2d_host_snapshot_id", None)
-        ):
-            p2d_host.mark_scheduler_consumed(req)
         if hasattr(req, "_async_prefill_transfer_payload"):
             delattr(req, "_async_prefill_transfer_payload")
         self._clear_tp_prefill_transfer_mailboxes(req)
+        return True
 
     def _prefill_queued_keys(self: Scheduler) -> set[str]:
         keys = getattr(self, "_prefill_ready_queued_keys", None)
@@ -576,10 +632,18 @@ class SchedulerDisaggregationPrefillMixin:
         if (
             getattr(self, "tp_size", 1) > 1
             and getattr(req, "_async_prefill_transfer_payload", None) is not None
+            and not getattr(
+                req, "_async_prefill_transfer_producer_reported_once", False
+            )
         ):
             self.agentic_tp_p2d_sender_mailbox.publish_local(
                 self._prefill_transfer_key(req), int(KVPoll.Bootstrapping)
             )
+            # Producer preparation is immutable for one request-generation.
+            # Re-reporting from TP followers would otherwise overwrite a
+            # worker's later Waiting/terminal state or recreate its sender
+            # file after group cleanup.
+            req._async_prefill_transfer_producer_reported_once = True
 
     def _enqueue_deferred_prefill_transfer(self: Scheduler, req: Req) -> bool:
         """Append one producer result to the transfer-consumer FIFO.
@@ -599,8 +663,19 @@ class SchedulerDisaggregationPrefillMixin:
             self._report_tp_prefill_producer_ready(req)
         with self._prefill_ready_condition:
             queued_keys = self._prefill_queued_keys()
+            tp_background = bool(
+                getattr(
+                    self,
+                    "_prefill_transfer_tp_background_enabled",
+                    getattr(self, "tp_size", 1) > 1,
+                )
+            )
             if (
-                key in queued_keys
+                (
+                    tp_background
+                    and getattr(req, "_async_prefill_transfer_enqueued_once", False)
+                )
+                or key in queued_keys
                 or getattr(req, "_async_prefill_transfer_consumer_active", False)
                 or (
                     getattr(self, "tp_size", 1) == 1
@@ -619,6 +694,12 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                     self._p_ready_publish_sequence = req._p_ready_sequence + 1
             self._prefill_ready_queue.append(req)
+            if tp_background:
+                # Every physical rank owns exactly one background state
+                # machine for this request-generation.  Only TP0 publishes
+                # the logical P-ready marker, so the rank-local notification
+                # flag cannot be used as the enqueue guard on followers.
+                req._async_prefill_transfer_enqueued_once = True
             queued_keys.add(key)
             self._prefill_ready_condition.notify()
         return True
@@ -656,6 +737,82 @@ class SchedulerDisaggregationPrefillMixin:
             req.time_stats.set_prefill_transfer_queue_entry_time()
             return int(KVPoll.Transferring)
         return poll
+
+    def _prefill_transfer_progress_tp_req_once(self: Scheduler, req: Req) -> int:
+        """Advance one TP P->D generation without a scheduler iteration.
+
+        Every rank prepares and reports its immutable physical shard.  TP0
+        publishes the P-ready marker only after all shards exist, then writes
+        one submit receipt after all senders have observed their matching D
+        receiver.  Direct completion is destination-authored; Host completion
+        is reduced across the producer ranks through the same mailbox.
+        """
+
+        key = self._prefill_transfer_key(req)
+        sender_mailbox = self.agentic_tp_p2d_sender_mailbox
+        receiver_mailbox = self.agentic_tp_p2d_receiver_mailbox
+        p2d_host = getattr(self, "agentic_p2d_host_staging_manager", None)
+
+        if getattr(req, "_agentic_p2d_host_terminal", False):
+            local_poll = int(KVPoll.Success)
+        elif p2d_host is not None:
+            host_poll = p2d_host.poll(req)
+            local_poll = None if host_poll is None else int(host_poll)
+        else:
+            local_poll = None
+
+        if local_poll is not None:
+            sender_mailbox.publish_local(key, local_poll)
+            if self.tp_rank == 0:
+                group_poll = sender_mailbox.group_status(key)
+                if group_poll in (int(KVPoll.Success), int(KVPoll.Failed)):
+                    sender_mailbox.publish_receipt(key, group_poll)
+            receipt = sender_mailbox.receipt(key)
+            return (
+                int(KVPoll.Transferring)
+                if receipt not in (int(KVPoll.Success), int(KVPoll.Failed))
+                else int(receipt)
+            )
+
+        # A Direct transfer is complete only after D commits every shard and
+        # TP0 on D publishes the destination-authored receipt.
+        direct_receipt = receiver_mailbox.receipt(key)
+        if direct_receipt in (int(KVPoll.Success), int(KVPoll.Failed)):
+            return int(direct_receipt)
+
+        poll = int(req.disagg_kv_sender.poll())
+        sender_mailbox.publish_local(key, poll)
+
+        if self.tp_rank == 0:
+            group_poll = sender_mailbox.group_status(key)
+            if group_poll == int(KVPoll.Failed):
+                sender_mailbox.publish_receipt(key, int(KVPoll.Failed))
+            if (
+                group_poll is not None
+                and group_poll >= int(KVPoll.Bootstrapping)
+                and not getattr(req, "disagg_p_ready_notified", False)
+            ):
+                self._publish_deferred_prefill_ready(req)
+            if (
+                group_poll == int(KVPoll.WaitingForInput)
+                and sender_mailbox.receipt(key) is None
+            ):
+                # This receipt is the rank0 command authorizing every P rank
+                # to submit its already-prepared shard.
+                sender_mailbox.publish_receipt(key, int(KVPoll.WaitingForInput))
+
+        submit_command = sender_mailbox.receipt(key)
+        if submit_command == int(KVPoll.Failed):
+            return int(KVPoll.Failed)
+        if (
+            submit_command == int(KVPoll.WaitingForInput)
+            and not getattr(req, "disagg_p_ready_transfer_started", False)
+        ):
+            if not self._submit_tp_prefill_transfer(req):
+                # The submitter reports local failure.  Every rank remains in
+                # the state machine until TP0 publishes one group failure.
+                return int(KVPoll.Transferring)
+        return int(KVPoll.Transferring)
 
     def _submit_tp_prefill_transfer(self: Scheduler, req: Req) -> bool:
         """Submit one physical P->D shard at a native TP scheduler boundary."""
@@ -702,6 +859,14 @@ class SchedulerDisaggregationPrefillMixin:
         total_seconds = 0.0
         max_seconds = 0.0
         last_stats_at = time.monotonic()
+        # TP has one physical-shard worker per rank.  The configured progress
+        # interval is a full-queue sweep cadence, not a per-request delay: at
+        # c256 a 15 ms sleep after every request would make one control sweep
+        # take about four seconds and starve otherwise-empty D workers.
+        tp_background = bool(
+            getattr(self, "_prefill_transfer_tp_background_enabled", False)
+        )
+        tp_sweep_remaining = 0
         while not self._prefill_transfer_stop.is_set():
             with self._prefill_ready_condition:
                 while (
@@ -713,6 +878,11 @@ class SchedulerDisaggregationPrefillMixin:
                     return
                 req = self._prefill_ready_queue.popleft()
                 key = self._prefill_transfer_key(req)
+                if tp_background and tp_sweep_remaining <= 0:
+                    # Include the item just removed.  Requests arriving during
+                    # this sweep are picked up by the next sweep, preserving a
+                    # bounded and deterministic polling cadence.
+                    tp_sweep_remaining = len(self._prefill_ready_queue) + 1
                 self._prefill_queued_keys().discard(key)
                 if not getattr(req, "_async_prefill_transfer_consumer_active", False):
                     req._async_prefill_transfer_consumer_active = True
@@ -720,6 +890,7 @@ class SchedulerDisaggregationPrefillMixin:
                     self._prefill_transfer_active_reqs[key] = req
 
             poll = int(KVPoll.Failed)
+            elapsed = 0.0
             try:
                 if (
                     getattr(req, "disagg_p_ready_deferred", False)
@@ -735,7 +906,16 @@ class SchedulerDisaggregationPrefillMixin:
                 # P->D completion polling is not: the DMA is already in flight
                 # and a later status check is harmless.  Yield before entering
                 # the shared NIXL manager whenever reverse progress is queued.
-                if direct_requested is not None and direct_requested.is_set():
+                if getattr(self, "tp_size", 1) > 1:
+                    # TP P->D owns an independent state machine.  It shares a
+                    # lock only around short NIXL Python control calls; reverse
+                    # D->P activity must not suppress its progress.
+                    if nixl_lock is None:
+                        poll = self._prefill_transfer_progress_tp_req_once(req)
+                    else:
+                        with nixl_lock:
+                            poll = self._prefill_transfer_progress_tp_req_once(req)
+                elif direct_requested is not None and direct_requested.is_set():
                     poll = int(KVPoll.Transferring)
                 elif nixl_lock is None:
                     poll = self._prefill_transfer_progress_req_once(req)
@@ -780,25 +960,41 @@ class SchedulerDisaggregationPrefillMixin:
                         self._prefill_ready_publish_condition.notify_all()
 
             terminal = poll in (int(KVPoll.Success), int(KVPoll.Failed))
-            if getattr(self, "tp_size", 1) > 1 and terminal:
-                self.agentic_tp_p2d_sender_mailbox.publish_local(key, poll)
             if terminal:
-                with self._prefill_transfer_poll_lock:
-                    req._async_prefill_transfer_poll = poll
-                    req._async_prefill_transfer_consumer_active = False
+                # For TP background progress this worker is the sole terminal
+                # authority.  Quiesce every source of mailbox publication
+                # before making the terminal result scheduler-visible;
+                # otherwise scheduler cleanup can clear the group while this
+                # worker is still able to recreate a sender file.
+                if getattr(self, "tp_size", 1) > 1:
+                    self.agentic_tp_p2d_sender_mailbox.publish_local(key, poll)
                 with self._prefill_ready_condition:
                     self._prefill_transfer_active_reqs.pop(key, None)
+                with self._prefill_transfer_poll_lock:
+                    req._async_prefill_transfer_consumer_active = False
+                    req._async_prefill_transfer_poll = poll
             elif not self._prefill_transfer_stop.is_set():
                 # Keep the transfer active but relinquish this worker after
                 # one step, so later P results cannot be starved by waiters.
-                self._prefill_transfer_stop.wait(
-                    max(0.0, self._prefill_transfer_interval - elapsed)
-                )
+                if not tp_background:
+                    self._prefill_transfer_stop.wait(
+                        max(0.0, self._prefill_transfer_interval - elapsed)
+                    )
                 if not self._prefill_transfer_stop.is_set():
                     with self._prefill_ready_condition:
                         self._prefill_ready_queue.append(req)
                         self._prefill_queued_keys().add(key)
                         self._prefill_ready_condition.notify()
+
+            if tp_background:
+                tp_sweep_remaining -= 1
+                if (
+                    tp_sweep_remaining <= 0
+                    and not self._prefill_transfer_stop.is_set()
+                ):
+                    self._prefill_transfer_stop.wait(
+                        max(0.0, self._prefill_transfer_interval - elapsed)
+                    )
 
             now = time.monotonic()
             if now - last_stats_at >= 30.0:
@@ -1340,6 +1536,18 @@ class SchedulerDisaggregationPrefillMixin:
                 req.output_ids.append(next_token_id)
                 self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
                 self.disagg_prefill_inflight_queue.append(req)
+                p2d_host = getattr(
+                    self, "agentic_p2d_host_staging_manager", None
+                )
+                if p2d_host is not None:
+                    # Register once at the producer boundary.  The manager's
+                    # offer watcher starts D2H as soon as D advertises that
+                    # direct admission failed, even while the scheduler is in
+                    # the next Prefill forward.
+                    p2d_source_indices = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, : len(req.origin_input_ids)
+                    ].clone()
+                    p2d_host.watch(req, p2d_source_indices)
                 if self.spec_algorithm.is_eagle() and batch.spec_info is not None:
                     req.output_topk_p = batch.spec_info.topk_p[i]
                     req.output_topk_index = batch.spec_info.topk_index[i]
@@ -1368,8 +1576,7 @@ class SchedulerDisaggregationPrefillMixin:
                         self._prepare_deferred_prefill_transfer(req)
                     ):
                         if getattr(self, "_prefill_transfer_async_enabled", False):
-                            if self.tp_size == 1:
-                                self._enqueue_deferred_prefill_transfer(req)
+                            self._enqueue_deferred_prefill_transfer(req)
                         else:
                             self._publish_deferred_prefill_ready(req)
                 else:
@@ -1387,12 +1594,20 @@ class SchedulerDisaggregationPrefillMixin:
                         # Grammar accept_token can raise ValueError if the token is not in the grammar.
                         # This can happen if the grammar is not set correctly or the token is invalid.
                         error_message = f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-                        release_kv_cache(req, self.tree_cache)
-                        prepare_abort(
-                            req,
-                            error_message,
-                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                        )
+                        release_safe = p2d_host is None or p2d_host.cancel_watch(req)
+                        if release_safe:
+                            release_kv_cache(req, self.tree_cache)
+                            prepare_abort(
+                                req,
+                                error_message,
+                                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                            )
+                        else:
+                            # Extremely rare: Host D2H won concurrently with
+                            # grammar validation.  Preserve pages until that
+                            # copy reaches a terminal poll, then abort through
+                            # the normal inflight cleanup path.
+                            req._agentic_p2d_abort_after_copy = error_message
                     req.grammar.finished = req.finished()
             else:
                 # being chunked reqs' prefill is not finished
@@ -1456,16 +1671,6 @@ class SchedulerDisaggregationPrefillMixin:
         done_reqs = []
 
         p2d_host = getattr(self, "agentic_p2d_host_staging_manager", None)
-        if p2d_host is not None:
-            for req in inflight_queue:
-                if p2d_host.is_active(req) or not p2d_host.has_offer(req):
-                    continue
-                # Clone only the compact page-index vector.  KV bytes stay in
-                # their scheduler-owned pages until the async D2H completes.
-                source_indices = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, : len(req.origin_input_ids)
-                ].clone()
-                p2d_host.try_submit(req, source_indices)
 
         if getattr(self, "_prefill_transfer_async_enabled", False):
             # Metadata-buffer slots are bounded.  If none was available when
@@ -1478,27 +1683,29 @@ class SchedulerDisaggregationPrefillMixin:
                     getattr(req, "disagg_p_ready_deferred", False)
                     and self._prepare_deferred_prefill_transfer(req)
                 ):
-                    if self.tp_size == 1 and not getattr(
-                        req, "disagg_p_ready_notified", False
-                    ):
+                    if not getattr(req, "disagg_p_ready_notified", False):
                         self._enqueue_deferred_prefill_transfer(req)
             if self.tp_size > 1:
+                tp_background = bool(
+                    getattr(self, "_prefill_transfer_tp_background_enabled", False)
+                )
                 submit_keys = set(
                     getattr(self, "_agentic_tp_prefill_submit_keys", ())
                 )
-                for req in inflight_queue:
-                    request_key = (str(req.rid), int(req.bootstrap_room))
-                    if (
-                        request_key in submit_keys
-                        and not getattr(
-                            req, "disagg_p_ready_transfer_started", False
+                if not tp_background:
+                    for req in inflight_queue:
+                        request_key = (str(req.rid), int(req.bootstrap_room))
+                        if (
+                            request_key in submit_keys
+                            and not getattr(
+                                req, "disagg_p_ready_transfer_started", False
+                            )
+                        ):
+                            self._submit_tp_prefill_transfer(req)
+                        local_poll = self._prefill_transfer_progress_req_once(req)
+                        self.agentic_tp_p2d_sender_mailbox.publish_local(
+                            self._prefill_transfer_key(req), int(local_poll)
                         )
-                    ):
-                        self._submit_tp_prefill_transfer(req)
-                    local_poll = self._prefill_transfer_progress_req_once(req)
-                    self.agentic_tp_p2d_sender_mailbox.publish_local(
-                        self._prefill_transfer_key(req), int(local_poll)
-                    )
                 group_status = getattr(
                     self, "_agentic_tp_prefill_transfer_group_status", {}
                 )
@@ -1592,6 +1799,14 @@ class SchedulerDisaggregationPrefillMixin:
             ]:
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
+                # Resolve native-vs-Host ownership before freeing any GPU
+                # page.  A Host claim arriving after the last native poll
+                # keeps the request inflight until its D2H completes.
+                if p2d_host is not None and not p2d_host.prepare_scheduler_release(
+                    req
+                ):
+                    undone_reqs.append(req)
+                    continue
                 staged_p2d = bool(
                     p2d_host is not None
                     and getattr(req, "_agentic_p2d_host_snapshot_id", None)
@@ -1646,12 +1861,22 @@ class SchedulerDisaggregationPrefillMixin:
                             req.rid,
                             req.extra_key,
                         )
-                req.finished_reason = FINISH_LENGTH(length=0)
+                abort_after_copy = getattr(
+                    req, "_agentic_p2d_abort_after_copy", None
+                )
+                if abort_after_copy is None:
+                    req.finished_reason = FINISH_LENGTH(length=0)
+                else:
+                    delattr(req, "_agentic_p2d_abort_after_copy")
+                    prepare_abort(
+                        req,
+                        abort_after_copy,
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
                 # FIXME: clean up req's data in transfer engine
                 if hasattr(req.disagg_kv_sender, "clear"):
                     req.disagg_kv_sender.clear()
                 if staged_p2d:
-                    p2d_host.mark_scheduler_consumed(req)
                     logger.info(
                         "AgenticKV p2d_host_prefill_release snapshot=%s req=%s",
                         getattr(req, "_agentic_p2d_host_snapshot_id", ""),
@@ -1675,9 +1900,11 @@ class SchedulerDisaggregationPrefillMixin:
                     if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get()
                     else None
                 )
-                self._cleanup_failed_prefill_transfer(
+                if not self._cleanup_failed_prefill_transfer(
                     req, p2d_host, agentic_metadata
-                )
+                ):
+                    undone_reqs.append(req)
+                    continue
                 prepare_abort(
                     req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
                 )

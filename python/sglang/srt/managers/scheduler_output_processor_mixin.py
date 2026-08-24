@@ -476,7 +476,7 @@ class SchedulerOutputProcessorMixin:
                 self.maybe_collect_routed_experts(req)
 
                 response_ready = True
-                if self.server_args.disaggregation_decode_enable_offload_kvcache:
+                if self.decode_offload_manager is not None:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                     if self.decode_offload_manager.offload_kv_cache(req):
                         # Do not block the scheduler on Device->Host->storage.

@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 import torch
 
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -60,6 +61,19 @@ class HiRadixCache(RadixCache):
 
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
         self._enable_metrics_flag = params.enable_metrics
+        self.agentic_custom_storage_only = (
+            envs.SGLANG_AGENTIC_KV_CUSTOM_STORAGE_ONLY.get()
+        )
+        if self.agentic_custom_storage_only:
+            if not envs.SGLANG_AGENTIC_KV_LIFECYCLE.get():
+                raise ValueError(
+                    "SGLANG_AGENTIC_KV_CUSTOM_STORAGE_ONLY requires "
+                    "SGLANG_AGENTIC_KV_LIFECYCLE"
+                )
+            logger.info(
+                "Agentic custom-storage-only mode enabled: native HiCache "
+                "Radix backup/prefetch is disabled"
+            )
 
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
@@ -623,6 +637,8 @@ class HiRadixCache(RadixCache):
             return False
 
     def write_backup(self, node: TreeNode, write_back=False):
+        if getattr(self, "agentic_custom_storage_only", False):
+            return 0
         host_indices = self.cache_controller.write(
             device_indices=node.value,
             node_id=node.id,
@@ -646,6 +662,8 @@ class HiRadixCache(RadixCache):
         return len(host_indices)
 
     def write_backup_storage(self, node: TreeNode):
+        if getattr(self, "agentic_custom_storage_only", False):
+            return
         # Agentic request-generation snapshots have their own bounded
         # Direct/Shared-Arena lifecycle.  Sending these transient P branches
         # to generic HiCache storage duplicates ownership and can retain them
@@ -668,6 +686,8 @@ class HiRadixCache(RadixCache):
         node.protect_host()
 
     def _inc_hit_count(self, node: TreeNode, chunked=False):
+        if getattr(self, "agentic_custom_storage_only", False):
+            return
         # skip the hit count update for chunked requests
         if self.cache_controller.write_policy == "write_back" or chunked:
             return
@@ -1108,7 +1128,10 @@ class HiRadixCache(RadixCache):
                 continue
 
             if not x.backuped:
-                if self.cache_controller.write_policy == "write_back":
+                if (
+                    self.cache_controller.write_policy == "write_back"
+                    and not getattr(self, "agentic_custom_storage_only", False)
+                ):
                     # write to host if the node is not backuped
                     written = self.write_backup(x, write_back=True)
                     if written:
@@ -1136,7 +1159,10 @@ class HiRadixCache(RadixCache):
                     new_priority = self.eviction_strategy.get_priority(parent)
                     heapq.heappush(eviction_heap, (new_priority, parent))
 
-        if self.cache_controller.write_policy == "write_back":
+        if (
+            self.cache_controller.write_policy == "write_back"
+            and not getattr(self, "agentic_custom_storage_only", False)
+        ):
             self.writing_check(write_back=True)
             for node in write_back_nodes:
                 assert node.backuped
@@ -1570,6 +1596,10 @@ class HiRadixCache(RadixCache):
         new_input_tokens = new_input_tokens[:prefetch_length]
         if (
             not self.enable_storage
+            or (
+                getattr(self, "agentic_custom_storage_only", False)
+                and agentic_expected_tokens is None
+            )
             or (
                 agentic_expected_tokens is None
                 and prefetch_length < self.prefetch_threshold

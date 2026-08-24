@@ -929,10 +929,16 @@ class DecodePreallocQueue:
         if not self.queue:
             return
 
-        if all(decode_req.waiting_for_input for decode_req in self.queue):
+        # Handshake ownership ends permanently once WaitingForInput is seen.
+        # The scheduler may then bind the receiver and move the request to the
+        # transfer queue concurrently, so prealloc must never poll it again.
+        queue_snapshot = [
+            decode_req
+            for decode_req in self.queue
+            if not decode_req.waiting_for_input
+        ]
+        if not queue_snapshot:
             return
-
-        queue_snapshot = list(self.queue)
         if self._async_progress_enabled:
             # Agentic V1 is TP=1.  Avoid a Gloo collective in a background
             # thread and keep the model/collective submission thread isolated.
@@ -966,6 +972,12 @@ class DecodePreallocQueue:
                 )
                 if self.scheduler.enable_metrics:
                     self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+            elif poll in {KVPoll.Transferring, KVPoll.Success}:
+                # bind() may advance an asynchronous P->D Host receiver after
+                # this worker captured the prealloc queue but before the
+                # scheduler removes the request.  This is normal progress; the
+                # transfer queue remains the sole commit/removal authority.
+                pass
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
@@ -1746,15 +1758,31 @@ class DecodeTransferQueue:
         """Commit cached transfer progress without ever stalling Decode.
 
         The async poller and every receiver lifecycle mutation share one lock.
-        Decode takes it non-blockingly and, once acquired, retains it through
-        status consumption, commit/clear and queue removal.  Thus a poll can
-        neither race receiver teardown nor begin on another queue entry midway
-        through this scheduler transaction.
+        TP=1 takes it non-blockingly.  A TP group waits only after its all-rank
+        terminal decision, because every rank must commit in the same scheduler
+        iteration.  Once acquired, the lock is retained through status
+        consumption, commit/clear and queue removal.  Thus a poll can neither
+        race receiver teardown nor begin on another queue entry midway through
+        this scheduler transaction.
         """
 
         if not self._async_progress_enabled:
             return self._pop_transferred_locked(rids_to_check)
-        if not self._async_poll_lock.acquire(blocking=False):
+        # TP commits are group decisions.  Once TP0 has broadcast a terminal
+        # all-rank transfer status, every rank must commit that exact request
+        # in the same scheduler iteration.  Letting one rank skip because its
+        # local background poller still owns the lifecycle lock splits the
+        # waiting/running batches and deadlocks the next model collective.
+        #
+        # The background poll publishes its terminal status at the end of the
+        # same tiny critical section (normally a few microseconds), so waiting
+        # here only closes that publication tail.  TP=1 deliberately keeps the
+        # original non-blocking behavior to avoid coupling Decode Forward to a
+        # slow transport poll.
+        tp_group_commit = getattr(
+            getattr(self, "scheduler", None), "tp_size", 1
+        ) > 1
+        if not self._async_poll_lock.acquire(blocking=tp_group_commit):
             return []
         try:
             return self._pop_transferred_locked(rids_to_check)
@@ -2107,7 +2135,7 @@ class SchedulerDisaggregationDecodeMixin:
         return new_batch
 
     def process_decode_queue(self: Scheduler):
-        if self.server_args.disaggregation_decode_enable_offload_kvcache:
+        if self.decode_offload_manager is not None:
             self.decode_offload_manager.check_offload_progress()
             ready_responses = self.decode_offload_manager.pop_ready_responses()
             if ready_responses:

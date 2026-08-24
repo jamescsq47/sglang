@@ -81,6 +81,14 @@ class DecodeKVCacheOffloadManager:
         self.request_counter = 0
         self.tree_cache = tree_cache
         self.agentic_enabled = envs.SGLANG_AGENTIC_KV_LIFECYCLE.get()
+        self.agentic_custom_storage_only = (
+            envs.SGLANG_AGENTIC_KV_CUSTOM_STORAGE_ONLY.get()
+        )
+        if self.agentic_custom_storage_only and not self.agentic_enabled:
+            raise ValueError(
+                "SGLANG_AGENTIC_KV_CUSTOM_STORAGE_ONLY requires "
+                "SGLANG_AGENTIC_KV_LIFECYCLE"
+            )
         self.agentic_hostless = (
             self.agentic_enabled
             and envs.SGLANG_AGENTIC_KV_HOST_STAGING.get()
@@ -972,6 +980,12 @@ class DecodeKVCacheOffloadManager:
 
         if self.agentic_enabled and metadata is not None:
             return self._offload_agentic_finished_snapshot(req, metadata)
+        if self.agentic_custom_storage_only:
+            # This manager still provides the Host pool, Mooncake client, and
+            # request-generation slow path.  Untagged requests must retain the
+            # normal finish/release behavior instead of entering stock SGLang
+            # Decode HiCache offload.
+            return False
         if self.agentic_hostless:
             # Hostless mode is deliberately scoped to request-generation
             # snapshots. Ordinary requests retain the normal finish/release path.

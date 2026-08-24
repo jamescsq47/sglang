@@ -434,7 +434,7 @@ class SchedulerRuntimeCheckerMixin:
                     )
                 )
             )
-            if self.server_args.disaggregation_decode_enable_offload_kvcache:
+            if self.decode_offload_manager is not None:
                 queue_size += len(self.decode_offload_manager.ongoing_offload)
                 # A fast D->P offer intentionally retains the finished D KV
                 # until P has reserved HBM and the NIXL transfer completes.

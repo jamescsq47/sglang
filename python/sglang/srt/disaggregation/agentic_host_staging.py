@@ -39,6 +39,142 @@ logger = logging.getLogger(__name__)
 _LEDGER_ENTRY_UNSET = object()
 
 
+class AgenticStorageController:
+    """Storage-only resources for request-generation slow-path spill.
+
+    This deliberately is not HiCache: it owns no Radix policy, automatic
+    backup/prefetch queue, or device-to-host cache.  The Host pool is only a
+    temporary page-addressable staging allocation for explicit Mooncake
+    snapshot puts/gets initiated by ``AgenticPHostStagingManager``.
+    """
+
+    def __init__(self, mem_pool_host, storage_backend, storage_batch_size=128):
+        self.mem_pool_host = mem_pool_host
+        self.storage_backend = storage_backend
+        self.storage_batch_size = int(storage_batch_size)
+
+    def close(self) -> None:
+        close = getattr(self.storage_backend, "close", None)
+        if close is not None:
+            close()
+
+
+def _agentic_storage_extra_config(value: Optional[str]) -> dict[str, Any]:
+    if not value:
+        return {}
+    if not value.startswith("@"):
+        config = json.loads(value)
+    else:
+        path = value[1:]
+        extension = os.path.splitext(path)[1].lower()
+        with open(path, "rb" if extension == ".toml" else "r") as handle:
+            if extension == ".json":
+                config = json.load(handle)
+            elif extension == ".toml":
+                import tomllib
+
+                config = tomllib.load(handle)
+            elif extension in {".yaml", ".yml"}:
+                import yaml
+
+                config = yaml.safe_load(handle)
+            else:
+                raise ValueError(f"unsupported storage config format: {extension}")
+    if not isinstance(config, dict):
+        raise ValueError("agentic storage backend config must be an object")
+    # These are generic HiCache scheduling knobs, not backend constructor
+    # options.  The custom request-generation state machine does not use them.
+    for name in (
+        "prefetch_threshold",
+        "prefetch_timeout_base",
+        "prefetch_timeout_per_ki_token",
+        "hicache_storage_pass_prefix_keys",
+    ):
+        config.pop(name, None)
+    return config
+
+
+def create_agentic_storage_controller(
+    *,
+    token_allocator,
+    server_args,
+    tp_rank: int,
+    tp_size: int,
+    pp_rank: int,
+    pp_size: int,
+    model_name: Optional[str],
+) -> AgenticStorageController:
+    """Create the custom slow-path storage data plane without HiCache."""
+
+    from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
+    from sglang.srt.mem_cache.memory_pool import (
+        MHATokenToKVPool,
+        MLATokenToKVPool,
+        NSATokenToKVPool,
+    )
+    from sglang.srt.mem_cache.memory_pool_host import (
+        MHATokenToKVPoolHost,
+        MLATokenToKVPoolHost,
+        NSATokenToKVPoolHost,
+    )
+    from sglang.srt.mem_cache.storage import StorageBackendFactory
+
+    backend_name = server_args.hicache_storage_backend
+    if backend_name is None:
+        raise ValueError("agentic Host staging requires a storage backend")
+    device_pool = token_allocator.get_kvcache()
+    common = (
+        device_pool,
+        server_args.hicache_ratio,
+        server_args.hicache_size,
+        server_args.page_size,
+        server_args.hicache_mem_layout,
+    )
+    if isinstance(device_pool, MHATokenToKVPool):
+        host_pool = MHATokenToKVPoolHost(
+            *common, allocator_type=backend_name
+        )
+    elif isinstance(device_pool, NSATokenToKVPool):
+        host_pool = NSATokenToKVPoolHost(
+            *common, allocator_type=backend_name
+        )
+    elif isinstance(device_pool, MLATokenToKVPool):
+        host_pool = MLATokenToKVPoolHost(
+            *common, allocator_type=backend_name
+        )
+    else:
+        raise ValueError(
+            f"unsupported agentic storage KV pool: {type(device_pool).__name__}"
+        )
+
+    storage_config = HiCacheStorageConfig(
+        tp_rank=int(tp_rank),
+        tp_size=int(tp_size),
+        pp_rank=int(pp_rank),
+        pp_size=int(pp_size),
+        is_mla_model=isinstance(device_pool, MLATokenToKVPool),
+        enable_storage_metrics=False,
+        is_page_first_layout=host_pool.layout == "page_first",
+        model_name=model_name,
+        extra_config=_agentic_storage_extra_config(
+            server_args.hicache_storage_backend_extra_config
+        ),
+    )
+    backend = StorageBackendFactory.create_backend(
+        backend_name, storage_config, host_pool
+    )
+    backend.register_mem_pool_host(host_pool)
+    logger.info(
+        "Agentic custom storage controller enabled backend=%s host_gib=%.2f "
+        "native_hicache=false",
+        backend_name,
+        host_pool.get_total_size() / (1024**3)
+        if hasattr(host_pool, "get_total_size")
+        else float(server_args.hicache_size),
+    )
+    return AgenticStorageController(host_pool, backend)
+
+
 class HostStageState(str, Enum):
     OFFERED = "offered"
     HOST_RESERVED = "host_reserved"
@@ -58,6 +194,10 @@ _TERMINAL_STATES = {
     HostStageState.REJECTED.value,
     HostStageState.FAILED.value,
 }
+
+P2D_RELEASE_NATIVE_WON = "native_won"
+P2D_RELEASE_HOST_OWNED = "host_owned"
+P2D_RELEASE_HOST_TERMINAL = "host_terminal"
 
 _ALLOWED_STAGE_TRANSITIONS = {
     HostStageState.OFFERED.value: {
@@ -196,6 +336,14 @@ class SharedHostStagingLedger:
             if not 0 <= tp_rank < tp_size:
                 raise ValueError("invalid host-staging TP rank")
             if current is not None:
+                # A P TP group may atomically choose native NIXL before every
+                # D rank has published its fallback offer.  Keep that decision
+                # as a tombstone so a late rank cannot resurrect Host staging.
+                if (
+                    current.get("state") == HostStageState.REJECTED.value
+                    and current.get("native_won")
+                ):
+                    return dict(current), False
                 if int(current.get("tp_size", 1)) != tp_size:
                     raise ValueError("host-staging TP size changed within snapshot")
                 if (
@@ -663,6 +811,62 @@ class SharedHostStagingLedger:
 
         return bool(self._mutate(callback))
 
+    def arbitrate_p2d_release(self, snapshot_id: str, *, tp_size: int) -> str:
+        """Resolve whether one untouched P shard may release its source pages.
+
+        A minimal REJECTED tombstone is created even when D has not published
+        its offer yet.  This makes the decision group-wide across independent
+        TP processes: a later Host offer/claim cannot split the KV shards.
+
+        ``host_terminal`` is distinct from ``host_owned``.  If another TP rank
+        claimed Host but the group subsequently failed/aborted before this rank
+        started D2H, this rank's source pages were never exposed to Host I/O and
+        are safe to release.  Treating both outcomes as False would retain the
+        untouched shard forever with no local worker able to consume failure.
+        """
+
+        def callback(entries):
+            current = entries.get(snapshot_id)
+            now = time.time()
+            if current is None:
+                entries[snapshot_id] = {
+                    "snapshot_id": snapshot_id,
+                    "state": HostStageState.REJECTED.value,
+                    "native_won": True,
+                    "tp_size": int(tp_size),
+                    "created_at": now,
+                    "updated_at": now,
+                }
+                return P2D_RELEASE_NATIVE_WON, True
+            if current.get("state") == HostStageState.REJECTED.value:
+                return P2D_RELEASE_NATIVE_WON, False
+            if current.get("state") in {
+                HostStageState.ABORTING.value,
+                HostStageState.FAILED.value,
+            }:
+                return P2D_RELEASE_HOST_TERMINAL, False
+            if current.get("p_owner") is not None or current.get("claimed_ranks"):
+                return P2D_RELEASE_HOST_OWNED, False
+            if current.get("state") not in {
+                HostStageState.OFFERED.value,
+                "tp_collecting",
+            }:
+                return P2D_RELEASE_HOST_OWNED, False
+            current["state"] = HostStageState.REJECTED.value
+            current["native_won"] = True
+            current["updated_at"] = now
+            return P2D_RELEASE_NATIVE_WON, True
+
+        return str(self._mutate(callback))
+
+    def arbitrate_p2d_native(self, snapshot_id: str, *, tp_size: int) -> bool:
+        """Compatibility bool for callers that only distinguish native/Host."""
+
+        return (
+            self.arbitrate_p2d_release(snapshot_id, tp_size=tp_size)
+            == P2D_RELEASE_NATIVE_WON
+        )
+
     def publish_rank_grant(
         self,
         snapshot_id: str,
@@ -929,28 +1133,82 @@ class SharedHostStagingLedger:
         return bool(self._mutate(callback))
 
     def mark_writer_drained(self, snapshot_id: str, d_pid: int) -> bool:
-        """ACK that no D-side DMA can still target an aborting extent."""
+        """ACK one rank has no DMA that can still target an aborting extent."""
+
+        return self.mark_writer_rank_drained(
+            snapshot_id, d_pid, tp_rank=0, tp_size=1
+        )
+
+    def mark_writer_rank_drained(
+        self,
+        snapshot_id: str,
+        d_pid: int,
+        *,
+        tp_rank: int,
+        tp_size: int,
+    ) -> bool:
+        """Publish group drain only after every D TP rank is quiescent."""
 
         def callback(entries):
             current = entries.get(snapshot_id)
-            if current is None or int(current.get("d_pid", -1)) != int(d_pid):
+            rank_offer = (
+                current.get("rank_offers", {}).get(str(int(tp_rank)), {})
+                if current
+                else {}
+            )
+            owner_pid = (
+                int(current.get("d_pid", -1))
+                if int(tp_size) == 1 and current is not None
+                else int(rank_offer.get("d_pid", -1))
+            )
+            if (
+                current is None
+                or owner_pid != int(d_pid)
+                or int(current.get("tp_size", 1)) != int(tp_size)
+            ):
                 return False, False
             if current.get("state") != HostStageState.ABORTING.value:
                 return False, False
-            if current.get("writer_drained"):
-                return True, False
-            current["writer_drained"] = True
+            drained = set(
+                int(value) for value in current.get("writer_drained_ranks", [])
+            )
+            changed = int(tp_rank) not in drained
+            drained.add(int(tp_rank))
+            current["writer_drained_ranks"] = sorted(drained)
+            current["writer_drained"] = len(drained) == int(tp_size)
             current["updated_at"] = time.time()
-            return True, True
+            return True, changed
 
         return bool(self._mutate(callback))
 
-    def fail_host_write(self, snapshot_id: str, d_pid: int, reason: str) -> bool:
-        """Fail closed after D has stopped touching the shared extent."""
+    def fail_host_write(
+        self,
+        snapshot_id: str,
+        d_pid: int,
+        reason: str,
+        *,
+        tp_rank: int = 0,
+        tp_size: int = 1,
+    ) -> bool:
+        """Fail one D rank closed and wait for all peer DMAs to drain."""
 
         def callback(entries):
             current = entries.get(snapshot_id)
-            if current is None or int(current.get("d_pid", -1)) != int(d_pid):
+            rank_offer = (
+                current.get("rank_offers", {}).get(str(int(tp_rank)), {})
+                if current
+                else {}
+            )
+            owner_pid = (
+                int(current.get("d_pid", -1))
+                if int(tp_size) == 1 and current is not None
+                else int(rank_offer.get("d_pid", -1))
+            )
+            if (
+                current is None
+                or owner_pid != int(d_pid)
+                or int(current.get("tp_size", 1)) != int(tp_size)
+            ):
                 return False, False
             if current.get("state") not in {
                 HostStageState.HOST_RESERVED.value,
@@ -959,7 +1217,12 @@ class SharedHostStagingLedger:
             }:
                 return False, False
             current["state"] = HostStageState.ABORTING.value
-            current["writer_drained"] = True
+            drained = set(
+                int(value) for value in current.get("writer_drained_ranks", [])
+            )
+            drained.add(int(tp_rank))
+            current["writer_drained_ranks"] = sorted(drained)
+            current["writer_drained"] = len(drained) == int(tp_size)
             current["reason"] = str(reason)[:256]
             current["updated_at"] = time.time()
             return True, True
@@ -2539,7 +2802,12 @@ class AgenticPHostStagingManager:
             tp_size = int(getattr(self, "tp_size", 1))
             commit_matches = (
                 tp_size > 1
-                and getattr(self, "tp_host_commit_snapshot", None) == snapshot_id
+                and (
+                    snapshot_id
+                    in getattr(self, "tp_host_commit_snapshots", set())
+                    or getattr(self, "tp_host_commit_snapshot", None)
+                    == snapshot_id
+                )
             )
             if tp_size > 1 and not commit_matches:
                 # Rank-local H2D completion is not a scheduler admission
@@ -2744,9 +3012,11 @@ class AgenticPHostStagingManager:
                     (time.monotonic() - started_at) * 1000.0,
                     snapshot_id,
                 )
-                # Keep one bounded control action per scheduler visit. The
-                # next visit reserves HBM and launches the first H2D chunk.
-                return True
+                # mmap is metadata-only and uses the process-lifetime pinned
+                # bounce buffer.  Continue directly to normal-page admission;
+                # deferring this harmless step to another scheduler visit
+                # creates multi-second gaps whenever the next Prefill batch is
+                # long, even though HBM is already available.
             # Claim before touching the GPU allocator so spill selection and
             # H2D admission can never own the same snapshot concurrently.
             record["loading"] = "h2d_reserving"
@@ -3511,33 +3781,13 @@ class AgenticDHostStagingClient:
                 return "waiting"
             return "failed"
         state = entry.get("state")
-        if candidate.get("rank_host_write_complete"):
-            return (
-                "host_ready"
-                if state
-                in {
-                    HostStageState.HOST_READY.value,
-                    HostStageState.H2D_LOADING.value,
-                    HostStageState.SPILLING.value,
-                    HostStageState.MOONCAKE_READY.value,
-                    HostStageState.CONSUMED.value,
-                }
-                else "waiting"
-            )
-        if state in {
+        durable_states = {
             HostStageState.HOST_READY.value,
             HostStageState.H2D_LOADING.value,
             HostStageState.SPILLING.value,
             HostStageState.MOONCAKE_READY.value,
             HostStageState.CONSUMED.value,
-        }:
-            # HOST_READY is a monotonic durability boundary.  P may already be
-            # loading or spilling by the time D polls; all later states still
-            # imply that a complete non-D copy exists.
-            if not self._cleanup_write(candidate):
-                return "waiting"
-            self._cleanup_relay_senders(candidate)
-            return "host_ready"
+        }
         if state in {
             HostStageState.REJECTED.value,
             HostStageState.FAILED.value,
@@ -3546,16 +3796,31 @@ class AgenticDHostStagingClient:
                 return "waiting"
             self._cleanup_relay_senders(candidate)
             return "failed"
-        write = candidate.get("arena_write")
         if state == HostStageState.ABORTING.value:
             try:
                 if not self._cleanup_write(candidate):
                     return "waiting"
-                self.ledger.mark_writer_drained(snapshot_id, os.getpid())
+                self.ledger.mark_writer_rank_drained(
+                    snapshot_id,
+                    os.getpid(),
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
+                )
             except Exception:
                 logger.exception("Failed to drain shared Host writer for %s", snapshot_id)
                 return "failed"
             return "waiting"
+        if candidate.get("rank_host_write_complete"):
+            return "host_ready" if state in durable_states else "waiting"
+        if state in durable_states:
+            # HOST_READY is a monotonic durability boundary.  P may already be
+            # loading or spilling by the time D polls; all later states still
+            # imply that a complete non-D copy exists.
+            if not self._cleanup_write(candidate):
+                return "waiting"
+            self._cleanup_relay_senders(candidate)
+            return "host_ready"
+        write = candidate.get("arena_write")
         if state != HostStageState.HOST_WRITING.value:
             return "waiting"
         write_mode = entry.get("write_mode")
@@ -3600,7 +3865,11 @@ class AgenticDHostStagingClient:
             except Exception:
                 logger.exception("Agentic shared Host D2H start failed for %s", snapshot_id)
                 self.ledger.fail_host_write(
-                    snapshot_id, os.getpid(), "shared_host_d2h_start_failed"
+                    snapshot_id,
+                    os.getpid(),
+                    "shared_host_d2h_start_failed",
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
                 )
                 return "failed"
             write = candidate["arena_write"]
@@ -3640,7 +3909,12 @@ class AgenticDHostStagingClient:
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
         ):
-            self.ledger.mark_writer_drained(snapshot_id, os.getpid())
+            self.ledger.mark_writer_rank_drained(
+                snapshot_id,
+                os.getpid(),
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+            )
             return "failed"
         logger.info(
             "AgenticKV shared_host_d2h_complete snapshot=%s completed_at=%.6f "

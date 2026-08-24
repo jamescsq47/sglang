@@ -61,6 +61,7 @@ from sglang.srt.disaggregation.agentic_early_claim import AgenticEarlyClaimStore
 from sglang.srt.disaggregation.agentic_host_staging import (
     AgenticPHostStagingManager,
     SharedHostStagingLedger,
+    create_agentic_storage_controller,
 )
 from sglang.srt.disaggregation.agentic_tp import (
     rank_env_int,
@@ -643,8 +644,23 @@ class Scheduler(
         )
         self.gpu_id = gpu_id
         self.page_size = server_args.page_size
+        custom_storage_only = envs.SGLANG_AGENTIC_KV_CUSTOM_STORAGE_ONLY.get()
+        if custom_storage_only and server_args.enable_hierarchical_cache:
+            raise ValueError(
+                "new-method custom storage forbids native --enable-hierarchical-cache"
+            )
+        if (
+            custom_storage_only
+            and server_args.disaggregation_decode_enable_offload_kvcache
+        ):
+            raise ValueError(
+                "new-method custom storage forbids native Decode KV offload"
+            )
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
-        self.enable_hicache_storage = server_args.hicache_storage_backend is not None
+        self.enable_hicache_storage = (
+            server_args.hicache_storage_backend is not None
+            and not custom_storage_only
+        )
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.enable_hisparse = server_args.enable_hisparse
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
@@ -1130,9 +1146,14 @@ class Scheduler(
             self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
             self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
 
-        if (
-            server_args.disaggregation_mode == "decode"
-            and server_args.disaggregation_decode_enable_offload_kvcache
+        custom_agentic_decode = bool(
+            envs.SGLANG_AGENTIC_KV_LIFECYCLE.get()
+            and envs.SGLANG_AGENTIC_KV_CUSTOM_STORAGE_ONLY.get()
+            and envs.SGLANG_AGENTIC_KV_HOST_STAGING.get()
+        )
+        if server_args.disaggregation_mode == "decode" and (
+            server_args.disaggregation_decode_enable_offload_kvcache
+            or custom_agentic_decode
         ):
             self.decode_offload_manager = DecodeKVCacheOffloadManager(
                 req_to_token_pool=self.req_to_token_pool,
@@ -1193,6 +1214,13 @@ class Scheduler(
         self.agentic_tp_host_active_since = 0.0
         self.agentic_tp_host_command_visible = False
         self.agentic_tp_host_group_status = 0
+        # Slow restores are a bounded pipeline, not a single global baton.
+        # The legacy scalar fields above remain compatibility aliases for
+        # tests and external instrumentation; all scheduling decisions use
+        # these request-generation keyed maps.
+        self.agentic_tp_host_active_requests: Dict[str, RequestGeneration] = {}
+        self.agentic_tp_host_active_since_by_snapshot: Dict[str, float] = {}
+        self.agentic_tp_host_group_statuses: Dict[str, int] = {}
         self.agentic_tp_host_local_admitted: set[str] = set()
         if self.tp_size > 1 and envs.SGLANG_AGENTIC_KV_LIFECYCLE.get():
             mailbox_dir = os.getenv("SGLANG_PD_P_READY_DIR", "/dev/shm")
@@ -1217,12 +1245,16 @@ class Scheduler(
             self.agentic_tp_p2d_admission_mailbox = TPGroupMailbox(
                 "p2d-admission", **common
             )
+            self.agentic_tp_p2d_cleanup_mailbox = TPGroupMailbox(
+                "p2d-cleanup", **common
+            )
         else:
             self.agentic_tp_direct_mailbox = None
             self.agentic_tp_host_mailbox = None
             self.agentic_tp_p2d_sender_mailbox = None
             self.agentic_tp_p2d_receiver_mailbox = None
             self.agentic_tp_p2d_admission_mailbox = None
+            self.agentic_tp_p2d_cleanup_mailbox = None
         self.agentic_early_direct_arrival_watcher = None
         self.agentic_early_claim_store = None
         self.agentic_direct_credit_pool = None
@@ -1573,11 +1605,25 @@ class Scheduler(
                             "P Host staging requires SGLANG_AGENTIC_KV_LEDGER_PATH "
                             "or SGLANG_AGENTIC_KV_STAGING_LEDGER_PATH"
                         )
-                    controller = getattr(self.tree_cache, "cache_controller", None)
-                    if controller is None:
-                        raise ValueError(
-                            "P Host staging requires --enable-hierarchical-cache"
+                    if envs.SGLANG_AGENTIC_KV_CUSTOM_STORAGE_ONLY.get():
+                        controller = create_agentic_storage_controller(
+                            token_allocator=self.token_to_kv_pool_allocator,
+                            server_args=self.server_args,
+                            tp_rank=self.tp_rank,
+                            tp_size=self.tp_size,
+                            pp_rank=self.pp_rank,
+                            pp_size=self.pp_size,
+                            model_name=self.server_args.served_model_name,
                         )
+                        self.agentic_storage_controller = controller
+                    else:
+                        controller = getattr(
+                            self.tree_cache, "cache_controller", None
+                        )
+                        if controller is None:
+                            raise ValueError(
+                                "P Host staging requires a storage controller"
+                            )
                     expected_tool_seconds = {
                         str(name): float(seconds)
                         for name, seconds in json.loads(
@@ -2574,6 +2620,12 @@ class Scheduler(
 
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
+            agentic_manifest = getattr(req, "_agentic_kv_manifest", None)
+            if (
+                envs.SGLANG_AGENTIC_KV_CUSTOM_STORAGE_ONLY.get()
+                and agentic_manifest is None
+            ):
+                return
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             last_host_node = req.last_host_node
             if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
@@ -2586,7 +2638,6 @@ class Scheduler(
                     if self.tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
-                agentic_manifest = getattr(req, "_agentic_kv_manifest", None)
                 agentic_expected_tokens = (
                     max(0, agentic_manifest.token_count - matched_len)
                     if agentic_manifest is not None
@@ -2608,7 +2659,9 @@ class Scheduler(
     def _agentic_snapshot_store(self):
         if not envs.SGLANG_AGENTIC_KV_LIFECYCLE.get():
             return None
-        controller = getattr(self.tree_cache, "cache_controller", None)
+        controller = getattr(self, "agentic_storage_controller", None)
+        if controller is None:
+            controller = getattr(self.tree_cache, "cache_controller", None)
         backend = getattr(controller, "storage_backend", None)
         factory = getattr(backend, "agentic_snapshot_store", None)
         if factory is None:
@@ -3110,6 +3163,20 @@ class Scheduler(
                 )
                 continue
             if manifest.state is not SnapshotState.DIRECT_READY:
+                continue
+            # The fixed Direct pool is only a transit area.  After reception
+            # the snapshot is promoted into the ordinary P KV pool so Prefill
+            # can append the tool result.  Reserve that eventual working-set
+            # space before granting the transfer; checking only the transit
+            # pool lets a burst of fast tools promote snapshots until ordinary
+            # HBM reaches 100%, at which point none of them can Prefill.  TP0
+            # owns this decision and followers mirror its exact grant.
+            if credit_pool is not None and not self._agentic_direct_hbm_fits(
+                pending_credit_tokens + required_tokens
+            ):
+                with poll_lock:
+                    queue.append((request, payload, manifest))
+                    pending.add(request.snapshot_id)
                 continue
             if credit_pool is not None and (
                 credit_pool.free_tokens - pending_credit_tokens < required_tokens
@@ -4540,22 +4607,21 @@ class Scheduler(
         host_staging = getattr(self, "agentic_host_staging_manager", None)
         if host_staging is not None:
             if getattr(self, "tp_size", 1) > 1:
-                selected_host = getattr(
-                    self, "_agentic_tp_host_selected_snapshot", None
-                )
-                host_action = getattr(self, "_agentic_tp_host_action", None)
+                host_action = getattr(
+                    self, "_agentic_tp_host_actions", {}
+                ).get(metadata.parent.snapshot_id)
                 allow_prepare_io = bool(
                     allow_start_io
-                    and selected_host == metadata.parent.snapshot_id
+                    and host_action is not None
                     and host_action in {"prepare", "start", "bind", "commit"}
                 )
                 allow_start_io = bool(
                     allow_start_io
-                    and selected_host == metadata.parent.snapshot_id
+                    and host_action is not None
                     and host_action in {"start", "bind", "commit"}
                 )
                 allow_bind_io = bool(
-                    selected_host == metadata.parent.snapshot_id
+                    host_action is not None
                     and host_action in {"bind", "commit"}
                 )
             else:
@@ -4943,33 +5009,37 @@ class Scheduler(
             }
 
     def _agentic_tp_reduce_host_status(self) -> None:
-        """Report one rank's slow restore; TP0 reads the complete shard set."""
+        """Report every pipelined slow restore; TP0 reads each shard set."""
 
         if not getattr(self, "agentic_tp_host_command_visible", False):
             return
-        active = getattr(self, "agentic_tp_host_active", None)
-        snapshot_id = (
-            active.snapshot_id
-            if active is not None
-            else getattr(self, "_agentic_tp_host_selected_snapshot", None)
+        active_requests = getattr(
+            self, "agentic_tp_host_active_requests", {}
         )
-        if snapshot_id is None:
+        visible = list(getattr(self, "_agentic_tp_host_actions", {}))
+        if not visible:
             return
-        local_status = 0
-        if active is not None:
-            request = active
+        mailbox = self.agentic_tp_host_mailbox
+        statuses = {}
+        host_staging = getattr(self, "agentic_host_staging_manager", None)
+        waiting = tuple(getattr(self, "agentic_kv_waiting_queue", ()))
+        for snapshot_id in visible:
+            request = active_requests.get(snapshot_id)
+            local_status = 0
+            if request is None:
+                mailbox.publish_local(snapshot_id, local_status)
+                continue
             if request.snapshot_id in getattr(
                 self, "agentic_tp_host_local_admitted", ()
             ):
                 local_status = 4
-            for req, _ in getattr(self, "agentic_kv_waiting_queue", ()):
+            for req, _ in waiting:
                 metadata = AgenticRequestMetadata.from_req(req)
                 parent = metadata.parent if metadata is not None else None
                 if parent != request:
                     continue
                 if getattr(req, "_agentic_host_rank_loaded", False):
                     local_status = max(local_status, 3)
-                host_staging = getattr(self, "agentic_host_staging_manager", None)
                 if host_staging is not None and req.rid in host_staging.loads:
                     load = host_staging.loads[req.rid]
                     local_status = max(
@@ -4979,12 +5049,16 @@ class Scheduler(
                 if getattr(req, "_agentic_kv_gate_complete", False):
                     local_status = 3
                 break
-        mailbox = self.agentic_tp_host_mailbox
-        mailbox.publish_local(snapshot_id, local_status)
+            mailbox.publish_local(snapshot_id, local_status)
+            if self.tp_rank == 0:
+                status = mailbox.group_status(snapshot_id)
+                if status is not None:
+                    statuses[snapshot_id] = int(status)
         if self.tp_rank == 0:
-            status = mailbox.group_status(snapshot_id)
-            if status is not None:
-                self.agentic_tp_host_group_status = int(status)
+            self.agentic_tp_host_group_statuses.update(statuses)
+            self.agentic_tp_host_group_status = (
+                0 if not visible else statuses.get(visible[0], 0)
+            )
 
     @staticmethod
     def _agentic_tp_host_next_action(group_status: int) -> str:
@@ -5175,6 +5249,13 @@ class Scheduler(
                 }
             )
         prefill_transfer_keys = []
+        # Background workers own transport progress, but SGLang's native TP
+        # scheduler broadcast remains the sole authority for a logical group
+        # completion.  This keeps page release and request retirement on the
+        # same scheduler iteration on every rank.
+        tp_p2d_background = bool(
+            getattr(self, "_prefill_transfer_tp_background_enabled", False)
+        )
         prefill_inflight = getattr(self, "disagg_prefill_inflight_queue", None)
         if prefill_inflight:
             # TP0 owns the P-ready FIFO and broadcasts its complete ordered
@@ -5229,7 +5310,19 @@ class Scheduler(
                         *head_state,
                     )
                     self._agentic_tp_debug_prefill_head_state = head_state
-            if sender_status == int(KVPoll.Failed):
+            if tp_p2d_background:
+                # A rank publishes terminal sender status only after its
+                # background worker has stopped touching this generation.
+                # Requiring the all-rank sender reduction therefore prevents
+                # one scheduler from freeing pages while a peer worker still
+                # polls or submits its shard.
+                logical_status = (
+                    int(KVPoll.Transferring)
+                    if sender_status
+                    not in (int(KVPoll.Success), int(KVPoll.Failed))
+                    else int(sender_status)
+                )
+            elif sender_status == int(KVPoll.Failed):
                 logical_status = int(KVPoll.Failed)
             elif req.bootstrap_host == FAKE_BOOTSTRAP_HOST or host_path:
                 # A complete Host snapshot is already an authoritative copy;
@@ -5248,7 +5341,8 @@ class Scheduler(
                     else int(receipt_status)
                 )
                 if (
-                    len(prefill_submit_keys) < submit_limit
+                    not tp_p2d_background
+                    and len(prefill_submit_keys) < submit_limit
                     and sender_status == int(KVPoll.WaitingForInput)
                     and not getattr(req, "disagg_p_ready_transfer_started", False)
                 ):
@@ -5283,42 +5377,73 @@ class Scheduler(
                 prefill_transfer_statuses,
             )
             self._agentic_tp_debug_prefill_submit_keys = list(prefill_submit_keys)
-        host_snapshot = None
-        host_request = None
-        host_action = None
+        host_commands = []
         host_timeout_snapshot = None
         host_staging = getattr(self, "agentic_host_staging_manager", None)
         if host_staging is not None:
-            host_request = getattr(self, "agentic_tp_host_active", None)
-            if host_request is None and not getattr(
-                self, "agentic_tp_host_command_visible", False
-            ):
+            active_host = self.agentic_tp_host_active_requests
+            active_since = self.agentic_tp_host_active_since_by_snapshot
+            try:
+                requested_host_pipeline_depth = max(
+                    1,
+                    int(
+                        os.getenv(
+                            "SGLANG_AGENTIC_KV_TP_HOST_PIPELINE_DEPTH",
+                            os.getenv(
+                                "SGLANG_AGENTIC_KV_P_H2D_MAX_INFLIGHT", "1"
+                            ),
+                        )
+                    ),
+                )
+            except ValueError:
+                logger.exception("Invalid TP Host pipeline depth")
+                raise
+            # The Host manager currently owns one process-lifetime pinned
+            # bounce buffer.  Never broadcast more independent snapshots than
+            # the physical loader can make progress on; opposite rank order
+            # could otherwise reserve A/B and deadlock the TP group.
+            host_pipeline_depth = min(
+                requested_host_pipeline_depth,
+                int(getattr(host_staging, "max_h2d_inflight", 1)),
+            )
+            # Fill the bounded pipeline in request arrival order.  This only
+            # chooses request-generations; every rank still allocates, copies,
+            # and binds the exact same command through the native TP broadcast.
+            if len(active_host) < host_pipeline_depth:
                 for req, _ in self.agentic_kv_waiting_queue:
                     metadata = AgenticRequestMetadata.from_req(req)
                     parent = metadata.parent if metadata is not None else None
-                    if parent is not None and host_staging.snapshot_ready(parent):
-                        host_request = parent
-                        self.agentic_tp_host_active = parent
-                        self.agentic_tp_host_active_since = time.monotonic()
+                    if (
+                        parent is None
+                        or parent.snapshot_id in active_host
+                        or not host_staging.snapshot_ready(parent)
+                    ):
+                        continue
+                    active_host[parent.snapshot_id] = parent
+                    active_since[parent.snapshot_id] = time.monotonic()
+                    if len(active_host) >= host_pipeline_depth:
                         break
-            if host_request is not None:
-                host_snapshot = host_request.snapshot_id
-                host_status = int(
-                    getattr(self, "agentic_tp_host_group_status", 0)
-                )
+            group_statuses = self.agentic_tp_host_group_statuses
+            for snapshot_id, host_request in tuple(active_host.items()):
+                host_status = int(group_statuses.get(snapshot_id, 0))
                 host_action = self._agentic_tp_host_next_action(host_status)
-                if host_action == "clear":
-                    self.agentic_tp_host_active = None
-                    self.agentic_tp_host_active_since = 0.0
-                elif host_action == "commit":
+                if host_action == "commit":
                     # Every rank has restored its physical shard. TP0 alone
                     # closes the logical slow-path manifest before the group
                     # admission command is broadcast.
                     host_staging._complete_shared_host_manifest(host_request)
-                # PREPARE is a true TP barrier: START is emitted only after the
-                # all-rank minimum reaches prepared (status 1).
-            elif getattr(self, "agentic_tp_host_command_visible", False):
-                host_action = "clear"
+                host_commands.append(
+                    {
+                        "snapshot": snapshot_id,
+                        "request_id": host_request.request_id,
+                        "generation": host_request.generation,
+                        "action": host_action,
+                    }
+                )
+                if host_action == "clear":
+                    active_host.pop(snapshot_id, None)
+                    active_since.pop(snapshot_id, None)
+                    group_statuses.pop(snapshot_id, None)
             # Timeout is also a TP admission decision.  Rank 0 chooses one
             # exact stale Host waiter and piggybacks it on SGLang's existing
             # request broadcast; peers never make this decision from their
@@ -5361,14 +5486,20 @@ class Scheduler(
             "prefill_submit_keys": prefill_submit_keys,
             "prefill_transfer_rid": prefill_transfer_rid,
             "prefill_transfer_room": prefill_transfer_room,
-            "host_snapshot": host_snapshot,
+            "host_commands": host_commands,
+            # Scalar aliases keep older diagnostics/tests readable.
+            "host_snapshot": (
+                None if not host_commands else host_commands[0]["snapshot"]
+            ),
             "host_request_id": (
-                None if host_request is None else host_request.request_id
+                None if not host_commands else host_commands[0]["request_id"]
             ),
             "host_generation": (
-                None if host_request is None else host_request.generation
+                None if not host_commands else host_commands[0]["generation"]
             ),
-            "host_action": host_action,
+            "host_action": (
+                None if not host_commands else host_commands[0]["action"]
+            ),
             "host_timeout_snapshot": host_timeout_snapshot,
             "direct_arrived_at": (
                 0.0 if not direct_commands else direct_commands[0]["arrived_at"]
@@ -5536,44 +5667,95 @@ class Scheduler(
         self._agentic_tp_prefill_submit_keys = [
             (str(rid), int(room)) for rid, room in submit_keys
         ]
-        host_snapshot = control.get("host_snapshot")
-        host_action = control.get("host_action")
-        if host_action == "clear":
-            if host_snapshot is not None:
-                self.agentic_tp_host_local_admitted.discard(str(host_snapshot))
-                mailbox = getattr(self, "agentic_tp_host_mailbox", None)
+        host_commands = control.get("host_commands")
+        if host_commands is None:
+            host_snapshot = control.get("host_snapshot")
+            host_commands = (
+                []
+                if host_snapshot is None
+                else [
+                    {
+                        "snapshot": host_snapshot,
+                        "request_id": control["host_request_id"],
+                        "generation": control["host_generation"],
+                        "action": control.get("host_action"),
+                    }
+                ]
+            )
+        active_host = getattr(self, "agentic_tp_host_active_requests", None)
+        if active_host is None:
+            active_host = {}
+            legacy_active = getattr(self, "agentic_tp_host_active", None)
+            if legacy_active is not None:
+                active_host[legacy_active.snapshot_id] = legacy_active
+            self.agentic_tp_host_active_requests = active_host
+        active_since = getattr(
+            self, "agentic_tp_host_active_since_by_snapshot", None
+        )
+        if active_since is None:
+            active_since = {}
+            legacy_active = getattr(self, "agentic_tp_host_active", None)
+            if legacy_active is not None:
+                active_since[legacy_active.snapshot_id] = float(
+                    getattr(self, "agentic_tp_host_active_since", 0.0)
+                )
+            self.agentic_tp_host_active_since_by_snapshot = active_since
+        if not hasattr(self, "agentic_tp_host_group_statuses"):
+            self.agentic_tp_host_group_statuses = {}
+        host_actions = {}
+        commit_snapshots = set()
+        mailbox = getattr(self, "agentic_tp_host_mailbox", None)
+        for command in host_commands:
+            host_snapshot = str(command["snapshot"])
+            host_action = command.get("action")
+            if host_action == "clear":
+                self.agentic_tp_host_local_admitted.discard(host_snapshot)
+                active_host.pop(host_snapshot, None)
+                active_since.pop(host_snapshot, None)
+                self.agentic_tp_host_group_statuses.pop(host_snapshot, None)
                 if mailbox is not None:
                     # Each rank removes its own report. TP0 additionally clears
                     # the logical receipt after the native broadcast made the
                     # CLEAR command visible to the complete group.
-                    mailbox.clear_local(str(host_snapshot))
+                    mailbox.clear_local(host_snapshot)
                     if self.tp_rank == 0:
-                        mailbox.clear_group(str(host_snapshot))
-            self.agentic_tp_host_active = None
-            self.agentic_tp_host_active_since = 0.0
-            self.agentic_tp_host_command_visible = False
-            self.agentic_tp_host_group_status = 0
-        elif host_snapshot is not None:
-            self.agentic_tp_host_active = RequestGeneration(
-                str(control["host_request_id"]),
-                int(control["host_generation"]),
+                        mailbox.clear_group(host_snapshot)
+                continue
+            request = RequestGeneration(
+                str(command["request_id"]), int(command["generation"])
             )
-            if not getattr(self, "agentic_tp_host_active_since", 0.0):
-                self.agentic_tp_host_active_since = time.monotonic()
-            self.agentic_tp_host_command_visible = True
-        self._agentic_tp_host_selected_snapshot = (
-            None
-            if host_snapshot is None or host_action == "clear"
-            else str(host_snapshot)
+            active_host[host_snapshot] = request
+            active_since.setdefault(host_snapshot, time.monotonic())
+            host_actions[host_snapshot] = host_action
+            if host_action == "commit":
+                commit_snapshots.add(host_snapshot)
+        self._agentic_tp_host_actions = host_actions
+        self.agentic_tp_host_command_visible = bool(host_actions)
+        visible_host = list(host_actions)
+        first_host = None if not visible_host else visible_host[0]
+        # Compatibility aliases for the former single-snapshot state machine.
+        self.agentic_tp_host_active = (
+            None if first_host is None else active_host[first_host]
         )
-        self._agentic_tp_host_action = host_action
+        self.agentic_tp_host_active_since = (
+            0.0 if first_host is None else active_since[first_host]
+        )
+        self.agentic_tp_host_group_status = (
+            0
+            if first_host is None
+            else self.agentic_tp_host_group_statuses.get(first_host, 0)
+        )
+        self._agentic_tp_host_selected_snapshot = first_host
+        self._agentic_tp_host_action = (
+            None if first_host is None else host_actions[first_host]
+        )
+        self._agentic_tp_host_commit_snapshots = commit_snapshots
         self._agentic_tp_host_commit_snapshot = (
-            str(host_snapshot)
-            if host_snapshot is not None and host_action == "commit"
-            else None
+            None if not commit_snapshots else next(iter(commit_snapshots))
         )
         host_staging = getattr(self, "agentic_host_staging_manager", None)
         if host_staging is not None:
+            host_staging.tp_host_commit_snapshots = commit_snapshots
             host_staging.tp_host_commit_snapshot = (
                 self._agentic_tp_host_commit_snapshot
             )
@@ -5674,19 +5856,31 @@ class Scheduler(
             if getattr(self, "tp_size", 1) > 1
             else None
         )
-        tp_host_commit_snapshot = (
-            getattr(self, "_agentic_tp_host_commit_snapshot", None)
+        tp_host_commit_snapshots = (
+            list(getattr(self, "_agentic_tp_host_commit_snapshots", ()))
             if getattr(self, "tp_size", 1) > 1
-            else None
+            else []
         )
+        if (
+            getattr(self, "tp_size", 1) > 1
+            and not tp_host_commit_snapshots
+            and getattr(self, "_agentic_tp_host_commit_snapshot", None) is not None
+        ):
+            tp_host_commit_snapshots = [self._agentic_tp_host_commit_snapshot]
         if not self.agentic_kv_waiting_queue:
             return
 
-        tp_host_snapshot = (
-            getattr(self, "_agentic_tp_host_selected_snapshot", None)
+        tp_host_snapshots = (
+            list(getattr(self, "_agentic_tp_host_actions", ()))
             if getattr(self, "tp_size", 1) > 1
-            else None
+            else []
         )
+        if (
+            getattr(self, "tp_size", 1) > 1
+            and not tp_host_snapshots
+            and getattr(self, "_agentic_tp_host_selected_snapshot", None) is not None
+        ):
+            tp_host_snapshots = [self._agentic_tp_host_selected_snapshot]
 
         try:
             scan_limit = max(
@@ -5730,9 +5924,9 @@ class Scheduler(
         # that both ranks mutate the same request generations.
         forced_tp_snapshots = list(tp_bind_snapshots)
         for snapshot_id in (
-            tp_host_commit_snapshot,
-            tp_host_snapshot,
-            tp_host_timeout_snapshot,
+            tp_host_commit_snapshots
+            + tp_host_snapshots
+            + [tp_host_timeout_snapshot]
         ):
             if snapshot_id is not None and snapshot_id not in forced_tp_snapshots:
                 forced_tp_snapshots.append(snapshot_id)
@@ -5756,14 +5950,18 @@ class Scheduler(
                     selected_by_snapshot[parent.snapshot_id] = entry
                 else:
                     untouched.append(entry)
-            # Binding is a group command.  Do not let one rank admit a proper
-            # subset while a peer is still waiting for a tokenized request.
-            if len(selected_by_snapshot) != len(forced_tp_snapshots):
-                return
             selected = [
                 selected_by_snapshot[snapshot_id]
                 for snapshot_id in forced_tp_snapshots
+                if snapshot_id in selected_by_snapshot
             ]
+            # HTTP arrival at TP ranks can be skewed.  Preparing local I/O for
+            # one available snapshot is safe: the existing group-status
+            # barrier still prevents model admission until every rank has
+            # restored that same snapshot.  A missing command therefore must
+            # not block unrelated restores that are already visible.
+            if not selected:
+                return
         else:
             inactive = sorted(fast + slow + new, key=lambda entry: entry[1])
             selected = (

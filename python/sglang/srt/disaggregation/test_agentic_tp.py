@@ -7,10 +7,12 @@ from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace
 
+import pytest
 import torch
 import sglang.srt.disaggregation.prefill as prefill_module
 
 from sglang.srt.disaggregation.agentic_host_staging import (
+    AgenticDHostStagingClient,
     AgenticPHostStagingManager,
     HostStageState,
     SharedHostStagingLedger,
@@ -33,10 +35,12 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
-from sglang.srt.disaggregation.decode import DecodeTransferQueue
+from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeTransferQueue
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.disaggregation.p2d_host_staging import (
     AgenticPToDHostStagingManager,
+    _p2d_host_write_committed,
+    _raise_if_p2d_host_failed,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler import (
@@ -233,10 +237,80 @@ def test_decode_receiver_lifecycle_lock_serializes_poll_and_clear():
     allow_poll_to_finish.set()
     poll_thread.join(timeout=2.0)
     commit_thread.join(timeout=2.0)
-
     assert committed.is_set()
     assert receiver.cleared
     assert decode_req.kv_receiver is None
+
+
+def test_tp_decode_group_commit_waits_for_receiver_lifecycle_lock():
+    """A TP rank may not skip a group-committed transfer locally."""
+
+    queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+    queue._async_progress_enabled = True
+    queue._async_poll_lock = threading.Lock()
+    queue.scheduler = SimpleNamespace(tp_size=2)
+
+    entered_commit = threading.Event()
+    queue._pop_transferred_locked = lambda _keys=None: entered_commit.set() or [1]
+    queue._async_poll_lock.acquire()
+
+    result = []
+    commit_thread = threading.Thread(
+        target=lambda: result.extend(queue.pop_transferred([("rid", 1)]))
+    )
+    commit_thread.start()
+    time.sleep(0.02)
+    assert not entered_commit.is_set()
+
+    queue._async_poll_lock.release()
+    commit_thread.join(timeout=2.0)
+    assert not commit_thread.is_alive()
+    assert entered_commit.is_set()
+    assert result == [1]
+
+
+@pytest.mark.parametrize("poll", [KVPoll.Transferring, KVPoll.Success])
+def test_async_prealloc_poll_accepts_receiver_progress_after_bind(poll):
+    """A stale prealloc snapshot may observe Host H2D already in progress."""
+
+    decode_req = SimpleNamespace(
+        waiting_for_input=False,
+        kv_receiver=SimpleNamespace(poll=lambda: poll),
+        req=SimpleNamespace(rid="host-race", bootstrap_room=17),
+    )
+    queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+    queue.queue = [decode_req]
+    queue._async_progress_enabled = True
+
+    queue._update_handshake_waiters()
+    assert decode_req.waiting_for_input is False
+
+
+def test_async_prealloc_never_repolls_waiting_receiver():
+    def stale_poll():
+        raise AssertionError("receiver ownership already moved to transfer queue")
+
+    waiting = SimpleNamespace(
+        waiting_for_input=True,
+        kv_receiver=SimpleNamespace(poll=stale_poll),
+        req=SimpleNamespace(rid="waiting", bootstrap_room=1),
+    )
+    pending = SimpleNamespace(
+        waiting_for_input=False,
+        kv_receiver=SimpleNamespace(poll=lambda: KVPoll.WaitingForInput),
+        req=SimpleNamespace(
+            rid="pending",
+            bootstrap_room=2,
+            time_stats=SimpleNamespace(set_bootstrap_done_time=lambda: None),
+        ),
+    )
+    queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+    queue.queue = [waiting, pending]
+    queue._async_progress_enabled = True
+
+    queue._update_handshake_waiters()
+    assert waiting.waiting_for_input is True
+    assert pending.waiting_for_input is True
 
 
 def test_decode_rank_zero_emits_only_lifecycle_transitions():
@@ -477,6 +551,236 @@ def test_tp_p2d_host_commit_is_order_independent():
             os.unlink(path)
         except FileNotFoundError:
             pass
+
+
+def test_tp_d2p_failure_and_drain_are_rank_aware():
+    ledger, path = _ledger()
+    snapshot_id = "request:rank-failure"
+    owner = "p-group:p0"
+    try:
+        for rank, pid in ((0, 100), (1, 101)):
+            offer = _rank_offer(rank)
+            offer["snapshot_id"] = snapshot_id
+            offer["d_pid"] = pid
+            ledger.offer(offer)
+        assert ledger.claim_rank(snapshot_id, owner, tp_rank=0, tp_size=2)
+        assert ledger.claim_rank(snapshot_id, owner, tp_rank=1, tp_size=2)
+
+        assert ledger.fail_host_write(
+            snapshot_id,
+            101,
+            "rank1_failed",
+            tp_rank=1,
+            tp_size=2,
+        )
+        current = ledger.get(snapshot_id)
+        assert current["state"] == HostStageState.ABORTING.value
+        assert current["writer_drained_ranks"] == [1]
+        assert current["writer_drained"] is False
+
+        assert ledger.mark_writer_rank_drained(
+            snapshot_id, 100, tp_rank=0, tp_size=2
+        )
+        current = ledger.get(snapshot_id)
+        assert current["writer_drained_ranks"] == [0, 1]
+        assert current["writer_drained"] is True
+        assert ledger.transition(
+            snapshot_id, HostStageState.FAILED, owner=owner
+        )
+    finally:
+        os.unlink(path)
+
+
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [
+        (HostStageState.FAILED, "failed"),
+        (HostStageState.H2D_LOADING, "host_ready"),
+        (HostStageState.CONSUMED, "host_ready"),
+    ],
+)
+def test_tp_d2p_completed_rank_observes_group_terminal_state(state, expected):
+    snapshot_id = "request:completed-rank"
+    candidate = {
+        "manifest": SimpleNamespace(snapshot_id=snapshot_id),
+        "rank_host_write_complete": True,
+    }
+    client = AgenticDHostStagingClient.__new__(AgenticDHostStagingClient)
+    client.ledger = SimpleNamespace(
+        get=lambda _snapshot_id: {"state": state.value}
+    )
+    client._cleanup_write = lambda _candidate: True
+    client._cleanup_relay_senders = lambda _candidate: None
+
+    assert client.progress(candidate, []) == expected
+
+
+def test_tp_d2p_completed_rank_drains_when_peer_aborts():
+    snapshot_id = "request:completed-rank-abort"
+    candidate = {
+        "manifest": SimpleNamespace(snapshot_id=snapshot_id),
+        "rank_host_write_complete": True,
+    }
+    drained = []
+    client = AgenticDHostStagingClient.__new__(AgenticDHostStagingClient)
+    client.tp_rank = 1
+    client.tp_size = 2
+    client.ledger = SimpleNamespace(
+        get=lambda _snapshot_id: {"state": HostStageState.ABORTING.value},
+        mark_writer_rank_drained=lambda *args, **kwargs: drained.append(
+            (args, kwargs)
+        )
+        or True,
+    )
+    client._cleanup_write = lambda _candidate: True
+
+    assert client.progress(candidate, []) == "waiting"
+    assert len(drained) == 1
+    assert drained[0][1] == {"tp_rank": 1, "tp_size": 2}
+
+
+def test_tp_p2d_host_write_ready_is_a_monotonic_boundary():
+    """A fast D may advance past HOST_READY before a P rank observes it."""
+
+    assert _p2d_host_write_committed(
+        {"state": HostStageState.HOST_READY.value}
+    )
+    assert _p2d_host_write_committed(
+        {"state": HostStageState.H2D_LOADING.value}
+    )
+    assert _p2d_host_write_committed(
+        {"state": HostStageState.CONSUMED.value}
+    )
+    assert not _p2d_host_write_committed(
+        {"state": HostStageState.HOST_WRITING.value}
+    )
+
+
+def test_tp_p2d_host_wait_fails_closed_instead_of_hanging():
+    with pytest.raises(RuntimeError, match="terminated in failed"):
+        _raise_if_p2d_host_failed(
+            "p2d:failed",
+            {"state": HostStageState.FAILED.value, "reason": "peer_failed"},
+        )
+    with pytest.raises(RuntimeError, match="disappeared"):
+        _raise_if_p2d_host_failed("p2d:missing", None)
+
+
+def test_tp_p2d_native_arbitration_rejects_late_host_offer():
+    ledger, path = _ledger()
+    snapshot_id = "p2d:901"
+    try:
+        assert ledger.arbitrate_p2d_native(snapshot_id, tp_size=2)
+        late = ledger.offer(
+            {
+                "snapshot_id": snapshot_id,
+                "bootstrap_room": 901,
+                "token_count": 128,
+                "prefill_domain": 0,
+                "request_direction": "p2d",
+                "control_offer": True,
+                "tp_size": 2,
+            }
+        )
+        assert late["state"] == HostStageState.REJECTED.value
+        assert late["native_won"] is True
+        assert ledger.claim_rank(
+            snapshot_id, "p2d-p-group:p0", tp_rank=1, tp_size=2
+        ) is None
+    finally:
+        os.unlink(path)
+
+
+def test_tp_p2d_peer_host_claim_blocks_native_page_release():
+    ledger, path = _ledger()
+    snapshot_id = "p2d:902"
+    owner = "p2d-p-group:p0"
+    try:
+        ledger.offer(
+            {
+                "snapshot_id": snapshot_id,
+                "bootstrap_room": 902,
+                "token_count": 128,
+                "prefill_domain": 0,
+                "request_direction": "p2d",
+                "control_offer": True,
+                "tp_size": 2,
+            }
+        )
+        assert ledger.claim_rank(snapshot_id, owner, tp_rank=1, tp_size=2)
+        manager = AgenticPToDHostStagingManager.__new__(
+            AgenticPToDHostStagingManager
+        )
+        manager.ledger = ledger
+        manager.tp_size = 2
+        manager._lock = threading.RLock()
+        manager._active = {}
+        manager._results = {}
+        manager._candidates = {}
+        req = SimpleNamespace(bootstrap_room=902)
+
+        assert manager.prepare_scheduler_release(req) is False
+        assert not getattr(req, "_agentic_p2d_host_terminal", False)
+    finally:
+        os.unlink(path)
+
+
+def test_p2d_abort_cannot_release_pages_owned_by_d2h():
+    manager = AgenticPToDHostStagingManager.__new__(AgenticPToDHostStagingManager)
+    manager._lock = threading.RLock()
+    manager._active = {"p2d:903": {}}
+    manager._results = {}
+    manager._candidates = {}
+    req = SimpleNamespace(
+        bootstrap_room=903, _agentic_p2d_host_snapshot_id="p2d:903"
+    )
+
+    assert manager.cancel_watch(req) is False
+    assert not getattr(req, "_agentic_p2d_host_terminal", False)
+
+
+@pytest.mark.parametrize(
+    "terminal_state",
+    [HostStageState.FAILED, HostStageState.ABORTING],
+)
+@pytest.mark.parametrize("release_method", ["prepare_scheduler_release", "cancel_watch"])
+def test_tp_p2d_peer_terminal_releases_unsubmitted_local_shard(
+    terminal_state, release_method
+):
+    ledger, path = _ledger()
+    snapshot_id = "p2d:904"
+    owner = "p2d-p-group:p0"
+    try:
+        ledger.offer(
+            {
+                "snapshot_id": snapshot_id,
+                "bootstrap_room": 904,
+                "token_count": 128,
+                "prefill_domain": 0,
+                "request_direction": "p2d",
+                "control_offer": True,
+                "tp_size": 2,
+            }
+        )
+        assert ledger.claim_rank(snapshot_id, owner, tp_rank=1, tp_size=2)
+        assert ledger.transition(snapshot_id, terminal_state, owner=owner)
+
+        manager = AgenticPToDHostStagingManager.__new__(
+            AgenticPToDHostStagingManager
+        )
+        manager.ledger = ledger
+        manager.tp_size = 2
+        manager._lock = threading.RLock()
+        manager._active = {}
+        manager._results = {}
+        manager._candidates = {snapshot_id: {}}
+        req = SimpleNamespace(bootstrap_room=904)
+
+        assert getattr(manager, release_method)(req) is True
+        assert getattr(req, "_agentic_p2d_host_terminal", False)
+        assert snapshot_id not in manager._candidates
+    finally:
+        os.unlink(path)
 
 
 def test_tp_host_commit_admits_after_manifest_cleanup():
@@ -917,6 +1221,7 @@ def test_tp_prefill_producer_reports_local_payload_before_logical_ready():
             )
             for _ in range(2)
         ]
+        schedulers = []
 
         for rank in range(2):
             scheduler = SimpleNamespace(
@@ -938,6 +1243,7 @@ def test_tp_prefill_producer_reports_local_payload_before_logical_ready():
             scheduler._prefill_queued_keys = lambda: (
                 SchedulerDisaggregationPrefillMixin._prefill_queued_keys(scheduler)
             )
+            schedulers.append(scheduler)
             assert SchedulerDisaggregationPrefillMixin._enqueue_deferred_prefill_transfer(
                 scheduler, requests[rank]
             )
@@ -946,6 +1252,26 @@ def test_tp_prefill_producer_reports_local_payload_before_logical_ready():
 
         key = request_generation_key("tp-producer", 4321)
         assert mailboxes[0].group_status(key) == int(KVPoll.Bootstrapping)
+
+        report = SchedulerDisaggregationPrefillMixin._report_tp_prefill_producer_ready
+        mailboxes[1].publish_local(key, int(KVPoll.WaitingForInput))
+        report(schedulers[1], requests[1])
+        assert mailboxes[1].local_status(key) == int(KVPoll.WaitingForInput)
+
+        # TP1 never publishes the logical P-ready marker, so its notified flag
+        # remains false.  A terminal worker must nevertheless not let the
+        # scheduler enqueue this generation a second time or recreate its
+        # sender state after cleanup removes it.
+        follower = requests[1]
+        follower._async_prefill_transfer_consumer_active = False
+        schedulers[1]._prefill_ready_queue.clear()
+        schedulers[1]._prefill_ready_queued_keys.clear()
+        mailboxes[0].clear_group(key)
+        assert SchedulerDisaggregationPrefillMixin._enqueue_deferred_prefill_transfer(
+            schedulers[1], follower
+        )
+        assert len(schedulers[1]._prefill_ready_queue) == 0
+        assert mailboxes[1].local_status(key) is None
 
 
 def test_tp_prefill_worker_activation_preserves_producer_sequence():
@@ -1077,6 +1403,286 @@ def test_tp_prefill_batch_submits_each_rank_shard_exactly_once():
 
     assert calls[0] == calls[1]
     assert [call[0] for call in calls[0]] == ["init", "send"]
+
+
+def test_tp_prefill_background_progress_submits_without_scheduler_control():
+    """TP0 authorizes prepared shards through tmpfs, not a forward tick."""
+
+    with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+        namespace = f"p2d-background-{time.time_ns()}"
+        sender_mailboxes = [
+            TPGroupMailbox(
+                namespace,
+                tp_rank=rank,
+                tp_size=2,
+                directory=directory,
+            )
+            for rank in range(2)
+        ]
+        receiver_mailboxes = [
+            TPGroupMailbox(
+                f"{namespace}-receiver",
+                tp_rank=rank,
+                tp_size=2,
+                directory=directory,
+            )
+            for rank in range(2)
+        ]
+        requests = []
+        schedulers = []
+        submissions = [0, 0]
+
+        class Sender:
+            def poll(self):
+                return int(KVPoll.WaitingForInput)
+
+        for rank in range(2):
+            req = SimpleNamespace(
+                rid="background-submit",
+                bootstrap_room=123,
+                disagg_kv_sender=Sender(),
+                disagg_p_ready_notified=False,
+                disagg_p_ready_transfer_started=False,
+                _async_prefill_transfer_payload=(1, [rank + 1], None),
+            )
+            scheduler = SimpleNamespace(
+                tp_size=2,
+                tp_rank=rank,
+                agentic_tp_p2d_sender_mailbox=sender_mailboxes[rank],
+                agentic_tp_p2d_receiver_mailbox=receiver_mailboxes[rank],
+                agentic_p2d_host_staging_manager=None,
+            )
+            scheduler._prefill_transfer_key = (
+                SchedulerDisaggregationPrefillMixin._prefill_transfer_key
+            )
+            scheduler._publish_deferred_prefill_ready = (
+                lambda request: setattr(request, "disagg_p_ready_notified", True)
+            )
+
+            def submit(request, rank=rank):
+                submissions[rank] += 1
+                request.disagg_p_ready_transfer_started = True
+                return True
+
+            scheduler._submit_tp_prefill_transfer = submit
+            requests.append(req)
+            schedulers.append(scheduler)
+            sender_mailboxes[rank].publish_local(
+                scheduler._prefill_transfer_key(req), int(KVPoll.Bootstrapping)
+            )
+
+        progress = (
+            SchedulerDisaggregationPrefillMixin._prefill_transfer_progress_tp_req_once
+        )
+        # Rank0 may publish P-ready, but cannot authorize transfer until rank1
+        # has also observed its matching D receiver.
+        assert progress(schedulers[0], requests[0]) == int(KVPoll.Transferring)
+        assert submissions == [0, 0]
+        assert requests[0].disagg_p_ready_notified
+        assert progress(schedulers[1], requests[1]) == int(KVPoll.Transferring)
+        assert submissions == [0, 0]
+
+        # No scheduler method is called between these background progress
+        # steps. TP0 writes the command and both ranks submit exactly once.
+        assert progress(schedulers[0], requests[0]) == int(KVPoll.Transferring)
+        assert progress(schedulers[1], requests[1]) == int(KVPoll.Transferring)
+        assert submissions == [1, 1]
+
+
+def test_tp_prefill_cleanup_waits_for_every_scheduler_rank():
+    with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+        namespace = f"p2d-cleanup-{time.time_ns()}"
+
+        def mailbox(name, rank):
+            return TPGroupMailbox(
+                f"{namespace}-{name}",
+                tp_rank=rank,
+                tp_size=2,
+                directory=directory,
+            )
+
+        ranks = []
+        for rank in range(2):
+            scheduler = SimpleNamespace(
+                tp_size=2,
+                tp_rank=rank,
+                _prefill_transfer_tp_background_enabled=True,
+                agentic_tp_p2d_sender_mailbox=mailbox("sender", rank),
+                agentic_tp_p2d_receiver_mailbox=mailbox("receiver", rank),
+                agentic_tp_p2d_cleanup_mailbox=mailbox("cleanup", rank),
+                _prefill_transfer_cleanup_lock=threading.Lock(),
+                _prefill_transfer_cleanup_pending=set(),
+            )
+            scheduler._prefill_transfer_key = (
+                SchedulerDisaggregationPrefillMixin._prefill_transfer_key
+            )
+            ranks.append(scheduler)
+
+        request = SimpleNamespace(rid="cleanup", bootstrap_room=456)
+        key = ranks[0]._prefill_transfer_key(request)
+        ranks[0].agentic_tp_p2d_sender_mailbox.publish_receipt(
+            key, int(KVPoll.Success)
+        )
+        clear = SchedulerDisaggregationPrefillMixin._clear_tp_prefill_transfer_mailboxes
+        clear(ranks[0], request)
+        cleanup_once = (
+            SchedulerDisaggregationPrefillMixin._prefill_transfer_cleanup_once
+        )
+        assert cleanup_once(ranks[0]) == 0
+        assert ranks[0].agentic_tp_p2d_sender_mailbox.receipt(key) == int(
+            KVPoll.Success
+        )
+
+        clear(ranks[1], request)
+        assert cleanup_once(ranks[0]) == 1
+        assert ranks[0].agentic_tp_p2d_sender_mailbox.receipt(key) is None
+        assert key not in ranks[0]._prefill_transfer_cleanup_pending
+
+
+def test_tp_background_terminal_uses_all_rank_sender_reduction():
+    """Native TP control must not retire P pages after only one worker stops."""
+
+    with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+        namespace = f"p2d-terminal-{time.time_ns()}"
+        sender = [
+            TPGroupMailbox(
+                f"{namespace}-sender",
+                tp_rank=rank,
+                tp_size=2,
+                directory=directory,
+            )
+            for rank in range(2)
+        ]
+        receiver = [
+            TPGroupMailbox(
+                f"{namespace}-receiver",
+                tp_rank=rank,
+                tp_size=2,
+                directory=directory,
+            )
+            for rank in range(2)
+        ]
+        request = SimpleNamespace(
+            rid="group-terminal",
+            bootstrap_room=901,
+            bootstrap_host="127.0.0.1",
+            disagg_p_ready_notified=True,
+            disagg_p_ready_transfer_started=True,
+        )
+        owner = SimpleNamespace(
+            tp_size=2,
+            tp_rank=0,
+            disaggregation_mode=DisaggregationMode.PREFILL,
+            _AGENTIC_TP_CONTROL_KEY=Scheduler._AGENTIC_TP_CONTROL_KEY,
+            agentic_tp_direct_admission_active={},
+            agentic_tp_direct_mailbox=None,
+            disagg_prefill_inflight_queue=[request],
+            _prefill_transfer_tp_background_enabled=True,
+            agentic_tp_p2d_sender_mailbox=sender[0],
+            agentic_tp_p2d_receiver_mailbox=receiver[0],
+            agentic_p2d_host_staging_manager=None,
+            agentic_host_staging_manager=None,
+        )
+        key = request_generation_key(request.rid, request.bootstrap_room)
+
+        sender[0].publish_local(key, int(KVPoll.Success))
+        sender[1].publish_local(key, int(KVPoll.Transferring))
+        control = Scheduler._agentic_tp_prepare_admission_control(owner)
+        assert control["prefill_transfer_statuses"] == [int(KVPoll.Transferring)]
+        assert control["prefill_submit_keys"] == []
+
+        sender[1].publish_local(key, int(KVPoll.Success))
+        control = Scheduler._agentic_tp_prepare_admission_control(owner)
+        assert control["prefill_transfer_statuses"] == [int(KVPoll.Success)]
+
+
+def test_tp_prefill_submit_failure_becomes_one_group_terminal_result():
+    with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+        namespace = f"p2d-failure-{time.time_ns()}"
+        sender_mailboxes = [
+            TPGroupMailbox(
+                f"{namespace}-sender",
+                tp_rank=rank,
+                tp_size=2,
+                directory=directory,
+            )
+            for rank in range(2)
+        ]
+        receiver_mailboxes = [
+            TPGroupMailbox(
+                f"{namespace}-receiver",
+                tp_rank=rank,
+                tp_size=2,
+                directory=directory,
+            )
+            for rank in range(2)
+        ]
+
+        class Sender:
+            def __init__(self, fail):
+                self.fail = fail
+
+            def poll(self):
+                return int(KVPoll.WaitingForInput)
+
+            def init(self, _pages, _metadata_index):
+                if self.fail:
+                    raise RuntimeError("injected shard failure")
+
+            def send(self, _page_indices, _state_indices):
+                pass
+
+        schedulers = []
+        requests = []
+        for rank in range(2):
+            request = SimpleNamespace(
+                rid="submit-failure",
+                bootstrap_room=789,
+                metadata_buffer_index=1,
+                disagg_kv_sender=Sender(fail=rank == 1),
+                disagg_p_ready_notified=False,
+                disagg_p_ready_transfer_started=False,
+                _async_prefill_transfer_payload=(1, [rank + 1], None),
+                time_stats=SimpleNamespace(
+                    set_prefill_transfer_queue_entry_time=lambda: None
+                ),
+            )
+            scheduler = SimpleNamespace(
+                tp_size=2,
+                tp_rank=rank,
+                agentic_tp_p2d_sender_mailbox=sender_mailboxes[rank],
+                agentic_tp_p2d_receiver_mailbox=receiver_mailboxes[rank],
+                agentic_p2d_host_staging_manager=None,
+            )
+            scheduler._prefill_transfer_key = (
+                SchedulerDisaggregationPrefillMixin._prefill_transfer_key
+            )
+            scheduler._publish_deferred_prefill_ready = (
+                lambda req: setattr(req, "disagg_p_ready_notified", True)
+            )
+            scheduler._submit_tp_prefill_transfer = (
+                lambda req, scheduler=scheduler: SchedulerDisaggregationPrefillMixin._submit_tp_prefill_transfer(
+                    scheduler, req
+                )
+            )
+            schedulers.append(scheduler)
+            requests.append(request)
+            sender_mailboxes[rank].publish_local(
+                scheduler._prefill_transfer_key(request),
+                int(KVPoll.Bootstrapping),
+            )
+
+        progress = (
+            SchedulerDisaggregationPrefillMixin._prefill_transfer_progress_tp_req_once
+        )
+        progress(schedulers[0], requests[0])
+        progress(schedulers[1], requests[1])
+        progress(schedulers[0], requests[0])
+        # Rank1 reports its injected submit failure but does not terminate
+        # independently before TP0 publishes the group result.
+        assert progress(schedulers[1], requests[1]) == int(KVPoll.Transferring)
+        assert progress(schedulers[0], requests[0]) == int(KVPoll.Failed)
+        assert progress(schedulers[1], requests[1]) == int(KVPoll.Failed)
 
 
 def test_tp_prefill_failure_releases_generation_and_control_state(monkeypatch):
@@ -1218,6 +1824,7 @@ def test_tp_direct_rank0_background_grant_starts_all_followers(monkeypatch):
                 agentic_tp_direct_local_failed=set(),
                 agentic_tp_direct_local_admitted=set(),
                 server_args=SimpleNamespace(page_size=64),
+                _agentic_direct_hbm_fits=lambda _tokens: True,
                 started=[],
             )
             def start(request, *_args, **_kwargs):
@@ -1719,6 +2326,7 @@ def test_tp1_direct_arrival_starts_without_scheduler_reservation_queue(monkeypat
         agentic_early_direct_terminal={},
         agentic_direct_credit_pool=SimpleNamespace(free_tokens=40000),
         server_args=SimpleNamespace(page_size=64),
+        _agentic_direct_hbm_fits=lambda _tokens: True,
         _agentic_start_early_direct_receive=lambda selected, *_args, **_kwargs: (
             started.append(selected.snapshot_id) or True
         ),
@@ -1730,6 +2338,50 @@ def test_tp1_direct_arrival_starts_without_scheduler_reservation_queue(monkeypat
 
     assert started == [request.snapshot_id]
     assert not scheduler.agentic_early_direct_admission_queue
+
+
+def test_direct_arrival_waits_when_ordinary_p_hbm_has_no_working_room(monkeypatch):
+    """Free transit credit cannot authorize a promotion that fills ordinary HBM."""
+
+    monkeypatch.setenv("SGLANG_PD_LATE_BIND_DYNAMIC_PREFILL_DOMAINS", "0")
+    request = RequestGeneration("p-hbm-full", 1)
+    arrived_at = time.time()
+    manifest = SimpleNamespace(
+        request=request,
+        state=SnapshotState.DIRECT_READY,
+        created_at=arrived_at,
+        token_count=1024,
+    )
+    started = []
+    scheduler = SimpleNamespace(
+        tp_size=1,
+        tp_rank=0,
+        agentic_early_claim_store=object(),
+        agentic_tp_direct_admission_active={},
+        agentic_early_direct_admission_queue=deque(
+            [(request, {"arrived_at": arrived_at}, manifest)]
+        ),
+        agentic_early_direct_admission_ids={request.snapshot_id},
+        agentic_early_direct_receives={},
+        agentic_early_direct_terminal={},
+        agentic_direct_credit_pool=SimpleNamespace(free_tokens=40000),
+        server_args=SimpleNamespace(page_size=64),
+        _agentic_direct_hbm_fits=lambda _tokens: False,
+        _agentic_start_early_direct_receive=lambda selected, *_args, **_kwargs: (
+            started.append(selected.snapshot_id) or True
+        ),
+    )
+    store = SimpleNamespace(load=lambda *_args, **_kwargs: manifest)
+
+    Scheduler._agentic_admit_queued_direct_receives(
+        scheduler, store, 2.0, nullcontext()
+    )
+
+    assert started == []
+    assert list(scheduler.agentic_early_direct_admission_ids) == [
+        request.snapshot_id
+    ]
+    assert len(scheduler.agentic_early_direct_admission_queue) == 1
 
 
 def test_disabled_compute_ahead_does_not_double_reserve_direct_headroom(monkeypatch):
@@ -1868,3 +2520,21 @@ def test_tp_p2d_peer_claim_suppresses_rank_local_native_completion():
         AgenticPToDHostStagingManager.poll(manager, req)
         == int(KVPoll.Transferring)
     )
+
+
+def test_custom_storage_only_rejects_ordinary_decode_offload():
+    """The native Decode HiCache path remains baseline-only."""
+
+    manager = DecodeKVCacheOffloadManager.__new__(DecodeKVCacheOffloadManager)
+    manager.agentic_hostless = False
+    manager.agentic_enabled = True
+    manager.agentic_custom_storage_only = True
+    manager.cache_controller = object()
+    manager.decode_host_mem_pool = object()
+    req = SimpleNamespace(
+        sampling_params=SimpleNamespace(custom_params={}),
+        req_pool_idx=1,
+        output_ids=[1],
+    )
+
+    assert not DecodeKVCacheOffloadManager.offload_kv_cache(manager, req)

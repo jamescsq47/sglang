@@ -543,6 +543,7 @@ class RadixCache(BasePrefixCache):
         )
         node = match.last_device_node
         released = 0
+        direct_credit_pool = getattr(req, "_agentic_direct_credit_pool", None)
         while (
             node is not self.root_node
             and node.lock_ref == 0
@@ -551,11 +552,60 @@ class RadixCache(BasePrefixCache):
         ):
             parent = node.parent
             released += len(node.value)
-            self.token_to_kv_pool_allocator.free(node.value)
-            self._record_remove_event(node)
-            self._delete_leaf(node)
+            if direct_credit_pool is None:
+                self.token_to_kv_pool_allocator.free(node.value)
+                self._record_remove_event(node)
+                self._delete_leaf(node)
+            else:
+                self._record_remove_event(node)
+                direct_credit_pool.reclaim_node_indices(
+                    node.value, self.token_to_kv_pool_allocator
+                )
+                self._delete_leaf(node)
             node = parent
+        remaining = self.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
+            )
+        ).last_device_node
+        branch_fully_released = (
+            remaining is self.root_node
+            or remaining.key.extra_key != req.extra_key
+        )
+        if direct_credit_pool is not None and branch_fully_released:
+            for name in (
+                "_agentic_direct_credit_pool",
+                "_agentic_direct_credit_allocation",
+                "_agentic_direct_parent_token_count",
+            ):
+                if hasattr(req, name):
+                    delattr(req, name)
+        elif direct_credit_pool is not None:
+            logger.error(
+                "Agentic Direct reserve branch remains protected after release "
+                "req=%s extra_key=%s lock_ref=%d children=%d",
+                req.rid,
+                req.extra_key,
+                remaining.lock_ref,
+                len(remaining.children),
+            )
         return released
+
+    def release_agentic_request_cache(
+        self,
+        req: Req,
+        *,
+        committed_len: Optional[int] = None,
+        _defer_if_blocked: bool = True,
+    ) -> int:
+        """Compatibility name for request-generation ownership release."""
+
+        return self.release_request_generation_cache(
+            req,
+            committed_len=committed_len,
+            _defer_if_blocked=_defer_if_blocked,
+            event_prefix="p_to_d_release",
+        )
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""

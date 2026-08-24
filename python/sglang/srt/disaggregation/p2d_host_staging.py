@@ -24,6 +24,7 @@ import torch
 from sglang.srt.disaggregation.agentic_host_staging import (
     HostStageState,
     LayerFirstD2HStaging,
+    P2D_RELEASE_HOST_OWNED,
     PinnedMHAHostBounce,
     SharedHostSnapshotArena,
     SharedHostStagingLedger,
@@ -35,6 +36,41 @@ logger = logging.getLogger(__name__)
 
 P2D_CUSTOM_SNAPSHOT_ID = "agentic_p2d_host_snapshot_id"
 P2D_CUSTOM_PREFILL_DOMAIN = "agentic_p2d_prefill_domain"
+
+# HOST_READY is a transient group-level notification, not a state that every
+# TP process is guaranteed to observe.  Once D starts (or finishes) loading,
+# the complete P->Host write is still durably committed.  Waiters must use this
+# monotonic boundary instead of testing exact equality with HOST_READY.
+_P2D_HOST_WRITE_COMMITTED_STATES = {
+    HostStageState.HOST_READY.value,
+    HostStageState.H2D_LOADING.value,
+    HostStageState.CONSUMED.value,
+}
+_P2D_HOST_TERMINAL_FAILURE_STATES = {
+    HostStageState.ABORTING.value,
+    HostStageState.REJECTED.value,
+    HostStageState.FAILED.value,
+}
+
+
+def _p2d_host_write_committed(entry: Optional[dict[str, Any]]) -> bool:
+    return bool(
+        entry is not None
+        and entry.get("state") in _P2D_HOST_WRITE_COMMITTED_STATES
+    )
+
+
+def _raise_if_p2d_host_failed(
+    snapshot_id: str, entry: Optional[dict[str, Any]]
+) -> None:
+    if entry is None:
+        raise RuntimeError(f"P->D Host ledger entry disappeared for {snapshot_id}")
+    state = entry.get("state")
+    if state in _P2D_HOST_TERMINAL_FAILURE_STATES:
+        reason = entry.get("reason", state)
+        raise RuntimeError(
+            f"P->D Host snapshot {snapshot_id} terminated in {state}: {reason}"
+        )
 
 
 def p2d_snapshot_id(bootstrap_room: int) -> str:
@@ -122,13 +158,27 @@ class AgenticPToDHostStagingManager:
         self._active: dict[str, dict[str, Any]] = {}
         self._results: dict[str, int] = {}
         self._records: dict[str, dict[str, Any]] = {}
+        # Prefill completion and D admission are deliberately decoupled.  The
+        # scheduler registers an immutable page-index vector once; this worker
+        # watches the request-level ledger and starts Host staging as soon as D
+        # publishes an offer.  No scheduler iteration is needed to discover
+        # that offer, so a long subsequent Prefill cannot pin completed KV in
+        # P HBM merely because control progress is delayed.
+        self._candidates: dict[str, dict[str, Any]] = {}
+        self._candidate_wakeup = threading.Event()
         self._pending_bytes = 0
         self._stop = threading.Event()
+        self._offer_thread = threading.Thread(
+            target=self._offer_worker,
+            name=f"agentic-p2d-offer-{os.getpid()}",
+            daemon=True,
+        )
         self._thread = threading.Thread(
             target=self._worker,
             name=f"agentic-p2d-spill-{os.getpid()}",
             daemon=True,
         )
+        self._offer_thread.start()
         self._thread.start()
         logger.info(
             "Agentic P->D Host staging enabled directory=%s capacity_gib=%.1f "
@@ -188,7 +238,53 @@ class AgenticPToDHostStagingManager:
             }
         )
 
-    def try_submit(self, req, source_indices) -> bool:
+    def watch(self, req, source_indices) -> bool:
+        """Register completed P KV for scheduler-independent Host admission."""
+
+        snapshot_id = p2d_snapshot_id(req.bootstrap_room)
+        with self._lock:
+            if (
+                snapshot_id in self._active
+                or snapshot_id in self._results
+                or snapshot_id in self._candidates
+                or getattr(req, "_agentic_p2d_host_terminal", False)
+            ):
+                return True
+            source_ready_event = None
+            if torch.is_tensor(source_indices) and source_indices.is_cuda:
+                source_ready_event = torch.cuda.Event()
+                source_ready_event.record(
+                    torch.cuda.current_stream(device=source_indices.device)
+                )
+            self._candidates[snapshot_id] = {
+                "req": req,
+                "source_indices": source_indices,
+                "source_ready_event": source_ready_event,
+            }
+        self._candidate_wakeup.set()
+        return True
+
+    def cancel_watch(self, req) -> bool:
+        """Cancel before page release, or return False when Host owns KV."""
+
+        snapshot_id = p2d_snapshot_id(req.bootstrap_room)
+        with self._lock:
+            local_snapshot = getattr(req, "_agentic_p2d_host_snapshot_id", None)
+            if local_snapshot in self._active:
+                return False
+            if local_snapshot is None:
+                ownership = self.ledger.arbitrate_p2d_release(
+                    snapshot_id, tp_size=self.tp_size
+                )
+                if ownership == P2D_RELEASE_HOST_OWNED:
+                    return False
+            req._agentic_p2d_host_terminal = True
+            self._candidates.pop(snapshot_id, None)
+            if local_snapshot is not None:
+                self._results.pop(local_snapshot, None)
+            return True
+
+    def try_submit(self, req, source_indices, source_ready_event=None) -> bool:
         """Atomically claim one Router offer and enqueue immutable D2H work.
 
         This method is called by the P scheduler.  It performs no Host copy and
@@ -196,9 +292,6 @@ class AgenticPToDHostStagingManager:
         """
 
         snapshot_id = p2d_snapshot_id(req.bootstrap_room)
-        with self._lock:
-            if snapshot_id in self._active or snapshot_id in self._results:
-                return True
         entry = self.ledger.get(snapshot_id)
         if (
             entry is None
@@ -215,20 +308,6 @@ class AgenticPToDHostStagingManager:
         if len(source_indices) != token_count:
             raise RuntimeError("P->D staging source token count mismatch")
         byte_size = self._byte_size(token_count)
-        with self._lock:
-            if (
-                self.arena.used_bytes + self._pending_bytes + byte_size
-                > int(self.arena.capacity_bytes * self.hard_watermark)
-            ):
-                return False
-        claimed = self.ledger.claim_rank(
-            snapshot_id,
-            self.owner,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
-        )
-        if claimed is None:
-            return False
         try:
             # ``source_indices`` is cloned by the scheduler on its current
             # CUDA stream.  The D2H worker uses a private stream, so retaining
@@ -236,24 +315,48 @@ class AgenticPToDHostStagingManager:
             # gather could race the clone (and the preceding Prefill writes).
             # Record, but do not synchronize, at the scheduler boundary.  The
             # worker inserts the corresponding stream wait before touching KV.
-            source_ready_event = None
-            if torch.is_tensor(source_indices) and source_indices.is_cuda:
+            if (
+                source_ready_event is None
+                and torch.is_tensor(source_indices)
+                and source_indices.is_cuda
+            ):
                 source_ready_event = torch.cuda.Event()
                 source_ready_event.record(
                     torch.cuda.current_stream(device=source_indices.device)
                 )
-            record = {
-                "source_indices": source_indices,
-                "source_ready_event": source_ready_event,
-                "token_count": token_count,
-                "byte_size": byte_size,
-                "prefill_metadata": _prefill_metadata(req),
-                "started_at": time.monotonic(),
-            }
+            prefill_metadata = _prefill_metadata(req)
             with self._lock:
+                # Cancellation, capacity reservation, the ledger claim and
+                # active registration form one ownership transaction.  The
+                # scheduler cannot release these pages in the middle.
+                if getattr(req, "_agentic_p2d_host_terminal", False):
+                    return False
+                if snapshot_id in self._active or snapshot_id in self._results:
+                    return True
+                if (
+                    self.arena.used_bytes + self._pending_bytes + byte_size
+                    > int(self.arena.capacity_bytes * self.hard_watermark)
+                ):
+                    return False
+                claimed = self.ledger.claim_rank(
+                    snapshot_id,
+                    self.owner,
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
+                )
+                if claimed is None:
+                    return False
+                record = {
+                    "source_indices": source_indices,
+                    "source_ready_event": source_ready_event,
+                    "token_count": token_count,
+                    "byte_size": byte_size,
+                    "prefill_metadata": prefill_metadata,
+                    "started_at": time.monotonic(),
+                }
                 self._pending_bytes += byte_size
                 self._active[snapshot_id] = record
-            req._agentic_p2d_host_snapshot_id = snapshot_id
+                req._agentic_p2d_host_snapshot_id = snapshot_id
             self._work.put((snapshot_id, record))
             logger.info(
                 "AgenticKV p2d_host_d2h_queued snapshot=%s tokens=%d bytes=%d "
@@ -266,6 +369,12 @@ class AgenticPToDHostStagingManager:
             )
             return True
         except Exception as exc:
+            with self._lock:
+                record = self._active.pop(snapshot_id, None)
+                if record is not None:
+                    self._pending_bytes = max(
+                        0, self._pending_bytes - int(record["byte_size"])
+                    )
             self.ledger.transition(
                 snapshot_id,
                 HostStageState.FAILED,
@@ -304,22 +413,106 @@ class AgenticPToDHostStagingManager:
             return result
         return int(KVPoll.Transferring) if active else None
 
-    def mark_scheduler_consumed(self, req) -> None:
-        snapshot_id = getattr(req, "_agentic_p2d_host_snapshot_id", None)
-        if snapshot_id is None:
-            return
+    def prepare_scheduler_release(self, req) -> bool:
+        """Atomically return final page ownership to the scheduler.
+
+        The scheduler calls this before releasing GPU KV.  If Host staging
+        won a race with native NIXL completion, the request stays inflight
+        until D2H has finished.
+        """
+
+        candidate_id = p2d_snapshot_id(req.bootstrap_room)
         with self._lock:
-            self._results.pop(snapshot_id, None)
-        # The independent NIXL consumer may still hold this request in its
-        # round-robin queue.  Publish a terminal level-trigger so it removes
-        # the request instead of resurrecting the unused direct sender.
-        req._agentic_p2d_host_terminal = True
+            snapshot_id = getattr(req, "_agentic_p2d_host_snapshot_id", None)
+            if snapshot_id is not None:
+                if snapshot_id in self._active:
+                    return False
+                if self._results.get(snapshot_id) != int(KVPoll.Success):
+                    return False
+                self._results.pop(snapshot_id, None)
+            elif candidate_id in self._active or candidate_id in self._results:
+                return False
+            else:
+                ownership = self.ledger.arbitrate_p2d_release(
+                    candidate_id, tp_size=self.tp_size
+                )
+                if ownership == P2D_RELEASE_HOST_OWNED:
+                    # Another TP rank won live Host ownership after our last
+                    # poll.  Keep this shard until its offer worker joins.  A
+                    # failed/aborting peer is different: no local D2H exists,
+                    # so this untouched shard may be released immediately.
+                    return False
+            req._agentic_p2d_host_terminal = True
+            self._candidates.pop(candidate_id, None)
+            return True
+
+    def mark_scheduler_consumed(self, req) -> None:
+        """Compatibility wrapper for callers that already saw success."""
+
+        if not self.prepare_scheduler_release(req):
+            raise RuntimeError("P->D Host pages are still owned by staging")
 
     def close(self) -> None:
         """Stop the background worker before its tmpfs control files vanish."""
 
         self._stop.set()
+        self._candidate_wakeup.set()
+        self._offer_thread.join(timeout=2.0)
         self._thread.join(timeout=2.0)
+
+    def _offer_worker(self) -> None:
+        """Claim new D Host offers without waiting for the P scheduler."""
+
+        while not self._stop.is_set():
+            self._candidate_wakeup.wait(timeout=0.02)
+            self._candidate_wakeup.clear()
+            with self._lock:
+                candidates = list(self._candidates.items())
+            entries = self.ledger.snapshot_entries() if candidates else {}
+            for snapshot_id, candidate in candidates:
+                if self._stop.is_set():
+                    return
+                req = candidate["req"]
+                if getattr(req, "_agentic_p2d_host_terminal", False):
+                    with self._lock:
+                        self._candidates.pop(snapshot_id, None)
+                    continue
+                entry = entries.get(snapshot_id)
+                if entry is None:
+                    continue
+                if entry.get("state") in {
+                    HostStageState.CONSUMED.value,
+                    HostStageState.FAILED.value,
+                    HostStageState.REJECTED.value,
+                }:
+                    with self._lock:
+                        self._candidates.pop(snapshot_id, None)
+                    continue
+                if (
+                    entry.get("state")
+                    not in {
+                        HostStageState.OFFERED.value,
+                        HostStageState.HOST_RESERVED.value,
+                    }
+                    or not self._targets_this_p(entry)
+                ):
+                    continue
+                # Serialize the final claim against scheduler cleanup.  The
+                # lock is re-entrant because try_submit also protects active
+                # bookkeeping; once cleanup marks the Req terminal this
+                # candidate can never read pages that the scheduler released.
+                with self._lock:
+                    if (
+                        self._candidates.get(snapshot_id) is not candidate
+                        or getattr(req, "_agentic_p2d_host_terminal", False)
+                    ):
+                        continue
+                    if self.try_submit(
+                        req,
+                        candidate["source_indices"],
+                        candidate.get("source_ready_event"),
+                    ):
+                        self._candidates.pop(snapshot_id, None)
 
     def _worker(self) -> None:
         while not self._stop.is_set():
@@ -389,11 +582,9 @@ class AgenticPToDHostStagingManager:
                     raise RuntimeError("P->D HOST_READY publication was rejected")
                 while not self._stop.is_set():
                     current = self.ledger.get(snapshot_id)
-                    if (
-                        current is not None
-                        and current.get("state") == HostStageState.HOST_READY.value
-                    ):
+                    if _p2d_host_write_committed(current):
                         break
+                    _raise_if_p2d_host_failed(snapshot_id, current)
                     time.sleep(0.005)
                 if self._stop.is_set():
                     raise RuntimeError("P->D TP group stopped before HOST_READY")
@@ -584,6 +775,7 @@ class AgenticPToDHostLoadManager:
                         and current.get("state") == HostStageState.CONSUMED.value
                     ):
                         break
+                    _raise_if_p2d_host_failed(receiver.snapshot_id, current)
                     time.sleep(0.005)
                 if self._stop.is_set():
                     raise RuntimeError("P->D TP group stopped before CONSUMED")
