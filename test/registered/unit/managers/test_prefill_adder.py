@@ -1,6 +1,8 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
+
+import torch
 
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
@@ -93,6 +95,88 @@ class TestPrefillAdder(CustomTestCase):
         )
         defaults.update(kwargs)
         return PrefillAdder(**defaults)
+
+    def test_agentic_lease_admits_when_ordinary_kv_pool_is_empty(self):
+        self.mock_token_allocator.available_size.return_value = 0
+        req = self.create_mock_req("leased", priority=0, max_new_tokens=1)
+        req.sampling_params.ignore_eos = False
+        req.extend_input_len = 8
+        req.host_hit_length = 0
+        req.prefix_indices = torch.empty(0, dtype=torch.int64)
+        req.fill_ids = list(range(8))
+        req.last_node = MagicMock()
+        req._agentic_workset_suffix_indices = torch.arange(8)
+        adder = self.create_adder(
+            self.create_running_batch(), page_size=4, rem_chunk_tokens=None
+        )
+
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.CONTINUE)
+        self.assertIn(req, adder.can_run_list)
+        self.assertEqual(adder.rem_total_token_offset, 0)
+
+        second = self.create_mock_req("leased-2", priority=0, max_new_tokens=1)
+        second.sampling_params.ignore_eos = False
+        second.extend_input_len = 8
+        second.host_hit_length = 0
+        second.prefix_indices = torch.empty(0, dtype=torch.int64)
+        second.fill_ids = list(range(8))
+        second.last_node = MagicMock()
+        second._agentic_workset_suffix_indices = torch.arange(8, 16)
+        second_result = adder.add_one_req(
+            second, has_chunked_req=False, truncation_align_size=None
+        )
+        self.assertEqual(second_result, AddReqResult.CONTINUE)
+        self.assertIn(second, adder.can_run_list)
+        self.assertEqual(adder.rem_total_token_offset, 0)
+
+    def test_agentic_lease_chunk_continuation_ignores_empty_ordinary_pool(self):
+        self.mock_token_allocator.available_size.return_value = 0
+        req = SimpleNamespace(
+            rid="leased-chunk",
+            extend_input_len=12,
+            fill_ids=list(range(12)),
+            prefix_indices=[],
+            sampling_params=SimpleNamespace(max_new_tokens=0),
+            _agentic_workset_suffix_indices=torch.arange(12),
+        )
+
+        def set_extend_input_len(value):
+            req.extend_input_len = int(value)
+
+        req.set_extend_input_len = set_extend_input_len
+        adder = self.create_adder(
+            self.create_running_batch(), page_size=4, rem_chunk_tokens=6
+        )
+
+        chunked = adder.add_chunked_req(req)
+
+        self.assertIs(chunked, req)
+        self.assertEqual(req.extend_input_len, 4)
+        self.assertEqual(adder.rem_total_token_offset, 0)
+
+    def test_agentic_slow_parent_pin_bridges_to_native_request_lock(self):
+        direct_pin = object()
+        slow_pin = object()
+        req = SimpleNamespace(
+            last_node=object(),
+            _agentic_direct_parent_pin_node=direct_pin,
+            _agentic_kv_host_pin_node=slow_pin,
+        )
+        adder = self.create_adder(self.create_running_batch())
+
+        adder._req_inc_lock_ref(req)
+
+        self.mock_tree_cache.inc_lock_ref.assert_called_once_with(req.last_node)
+        self.assertEqual(
+            self.mock_tree_cache.dec_lock_ref.call_args_list,
+            [call(direct_pin), call(slow_pin)],
+        )
+        self.assertFalse(hasattr(req, "_agentic_direct_parent_pin_node"))
+        self.assertFalse(hasattr(req, "_agentic_kv_host_pin_node"))
 
     def test_preempt_success_high_priority_values_first(self):
         params = [

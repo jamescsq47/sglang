@@ -1,5 +1,8 @@
+import errno
 import os
 import json
+import mmap
+import queue
 import tempfile
 import threading
 import time
@@ -10,12 +13,23 @@ from types import SimpleNamespace
 import pytest
 import torch
 import sglang.srt.disaggregation.prefill as prefill_module
+import sglang.srt.disaggregation.agentic_host_staging as host_staging_module
+import sglang.srt.disaggregation.p2d_host_staging as p2d_host_module
 
 from sglang.srt.disaggregation.agentic_host_staging import (
     AgenticDHostStagingClient,
+    AgenticNodeLocalRawStore,
     AgenticPHostStagingManager,
+    H2DLaunchFence,
     HostStageState,
+    LazySharedMHAHostSnapshot,
+    P2D_RELEASE_HOST_OWNED,
+    SharedHostSnapshotArena,
     SharedHostStagingLedger,
+    SharedMHAHostSnapshot,
+    _copy_layer_first_host_range,
+    create_agentic_storage_controller,
+    supports_agentic_kv_spill,
 )
 from sglang.srt.disaggregation.agentic_early_claim import AgenticEarlyClaimStore
 from sglang.srt.disaggregation.agentic_kv_lifecycle import RequestGeneration
@@ -36,15 +50,24 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeTransferQueue
+from sglang.srt.disaggregation.nixl.conn import (
+    NixlKVManager,
+    NixlKVReceiver,
+    NixlKVSender,
+    TransferStatus,
+)
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.disaggregation.p2d_host_staging import (
+    AgenticPToDHostLoadManager,
+    AgenticPToDHostReceiver,
     AgenticPToDHostStagingManager,
+    _RegisteredP2DHostArena,
     _p2d_host_write_committed,
     _raise_if_p2d_host_failed,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler import (
-    AgenticDirectPageCreditPool,
+    AgenticPWorksetLeaseBroker,
     Scheduler,
 )
 
@@ -74,10 +97,205 @@ def _rank_offer(rank: int):
     }
 
 
-def test_direct_credit_promotes_received_pages_and_replenishes_transit_pool():
+def test_layer_first_host_copy_moves_only_the_requested_token_range():
+    source = torch.arange(2 * 2 * 4 * 1 * 2, dtype=torch.int32).view(
+        2, 2, 4, 1, 2
+    )
+    destination = torch.full((2, 2, 6, 1, 2), -1, dtype=torch.int32)
+
+    _copy_layer_first_host_range(
+        destination,
+        source,
+        destination_start=3,
+        source_start=1,
+        token_count=2,
+    )
+
+    torch.testing.assert_close(destination[:, :, 3:5], source[:, :, 1:3])
+    assert torch.all(destination[:, :, :3] == -1)
+    assert torch.all(destination[:, :, 5:] == -1)
+
+
+def test_tp1_p2d_completion_poll_does_not_wait_for_reverse_direct_lock():
+    class ForbiddenLock:
+        def __enter__(self):
+            raise AssertionError("submitted P->D completion must be lock-free")
+
+        def __exit__(self, *_args):
+            return False
+
+    polls = []
+    req = SimpleNamespace(
+        disagg_p_ready_transfer_started=True,
+        disagg_kv_sender=SimpleNamespace(
+            kv_mgr=SimpleNamespace(thread_sync_rw_enabled=True),
+            poll=lambda: polls.append(True) or KVPoll.Success
+        ),
+    )
+    scheduler = SimpleNamespace(
+        agentic_p2d_host_staging_manager=None,
+        agentic_nixl_control_lock=ForbiddenLock(),
+    )
+
+    result = (
+        SchedulerDisaggregationPrefillMixin._prefill_transfer_progress_tp1_req_once(
+            scheduler, req
+        )
+    )
+
+    assert result == int(KVPoll.Success)
+    assert polls == [True]
+
+
+def test_tp1_p2d_completion_keeps_python_lock_without_native_rw_sync():
+    class TrackingLock:
+        def __init__(self):
+            self.held = False
+
+        def __enter__(self):
+            self.held = True
+
+        def __exit__(self, *_args):
+            self.held = False
+
+    lock = TrackingLock()
+    sender = SimpleNamespace(
+        kv_mgr=SimpleNamespace(thread_sync_rw_enabled=False),
+    )
+    sender.poll = lambda: (
+        KVPoll.Success
+        if lock.held
+        else (_ for _ in ()).throw(
+            AssertionError("legacy NIXL completion poll must remain locked")
+        )
+    )
+    req = SimpleNamespace(
+        disagg_p_ready_transfer_started=True,
+        disagg_kv_sender=sender,
+    )
+    scheduler = SimpleNamespace(
+        agentic_p2d_host_staging_manager=None,
+        agentic_nixl_control_lock=lock,
+    )
+    scheduler._prefill_transfer_progress_req_once = lambda request: int(
+        request.disagg_kv_sender.poll()
+    )
+
+    result = (
+        SchedulerDisaggregationPrefillMixin._prefill_transfer_progress_tp1_req_once(
+            scheduler, req
+        )
+    )
+
+    assert result == int(KVPoll.Success)
+
+
+def test_tp1_p2d_submission_keeps_short_nixl_control_lock():
+    class TrackingLock:
+        def __init__(self):
+            self.held = False
+
+        def __enter__(self):
+            self.held = True
+
+        def __exit__(self, *_args):
+            self.held = False
+
+    lock = TrackingLock()
+    scheduler = SimpleNamespace(
+        agentic_p2d_host_staging_manager=None,
+        agentic_nixl_control_lock=lock,
+    )
+    scheduler._prefill_transfer_progress_req_once = lambda _req: (
+        int(KVPoll.Transferring)
+        if lock.held
+        else (_ for _ in ()).throw(AssertionError("NIXL submission is unlocked"))
+    )
+    req = SimpleNamespace(disagg_p_ready_transfer_started=False)
+
+    result = (
+        SchedulerDisaggregationPrefillMixin._prefill_transfer_progress_tp1_req_once(
+            scheduler, req
+        )
+    )
+
+    assert result == int(KVPoll.Transferring)
+
+
+def test_node_local_metadata_store_is_cross_instance_and_create_only():
+    with tempfile.TemporaryDirectory(
+        prefix="sglang-agentic-metadata-", dir="/dev/shm"
+    ) as directory:
+        first = AgenticNodeLocalRawStore(directory)
+        second = AgenticNodeLocalRawStore(directory)
+
+        assert first.put("manifest", b"ready") == 0
+        assert second.put("manifest", b"duplicate") != 0
+        assert second.get("manifest") == b"ready"
+        assert second.is_exist("manifest") == 1
+        assert second.upsert("manifest", b"loading") == 0
+        assert first.get("manifest") == b"loading"
+        assert first.batch_is_exist(["manifest", "missing"]) == [1, 0]
+        assert first.batch_remove(["manifest", "missing"]) == [0, -1]
+        assert second.get("manifest") == b""
+
+
+def test_custom_storage_controller_needs_no_native_storage_backend(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("SGLANG_AGENTIC_KV_METADATA_DIR", str(tmp_path))
+    controller = create_agentic_storage_controller(
+        token_allocator=None,
+        server_args=SimpleNamespace(hicache_storage_backend=None),
+        tp_rank=0,
+        tp_size=1,
+        pp_rank=0,
+        pp_size=1,
+        model_name="test",
+    )
+    assert controller.mem_pool_host is None
+    assert not controller.storage_backend.supports_kv_spill
+    store = controller.storage_backend.agentic_snapshot_store()
+    assert store.store.put("claim", b"owner") == 0
+
+
+def test_agentic_nixl_ignores_heartbeat_failure_until_data_is_complete():
+    room = 17
+    bootstrap = "127.0.0.1:9000"
+    transfer = TransferStatus(is_failure=True)
+    manager = SimpleNamespace(
+        transfer_statuses={room: transfer},
+        addr_to_rooms_tracker={bootstrap: {room}},
+        update_transfer_status=lambda: None,
+    )
+    receiver = NixlKVReceiver.__new__(NixlKVReceiver)
+    receiver.bootstrap_room = room
+    receiver.bootstrap_addr = bootstrap
+    receiver.kv_mgr = manager
+    receiver.started_transfer = True
+    receiver.conclude_state = None
+
+    # Heartbeat failure is only control-plane evidence.  A late remote WRITE
+    # may still target these pages, so they remain quarantined.
+    assert receiver.poll_agentic() == KVPoll.WaitingForInput
+    assert room in manager.transfer_statuses
+
+    # Physical completion is the complete set of remote-write notifications;
+    # only this state authorizes allocator reuse.
+    transfer.received_aux = True
+    transfer.num_pp_ranks_expected = 1
+    transfer.expected_kvs_per_pp[0] = 1
+    transfer.received_kvs_per_pp[0].add(0)
+    assert receiver.poll_agentic() == KVPoll.Success
+    assert room not in manager.transfer_statuses
+    assert room not in manager.addr_to_rooms_tracker[bootstrap]
+
+
+def test_workset_lease_reserves_parent_and_suffix_then_commits_parent():
     class Allocator:
         def __init__(self):
             self.next_index = 0
+            self.freed = []
 
         def alloc(self, count):
             result = torch.arange(
@@ -86,28 +304,557 @@ def test_direct_credit_promotes_received_pages_and_replenishes_transit_pool():
             self.next_index += count
             return result
 
+        def free(self, indices):
+            self.freed.append(indices.clone())
+
+    allocator = Allocator()
+    broker = AgenticPWorksetLeaseBroker(page_size=4)
+    broker.request("request:3", parent_tokens=4, prompt_tokens=9)
+    broker.service(allocator)
+    lease = broker.get("request:3")
+    assert lease is not None
+    assert lease.allocated_tokens == 12
+    assert torch.equal(lease.parent_indices, torch.arange(0, 4))
+    assert torch.equal(lease.suffix_indices, torch.arange(4, 12))
+
+    assert broker.begin_bind("request:3", lease)
+    broker.commit_parent_bound("request:3", lease)
+    req = SimpleNamespace(origin_input_ids=list(range(9)))
+    broker.handoff_to_req("request:3", req, lease)
+    assert broker.get("request:3") is lease
+    assert allocator.freed == []
+    assert torch.equal(
+        req._agentic_workset_suffix_indices, torch.arange(4, 12)
+    )
+    with pytest.raises(RuntimeError, match="page boundary"):
+        broker.consume_suffix(lease, 3, final_prompt_chunk=False)
+    assert lease.suffix_cursor == 0
+    assert lease.state == "handed"
+    assert torch.equal(
+        broker.consume_suffix(lease, 4, final_prompt_chunk=False),
+        torch.arange(4, 8),
+    )
+    assert broker.get("request:3") is lease
+    assert torch.equal(
+        broker.consume_suffix(lease, 1, final_prompt_chunk=True),
+        torch.arange(8, 9),
+    )
+    assert broker.get("request:3") is None
+
+
+def test_workset_lease_rounds_parent_and_suffix_independently():
+    class Allocator:
+        def alloc(self, count):
+            return torch.arange(count, dtype=torch.int64)
+
+        def free(self, _indices):
+            raise AssertionError("live workset must not be freed")
+
+    broker = AgenticPWorksetLeaseBroker(page_size=4)
+    broker.request("unaligned:1", parent_tokens=5, prompt_tokens=10)
+    broker.service(Allocator())
+    lease = broker.get("unaligned:1")
+
+    assert lease is not None
+    assert lease.parent_allocated_tokens == 8
+    assert lease.suffix_allocated_tokens == 8
+    assert lease.allocated_tokens == 16
+
+
+def test_workset_lease_does_not_steal_native_chunk_continuation_capacity():
+    class Allocator:
+        def __init__(self):
+            self.available = 20
+
+        def available_size(self):
+            return self.available
+
+        def alloc(self, count):
+            if count > self.available:
+                return None
+            self.available -= count
+            return torch.arange(count, dtype=torch.int64)
+
         def free(self, _indices):
             pass
 
     allocator = Allocator()
-    pool = AgenticDirectPageCreditPool(
-        allocator, capacity_tokens=8, page_size=4
+    broker = AgenticPWorksetLeaseBroker(page_size=4)
+    broker.request("direct:1", parent_tokens=4, prompt_tokens=12)
+
+    # The workset needs 12 pages and would fit physically, but the active
+    # native chunk already owns the promise of the final 12 pages.
+    broker.service(allocator, reserve_tokens=12)
+    assert broker.get("direct:1") is None
+    assert allocator.available == 20
+
+    # Once the chunk finishes, the same pending intent can be granted.
+    broker.service(allocator)
+    assert broker.get("direct:1") is not None
+    assert allocator.available == 8
+
+
+def test_workset_reserve_never_delays_a_release():
+    class Allocator:
+        def __init__(self):
+            self.available = 16
+            self.freed = []
+
+        def available_size(self):
+            return self.available
+
+        def alloc(self, count):
+            self.available -= count
+            return torch.arange(count, dtype=torch.int64)
+
+        def free(self, indices):
+            self.freed.append(indices.clone())
+            self.available += int(indices.numel())
+
+    allocator = Allocator()
+    broker = AgenticPWorksetLeaseBroker(page_size=4)
+    broker.request("release:1", parent_tokens=4, prompt_tokens=8)
+    broker.service(allocator)
+    lease = broker.get("release:1")
+    assert lease is not None
+    assert broker.request_release("release:1", lease)
+
+    broker.service(allocator, reserve_tokens=allocator.available_size())
+
+    assert broker.get("release:1") is None
+    assert len(allocator.freed) == 1
+    assert allocator.available == 16
+
+
+def test_cancel_unstarted_reclaims_a_grant_created_after_arrival():
+    class Allocator:
+        def __init__(self):
+            self.available = 16
+
+        def available_size(self):
+            return self.available
+
+        def alloc(self, count):
+            self.available -= count
+            return torch.arange(count, dtype=torch.int64)
+
+        def free(self, indices):
+            self.available += int(indices.numel())
+
+    allocator = Allocator()
+    broker = AgenticPWorksetLeaseBroker(page_size=4)
+    owner = broker.direct_owner("stale:1")
+    broker.request("stale:1", parent_tokens=4, prompt_tokens=8, owner=owner)
+    broker.service(allocator)
+    assert broker.get("stale:1", owner=owner) is not None
+    assert allocator.available == 8
+
+    assert broker.cancel_unstarted("stale:1", owner=owner)
+    broker.service(allocator, reserve_tokens=16)
+
+    assert broker.get("stale:1", owner=owner) is None
+    assert allocator.available == 16
+
+
+def test_cancel_unstarted_never_reclaims_an_io_owned_workset():
+    class Allocator:
+        def available_size(self):
+            return 16
+
+        def alloc(self, count):
+            return torch.arange(count, dtype=torch.int64)
+
+        def free(self, _indices):
+            raise AssertionError("an I/O-owned workset must remain quarantined")
+
+    allocator = Allocator()
+    broker = AgenticPWorksetLeaseBroker(page_size=4)
+    owner = broker.direct_owner("inflight:1")
+    broker.request("inflight:1", parent_tokens=4, prompt_tokens=8, owner=owner)
+    broker.service(allocator)
+    lease = broker.get("inflight:1", owner=owner)
+    assert lease is not None
+    assert broker.begin_io_attempt("inflight:1", lease, "attempt:1")
+
+    assert not broker.cancel_unstarted("inflight:1", owner=owner)
+    broker.service(allocator)
+
+    assert broker.get("inflight:1", owner=owner) is lease
+    assert lease.state == "io_reserved"
+
+
+def test_scheduler_reserves_exact_unfinished_native_chunk_suffix():
+    calls = []
+    scheduler = SimpleNamespace(
+        page_size=4,
+        chunked_req=SimpleNamespace(
+            origin_input_ids=list(range(21)),
+            output_ids=[],
+            fill_ids=list(range(8)),
+        ),
+        agentic_p_workset_broker=SimpleNamespace(
+            service=lambda allocator, *, reserve_tokens: calls.append(reserve_tokens)
+        ),
+        token_to_kv_pool_allocator=object(),
     )
-    allocation = pool.allocate(4)
-    assert allocation is not None
-    received_indices = pool.device_view(allocation).clone()
-    assert pool.free_tokens == 4
 
-    replacement = allocator.alloc(allocation.allocated_tokens)
-    pool.promote_to_ordinary(allocation, replacement)
+    Scheduler._agentic_service_p_workset_leases(scheduler)
 
-    # The received KV stays on its original physical pages, while the fixed
-    # Direct slots immediately become reusable through ordinary empty pages.
-    assert torch.equal(received_indices, torch.arange(0, 4))
-    assert pool.free_tokens == 8
-    next_allocation = pool.allocate(4)
-    assert next_allocation is not None
-    assert torch.equal(pool.device_view(next_allocation), replacement)
+    assert calls == [16]
+
+
+def test_scheduler_does_not_reserve_again_for_private_workset_chunk():
+    calls = []
+    scheduler = SimpleNamespace(
+        page_size=4,
+        chunked_req=SimpleNamespace(
+            origin_input_ids=list(range(21)),
+            output_ids=[],
+            fill_ids=list(range(8)),
+            _agentic_workset_suffix_indices=torch.arange(16),
+        ),
+        agentic_p_workset_broker=SimpleNamespace(
+            service=lambda allocator, *, reserve_tokens: calls.append(reserve_tokens)
+        ),
+        token_to_kv_pool_allocator=object(),
+    )
+
+    Scheduler._agentic_service_p_workset_leases(scheduler)
+
+    assert calls == [0]
+
+
+def test_workset_release_waits_for_physical_direct_terminal():
+    class Allocator:
+        def __init__(self):
+            self.freed = []
+
+        def alloc(self, count):
+            return torch.arange(count, dtype=torch.int64)
+
+        def free(self, indices):
+            self.freed.append(indices.clone())
+
+    allocator = Allocator()
+    broker = AgenticPWorksetLeaseBroker(page_size=4)
+    owner = broker.direct_owner("dma:1")
+    broker.request("dma:1", 4, 9, owner=owner)
+    broker.service(allocator)
+    lease = broker.get("dma:1", owner=owner)
+    assert lease is not None
+
+    attempt = "direct:a"
+    assert broker.begin_io_attempt("dma:1", lease, attempt)
+    broker.mark_io_inflight("dma:1", lease, attempt)
+    assert not broker.request_release(
+        "dma:1", lease, owner=owner, io_attempt=attempt
+    )
+    assert lease.state == "release_pending"
+    broker.service(allocator)
+    assert allocator.freed == []
+    assert broker.get("dma:1", owner=owner) is lease
+
+    assert broker.mark_io_quiesced("dma:1", lease, attempt)
+    broker.service(allocator)
+    assert broker.get("dma:1", owner=owner) is None
+    assert len(allocator.freed) == 1
+    assert torch.equal(allocator.freed[0], torch.arange(12))
+
+
+def test_slow_h2d_abort_and_rollback_wait_for_physical_terminal():
+    class Allocator:
+        def __init__(self):
+            self.freed = []
+
+        def alloc(self, count):
+            return torch.arange(count, dtype=torch.int64)
+
+        def free(self, indices):
+            self.freed.append(indices.clone())
+
+    class Event:
+        ready = False
+
+        def query(self):
+            return self.ready
+
+        def synchronize(self):
+            assert self.ready
+
+    request = RequestGeneration("slow-dma", 1)
+    rid = "child-rid"
+    allocator = Allocator()
+    broker = AgenticPWorksetLeaseBroker(page_size=4)
+    owner = broker.slow_owner(request.snapshot_id, rid)
+    broker.request(request.snapshot_id, 4, 8, owner=owner)
+    broker.service(allocator)
+    lease = broker.get(request.snapshot_id, owner=owner)
+    assert lease is not None
+    attempt = f"slow-h2d:p:{rid}:{lease.lease_id}"
+    assert broker.begin_io_attempt(request.snapshot_id, lease, attempt)
+    broker.mark_io_inflight(request.snapshot_id, lease, attempt)
+
+    event = Event()
+    record = {}
+    load = {
+        "record": record,
+        "request_generation": request,
+        "workset_lease": lease,
+        "io_attempt": attempt,
+        "io_inflight": True,
+        "io_quiesced": False,
+        "launch_fence": H2DLaunchFence(
+            event=event, submitted=True, armed=True
+        ),
+    }
+    manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
+    manager.workset_broker = broker
+    manager.tree_cache = SimpleNamespace()
+    manager.loads = {rid: load}
+    manager.host_ready = {}
+    manager._control_wakeup = SimpleNamespace(set=lambda: None)
+    manager._h2d_poisoned = False
+    released_host = []
+    manager._release_record = lambda current: released_host.append(current)
+
+    req = SimpleNamespace(rid=rid)
+    manager.abort_request(rid, request)
+    manager.rollback_bound_parent(req, request)
+    broker.service(allocator)
+
+    assert lease.state == "io_inflight"
+    assert allocator.freed == []
+    assert not manager._discard_failed_h2d_load(rid, load)
+    broker.service(allocator)
+    assert allocator.freed == []
+
+    event.ready = True
+    assert manager._discard_failed_h2d_load(rid, load)
+    broker.service(allocator)
+    assert broker.get(request.snapshot_id, owner=owner) is None
+    assert len(allocator.freed) == 1
+    assert released_host == [record]
+
+
+def test_aborted_request_quarantines_direct_dma_without_fake_abort():
+    class Allocator:
+        def alloc(self, count):
+            return torch.arange(count, dtype=torch.int64)
+
+        def free(self, _indices):
+            raise AssertionError("in-flight DMA pages must remain quarantined")
+
+    class Receiver:
+        def abort(self):
+            raise AssertionError("local abort is not a physical DMA fence")
+
+    request = RequestGeneration("abort-dma", 1)
+    manifest = SimpleNamespace(
+        request=request,
+        snapshot_id=request.snapshot_id,
+    )
+    broker = AgenticPWorksetLeaseBroker(page_size=4)
+    owner = broker.direct_owner(request.snapshot_id)
+    broker.request(request.snapshot_id, 4, 8, owner=owner)
+    broker.service(Allocator())
+    lease = broker.get(request.snapshot_id, owner=owner)
+    assert lease is not None
+    attempt = "claim"
+    assert broker.begin_io_attempt(request.snapshot_id, lease, attempt)
+    broker.mark_io_inflight(request.snapshot_id, lease, attempt)
+
+    req = SimpleNamespace(
+        rid="child-rid",
+        _agentic_direct_receiver=Receiver(),
+        _agentic_direct_manifest=manifest,
+        _agentic_direct_workset_lease=lease,
+        _agentic_direct_claim_id="claim",
+        _agentic_direct_io_attempt=attempt,
+        _agentic_direct_indices=torch.arange(4),
+        _agentic_direct_started_at=time.monotonic(),
+        _agentic_kv_snapshot_store=object(),
+    )
+    scheduler = SimpleNamespace(
+        tree_cache=SimpleNamespace(),
+        agentic_p_workset_broker=broker,
+        agentic_early_direct_poll_lock=nullcontext(),
+        agentic_early_direct_receives={},
+    )
+
+    Scheduler._agentic_abort_cleanup(scheduler, req)
+
+    entry = scheduler.agentic_early_direct_receives[request.snapshot_id]
+    assert entry.abort_requested
+    assert entry.receiver is not None
+    assert lease.state == "release_pending"
+    assert broker.get(request.snapshot_id, owner=owner) is lease
+
+
+def test_workset_io_attempt_prevents_stale_quiesce_and_release():
+    class Allocator:
+        def alloc(self, count):
+            return torch.arange(count, dtype=torch.int64)
+
+        def free(self, _indices):
+            raise AssertionError("active Direct destination must not be freed")
+
+    broker = AgenticPWorksetLeaseBroker(page_size=4)
+    owner = broker.direct_owner("race:1")
+    broker.request("race:1", 4, 8, owner=owner)
+    broker.service(Allocator())
+    lease = broker.get("race:1", owner=owner)
+    assert lease is not None
+
+    assert broker.begin_io_attempt("race:1", lease, "attempt-a")
+    broker.mark_io_inflight("race:1", lease, "attempt-a")
+    assert not broker.begin_io_attempt("race:1", lease, "attempt-b")
+    assert not broker.mark_io_quiesced("race:1", lease, "attempt-b")
+    assert not broker.request_release(
+        "race:1", lease, io_attempt="attempt-b"
+    )
+    assert lease.state == "io_inflight"
+    assert lease.io_attempt == "attempt-a"
+    assert broker.mark_io_quiesced("race:1", lease, "attempt-a")
+    assert lease.state == "active"
+
+
+def test_transport_release_cannot_reclaim_request_owned_workset():
+    class Allocator:
+        def __init__(self):
+            self.freed = []
+
+        def alloc(self, count):
+            return torch.arange(count, dtype=torch.int64)
+
+        def free(self, indices):
+            self.freed.append(indices.clone())
+
+    allocator = Allocator()
+    broker = AgenticPWorksetLeaseBroker(page_size=4)
+    broker.request("handed:1", 4, 8)
+    broker.service(allocator)
+    lease = broker.get("handed:1")
+    assert lease is not None
+    assert broker.begin_bind("handed:1", lease)
+    broker.commit_parent_bound("handed:1", lease)
+    req = SimpleNamespace(origin_input_ids=list(range(8)))
+    broker.handoff_to_req("handed:1", req, lease)
+
+    assert not broker.request_release("handed:1", lease)
+    broker.service(allocator)
+    assert broker.get("handed:1") is lease
+    assert allocator.freed == []
+    assert broker.release_handed("handed:1", lease, req=req)
+    broker.service(allocator)
+    assert broker.get("handed:1") is None
+    assert len(allocator.freed) == 1
+
+
+def test_workset_lease_release_is_identity_scoped_and_blocks_handoff():
+    class Allocator:
+        def __init__(self):
+            self.next_index = 0
+            self.freed = []
+
+        def alloc(self, count):
+            result = torch.arange(
+                self.next_index, self.next_index + count, dtype=torch.int64
+            )
+            self.next_index += count
+            return result
+
+        def free(self, indices):
+            self.freed.append(indices.clone())
+
+    allocator = Allocator()
+    broker = AgenticPWorksetLeaseBroker(page_size=4)
+    broker.request("same:1", 4, 8)
+    broker.service(allocator)
+    first = broker.get("same:1")
+    assert first is not None
+    assert broker.request_release("same:1", first)
+    with pytest.raises(RuntimeError, match="disappeared"):
+        broker.service(allocator)
+        broker.handoff_to_req(
+            "same:1", SimpleNamespace(origin_input_ids=list(range(8))), first
+        )
+
+    broker.request("same:1", 4, 8)
+    broker.service(allocator)
+    second = broker.get("same:1")
+    assert second is not None and second.lease_id != first.lease_id
+    assert not broker.request_release("same:1", first)
+    assert not broker.request_release("same:1")
+    broker.service(allocator)
+    assert broker.get("same:1") is second
+
+
+def test_workset_bind_ownership_blocks_delayed_io_release():
+    class Allocator:
+        def alloc(self, count):
+            return torch.arange(count, dtype=torch.int64)
+
+        def free(self, _indices):
+            raise AssertionError("binding workset must not be released")
+
+    broker = AgenticPWorksetLeaseBroker(page_size=4)
+    broker.request("bind:1", 4, 8, owner="slow:attempt")
+    broker.service(Allocator())
+    lease = broker.get("bind:1", owner="slow:attempt")
+    assert lease is not None
+    assert broker.begin_bind("bind:1", lease)
+    assert not broker.request_release("bind:1", lease)
+    broker.commit_parent_bound("bind:1", lease)
+    req = SimpleNamespace(origin_input_ids=list(range(8)))
+    broker.handoff_to_req("bind:1", req, lease)
+    assert lease.state == "handed"
+
+
+def test_workset_owner_isolates_stale_direct_from_slow_restore():
+    class Allocator:
+        def alloc(self, count):
+            return torch.arange(count, dtype=torch.int64)
+
+        def free(self, _indices):
+            raise AssertionError("stale Direct must not release Slow pages")
+
+    broker = AgenticPWorksetLeaseBroker(page_size=4)
+    slow_owner = broker.slow_owner("generation:1", "child-rid")
+    direct_owner = broker.direct_owner("generation:1")
+    assert broker.request("generation:1", 4, 9, owner=slow_owner)
+    broker.service(Allocator())
+    slow = broker.get("generation:1", owner=slow_owner)
+    assert slow is not None
+
+    assert not broker.request("generation:1", 4, 9, owner=direct_owner)
+    assert broker.get("generation:1", owner=direct_owner) is None
+    broker.cancel_unstarted("generation:1", owner=direct_owner)
+    broker.service(Allocator())
+    assert broker.get("generation:1", owner=slow_owner) is slow
+
+
+def test_workset_handoff_validation_retains_allocator_ownership():
+    class Allocator:
+        def alloc(self, count):
+            return torch.arange(count, dtype=torch.int64)
+
+        def free(self, _indices):
+            raise AssertionError("validation must not release behind the caller")
+
+    broker = AgenticPWorksetLeaseBroker(page_size=4)
+    allocator = Allocator()
+    broker.request("prompt:2", 4, 8)
+    broker.service(allocator)
+    lease = broker.get("prompt:2")
+    assert lease is not None
+    assert broker.begin_bind("prompt:2", lease)
+    broker.commit_parent_bound("prompt:2", lease)
+    with pytest.raises(RuntimeError, match="prompt changed"):
+        broker.handoff_to_req(
+            "prompt:2", SimpleNamespace(origin_input_ids=list(range(9))), lease
+        )
+    assert broker.get("prompt:2") is lease
+    assert lease.state == "binding"
 
 
 def test_request_generation_key_distinguishes_multi_turn_generations():
@@ -141,6 +888,28 @@ def test_tp_mailbox_reports_complete_generation_without_collective():
 
         # A later generation of the same agent has independent state.
         assert ranks[0].group_status(request_generation_key("request", 1002)) is None
+
+
+def test_tp_transfer_failure_waits_for_every_rank_physical_terminal():
+    with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+        ranks = [
+            TPGroupMailbox(
+                "transfer-terminal", tp_rank=rank, tp_size=2, directory=directory
+            )
+            for rank in range(2)
+        ]
+        key = request_generation_key("transfer", 9)
+        ranks[0].publish_local(key, int(KVPoll.Failed))
+        ranks[1].publish_local(key, int(KVPoll.Transferring))
+
+        status, cancel = ranks[0].transfer_group_status(key)
+        assert status == int(KVPoll.Transferring)
+        assert cancel is True
+
+        ranks[1].publish_local(key, int(KVPoll.Failed))
+        status, cancel = ranks[0].transfer_group_status(key)
+        assert status == int(KVPoll.Failed)
+        assert cancel is True
 
 
 def test_tp_direct_progress_is_monotonic_until_explicit_clear():
@@ -311,6 +1080,37 @@ def test_async_prealloc_never_repolls_waiting_receiver():
     queue._update_handshake_waiters()
     assert waiting.waiting_for_input is True
     assert pending.waiting_for_input is True
+
+
+def test_async_prealloc_metadata_cannot_block_readiness_control():
+    metadata_started = threading.Event()
+    release_metadata = threading.Event()
+    control_steps = []
+
+    queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+    queue._async_progress_enabled = True
+    queue._async_control_next_at = 0.0
+    queue._async_control_interval = 0.0
+    queue._resolve_pending_reqs = lambda: control_steps.append("resolve")
+    queue._update_handshake_waiters = lambda: control_steps.append("handshake")
+    queue._background_update_p_ready = lambda: control_steps.append("p_ready")
+    queue._publish_tp_admission_readiness = lambda: control_steps.append("tp_ready")
+
+    def blocked_metadata():
+        metadata_started.set()
+        assert release_metadata.wait(timeout=2.0)
+
+    queue._background_prepare_metadata = blocked_metadata
+    metadata_thread = threading.Thread(target=queue.background_metadata_progress)
+    metadata_thread.start()
+    assert metadata_started.wait(timeout=2.0)
+
+    queue.background_control_progress()
+    assert control_steps == ["resolve", "handshake", "p_ready", "tp_ready"]
+
+    release_metadata.set()
+    metadata_thread.join(timeout=2.0)
+    assert not metadata_thread.is_alive()
 
 
 def test_decode_rank_zero_emits_only_lifecycle_transitions():
@@ -553,6 +1353,261 @@ def test_tp_p2d_host_commit_is_order_independent():
             pass
 
 
+def test_tp1_p2d_host_uses_same_rank_grant_commit_protocol():
+    ledger, path = _ledger()
+    snapshot_id = "p2d:42"
+    owner = "p2d-p-group:prefill-0"
+    try:
+        ledger.offer(
+            {
+                "snapshot_id": snapshot_id,
+                "bootstrap_room": 42,
+                "token_count": 128,
+                "prefill_domain": 0,
+                "request_direction": "p2d",
+                "control_offer": True,
+                "tp_size": 1,
+            }
+        )
+        assert ledger.claim_rank(snapshot_id, owner, tp_rank=0, tp_size=1)
+        assert ledger.publish_rank_grant(
+            snapshot_id,
+            owner,
+            {
+                "kind": "shared_host_extent",
+                "arena_path": "/dev/shm/p2d-tp1-rank-0",
+                "byte_size": 1024,
+                "token_count": 128,
+            },
+            tp_rank=0,
+            tp_size=1,
+        )
+        current = ledger.get(snapshot_id)
+        assert current["state"] == HostStageState.HOST_WRITING.value
+        assert list(current["rank_grants"]) == ["0"]
+
+        assert ledger.complete_p2d_host_write_rank(
+            snapshot_id, owner, tp_rank=0, tp_size=1
+        )
+        current = ledger.get(snapshot_id)
+        assert current["state"] == HostStageState.HOST_READY.value
+        assert current["writer_acks"] == [0]
+        assert len(current["grants"]) == 1
+    finally:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_p2d_claim_and_grant_are_one_ownership_transaction(tp_size):
+    ledger, path = _ledger()
+    snapshot_id = f"p2d:atomic-{tp_size}"
+    owner = "p2d-p-group:prefill-0"
+    try:
+        ledger.offer(
+            {
+                "snapshot_id": snapshot_id,
+                "bootstrap_room": 420 + tp_size,
+                "token_count": 128,
+                "prefill_domain": 0,
+                "request_direction": "p2d",
+                "control_offer": True,
+                "tp_size": tp_size,
+            }
+        )
+        for rank in range(tp_size):
+            grant = {
+                "kind": "shared_host_extent",
+                "arena_path": f"/dev/shm/p2d-atomic-rank-{rank}",
+                "arena_offset": rank * 1024,
+                "byte_size": 1024,
+                "token_count": 128,
+            }
+            claimed = ledger.claim_p2d_write_rank(
+                snapshot_id,
+                owner,
+                grant,
+                tp_rank=rank,
+                tp_size=tp_size,
+            )
+            assert claimed is not None
+            current = ledger.get(snapshot_id)
+            assert current["state"] == (
+                HostStageState.HOST_WRITING.value
+                if rank + 1 == tp_size
+                else HostStageState.HOST_RESERVED.value
+            )
+            assert current["p_owner"] == owner
+            assert current["claimed_ranks"] == list(range(rank + 1))
+            assert len(current["rank_grants"]) == rank + 1
+            # No native selector may terminate a snapshot after any physical
+            # Host extent became the exclusive owner of its P KV shard.
+            assert not ledger.reject_unclaimed_offer(
+                snapshot_id, reason="late_native_race"
+            )
+            assert (
+                ledger.arbitrate_p2d_release(snapshot_id, tp_size=tp_size)
+                == P2D_RELEASE_HOST_OWNED
+            )
+
+        for rank in range(tp_size):
+            assert ledger.complete_p2d_host_write_rank(
+                snapshot_id, owner, tp_rank=rank, tp_size=tp_size
+            )
+        assert ledger.get(snapshot_id)["state"] == HostStageState.HOST_READY.value
+    finally:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_duplicate_control_offer_never_regresses_owned_p2d_state(tp_size):
+    ledger, path = _ledger()
+    snapshot_id = f"p2d:duplicate-control-{tp_size}"
+    owner = "p2d-p-group:prefill-0"
+    control = {
+        "snapshot_id": snapshot_id,
+        "bootstrap_room": 500 + tp_size,
+        "token_count": 128,
+        "prefill_domain": 0,
+        "request_direction": "p2d",
+        "control_offer": True,
+        "tp_size": tp_size,
+    }
+    try:
+        ledger.offer(control)
+        for rank in range(tp_size):
+            grant = {
+                "kind": "shared_host_extent",
+                "arena_path": f"/dev/shm/p2d-control-rank-{rank}",
+                "arena_offset": rank * 1024,
+                "byte_size": 1024,
+                "token_count": 128,
+            }
+            assert ledger.claim_p2d_write_rank(
+                snapshot_id,
+                owner,
+                grant,
+                tp_rank=rank,
+                tp_size=tp_size,
+            )
+            before = ledger.get(snapshot_id)
+            replay = ledger.offer(control)
+            after = ledger.get(snapshot_id)
+            assert replay == before
+            assert after == before
+            assert after["rank_offers"] == {}
+
+        for rank in range(tp_size):
+            assert ledger.complete_p2d_host_write_rank(
+                snapshot_id, owner, tp_rank=rank, tp_size=tp_size
+            )
+        ready = ledger.get(snapshot_id)
+        assert ready["state"] == HostStageState.HOST_READY.value
+        assert ledger.offer(control) == ready
+        assert ledger.get(snapshot_id) == ready
+    finally:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
+@pytest.mark.parametrize("rank_order", [(0, 1), (1, 0)])
+def test_tp_p2d_managers_join_atomic_host_transaction_in_any_order(rank_order):
+    ledger, path = _ledger()
+    snapshot_id = "p2d:4242"
+    owner = "p2d-p-group:prefill-test"
+
+    class Arena:
+        capacity_bytes = 1 << 20
+        used_bytes = 0
+
+        def __init__(self, rank):
+            self.rank = rank
+
+        def can_reserve(self, *_args):
+            return True
+
+        def create(self, *_args):
+            return SimpleNamespace(
+                path=f"/dev/shm/p2d-manager-rank-{self.rank}",
+                offset=self.rank * 4096,
+            )
+
+        def release(self, _snapshot):
+            pass
+
+    def manager(rank):
+        value = AgenticPToDHostStagingManager.__new__(
+            AgenticPToDHostStagingManager
+        )
+        value.ledger = ledger
+        value.device_pool = SimpleNamespace(
+            layer_num=1,
+            head_num=1,
+            head_dim=1,
+            store_dtype=torch.uint8,
+        )
+        value.prefill_domain = 0
+        value.numa_node = rank
+        value.tp_rank = rank
+        value.tp_size = 2
+        value.owner = owner
+        value.hard_watermark = 1.0
+        value.arena = Arena(rank)
+        value._lock = threading.RLock()
+        value._active = {}
+        value._results = {}
+        value._records = {}
+        value._work = queue.SimpleQueue()
+        return value
+
+    managers = [manager(0), manager(1)]
+    reqs = [
+        SimpleNamespace(
+            bootstrap_room=4242,
+            origin_input_ids=[1, 2],
+            output_ids=[3],
+            return_logprob=False,
+            cached_tokens=0,
+        )
+        for _ in range(2)
+    ]
+    try:
+        ledger.offer(
+            {
+                "snapshot_id": snapshot_id,
+                "bootstrap_room": 4242,
+                "token_count": 2,
+                "prefill_domain": 0,
+                "request_direction": "p2d",
+                "control_offer": True,
+                "tp_size": 2,
+            }
+        )
+        for position, rank in enumerate(rank_order):
+            assert managers[rank].has_offer(reqs[rank])
+            assert managers[rank].try_submit(reqs[rank], torch.tensor([0, 1]))
+            current = ledger.get(snapshot_id)
+            assert current["state"] == (
+                HostStageState.HOST_WRITING.value
+                if position == 1
+                else HostStageState.HOST_RESERVED.value
+            )
+            assert current["claimed_ranks"] == sorted(rank_order[: position + 1])
+            assert len(current["rank_grants"]) == position + 1
+    finally:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
 def test_tp_d2p_failure_and_drain_are_rank_aware():
     ledger, path = _ledger()
     snapshot_id = "request:rank-failure"
@@ -639,6 +1694,599 @@ def test_tp_d2p_completed_rank_drains_when_peer_aborts():
     assert drained[0][1] == {"tp_rank": 1, "tp_size": 2}
 
 
+def test_d2p_slow_writer_uses_independent_copy_lanes():
+    class Snapshot:
+        def __init__(self):
+            self.started = []
+
+        def start_backup_range_from_device(self, indices, **kwargs):
+            self.started.append((indices.clone(), kwargs))
+            return object(), object()
+
+    client = AgenticDHostStagingClient.__new__(AgenticDHostStagingClient)
+    client._d2h_chunk_tokens = 4
+    client._d2h_lanes = [
+        {
+            "stream": object(),
+            "staging": object(),
+            "host_bounce": object(),
+            "snapshot_id": None,
+        }
+        for _ in range(2)
+    ]
+
+    def candidate(snapshot_id):
+        return {
+            "manifest": SimpleNamespace(snapshot_id=snapshot_id),
+            "arena_write": {
+                "snapshot": Snapshot(),
+                "event": None,
+                "copy_refs": None,
+                "offset": 0,
+                "chunk_end": 0,
+                "gpu_elapsed_ms": 0.0,
+            },
+        }
+
+    first = candidate("slow:1")
+    second = candidate("slow:2")
+    third = candidate("slow:3")
+    indices = torch.arange(8)
+
+    assert client._start_write_chunk(first, indices)
+    assert client._start_write_chunk(second, indices)
+    assert not client._start_write_chunk(third, indices)
+    assert first["arena_write"]["lane_id"] != second["arena_write"]["lane_id"]
+    assert {lane["snapshot_id"] for lane in client._d2h_lanes} == {
+        "slow:1",
+        "slow:2",
+    }
+
+
+def test_d2p_active_host_write_can_progress_without_ledger_poll():
+    candidate = {
+        "manifest": SimpleNamespace(snapshot_id="slow:local"),
+        "arena_write": {
+            "snapshot": object(),
+            "event": None,
+            "copy_refs": None,
+            "offset": 0,
+            "chunk_end": 0,
+            "gpu_elapsed_ms": 0.0,
+        },
+    }
+    client = AgenticDHostStagingClient.__new__(AgenticDHostStagingClient)
+    client.ledger = SimpleNamespace(
+        get=lambda _snapshot_id: pytest.fail("active D2H must not poll the ledger")
+    )
+    client._start_write_chunk = lambda _candidate, _indices: False
+
+    assert client.has_active_local_write(candidate)
+    assert client.progress(candidate, [], local_write_only=True) == "waiting"
+
+
+def test_shared_arena_spill_capability_has_one_compatibility_rule():
+    assert supports_agentic_kv_spill(SimpleNamespace())
+    assert supports_agentic_kv_spill(SimpleNamespace(supports_kv_spill=True))
+    assert not supports_agentic_kv_spill(
+        SimpleNamespace(supports_kv_spill=False)
+    )
+
+
+@pytest.mark.parametrize(
+    ("commit_succeeds", "expected"), [(True, "host_ready"), (False, "failed")]
+)
+def test_tp1_d2p_local_write_uses_final_commit_as_durability_fence(
+    commit_succeeds, expected
+):
+    snapshot_id = "slow:final-fence"
+
+    class Event:
+        def query(self):
+            return True
+
+    class StartEvent:
+        def elapsed_time(self, _event):
+            return 1.0
+
+    class Snapshot:
+        byte_size = 1024
+        _last_d2h_start_event = StartEvent()
+
+        def __init__(self):
+            self.commits = []
+            self.closed = False
+
+        def commit_backup_range_from_bounce(self, _bounce, **kwargs):
+            self.commits.append(kwargs)
+
+        def close(self, *, unlink):
+            assert not unlink
+            self.closed = True
+
+    snapshot = Snapshot()
+    candidate = {
+        "manifest": SimpleNamespace(snapshot_id=snapshot_id),
+        "arena_write": {
+            "snapshot": snapshot,
+            "event": Event(),
+            "copy_refs": object(),
+            "offset": 0,
+            "chunk_end": 1,
+            "gpu_elapsed_ms": 0.0,
+            "lane_id": 0,
+        },
+    }
+    drained = []
+    client = AgenticDHostStagingClient.__new__(AgenticDHostStagingClient)
+    client.tp_rank = 0
+    client.tp_size = 1
+    client._d2h_lanes = [
+        {"snapshot_id": snapshot_id, "host_bounce": object()}
+    ]
+    client.ledger = SimpleNamespace(
+        complete_host_write=lambda *args, **kwargs: commit_succeeds,
+        mark_writer_rank_drained=lambda *args, **kwargs: drained.append(
+            (args, kwargs)
+        )
+        or True,
+        get=lambda _snapshot_id: pytest.fail(
+            "TP1 final commit must not perform a second ledger read"
+        ),
+    )
+    client._cleanup_relay_senders = lambda _candidate: None
+
+    assert client.progress(candidate, torch.arange(1), local_write_only=True) == expected
+    assert snapshot.commits == [{"destination_start": 0, "token_count": 1}]
+    assert snapshot.closed
+    assert client._d2h_lanes[0]["snapshot_id"] is None
+    assert bool(drained) is (not commit_succeeds)
+
+
+def test_d2p_shared_arena_offer_omits_unused_spill_hashes():
+    captured = []
+    client = AgenticDHostStagingClient.__new__(AgenticDHostStagingClient)
+    client.ledger = SimpleNamespace(offer=lambda value: captured.append(value) or value)
+    client.retain_logical_hashes = False
+    client.source_numa_node = 0
+    client.arena_numa_node = 0
+    client.arena_domain = 0
+    client.direct_runtime = None
+    client.tp_rank = 0
+    client.tp_size = 1
+    manifest = SimpleNamespace(
+        snapshot_id="slow:no-spill-hashes",
+        tool_started_at=1.0,
+        direct_room=None,
+        kv_layout_hash="layout",
+    )
+    metadata = SimpleNamespace(
+        current=SimpleNamespace(
+            request_id="request",
+            generation=1,
+            storage_id="request:1",
+        ),
+        tool_type="search",
+    )
+
+    client.offer(
+        manifest=manifest,
+        metadata=metadata,
+        token_count=128,
+        token_digest="digest",
+        logical_hashes=["unused", "unused"],
+        byte_size=4096,
+    )
+
+    assert "logical_hashes" not in captured[0]
+
+    client.retain_logical_hashes = True
+    client.offer(
+        manifest=manifest,
+        metadata=metadata,
+        token_count=128,
+        token_digest="digest",
+        logical_hashes=["page-0", "page-1"],
+        byte_size=4096,
+    )
+    assert captured[1]["logical_hashes"] == ["page-0", "page-1"]
+
+
+def test_lazy_shared_host_extent_is_prefaulted_before_grant_publication():
+    directory = tempfile.mkdtemp(dir="/dev/shm")
+    path = os.path.join(directory, "snapshot.kv")
+    snapshot = LazySharedMHAHostSnapshot(
+        path=path,
+        token_count=1,
+        device_pool=SimpleNamespace(),
+        byte_size=4 * 1024 * 1024,
+    )
+    try:
+        snapshot.prefault_for_write()
+        assert os.stat(path).st_size == snapshot.byte_size
+        with open(path, "rb") as file_obj:
+            assert file_obj.read(16) == b"\0" * 16
+    finally:
+        snapshot.close(unlink=True)
+        os.rmdir(directory)
+
+
+def test_lazy_shared_host_extent_enospc_never_touches_sparse_pages(monkeypatch):
+    directory = tempfile.mkdtemp(dir="/dev/shm")
+    path = os.path.join(directory, "snapshot.kv")
+    snapshot = LazySharedMHAHostSnapshot(
+        path=path,
+        token_count=1,
+        device_pool=SimpleNamespace(),
+        byte_size=4 * 1024 * 1024,
+    )
+    memset_called = False
+
+    def fail_fallocate(fd, offset, length):
+        raise OSError(errno.ENOSPC, "tmpfs full")
+
+    def record_memset(*args):
+        nonlocal memset_called
+        memset_called = True
+
+    monkeypatch.setattr(os, "posix_fallocate", fail_fallocate)
+    monkeypatch.setattr(host_staging_module, "_HOST_MEMSET", record_memset)
+    try:
+        with pytest.raises(OSError) as error:
+            snapshot.prefault_for_write()
+        assert error.value.errno == errno.ENOSPC
+        assert not memset_called
+    finally:
+        snapshot.close(unlink=True)
+        os.rmdir(directory)
+
+
+def test_shared_host_arena_recycles_backed_extent_without_prefault():
+    directory = tempfile.mkdtemp(dir="/dev/shm")
+    arena = SharedHostSnapshotArena(directory, 16 * 1024 * 1024)
+    pool = SimpleNamespace()
+    first = arena.create("first", 1, pool, 4 * 1024 * 1024)
+    first_path = first.path
+    first.prefault_for_write()
+    assert not first.requires_prefault
+    arena.release(first)
+
+    second = arena.create("second", 1, pool, 2 * 1024 * 1024)
+    try:
+        assert second.path == first_path
+        assert second.allocation_bytes == 2 * 1024 * 1024
+        assert not second.requires_prefault
+        assert arena.used_bytes == 2 * 1024 * 1024
+        assert arena.committed_bytes == 2 * 1024 * 1024
+        assert os.stat(second.path).st_size == 2 * 1024 * 1024
+    finally:
+        arena.release(second)
+        os.unlink(first_path)
+        os.rmdir(directory)
+
+
+def test_shared_host_arena_discards_partial_extent_and_release_is_idempotent():
+    directory = tempfile.mkdtemp(dir="/dev/shm")
+    arena = SharedHostSnapshotArena(directory, 16 * 1024 * 1024)
+    snapshot = arena.create("partial", 1, SimpleNamespace(), 4 * 1024 * 1024)
+    path = snapshot.path
+
+    arena.release(snapshot)
+    arena.release(snapshot)
+
+    assert not os.path.exists(path)
+    assert arena.used_bytes == 0
+    assert arena.committed_bytes == 0
+    assert arena._free_extents == []
+    os.rmdir(directory)
+
+
+def test_shared_host_arena_stale_release_cannot_free_recycled_owner():
+    directory = tempfile.mkdtemp(dir="/dev/shm")
+    arena = SharedHostSnapshotArena(directory, 16 * 1024 * 1024)
+    first = arena.create("first", 1, SimpleNamespace(), 4 * 1024 * 1024)
+    first.prefault_for_write()
+    path = first.path
+    arena.release(first)
+    second = arena.create("second", 1, SimpleNamespace(), 2 * 1024 * 1024)
+
+    arena.release(first)
+
+    assert arena.used_bytes == 2 * 1024 * 1024
+    assert arena._active_extents[path][0] is second
+    assert arena._free_extents == []
+    arena.release(second)
+    os.unlink(path)
+    os.rmdir(directory)
+
+
+def _cpu_registered_p2d_arena(page_count=4):
+    """Build allocator-only state without requiring CUDA registration."""
+
+    arena = _RegisteredP2DHostArena.__new__(_RegisteredP2DHostArena)
+    arena.directory = "/dev/shm/test-registered-p2d"
+    arena.path = f"{arena.directory}/registered-arena.kv"
+    arena.capacity_bytes = mmap.ALLOCATIONGRANULARITY * page_count
+    arena.device_pool = SimpleNamespace(
+        layer_num=1,
+        head_num=1,
+        head_dim=1,
+        v_head_dim=1,
+        store_dtype=torch.uint8,
+        k_buffer=torch.empty(0),
+        v_buffer=torch.empty(0),
+    )
+    arena.raw = torch.zeros(arena.capacity_bytes, dtype=torch.uint8)
+    arena.mapping = None
+    arena._registered = False
+    arena.registration_seconds = 0.0
+    arena.used_bytes = 0
+    arena._lock = threading.Lock()
+    arena._free = [(0, arena.capacity_bytes)]
+    arena._active = {}
+    arena._closed = False
+    return arena
+
+
+def test_registered_p2d_arena_suballocates_and_coalesces_request_extents():
+    arena = _cpu_registered_p2d_arena(page_count=4)
+    pool = arena.device_pool
+    first = arena.create("first", 1024, pool, 2048)
+    second = arena.create("second", 1024, pool, 2048)
+
+    assert first.offset == 0
+    assert second.offset == mmap.ALLOCATIONGRANULARITY
+    assert arena.used_bytes == 2 * mmap.ALLOCATIONGRANULARITY
+
+    arena.release(first)
+    arena.release(second)
+    assert arena.used_bytes == 0
+    assert arena._free == [(0, arena.capacity_bytes)]
+
+
+def test_registered_p2d_arena_fragmentation_rejects_before_ledger_claim():
+    arena = _cpu_registered_p2d_arena(page_count=4)
+    pool = arena.device_pool
+    snapshots = [
+        arena.create(str(index), 1024, pool, 2048) for index in range(3)
+    ]
+    arena.release(snapshots[0])
+    arena.release(snapshots[2])
+
+    # Three pages are free in aggregate, but no three-page contiguous extent
+    # exists.  Admission must reject this before taking Host ledger ownership.
+    assert not arena.can_reserve(3 * mmap.ALLOCATIONGRANULARITY, 1.0)
+    arena.release(snapshots[1])
+    assert arena.can_reserve(3 * mmap.ALLOCATIONGRANULARITY, 1.0)
+
+
+def test_registered_p2d_arena_stale_release_cannot_free_new_owner():
+    arena = _cpu_registered_p2d_arena(page_count=2)
+    pool = arena.device_pool
+    first = arena.create("first", 1024, pool, 2048)
+    arena.release(first)
+    second = arena.create("second", 1024, pool, 2048)
+
+    arena.release(first)
+    assert arena.used_bytes == mmap.ALLOCATIONGRANULARITY
+    assert arena._active[id(second)][0] is second
+    arena.release(second)
+
+
+def test_registered_p2d_arena_rolls_back_extent_when_view_construction_fails(
+    monkeypatch,
+):
+    arena = _cpu_registered_p2d_arena(page_count=4)
+
+    def fail_snapshot(**_kwargs):
+        raise ValueError("invalid KV layout")
+
+    monkeypatch.setattr(p2d_host_module, "_RegisteredP2DHostSnapshot", fail_snapshot)
+    with pytest.raises(ValueError, match="invalid KV layout"):
+        arena.create("bad", 1024, arena.device_pool, 2048)
+
+    assert arena.used_bytes == 0
+    assert arena._active == {}
+    assert arena._free == [(0, arena.capacity_bytes)]
+
+
+def test_shared_snapshot_maps_only_its_registered_arena_extent():
+    page = mmap.ALLOCATIONGRANULARITY
+    fd, path = tempfile.mkstemp(prefix="sglang-p2d-offset-", dir="/dev/shm")
+    try:
+        os.ftruncate(fd, 2 * page)
+        os.pwrite(fd, bytes([17]) * page, 0)
+        os.pwrite(fd, bytes([29]) * page, page)
+    finally:
+        os.close(fd)
+    pool = SimpleNamespace(
+        layer_num=1,
+        head_num=1,
+        head_dim=1,
+        v_head_dim=1,
+        store_dtype=torch.uint8,
+        k_buffer=torch.empty(0),
+        v_buffer=torch.empty(0),
+    )
+    snapshot = SharedMHAHostSnapshot(
+        path=path,
+        token_count=page // 2,
+        device_pool=pool,
+        byte_size=page,
+        create=False,
+        file_offset=page,
+    )
+    try:
+        assert torch.all(snapshot.kv_buffer == 29)
+    finally:
+        snapshot.close()
+        os.unlink(path)
+
+
+def test_p2d_host_extent_is_reserved_before_ledger_claim_and_released_on_loss():
+    events = []
+    snapshot = SimpleNamespace(path="/dev/shm/test-p2d-arena", offset=0)
+
+    class Arena:
+        capacity_bytes = 1024
+        used_bytes = 0
+
+        def can_reserve(self, *_args):
+            events.append("capacity")
+            return True
+
+        def create(self, *_args):
+            events.append("reserve")
+            return snapshot
+
+        def release(self, value):
+            assert value is snapshot
+            events.append("release")
+
+    class Ledger:
+        def get(self, _snapshot_id):
+            return {
+                "state": HostStageState.OFFERED.value,
+                "prefill_domain": 0,
+            }
+
+        def claim_p2d_write_rank(self, *_args, **_kwargs):
+            events.append("claim")
+            return None
+
+        def transition(self, *_args, **_kwargs):
+            raise AssertionError("an unclaimed offer must not be failed")
+
+    manager = AgenticPToDHostStagingManager.__new__(AgenticPToDHostStagingManager)
+    manager.ledger = Ledger()
+    manager.device_pool = SimpleNamespace(
+        layer_num=1,
+        head_num=1,
+        head_dim=1,
+        store_dtype=torch.uint8,
+    )
+    manager.prefill_domain = 0
+    manager.numa_node = 0
+    manager.tp_rank = 0
+    manager.tp_size = 1
+    manager.owner = "p"
+    manager.hard_watermark = 1.0
+    manager.arena = Arena()
+    manager._lock = threading.RLock()
+    manager._active = {}
+    manager._results = {}
+    manager._records = {}
+    req = SimpleNamespace(
+        bootstrap_room=77,
+        origin_input_ids=[1, 2],
+        output_ids=[3],
+        return_logprob=False,
+        cached_tokens=0,
+    )
+
+    assert not manager.try_submit(req, torch.tensor([0, 1]))
+    assert events == ["capacity", "reserve", "claim", "release"]
+    assert manager._active == {}
+    assert manager._records == {}
+
+
+def test_p2d_manager_close_retains_arena_when_dma_has_no_fence():
+    class FinishedThread:
+        def join(self, **_kwargs):
+            pass
+
+        def is_alive(self):
+            return False
+
+    manager = AgenticPToDHostStagingManager.__new__(AgenticPToDHostStagingManager)
+    manager._stop = threading.Event()
+    manager._candidate_wakeup = threading.Event()
+    manager._group_wakeup = threading.Event()
+    manager._work = queue.SimpleQueue()
+    manager._threads = []
+    manager._offer_thread = FinishedThread()
+    manager._completion_thread = FinishedThread()
+    manager._dma_quarantine = [(object(),)]
+    manager.arena = SimpleNamespace(
+        close=lambda: (_ for _ in ()).throw(
+            AssertionError("an unfenced DMA arena must remain mapped")
+        )
+    )
+
+    manager.close()
+    assert manager._stop.is_set()
+
+
+def test_p_host_grant_is_published_only_after_prefault_completion():
+    published = []
+    snapshot = SimpleNamespace(
+        path="/dev/shm/prefaulted.kv",
+        byte_size=4096,
+        token_count=64,
+    )
+    record = {
+        "offer": {"snapshot_id": "slow:prefaulted"},
+        "snapshot": snapshot,
+        "prefault_pending": True,
+    }
+    manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
+    manager._state_lock = threading.RLock()
+    manager.active = {"slow:prefaulted": record}
+    manager.owner = "p:test"
+    manager.tp_rank = 0
+    manager.tp_size = 1
+    manager.arena_numa_node = 0
+    manager.ledger = SimpleNamespace(
+        publish_grants=lambda snapshot_id, owner, grants: published.append(
+            (snapshot_id, owner, grants)
+        )
+        or True
+    )
+
+    assert published == []
+    manager._publish_prefaulted_grant("slow:prefaulted", record, None)
+    assert len(published) == 1
+    assert published[0][2][0]["arena_path"] == snapshot.path
+    assert record["prefault_pending"] is False
+
+
+def test_p_host_prefault_failure_releases_extent_and_rejects_snapshot():
+    released = []
+    rejected = []
+    published = []
+    snapshot = SimpleNamespace(
+        path="/dev/shm/prefault-failed.kv",
+        byte_size=4096,
+        token_count=64,
+    )
+    offer = {"snapshot_id": "slow:prefault-failed"}
+    record = {
+        "offer": offer,
+        "snapshot": snapshot,
+        "prefault_pending": True,
+    }
+    manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
+    manager._state_lock = threading.RLock()
+    manager.active = {offer["snapshot_id"]: record}
+    manager.owner = "p:test"
+    manager.tp_rank = 0
+    manager.tp_size = 1
+    manager.arena_numa_node = 0
+    manager.arena = SimpleNamespace(release=released.append)
+    manager._reject = lambda claimed, reason: rejected.append((claimed, reason))
+    manager.ledger = SimpleNamespace(
+        publish_grants=lambda *args, **kwargs: published.append(args) or True
+    )
+
+    failure = OSError(errno.ENOSPC, "tmpfs full")
+    manager._publish_prefaulted_grant(offer["snapshot_id"], record, failure)
+
+    assert offer["snapshot_id"] not in manager.active
+    assert released == [snapshot]
+    assert rejected == [(offer, f"shared_host_extent_prefault_failed:{failure}")]
+    assert published == []
+
+
 def test_tp_p2d_host_write_ready_is_a_monotonic_boundary():
     """A fast D may advance past HOST_READY before a P rank observes it."""
 
@@ -691,6 +2339,61 @@ def test_tp_p2d_native_arbitration_rejects_late_host_offer():
         os.unlink(path)
 
 
+@pytest.mark.parametrize(
+    ("claimed_ranks", "commit", "expected"),
+    [
+        ((), False, HostStageState.REJECTED),
+        ((0,), False, HostStageState.ABORTING),
+        ((0, 1), True, HostStageState.FAILED),
+    ],
+)
+def test_router_abort_of_unsubmitted_tp_p2d_preserves_physical_fence(
+    claimed_ranks, commit, expected
+):
+    ledger, path = _ledger()
+    snapshot_id = "p2d:905"
+    owner = "p2d-p-group:p0"
+    try:
+        ledger.offer(
+            {
+                "snapshot_id": snapshot_id,
+                "bootstrap_room": 905,
+                "token_count": 128,
+                "prefill_domain": 0,
+                "request_direction": "p2d",
+                "control_offer": True,
+                "tp_size": 2,
+            }
+        )
+        for rank in claimed_ranks:
+            assert ledger.claim_rank(
+                snapshot_id, owner, tp_rank=rank, tp_size=2
+            )
+            assert ledger.publish_rank_grant(
+                snapshot_id,
+                owner,
+                {"kind": "shared_host_extent", "tp_rank": rank},
+                tp_rank=rank,
+                tp_size=2,
+            )
+            if commit:
+                assert ledger.complete_p2d_host_write_rank(
+                    snapshot_id,
+                    owner,
+                    tp_rank=rank,
+                    tp_size=2,
+                )
+
+        state = ledger.abort_unsubmitted_p2d(
+            snapshot_id, reason="router_cancelled_before_d_submit"
+        )
+
+        assert state == expected.value
+        assert ledger.get(snapshot_id)["state"] == expected.value
+    finally:
+        os.unlink(path)
+
+
 def test_tp_p2d_peer_host_claim_blocks_native_page_release():
     ledger, path = _ledger()
     snapshot_id = "p2d:902"
@@ -737,6 +2440,98 @@ def test_p2d_abort_cannot_release_pages_owned_by_d2h():
 
     assert manager.cancel_watch(req) is False
     assert not getattr(req, "_agentic_p2d_host_terminal", False)
+
+
+def test_tp_p2d_d2h_group_barrier_does_not_occupy_copy_lane():
+    """Local DMA completion waits for peers in the completion plane only."""
+
+    states = {
+        "p2d:first": HostStageState.HOST_WRITING.value,
+        "p2d:second": HostStageState.HOST_WRITING.value,
+    }
+    manager = AgenticPToDHostStagingManager.__new__(AgenticPToDHostStagingManager)
+    manager.ledger = SimpleNamespace(
+        get=lambda snapshot_id: {"state": states[snapshot_id]}
+    )
+    manager._lock = threading.RLock()
+    manager._active = {"p2d:first": {}, "p2d:second": {}}
+    manager._results = {}
+    manager._group_pending = {
+        "p2d:second": {
+            "started_at": time.monotonic(),
+            "token_count": 32,
+            "byte_size": 64,
+            "worker_id": 1,
+        },
+        "p2d:first": {
+            "started_at": time.monotonic(),
+            "token_count": 32,
+            "byte_size": 64,
+            "worker_id": 0,
+        },
+    }
+
+    # Neither peer group is complete, but both local copy lanes have already
+    # returned their records to this independent completion set.
+    assert manager._progress_group_completions_once() == 0
+    assert set(manager._group_pending) == {"p2d:first", "p2d:second"}
+
+    # Peer ranks may commit in the opposite order without tying up or
+    # deadlocking the finite DMA lane pool.
+    states["p2d:first"] = HostStageState.HOST_READY.value
+    assert manager._progress_group_completions_once() == 1
+    states["p2d:second"] = HostStageState.H2D_LOADING.value
+    assert manager._progress_group_completions_once() == 1
+    assert manager._group_pending == {}
+    assert manager._results == {
+        "p2d:first": int(KVPoll.Success),
+        "p2d:second": int(KVPoll.Success),
+    }
+
+
+def test_tp_p2d_h2d_group_barrier_does_not_occupy_copy_lane():
+    states = {
+        "p2d:first": HostStageState.H2D_LOADING.value,
+        "p2d:second": HostStageState.H2D_LOADING.value,
+    }
+    manager = AgenticPToDHostLoadManager.__new__(AgenticPToDHostLoadManager)
+    manager.ledger = SimpleNamespace(
+        get=lambda snapshot_id: {"state": states[snapshot_id]}
+    )
+    manager._completion_lock = threading.RLock()
+    manager.decode_domain = 0
+    manager.numa_node = 0
+    receivers = {
+        snapshot_id: SimpleNamespace(
+            snapshot_id=snapshot_id,
+            mark_terminal=lambda poll, snapshot_id=snapshot_id, **_kwargs: results.append(
+                (snapshot_id, int(poll))
+            ),
+        )
+        for snapshot_id in states
+    }
+    results = []
+    manager._group_pending = {
+        snapshot_id: {
+            "receiver": receiver,
+            "started_at": time.monotonic(),
+            "token_count": 32,
+            "byte_size": 64,
+            "worker_id": worker_id,
+        }
+        for worker_id, (snapshot_id, receiver) in enumerate(receivers.items())
+    }
+
+    assert manager._progress_group_completions_once() == 0
+    states["p2d:second"] = HostStageState.CONSUMED.value
+    assert manager._progress_group_completions_once() == 1
+    states["p2d:first"] = HostStageState.CONSUMED.value
+    assert manager._progress_group_completions_once() == 1
+    assert manager._group_pending == {}
+    assert set(results) == {
+        ("p2d:first", int(KVPoll.Success)),
+        ("p2d:second", int(KVPoll.Success)),
+    }
 
 
 @pytest.mark.parametrize(
@@ -794,11 +2589,14 @@ def test_tp_host_commit_admits_after_manifest_cleanup():
         owner="p-group:prefill-0",
         ledger=ledger,
         tp_host_commit_snapshot=request.snapshot_id,
+        workset_broker=SimpleNamespace(handoff_to_req=lambda *_args: None),
+        token_allocator=object(),
     )
     req = SimpleNamespace(
         rid="child",
         _agentic_host_rank_loaded=True,
         _agentic_host_rank_token_count=256,
+        _agentic_host_workset_lease=object(),
     )
 
     assert AgenticPHostStagingManager.gate_request(manager, req, request) is False
@@ -827,6 +2625,10 @@ def test_tp_host_h2d_progresses_on_independent_worker_after_group_prepare():
         "record": record,
         "request_generation": request,
         "device_indices": list(range(128)),
+        "workset_lease": object(),
+        "io_attempt": "slow-h2d:test",
+        "io_inflight": False,
+        "io_quiesced": False,
         "event": None,
         "copy_refs": None,
         "offset": 0,
@@ -845,8 +2647,13 @@ def test_tp_host_h2d_progresses_on_independent_worker_after_group_prepare():
         ),
         h2d_chunk_tokens=64,
         _h2d_stream=object(),
+        _h2d_poisoned=False,
         _h2d_staging=object(),
         _h2d_host_bounce=object(),
+        workset_broker=SimpleNamespace(
+            mark_io_inflight=lambda *_args: None,
+            mark_io_quiesced=lambda *_args: True,
+        ),
         _get_state_lock=nullcontext,
     )
     manager._start_h2d_chunk = lambda selected: (
@@ -904,6 +2711,10 @@ def test_tp_host_h2d_failure_fails_group_and_recomputes_without_leak():
         "record": record,
         "request_generation": request,
         "device_indices": [1, 2],
+        "workset_lease": object(),
+        "io_attempt": "slow-h2d:test",
+        "io_inflight": False,
+        "io_quiesced": False,
         "event": None,
         "copy_refs": None,
         "offset": 0,
@@ -925,7 +2736,14 @@ def test_tp_host_h2d_failure_fails_group_and_recomputes_without_leak():
         token_allocator=SimpleNamespace(
             free=lambda indices: freed_device.append(tuple(indices))
         ),
+        workset_broker=SimpleNamespace(
+            cancel_io_attempt=lambda *_args: True,
+            request_release=lambda snapshot_id, *_args: freed_device.append(
+                (snapshot_id,)
+            ),
+        ),
         _get_state_lock=nullcontext,
+        _h2d_poisoned=False,
         _start_h2d_chunk=lambda _load: (_ for _ in ()).throw(
             RuntimeError("injected H2D failure")
         ),
@@ -943,12 +2761,114 @@ def test_tp_host_h2d_failure_fails_group_and_recomputes_without_leak():
     assert isinstance(load["io_error"], RuntimeError)
 
     req = SimpleNamespace(rid="child")
-    assert AgenticPHostStagingManager.gate_request(manager, req, request) is False
-    assert req._agentic_kv_gate_complete is True
-    assert req._agentic_kv_fallback == "shared_host_h2d_failed"
+    assert AgenticPHostStagingManager.gate_request(manager, req, request) is True
+    assert req._agentic_tp_host_failed is True
     assert manager.loads == {}
-    assert freed_device == [(1, 2)]
+    assert freed_device == [(request.snapshot_id,)]
     assert released_host == [record]
+
+
+def test_slow_h2d_cuda_error_quarantines_source_and_destination():
+    request = RequestGeneration("h2d-fence-error", 1)
+
+    class BrokenEvent:
+        def query(self):
+            raise RuntimeError("CUDA event state unavailable")
+
+    released = []
+    load = {
+        "request_generation": request,
+        "event": BrokenEvent(),
+        "record": object(),
+        "workset_lease": object(),
+    }
+    manager = SimpleNamespace(
+        loads={"child": load},
+        workset_broker=SimpleNamespace(
+            request_release=lambda *_args: released.append("device")
+        ),
+        _release_record=lambda _record: released.append("host"),
+        _get_state_lock=nullcontext,
+    )
+
+    assert not AgenticPHostStagingManager._discard_failed_h2d_load(
+        manager, "child", load
+    )
+    assert load["dma_quarantined"] is True
+    assert manager.loads["child"] is load
+    assert released == []
+
+
+def test_slow_h2d_partial_launch_without_fence_is_quarantined():
+    request = RequestGeneration("h2d-partial-launch", 1)
+    released = []
+    launch_fence = H2DLaunchFence(event=object())
+    launch_fence.submitted = True
+    launch_fence.unavailable = True
+    load = {
+        "request_generation": request,
+        "event": None,
+        "launch_fence": launch_fence,
+        "record": object(),
+        "workset_lease": object(),
+    }
+    manager = SimpleNamespace(
+        loads={"child": load},
+        workset_broker=SimpleNamespace(
+            request_release=lambda *_args, **_kwargs: released.append("device")
+        ),
+        _release_record=lambda _record: released.append("host"),
+        _get_state_lock=nullcontext,
+    )
+
+    assert not AgenticPHostStagingManager._discard_failed_h2d_load(
+        manager, "child", load
+    )
+    assert load["dma_quarantined"] is True
+    assert manager.loads["child"] is load
+    assert released == []
+
+
+def test_p2d_host_abort_waits_for_physical_h2d_terminal():
+    manager = SimpleNamespace()
+
+    before_submit = AgenticPToDHostReceiver(manager, "before-submit")
+    before_submit.abort()
+    assert before_submit.poll() == int(KVPoll.Failed)
+
+    inflight = AgenticPToDHostReceiver(manager, "inflight")
+    inflight._submitted = True
+    inflight._poll = int(KVPoll.Transferring)
+    inflight.abort()
+    assert inflight.poll() == int(KVPoll.Transferring)
+    inflight.mark_terminal(KVPoll.Success)
+    assert inflight.poll() == int(KVPoll.Failed)
+
+    unfenced = AgenticPToDHostReceiver(manager, "unfenced")
+    unfenced._submitted = True
+    unfenced.mark_quarantined(RuntimeError("no DMA fence"))
+    unfenced.abort()
+    assert unfenced.poll() == int(KVPoll.WaitingForInput)
+
+
+def test_tp_cancel_phase_keeps_peer_h2d_pages_owned_until_fence():
+    receiver = AgenticPToDHostReceiver(SimpleNamespace(), "peer-inflight")
+    receiver._submitted = True
+    receiver._poll = int(KVPoll.Transferring)
+    decode_req = SimpleNamespace(
+        req=SimpleNamespace(rid="peer", bootstrap_room=77),
+        kv_receiver=receiver,
+    )
+    transfer_queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+    transfer_queue.queue = [decode_req]
+    transfer_queue._async_poll_lock = threading.Lock()
+
+    transfer_queue.abort_agentic_host_transfers([("peer", 77)])
+
+    assert receiver.abort_pending is True
+    assert receiver.poll() == int(KVPoll.Transferring)
+    receiver.mark_terminal(KVPoll.Success)
+    assert receiver.poll() == int(KVPoll.Failed)
 
 
 def test_tp_host_group_state_machine_has_an_explicit_prepare_barrier():
@@ -1021,6 +2941,33 @@ def test_tp_direct_and_slow_group_commands_progress_together():
     assert list(scheduler.agentic_early_direct_completion_queue) == [snapshot_id]
 
 
+def test_prefill_priority_puts_owned_worksets_before_unrunnable_fast_fallbacks():
+    fallback_fast = SimpleNamespace(_agentic_kv_queue_class="fast")
+    owned_slow = SimpleNamespace(
+        _agentic_kv_queue_class="slow",
+        _agentic_workset_suffix_indices=torch.arange(8),
+    )
+    owned_fast = SimpleNamespace(
+        _agentic_kv_queue_class="fast",
+        _agentic_workset_suffix_indices=torch.arange(4),
+    )
+    ordinary_slow = SimpleNamespace(_agentic_kv_queue_class="slow")
+    fresh = SimpleNamespace(_agentic_kv_queue_class="new")
+    scheduler = SimpleNamespace(
+        waiting_queue=[fallback_fast, ordinary_slow, owned_slow, fresh, owned_fast]
+    )
+
+    Scheduler._prioritize_agentic_prefill_ready(scheduler)
+
+    assert scheduler.waiting_queue == [
+        owned_slow,
+        owned_fast,
+        fallback_fast,
+        ordinary_slow,
+        fresh,
+    ]
+
+
 def test_tp_direct_worker_defers_failed_page_release_to_owner_scheduler():
     """A TP ingress worker must not free GPU pages outside the model loop."""
 
@@ -1031,6 +2978,8 @@ def test_tp_direct_worker_defers_failed_page_release_to_owner_scheduler():
         transport_poll=KVPoll.Failed,
         started_at=time.monotonic(),
         receiver=SimpleNamespace(),
+        workset_lease=None,
+        abort_requested=False,
     )
     scheduler = object.__new__(Scheduler)
     scheduler.tp_size = 2
@@ -1070,6 +3019,9 @@ def test_tp_direct_stale_offer_aborts_instead_of_blocking_group():
     scheduler = SimpleNamespace(
         agentic_early_direct_receives={},
         agentic_tp_direct_local_failed=set(),
+        agentic_p_workset_broker=SimpleNamespace(
+            request_release=lambda *_args, **_kwargs: None
+        ),
         _agentic_snapshot_store=lambda: store,
         _agentic_start_early_direct_receive=lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("stale Direct must not start a receiver")
@@ -1360,6 +3312,104 @@ def test_tp_prefill_batch_control_preserves_identical_order_on_all_ranks():
         }
 
 
+def test_tp_direct_control_round_trip_preserves_local_workset_lease():
+    request = RequestGeneration("lease-round-trip", 1)
+    lease = object()
+    snapshot_id = request.snapshot_id
+    control = {
+        Scheduler._AGENTIC_TP_CONTROL_KEY: True,
+        "direct_commands": [
+            {
+                "snapshot": snapshot_id,
+                "request_id": request.request_id,
+                "generation": request.generation,
+                "action": "poll",
+                "arrived_at": 1.0,
+                "domain": 0,
+                "required_tokens": 1024,
+            }
+        ],
+        "prefill_transfer_keys": [],
+        "prefill_transfer_statuses": [],
+        "prefill_submit_keys": [],
+        "host_commands": [],
+    }
+    direct_lock = threading.RLock()
+
+    class LockCheckedActive(dict):
+        def get(self, key, default=None):
+            assert direct_lock._is_owned()
+            return super().get(key, default)
+
+        def __setitem__(self, key, value):
+            assert direct_lock._is_owned()
+            return super().__setitem__(key, value)
+
+    active = LockCheckedActive()
+    dict.__setitem__(
+        active, snapshot_id, (request, 0.5, 0, 1024, lease)
+    )
+    owner = SimpleNamespace(
+        tp_size=2,
+        tp_rank=1,
+        disaggregation_mode=DisaggregationMode.PREFILL,
+        _AGENTIC_TP_CONTROL_KEY=Scheduler._AGENTIC_TP_CONTROL_KEY,
+        agentic_tp_direct_admission_active=active,
+        agentic_tp_direct_group_status={},
+        agentic_tp_direct_local_admitted=set(),
+        agentic_tp_direct_local_failed=set(),
+        agentic_early_direct_receives={},
+        agentic_early_direct_poll_lock=direct_lock,
+        agentic_p_workset_broker=SimpleNamespace(
+            get=lambda *_args, **_kwargs: None
+        ),
+        agentic_tp_host_local_admitted=set(),
+        agentic_tp_host_active=None,
+        agentic_tp_host_active_since=0.0,
+        agentic_tp_host_command_visible=False,
+        agentic_tp_host_group_status=0,
+        agentic_host_staging_manager=None,
+    )
+
+    assert Scheduler._agentic_tp_consume_admission_control(owner, [control]) == []
+    active = owner.agentic_tp_direct_admission_active[snapshot_id]
+    assert len(active) == 5
+    assert active[4] is lease
+
+
+def test_delayed_direct_cleanup_cannot_remove_new_attempt_entry():
+    request = RequestGeneration("entry-cas", 1)
+    old_entry = SimpleNamespace(
+        request=request,
+        completed_at=time.monotonic(),
+        transport_poll=KVPoll.Success,
+        workset_lease=None,
+        receiver=object(),
+        manifest=SimpleNamespace(),
+        claim_id="old",
+    )
+    new_entry = SimpleNamespace(request=request, claim_id="new")
+    scheduler = SimpleNamespace(
+        tp_size=1,
+        agentic_early_direct_poll_lock=threading.RLock(),
+        agentic_early_direct_receives={request.snapshot_id: new_entry},
+        agentic_early_direct_terminal={},
+        agentic_p_workset_broker=SimpleNamespace(
+            request_release=lambda *_args, **_kwargs: False
+        ),
+    )
+
+    Scheduler._agentic_drop_early_direct_receive(
+        scheduler,
+        old_entry,
+        snapshot_store=object(),
+        release_claim=False,
+        reason="late_old_cleanup",
+    )
+
+    assert scheduler.agentic_early_direct_receives[request.snapshot_id] is new_entry
+
+
 def test_tp_prefill_batch_submits_each_rank_shard_exactly_once():
     calls = [[], []]
 
@@ -1538,7 +3588,6 @@ def test_tp_prefill_cleanup_waits_for_every_scheduler_rank():
         assert ranks[0].agentic_tp_p2d_sender_mailbox.receipt(key) is None
         assert key not in ranks[0]._prefill_transfer_cleanup_pending
 
-
 def test_tp_background_terminal_uses_all_rank_sender_reduction():
     """Native TP control must not retire P pages after only one worker stops."""
 
@@ -1569,6 +3618,7 @@ def test_tp_background_terminal_uses_all_rank_sender_reduction():
             disagg_p_ready_notified=True,
             disagg_p_ready_transfer_started=True,
         )
+        lease = object()
         owner = SimpleNamespace(
             tp_size=2,
             tp_rank=0,
@@ -1594,6 +3644,18 @@ def test_tp_background_terminal_uses_all_rank_sender_reduction():
         sender[1].publish_local(key, int(KVPoll.Success))
         control = Scheduler._agentic_tp_prepare_admission_control(owner)
         assert control["prefill_transfer_statuses"] == [int(KVPoll.Success)]
+
+        # A failed shard is not a fence for a peer whose sender still owns a
+        # live DMA. P source pages remain represented as Transferring until
+        # every shard reaches a physical terminal state.
+        sender[0].publish_local(key, int(KVPoll.Failed))
+        sender[1].publish_local(key, int(KVPoll.Transferring))
+        control = Scheduler._agentic_tp_prepare_admission_control(owner)
+        assert control["prefill_transfer_statuses"] == [int(KVPoll.Transferring)]
+
+        sender[1].publish_local(key, int(KVPoll.Success))
+        control = Scheduler._agentic_tp_prepare_admission_control(owner)
+        assert control["prefill_transfer_statuses"] == [int(KVPoll.Failed)]
 
 
 def test_tp_prefill_submit_failure_becomes_one_group_terminal_result():
@@ -1621,16 +3683,22 @@ def test_tp_prefill_submit_failure_becomes_one_group_terminal_result():
         class Sender:
             def __init__(self, fail):
                 self.fail = fail
+                self.sent = False
 
             def poll(self):
-                return int(KVPoll.WaitingForInput)
+                return int(
+                    KVPoll.Success if self.sent else KVPoll.WaitingForInput
+                )
 
             def init(self, _pages, _metadata_index):
                 if self.fail:
                     raise RuntimeError("injected shard failure")
 
             def send(self, _page_indices, _state_indices):
-                pass
+                self.sent = True
+
+            def fence_failed_launch(self, _error):
+                return KVPoll.Failed
 
         schedulers = []
         requests = []
@@ -1681,8 +3749,319 @@ def test_tp_prefill_submit_failure_becomes_one_group_terminal_result():
         # Rank1 reports its injected submit failure but does not terminate
         # independently before TP0 publishes the group result.
         assert progress(schedulers[1], requests[1]) == int(KVPoll.Transferring)
+        # The successful peer reaches its own physical terminal before TP0
+        # publishes one group failure.
         assert progress(schedulers[0], requests[0]) == int(KVPoll.Failed)
         assert progress(schedulers[1], requests[1]) == int(KVPoll.Failed)
+
+
+def test_nixl_sender_partial_launch_keeps_source_owned_until_handle_terminal():
+    handle = object()
+    states = {handle: "PROC"}
+
+    class Agent:
+        def transfer(self, submitted_handle):
+            assert submitted_handle is handle
+            raise RuntimeError("injected failure after post")
+
+        def check_xfer_state(self, submitted_handle):
+            return states[submitted_handle]
+
+    manager = NixlKVManager.__new__(NixlKVManager)
+    manager.agent = Agent()
+    manager.transfer_infos = {}
+    manager.request_status = {}
+
+    sender = NixlKVSender.__new__(NixlKVSender)
+    sender.kv_mgr = manager
+    sender.bootstrap_room = 42
+    sender.xfer_handles = []
+    sender.has_sent = False
+    sender.launch_failed = False
+    sender.launch_exception = None
+
+    with pytest.raises(RuntimeError, match="after post") as raised:
+        manager._post_transfer(handle, sender.xfer_handles.append, "post failed")
+    assert sender.xfer_handles == [handle]
+    assert sender.fence_failed_launch(raised.value) == KVPoll.Transferring
+
+    states[handle] = "DONE"
+    assert sender.poll() == KVPoll.Failed
+
+
+def test_nixl_sender_unreadable_handle_quarantines_source_pages():
+    class Agent:
+        def check_xfer_state(self, _handle):
+            raise RuntimeError("transport status unavailable")
+
+    sender = NixlKVSender.__new__(NixlKVSender)
+    sender.kv_mgr = SimpleNamespace(
+        agent=Agent(), transfer_infos={}, request_status={}
+    )
+    sender.bootstrap_room = 43
+    sender.xfer_handles = [object()]
+    sender.has_sent = True
+    sender.launch_failed = True
+    sender.launch_exception = RuntimeError("control failure")
+
+    assert sender.poll() == KVPoll.Transferring
+
+
+@pytest.mark.parametrize(
+    ("transport_poll", "manifest_state", "expect_released"),
+    (
+        (KVPoll.Transferring, SnapshotState.DIRECT_LOADING, False),
+        (KVPoll.Transferring, SnapshotState.CONSUMED, False),
+        (KVPoll.Success, SnapshotState.DIRECT_LOADING, True),
+    ),
+)
+def test_tp1_direct_release_waits_for_physical_nixl_completion(
+    transport_poll, manifest_state, expect_released
+):
+    snapshot_id = "request:physical-fence"
+    released = []
+    cleaned = []
+    popped = []
+    claims = []
+    manifest = SimpleNamespace(state=manifest_state)
+    candidate = {
+        "req": SimpleNamespace(req_pool_idx=1),
+        "metadata": SimpleNamespace(current=SimpleNamespace()),
+        "manifest": manifest,
+        "sender": SimpleNamespace(poll=lambda: transport_poll),
+        "sent": True,
+        "local_send_complete": False,
+        "staging": False,
+        "created_at": time.monotonic(),
+        "fallback_retry_at": 0.0,
+        "io_lock": threading.RLock(),
+    }
+    manager = SimpleNamespace(
+        tp_world_size=1,
+        tp_rank=0,
+        agentic_fast_threshold=2.0,
+        agentic_relay_worker=None,
+        _agentic_candidate_items=lambda: ((snapshot_id, candidate),),
+        _agentic_try_final_confirmation=lambda _candidate: False,
+        _agentic_candidate_is_live_locked=lambda sid, value: (
+            sid == snapshot_id and value is candidate
+        ),
+        _agentic_direct_manifest=lambda *_args, **_kwargs: manifest,
+        _cleanup_agentic_direct_sender=lambda value: cleaned.append(value),
+        _agentic_release_early_claim=lambda value, reason: claims.append(
+            (value, reason)
+        ),
+        _agentic_candidate_pop=lambda sid: popped.append(sid),
+        _enqueue_agentic_release=lambda req, offset: released.append((req, offset)),
+    )
+
+    DecodeKVCacheOffloadManager._check_agentic_direct_progress(
+        manager, progress_relay=False
+    )
+
+    assert bool(released) is expect_released
+    assert bool(cleaned) is expect_released
+    assert bool(popped) is expect_released
+    assert bool(claims) is expect_released
+    assert candidate["local_send_complete"] is expect_released
+
+
+def test_tp1_direct_poll_exception_quarantines_source_pages():
+    snapshot_id = "request:unreadable-fence"
+
+    def unreadable_poll():
+        raise RuntimeError("injected status error")
+
+    candidate = {
+        "req": SimpleNamespace(req_pool_idx=1),
+        "metadata": SimpleNamespace(current=SimpleNamespace()),
+        "manifest": SimpleNamespace(state=SnapshotState.CONSUMED),
+        "sender": SimpleNamespace(poll=unreadable_poll),
+        "sent": True,
+        "local_send_complete": False,
+        "staging": False,
+        "created_at": time.monotonic(),
+        "fallback_retry_at": 0.0,
+        "io_lock": threading.RLock(),
+    }
+    manager = SimpleNamespace(
+        tp_world_size=1,
+        tp_rank=0,
+        agentic_fast_threshold=2.0,
+        agentic_relay_worker=None,
+        _agentic_candidate_items=lambda: ((snapshot_id, candidate),),
+        _agentic_try_final_confirmation=lambda _candidate: False,
+        _agentic_candidate_is_live_locked=lambda _sid, value: value is candidate,
+        _agentic_direct_manifest=lambda *_args, **_kwargs: candidate["manifest"],
+        _cleanup_agentic_direct_sender=lambda _value: pytest.fail(
+            "unreadable transport must not be cleaned"
+        ),
+        _agentic_release_early_claim=lambda *_args: pytest.fail(
+            "unreadable transport must retain the claim"
+        ),
+        _agentic_candidate_pop=lambda _sid: pytest.fail(
+            "unreadable transport must retain the candidate"
+        ),
+        _enqueue_agentic_release=lambda *_args: pytest.fail(
+            "unreadable transport must retain D KV"
+        ),
+    )
+
+    DecodeKVCacheOffloadManager._check_agentic_direct_progress(
+        manager, progress_relay=False
+    )
+    assert not candidate["local_send_complete"]
+
+
+@pytest.mark.parametrize("tp_world_size", [1, 2])
+def test_slow_fallback_offer_retry_retains_d_kv_until_host_staging(tp_world_size):
+    snapshot_id = f"request:slow-retry:tp{tp_world_size}"
+    manifest = SimpleNamespace(
+        snapshot_id=snapshot_id,
+        state=SnapshotState.DIRECT_READY,
+        token_count=1024,
+    )
+    candidate = {
+        "req": object(),
+        "metadata": SimpleNamespace(current=SimpleNamespace()),
+        "manifest": manifest,
+        "sender": SimpleNamespace(poll=lambda: KVPoll.WaitingForInput),
+        "sent": False,
+        "staging": False,
+        "claimed_at": None,
+        "created_at": time.monotonic() - 3.0,
+        "fallback_retry_at": 0.0,
+        "io_lock": threading.RLock(),
+    }
+    attempts = []
+    releases = []
+    popped = []
+    routes = []
+
+    def start_host(value, current):
+        attempts.append(current.state)
+        if len(attempts) == 1:
+            # Model begin_slow_fallback() committing ownership before the
+            # first Shared-Arena offer raises.
+            current.state = SnapshotState.SLOW_FALLBACK
+            value["manifest"] = current
+            raise RuntimeError("injected Host offer failure")
+        value["staging"] = True
+        return True
+
+    manager = SimpleNamespace(
+        tp_world_size=tp_world_size,
+        tp_rank=0,
+        agentic_fast_threshold=2.0,
+        agentic_early_claim_post_timeout=2.0,
+        agentic_relay_worker=None,
+        agentic_early_claim_store=object(),
+        agentic_host_staging_client=object(),
+        _agentic_candidate_items=lambda: ((snapshot_id, candidate),),
+        _agentic_try_final_confirmation=lambda _candidate: False,
+        _agentic_candidate_is_live_locked=lambda sid, value: (
+            sid == snapshot_id and value is candidate
+        ),
+        _agentic_try_early_claim=lambda _candidate, _now: "absent",
+        _agentic_direct_manifest=lambda *_args, **_kwargs: manifest,
+        _agentic_try_tool_confirmation=lambda _candidate: False,
+        _agentic_release_early_claim=lambda *_args: None,
+        _agentic_direct_kv_usage=lambda: 0.5,
+        _start_agentic_host_staging=start_host,
+        _publish_agentic_route=lambda *_args, **kwargs: (
+            routes.append(kwargs) or True
+        ),
+        _cleanup_agentic_direct_sender=lambda *_args: pytest.fail(
+            "non-durable slow fallback must retain the sender"
+        ),
+        _agentic_candidate_pop=lambda sid: popped.append(sid),
+        _enqueue_agentic_release=lambda req, offset: releases.append((req, offset)),
+    )
+
+    DecodeKVCacheOffloadManager._check_agentic_direct_progress(
+        manager, progress_relay=False
+    )
+    assert manifest.state is SnapshotState.SLOW_FALLBACK
+    assert not candidate["staging"]
+    assert not releases and not popped
+
+    candidate["fallback_retry_at"] = 0.0
+    DecodeKVCacheOffloadManager._check_agentic_direct_progress(
+        manager, progress_relay=False
+    )
+    assert candidate["staging"]
+    assert attempts == [SnapshotState.DIRECT_READY, SnapshotState.SLOW_FALLBACK]
+    assert routes and routes[-1]["route"] == "host_writing"
+    assert not releases and not popped
+
+
+def test_nixl_sender_records_each_posted_handle_once_and_completes():
+    room = 44
+    kv_handle = object()
+    aux_handle = object()
+    transfer_calls = []
+
+    class Agent:
+        def transfer(self, handle):
+            transfer_calls.append(handle)
+            return "DONE"
+
+        def check_xfer_state(self, _handle):
+            return "DONE"
+
+    transfer = SimpleNamespace(
+        room=room,
+        is_dummy=lambda: False,
+        dst_kv_indices=[7],
+        agent_name="decode-peer",
+        dst_aux_index=0,
+    )
+    manager = NixlKVManager.__new__(NixlKVManager)
+    manager.disaggregation_mode = DisaggregationMode.PREFILL
+    manager.agent = Agent()
+    manager.transfer_infos = {room: {"decode-peer": transfer}}
+    manager.request_status = {room: KVPoll.WaitingForInput}
+    manager.decode_kv_args_table = {
+        "decode-peer": SimpleNamespace(
+            decode_tp_size=1,
+            dst_kv_ptrs=[1],
+            dst_aux_ptrs=[2],
+            gpu_id=0,
+        )
+    }
+    manager.is_mla_backend = False
+    manager.attn_tp_size = 1
+    manager.kv_args = SimpleNamespace(pp_rank=0)
+    manager.enable_all_cp_ranks_for_transfer = False
+    manager.is_dummy_cp_rank = False
+
+    def send_kvcache(*_args):
+        recorder = _args[-1]
+        return manager._post_transfer(kv_handle, recorder, "KV post failed")
+
+    def send_aux(*_args):
+        recorder = _args[-1]
+        return manager._post_transfer(aux_handle, recorder, "aux post failed")
+
+    manager.send_kvcache = send_kvcache
+    manager.send_aux = send_aux
+
+    sender = NixlKVSender.__new__(NixlKVSender)
+    sender.kv_mgr = manager
+    sender.bootstrap_room = room
+    sender.curr_idx = 0
+    sender.num_kv_indices = 1
+    sender.aux_index = 0
+    sender.xfer_handles = []
+    sender.has_sent = False
+    sender.chunk_id = 0
+    sender.launch_failed = False
+    sender.launch_exception = None
+    sender.send([3])
+
+    assert sender.xfer_handles == [kv_handle, aux_handle]
+    assert transfer_calls == [kv_handle, aux_handle]
+    assert sender.poll() == KVPoll.Success
 
 
 def test_tp_prefill_failure_releases_generation_and_control_state(monkeypatch):
@@ -1780,7 +4159,13 @@ def test_tp_direct_rank0_background_grant_starts_all_followers(monkeypatch):
         marker_store = AgenticEarlyClaimStore(directory)
         arrived_at = time.time()
         requests = [RequestGeneration("first", 1), RequestGeneration("second", 2)]
-        payloads = [{"arrived_at": arrived_at + index * 0.001} for index in range(2)]
+        payloads = [
+            {
+                "arrived_at": arrived_at + index * 0.001,
+                "prompt_token_count": 2048,
+            }
+            for index in range(2)
+        ]
         manifests = {
             request.snapshot_id: SimpleNamespace(
                 request=request,
@@ -1819,12 +4204,15 @@ def test_tp_direct_rank0_background_grant_starts_all_followers(monkeypatch):
                 },
                 agentic_early_direct_receives={},
                 agentic_early_direct_terminal={},
-                agentic_direct_credit_pool=SimpleNamespace(free_tokens=40000),
+                    agentic_p_workset_broker=SimpleNamespace(
+                        request=lambda *_args, **_kwargs: None,
+                        get=lambda _snapshot_id, **_kwargs: object(),
+                        request_release=lambda *_args: None,
+                    ),
                 agentic_tp_direct_mailbox=mailboxes[rank],
                 agentic_tp_direct_local_failed=set(),
                 agentic_tp_direct_local_admitted=set(),
                 server_args=SimpleNamespace(page_size=64),
-                _agentic_direct_hbm_fits=lambda _tokens: True,
                 started=[],
             )
             def start(request, *_args, **_kwargs):
@@ -1932,8 +4320,15 @@ def test_tp_direct_rank_init_failure_never_releases_group_claim():
         direct_bootstrap_addr="127.0.0.1:1",
     )
     released_claims = []
-    released_credits = []
-    allocation = SimpleNamespace(page_indices=torch.arange(64))
+    released_worksets = []
+    workset = SimpleNamespace(
+        lease_id=1,
+        parent_tokens=64,
+        allocated_tokens=128,
+        parent_indices=torch.arange(64),
+        parent_page_indices=[0],
+        state="active",
+    )
     store = SimpleNamespace(
         claim_direct=lambda *_args: manifest,
         load=lambda *_args, **_kwargs: manifest,
@@ -1951,9 +4346,14 @@ def test_tp_direct_rank_init_failure_never_releases_group_claim():
                 ),
                 receiver_class=None,
             ),
-            agentic_direct_credit_pool=SimpleNamespace(
-                allocate=lambda _tokens: allocation,
-                release=lambda value: released_credits.append(value),
+            agentic_p_workset_broker=SimpleNamespace(
+                begin_io_attempt=lambda *_args: True,
+                mark_io_inflight=lambda *_args: None,
+                mark_io_quiesced=lambda *_args: True,
+                cancel_io_attempt=lambda *_args: True,
+                request_release=lambda snapshot_id, *_args: released_worksets.append(
+                    snapshot_id
+                )
             ),
             agentic_direct_poll_requested=None,
             agentic_nixl_control_lock=nullcontext(),
@@ -1968,11 +4368,12 @@ def test_tp_direct_rank_init_failure_never_releases_group_claim():
             manifest,
             store,
             arrived_at=time.time(),
+            workset_lease=workset,
         )
         assert request.snapshot_id not in scheduler.agentic_early_direct_receives
         assert request.snapshot_id not in scheduler.agentic_tp_direct_local_failed
 
-    assert released_credits == [allocation, allocation]
+    assert released_worksets == [request.snapshot_id, request.snapshot_id]
     assert released_claims == []
 
 
@@ -2082,16 +4483,21 @@ def test_tp_direct_background_abort_survives_cleanup_error(monkeypatch):
         ]
         for mailbox in mailboxes:
             mailbox.publish_local_progress(request.snapshot_id, -1)
+        lease = object()
         owner = SimpleNamespace(
             tp_rank=0,
             agentic_tp_direct_mailbox=mailboxes[0],
             agentic_early_direct_poll_lock=nullcontext(),
             agentic_tp_direct_admission_active={
-                request.snapshot_id: (request, arrived_at, None, 1024)
+                request.snapshot_id: (request, arrived_at, None, 1024, lease)
             },
             agentic_early_direct_receives={},
             agentic_tp_direct_local_failed=set(),
-            agentic_tp_direct_local_admitted=set(),
+                agentic_tp_direct_local_admitted=set(),
+                agentic_p_workset_broker=SimpleNamespace(
+                    request_release=lambda *_args, **_kwargs: None,
+                    cancel_unstarted=lambda *_args, **_kwargs: None,
+                ),
         )
         store = SimpleNamespace(
             load=lambda *_args, **_kwargs: manifest,
@@ -2124,16 +4530,21 @@ def test_tp_direct_background_start_timeout_releases_group_claim(monkeypatch):
             directory=directory,
         )
         mailbox.publish_receipt(request.snapshot_id, 1)
+        lease = object()
         owner = SimpleNamespace(
             tp_rank=0,
             agentic_tp_direct_mailbox=mailbox,
             agentic_early_direct_poll_lock=nullcontext(),
             agentic_tp_direct_admission_active={
-                request.snapshot_id: (request, arrived_at, None, 1024)
+                request.snapshot_id: (request, arrived_at, None, 1024, lease)
             },
             agentic_early_direct_receives={},
             agentic_tp_direct_local_failed=set(),
-            agentic_tp_direct_local_admitted=set(),
+                agentic_tp_direct_local_admitted=set(),
+                agentic_p_workset_broker=SimpleNamespace(
+                    request_release=lambda *_args, **_kwargs: None,
+                    cancel_unstarted=lambda *_args, **_kwargs: None,
+                ),
         )
         owner._agentic_abort_tp_direct_grant = (
             lambda selected, store, reason: Scheduler._agentic_abort_tp_direct_grant(
@@ -2164,9 +4575,9 @@ def test_tp_direct_bind_control_is_two_phase():
         tp_rank=0,
         disaggregation_mode=DisaggregationMode.PREFILL,
         _AGENTIC_TP_CONTROL_KEY=Scheduler._AGENTIC_TP_CONTROL_KEY,
-        agentic_tp_direct_admission_active={
-            request.snapshot_id: (request, time.time(), None, 1024)
-        },
+                agentic_tp_direct_admission_active={
+                    request.snapshot_id: (request, time.time(), None, 1024, None)
+                },
         agentic_tp_direct_group_status={},
         agentic_tp_direct_mailbox=SimpleNamespace(
             receipt=lambda _snapshot_id: receipt["value"]
@@ -2242,13 +4653,16 @@ def test_tp_direct_peer_abort_waits_for_ordered_scheduler_rollback():
             _AGENTIC_TP_CONTROL_KEY=Scheduler._AGENTIC_TP_CONTROL_KEY,
             agentic_tp_direct_mailbox=mailbox,
             agentic_early_direct_poll_lock=nullcontext(),
-            agentic_tp_direct_admission_active={
-                request.snapshot_id: (request, time.time(), None, 1024)
-            },
+                agentic_tp_direct_admission_active={
+                    request.snapshot_id: (request, time.time(), None, 1024, None)
+                },
             agentic_tp_direct_group_status={},
             agentic_early_direct_receives={request.snapshot_id: entry},
             agentic_tp_direct_local_failed=set(),
             agentic_tp_direct_local_admitted=set(),
+                agentic_p_workset_broker=SimpleNamespace(
+                    request_release=lambda *_args, **_kwargs: None
+                ),
             agentic_tp_host_local_admitted=set(),
             agentic_tp_host_active=None,
             agentic_tp_host_active_since=0.0,
@@ -2319,14 +4733,21 @@ def test_tp1_direct_arrival_starts_without_scheduler_reservation_queue(monkeypat
         agentic_early_claim_store=object(),
         agentic_tp_direct_admission_active={},
         agentic_early_direct_admission_queue=deque(
-            [(request, {"arrived_at": arrived_at}, manifest)]
+            [(
+                request,
+                {"arrived_at": arrived_at, "prompt_token_count": 2048},
+                manifest,
+            )]
         ),
         agentic_early_direct_admission_ids={request.snapshot_id},
         agentic_early_direct_receives={},
         agentic_early_direct_terminal={},
-        agentic_direct_credit_pool=SimpleNamespace(free_tokens=40000),
+        agentic_p_workset_broker=SimpleNamespace(
+            request=lambda *_args, **_kwargs: None,
+            get=lambda _snapshot_id, **_kwargs: object(),
+            request_release=lambda *_args: None,
+        ),
         server_args=SimpleNamespace(page_size=64),
-        _agentic_direct_hbm_fits=lambda _tokens: True,
         _agentic_start_early_direct_receive=lambda selected, *_args, **_kwargs: (
             started.append(selected.snapshot_id) or True
         ),
@@ -2340,8 +4761,7 @@ def test_tp1_direct_arrival_starts_without_scheduler_reservation_queue(monkeypat
     assert not scheduler.agentic_early_direct_admission_queue
 
 
-def test_direct_arrival_waits_when_ordinary_p_hbm_has_no_working_room(monkeypatch):
-    """Free transit credit cannot authorize a promotion that fills ordinary HBM."""
+def test_direct_arrival_waits_until_complete_workset_is_granted(monkeypatch):
 
     monkeypatch.setenv("SGLANG_PD_LATE_BIND_DYNAMIC_PREFILL_DOMAINS", "0")
     request = RequestGeneration("p-hbm-full", 1)
@@ -2359,14 +4779,21 @@ def test_direct_arrival_waits_when_ordinary_p_hbm_has_no_working_room(monkeypatc
         agentic_early_claim_store=object(),
         agentic_tp_direct_admission_active={},
         agentic_early_direct_admission_queue=deque(
-            [(request, {"arrived_at": arrived_at}, manifest)]
+            [(
+                request,
+                {"arrived_at": arrived_at, "prompt_token_count": 2048},
+                manifest,
+            )]
         ),
         agentic_early_direct_admission_ids={request.snapshot_id},
         agentic_early_direct_receives={},
         agentic_early_direct_terminal={},
-        agentic_direct_credit_pool=SimpleNamespace(free_tokens=40000),
+        agentic_p_workset_broker=SimpleNamespace(
+            request=lambda *_args, **_kwargs: None,
+            get=lambda _snapshot_id, **_kwargs: None,
+            request_release=lambda *_args: None,
+        ),
         server_args=SimpleNamespace(page_size=64),
-        _agentic_direct_hbm_fits=lambda _tokens: False,
         _agentic_start_early_direct_receive=lambda selected, *_args, **_kwargs: (
             started.append(selected.snapshot_id) or True
         ),
@@ -2387,7 +4814,6 @@ def test_direct_arrival_waits_when_ordinary_p_hbm_has_no_working_room(monkeypatc
 def test_disabled_compute_ahead_does_not_double_reserve_direct_headroom(monkeypatch):
     monkeypatch.setenv("SGLANG_PD_P_READY_BACKPRESSURE_MODE", "disabled")
     scheduler = SimpleNamespace(
-        agentic_direct_credit_pool=SimpleNamespace(capacity_tokens=40000),
         disagg_prefill_bootstrap_queue=SimpleNamespace(p_ready_dir="/dev/shm"),
         chunked_req=None,
         _p_ready_compute_ahead_throttled=False,
@@ -2403,6 +4829,27 @@ def test_disabled_compute_ahead_does_not_double_reserve_direct_headroom(monkeypa
     assert not method(scheduler)
     assert not scheduler._p_ready_compute_ahead_throttled
     assert scheduler._p_ready_compute_credit_tokens is None
+
+
+def test_disagg_prefill_services_workset_broker_at_scheduler_boundary():
+    events = []
+    scheduler = SimpleNamespace(
+        running_batch=SimpleNamespace(batch_is_full=True),
+        waiting_queue=[],
+        _agentic_service_p_workset_leases=lambda: events.append("workset"),
+        process_prefill_chunk=lambda: events.append("chunk"),
+        _should_throttle_p_ready_compute_ahead=lambda: False,
+        get_new_batch_prefill=lambda: None,
+        maybe_prepare_mlp_sync_batch=lambda batch: batch,
+    )
+
+    batch = SchedulerDisaggregationPrefillMixin.get_next_disagg_prefill_batch_to_run(
+        scheduler
+    )
+
+    assert batch is None
+    assert events == ["workset", "chunk"]
+    assert scheduler.running_batch.batch_is_full is False
 
 
 def test_tp_decode_release_uses_native_scheduler_control():
@@ -2433,6 +4880,7 @@ def test_tp_decode_release_uses_native_scheduler_control():
         "decode_admit_keys": [],
         "decode_transfer_keys": [],
         "decode_transfer_statuses": [],
+        "decode_transfer_cancel_keys": [],
         "decode_transfer_rid": None,
         "decode_transfer_room": None,
         "decode_agentic_commands": [],
@@ -2492,6 +4940,155 @@ def test_tp_decode_release_can_resolve_peer_live_candidate():
     assert len(cleaned) == 1
     assert claims[0][1] == "tp_release_commit"
     assert manager.agentic_direct_candidates == {}
+
+
+def test_tp_decode_release_never_waits_for_background_io():
+    """The Decode scheduler defers, rather than blocking on an I/O lane."""
+
+    snapshot_id = "request:5"
+    req = SimpleNamespace(rid="request", req_pool_idx=9)
+    io_lock = threading.RLock()
+    entered = threading.Event()
+    leave = threading.Event()
+
+    def hold_io_lane():
+        with io_lock:
+            entered.set()
+            leave.wait(timeout=5)
+
+    holder = threading.Thread(target=hold_io_lane)
+    holder.start()
+    assert entered.wait(timeout=2)
+
+    released = []
+    manager = SimpleNamespace(
+        _agentic_tp_pending_releases={snapshot_id: (req, 0)},
+        _agentic_pending_release_lock=threading.RLock(),
+        agentic_direct_candidates={
+            snapshot_id: {"req": req, "io_lock": io_lock}
+        },
+        _agentic_candidates_lock=threading.RLock(),
+        _release_finished_req=lambda value, offset: released.append(
+            (value, offset)
+        ),
+        _cleanup_agentic_direct_sender=lambda _candidate: None,
+        _agentic_release_early_claim=lambda _candidate, _reason: None,
+    )
+
+    started = time.perf_counter()
+    assert not DecodeKVCacheOffloadManager.commit_tp_release(
+        manager, snapshot_id
+    )
+    assert time.perf_counter() - started < 0.1
+    assert manager._agentic_tp_pending_releases
+    assert manager.agentic_direct_candidates
+    assert released == []
+
+    leave.set()
+    holder.join(timeout=2)
+    assert DecodeKVCacheOffloadManager.commit_tp_release(manager, snapshot_id)
+    assert released == [(req, 0)]
+    assert manager._agentic_tp_pending_releases == {}
+    assert manager.agentic_direct_candidates == {}
+
+
+def test_tp_deferred_releases_are_ordered_and_never_overwrite():
+    """Two busy follower shards retain both one-shot rank-0 releases."""
+
+    snapshots = ("request:6", "request:7")
+    locks = {snapshot_id: threading.RLock() for snapshot_id in snapshots}
+    leave = threading.Event()
+    entered = {snapshot_id: threading.Event() for snapshot_id in snapshots}
+
+    def hold(snapshot_id):
+        with locks[snapshot_id]:
+            entered[snapshot_id].set()
+            leave.wait(timeout=5)
+
+    holders = [
+        threading.Thread(target=hold, args=(snapshot_id,))
+        for snapshot_id in snapshots
+    ]
+    for holder in holders:
+        holder.start()
+    assert all(event.wait(timeout=2) for event in entered.values())
+
+    reqs = {
+        snapshot_id: SimpleNamespace(rid=snapshot_id, req_pool_idx=index + 1)
+        for index, snapshot_id in enumerate(snapshots)
+    }
+    released = []
+    manager = SimpleNamespace(
+        _agentic_tp_pending_releases={
+            snapshot_id: (reqs[snapshot_id], 0) for snapshot_id in snapshots
+        },
+        _agentic_pending_release_lock=threading.RLock(),
+        _agentic_tp_deferred_releases={},
+        agentic_direct_candidates={
+            snapshot_id: {
+                "req": reqs[snapshot_id],
+                "io_lock": locks[snapshot_id],
+            }
+            for snapshot_id in snapshots
+        },
+        _agentic_candidates_lock=threading.RLock(),
+        _release_finished_req=lambda req, _offset: released.append(req.rid),
+        _cleanup_agentic_direct_sender=lambda _candidate: None,
+        _agentic_release_early_claim=lambda _candidate, _reason: None,
+    )
+
+    for snapshot_id in snapshots:
+        assert not DecodeKVCacheOffloadManager.commit_tp_release(
+            manager, snapshot_id
+        )
+    assert tuple(manager._agentic_tp_deferred_releases) == snapshots
+
+    leave.set()
+    for holder in holders:
+        holder.join(timeout=2)
+    for snapshot_id in tuple(manager._agentic_tp_deferred_releases):
+        assert DecodeKVCacheOffloadManager.commit_tp_release(manager, snapshot_id)
+    assert released == list(snapshots)
+    assert manager._agentic_tp_deferred_releases == {}
+
+
+def test_tp_follower_skips_retired_candidate_snapshot():
+    """A worker's stale map snapshot cannot touch transport after release."""
+
+    snapshot_id = "request:8"
+
+    class Sender:
+        polls = 0
+
+        def poll(self):
+            self.polls += 1
+            return KVPoll.WaitingForInput
+
+    sender = Sender()
+    candidate = {
+        "tp_command": "direct",
+        "io_lock": threading.RLock(),
+        "sender": sender,
+        "sent": False,
+        "source_page_indices": [1, 2],
+        "retired": True,
+    }
+    manager = SimpleNamespace(
+        agentic_relay_worker=None,
+        agentic_direct_candidates={},
+        _agentic_candidates_lock=threading.RLock(),
+        _agentic_candidate_items=lambda: ((snapshot_id, candidate),),
+        _agentic_candidate_is_live_locked=lambda sid, value: (
+            DecodeKVCacheOffloadManager._agentic_candidate_is_live_locked(
+                manager, sid, value
+            )
+        ),
+    )
+
+    DecodeKVCacheOffloadManager._check_agentic_tp_follower_progress(
+        manager, progress_relay=False, progress_class="direct"
+    )
+    assert sender.polls == 0
 
 
 def test_tp_p2d_peer_claim_suppresses_rank_local_native_completion():

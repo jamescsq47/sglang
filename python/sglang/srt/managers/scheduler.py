@@ -62,6 +62,7 @@ from sglang.srt.disaggregation.agentic_host_staging import (
     AgenticPHostStagingManager,
     SharedHostStagingLedger,
     create_agentic_storage_controller,
+    supports_agentic_kv_spill,
 )
 from sglang.srt.disaggregation.agentic_tp import (
     rank_env_int,
@@ -278,243 +279,530 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class AgenticDirectCreditAllocation:
-    """One request-generation allocation from the P Direct reserve."""
+class AgenticPWorksetLease:
+    """Physical P-HBM ownership for one complete next-turn prompt.
 
-    allocation_id: int
-    segments: Tuple[Tuple[int, int], ...]
-    page_indices: np.ndarray
-    token_count: int
-    allocated_tokens: int
-    bound: bool = False
-
-
-class AgenticDirectPageCreditPool:
-    """A fixed P-HBM reserve that can be admitted off the scheduler thread.
-
-    The SGLang allocator is intentionally touched only once during startup.
-    Afterwards the ingress worker allocates Python interval metadata and sends
-    precomputed page ids to NIXL, so a long Prefill forward cannot delay a
-    reverse-transfer claim.  Once received KV is bound into Radix, ordinary
-    empty pages replace its reserve slots.  This changes only page ownership --
-    no KV copy is required -- and makes the fixed reserve a transit buffer.
+    The parent slice is the destination of Direct or Slow restore.  The suffix
+    slice stays unavailable to every other request until this exact request is
+    admitted for incremental Prefill.  All allocator mutations are performed
+    by the model scheduler; I/O workers consume only immutable page ids.
     """
 
-    def __init__(self, allocator, *, capacity_tokens: int, page_size: int):
-        self.page_size = int(page_size)
-        capacity_tokens = (
-            int(capacity_tokens) // self.page_size * self.page_size
-        )
-        if capacity_tokens <= 0:
-            raise ValueError("Direct page-credit reserve must contain one page")
-        device_indices = allocator.alloc(capacity_tokens)
-        if device_indices is None:
-            raise RuntimeError(
-                f"Could not reserve {capacity_tokens} P KV tokens for Direct ingress"
-            )
-        self.device_indices = device_indices
-        self.capacity_tokens = capacity_tokens
-        self.capacity_pages = capacity_tokens // self.page_size
-        self.page_indices = kv_to_page_indices(
-            device_indices.cpu().numpy(), self.page_size
-        )
-        if len(self.page_indices) != self.capacity_pages:
-            allocator.free(device_indices)
-            raise RuntimeError("Direct reserve page metadata has the wrong size")
-        self._page_to_slot = {
-            int(page): slot for slot, page in enumerate(self.page_indices.tolist())
-        }
-        self._free: List[Tuple[int, int]] = [(0, self.capacity_pages)]
-        self._allocations: Dict[int, AgenticDirectCreditAllocation] = {}
-        self._next_allocation_id = 1
-        self._lock = threading.RLock()
+    snapshot_id: str
+    lease_id: int
+    owner: str
+    parent_tokens: int
+    parent_allocated_tokens: int
+    prompt_tokens: int
+    allocated_tokens: int
+    device_indices: torch.Tensor
+    parent_page_indices: np.ndarray
+    parent_bound: bool = False
+    state: str = "active"
+    suffix_cursor: int = 0
+    io_attempt: Optional[str] = None
 
     @property
-    def free_tokens(self) -> int:
+    def parent_indices(self) -> torch.Tensor:
+        return self.device_indices[: self.parent_allocated_tokens]
+
+    @property
+    def suffix_indices(self) -> torch.Tensor:
+        return self.device_indices[self.parent_allocated_tokens :]
+
+    @property
+    def suffix_allocated_tokens(self) -> int:
+        return self.allocated_tokens - self.parent_allocated_tokens
+
+    @property
+    def remaining_suffix_indices(self) -> torch.Tensor:
+        if self.state == "consumed":
+            return self.suffix_indices[:0]
+        return self.suffix_indices[self.suffix_cursor :]
+
+
+class AgenticPWorksetLeaseBroker:
+    """Thread-safe intent queue with scheduler-owned physical allocation."""
+
+    def __init__(self, page_size: int):
+        self.page_size = int(page_size)
+        self._intents: Dict[str, Tuple[str, int, int]] = {}
+        self._leases: Dict[str, AgenticPWorksetLease] = {}
+        self._release_requested: Dict[str, int] = {}
+        self._next_lease_id = 1
+        self._grants = 0
+        self._allocation_failures = 0
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def direct_owner(snapshot_id: str) -> str:
+        return f"direct:{snapshot_id}"
+
+    @staticmethod
+    def slow_owner(snapshot_id: str, rid: str) -> str:
+        return f"slow:{snapshot_id}:{rid}"
+
+    def request(
+        self,
+        snapshot_id: str,
+        parent_tokens: int,
+        prompt_tokens: int,
+        *,
+        owner: str = "legacy",
+    ) -> bool:
+        parent_tokens = int(parent_tokens)
+        prompt_tokens = int(prompt_tokens)
+        if parent_tokens <= 0 or prompt_tokens < parent_tokens:
+            raise ValueError(
+                f"invalid workset shape parent={parent_tokens} prompt={prompt_tokens}"
+            )
         with self._lock:
-            return sum(count for _, count in self._free) * self.page_size
+            current = self._leases.get(snapshot_id)
+            if current is not None:
+                return (
+                    current.owner == owner
+                    and current.parent_tokens == parent_tokens
+                    and current.prompt_tokens == prompt_tokens
+                    and current.state not in {"releasing", "consumed"}
+                )
+            pending = self._intents.get(snapshot_id)
+            if pending is not None:
+                return pending == (owner, parent_tokens, prompt_tokens)
+            if snapshot_id in self._release_requested:
+                return False
+            self._intents[snapshot_id] = (owner, parent_tokens, prompt_tokens)
+            return True
+
+    def get(
+        self, snapshot_id: str, *, owner: Optional[str] = None
+    ) -> Optional[AgenticPWorksetLease]:
+        with self._lock:
+            lease = self._leases.get(snapshot_id)
+            if lease is not None and (owner is None or lease.owner == owner):
+                return lease
+            return None
+
+    def request_release(
+        self,
+        snapshot_id: str,
+        lease: Optional[AgenticPWorksetLease] = None,
+        *,
+        owner: Optional[str] = None,
+        io_attempt: Optional[str] = None,
+    ) -> bool:
+        """Schedule release of the exact lease owned by the caller.
+
+        A caller without a lease identity cannot release anything; intent
+        cancellation is a separate owner-scoped operation.  This prevents a
+        delayed Direct callback from cancelling a newer Slow owner for the
+        same request-generation.
+        """
+
+        with self._lock:
+            if lease is None:
+                return False
+            current = self._leases.get(snapshot_id)
+            if current is None or current.lease_id != lease.lease_id:
+                return False
+            if owner is not None and current.owner != owner:
+                return False
+            pending = self._intents.get(snapshot_id)
+            if pending is not None and pending[0] == current.owner:
+                self._intents.pop(snapshot_id, None)
+            if current.state in {"io_reserved", "io_inflight"}:
+                if current.io_attempt != io_attempt:
+                    return False
+                current.state = "release_pending"
+                return False
+            if current.state in {
+                "release_pending",
+                "binding",
+                "handed",
+                "consumed",
+                "releasing",
+            }:
+                return False
+            current.state = "releasing"
+            self._release_requested[snapshot_id] = current.lease_id
+            return True
+
+    def release_handed(
+        self,
+        snapshot_id: str,
+        lease: AgenticPWorksetLease,
+        *,
+        req,
+    ) -> bool:
+        """Release a workset after scheduler ownership was handed to ``req``.
+
+        Transport callbacks deliberately cannot release a handed lease.  Only
+        the live request that owns the suffix may return it on cancellation.
+        This separates request lifetime from stale Direct/Slow completions.
+        """
+
+        with self._lock:
+            current = self._leases.get(snapshot_id)
+            if current is None or current.lease_id != lease.lease_id:
+                return False
+            if current.state != "handed":
+                return False
+            if getattr(req, "_agentic_p_workset_lease", None) is not current:
+                return False
+            current.state = "releasing"
+            self._release_requested[snapshot_id] = current.lease_id
+            return True
+
+    def service(self, allocator, *, reserve_tokens: int = 0) -> None:
+        """Allocate/free only at a scheduler-safe boundary.
+
+        ``reserve_tokens`` protects the unfinished suffix of the one native
+        chunked-Prefill request.  That request was admitted only after the
+        scheduler proved that its complete prompt fitted, but its later
+        chunks are allocated lazily.  Background Direct/Slow intents must not
+        consume that already-promised capacity between chunks.
+        """
+
+        reserve_tokens = max(0, int(reserve_tokens))
+
+        with self._lock:
+            releases = tuple(self._release_requested.items())
+            self._release_requested.clear()
+            for snapshot_id, expected_id in releases:
+                lease = self._leases.get(snapshot_id)
+                if (
+                    lease is not None
+                    and lease.lease_id == expected_id
+                    and lease.state == "releasing"
+                ):
+                    self._leases.pop(snapshot_id, None)
+                    allocator.free(
+                        lease.remaining_suffix_indices
+                        if lease.parent_bound
+                        else lease.device_indices
+                    )
+
+            for snapshot_id, (owner, parent_tokens, prompt_tokens) in tuple(
+                self._intents.items()
+            ):
+                # Parent and suffix have distinct ownership transitions: the
+                # parent is filled by Direct/Slow I/O, while the suffix is
+                # filled by incremental Prefill.  Round each slice
+                # independently so an unaligned parent can never steal the
+                # first page required by the suffix.
+                parent_allocated = (
+                    (parent_tokens + self.page_size - 1) // self.page_size
+                ) * self.page_size
+                suffix_tokens = prompt_tokens - parent_tokens
+                suffix_allocated = (
+                    (suffix_tokens + self.page_size - 1) // self.page_size
+                ) * self.page_size
+                allocated_tokens = parent_allocated + suffix_allocated
+                if reserve_tokens and (
+                    allocator.available_size() - reserve_tokens < allocated_tokens
+                ):
+                    self._allocation_failures += 1
+                    continue
+                device_indices = allocator.alloc(allocated_tokens)
+                if device_indices is None:
+                    self._allocation_failures += 1
+                    continue
+                parent_indices = device_indices[:parent_allocated]
+                page_indices = kv_to_page_indices(
+                    parent_indices.cpu().numpy(), self.page_size
+                )
+                self._leases[snapshot_id] = AgenticPWorksetLease(
+                    snapshot_id=snapshot_id,
+                    lease_id=self._next_lease_id,
+                    owner=owner,
+                    parent_tokens=parent_tokens,
+                    parent_allocated_tokens=parent_allocated,
+                    prompt_tokens=prompt_tokens,
+                    allocated_tokens=allocated_tokens,
+                    device_indices=device_indices,
+                    parent_page_indices=page_indices,
+                )
+                self._next_lease_id += 1
+                self._grants += 1
+                self._intents.pop(snapshot_id, None)
+
+    def handoff_to_req(
+        self, snapshot_id: str, req, lease: AgenticPWorksetLease
+    ) -> None:
+        """Move the complete lease from broker ownership to one live Req."""
+
+        with self._lock:
+            current = self._leases.get(snapshot_id)
+            if current is None or current.lease_id != lease.lease_id:
+                raise RuntimeError(f"workset lease disappeared for {snapshot_id}")
+            if current.state != "binding":
+                raise RuntimeError(
+                    f"workset lease is {current.state} for {snapshot_id}"
+                )
+            if not current.parent_bound:
+                raise RuntimeError(f"workset parent is not bound for {snapshot_id}")
+            actual_prompt_tokens = len(req.origin_input_ids)
+            if actual_prompt_tokens != current.prompt_tokens:
+                raise RuntimeError(
+                    f"workset prompt changed for {snapshot_id}: "
+                    f"reserved={current.prompt_tokens} actual={actual_prompt_tokens}"
+                )
+            current.state = "handed"
+            self._intents.pop(snapshot_id, None)
+            req._agentic_p_workset_lease = current
+            req._agentic_p_workset_broker = self
+            req._agentic_workset_suffix_indices = current.remaining_suffix_indices
+
+    def consume_suffix(
+        self,
+        lease: AgenticPWorksetLease,
+        extend_tokens: int,
+        *,
+        final_prompt_chunk: bool,
+    ) -> torch.Tensor:
+        """Transfer suffix slots to one Prefill chunk.
+
+        The returned tensor has the length expected by SGLang's extend
+        batch.  On the final logical prompt chunk, ownership of the whole
+        final KV page (including unused padding slots) moves to the request,
+        so the broker drops the lease without freeing that padding.
+        """
+
+        extend_tokens = int(extend_tokens)
+        if extend_tokens < 0:
+            raise ValueError("extend_tokens must be non-negative")
+        with self._lock:
+            current = self._leases.get(lease.snapshot_id)
+            if current is None or current.lease_id != lease.lease_id:
+                raise RuntimeError(f"workset lease disappeared for {lease.snapshot_id}")
+            if current.state != "handed":
+                raise RuntimeError(
+                    f"workset lease is {current.state} for {lease.snapshot_id}"
+                )
+            start = current.suffix_cursor
+            end = start + extend_tokens
+            logical_suffix_tokens = current.prompt_tokens - current.parent_tokens
+            physical_suffix_tokens = current.suffix_allocated_tokens
+            if end > physical_suffix_tokens:
+                raise RuntimeError(
+                    f"workset suffix over-consumed for {lease.snapshot_id}: "
+                    f"end={end} physical={physical_suffix_tokens}"
+                )
+            if final_prompt_chunk and end < logical_suffix_tokens:
+                raise RuntimeError(
+                    f"final workset chunk is incomplete for {lease.snapshot_id}: "
+                    f"end={end} logical={logical_suffix_tokens}"
+                )
+            if (
+                not final_prompt_chunk
+                and end < physical_suffix_tokens
+                and end % self.page_size
+            ):
+                raise RuntimeError(
+                    "non-final chunked Prefill must end on a KV page boundary"
+                )
+            indices = current.suffix_indices[start:end]
+            current.suffix_cursor = end
+            if final_prompt_chunk or end == physical_suffix_tokens:
+                current.state = "consumed"
+                self._leases.pop(lease.snapshot_id, None)
+            return indices
+
+    def begin_bind(self, snapshot_id: str, lease: AgenticPWorksetLease) -> bool:
+        """Atomically transfer a completed I/O lease to scheduler binding."""
+
+        with self._lock:
+            current = self._leases.get(snapshot_id)
+            if current is None or current.lease_id != lease.lease_id:
+                return False
+            if current.state != "active":
+                return current.state == "binding"
+            current.state = "binding"
+            return True
+
+    def begin_io_attempt(
+        self,
+        snapshot_id: str,
+        lease: AgenticPWorksetLease,
+        attempt: str,
+    ) -> bool:
+        """Exclusively reserve one lease for one concrete Direct session."""
+
+        with self._lock:
+            current = self._leases.get(snapshot_id)
+            if current is None or current.lease_id != lease.lease_id:
+                return False
+            if current.state != "active":
+                return False
+            current.state = "io_reserved"
+            current.io_attempt = str(attempt)
+            return True
+
+    def mark_io_inflight(
+        self,
+        snapshot_id: str,
+        lease: AgenticPWorksetLease,
+        attempt: str,
+    ) -> None:
+        """Fence allocator reuse after this attempt publishes destinations."""
+
+        with self._lock:
+            current = self._leases.get(snapshot_id)
+            if current is None or current.lease_id != lease.lease_id:
+                raise RuntimeError(f"workset lease disappeared for {snapshot_id}")
+            if current.state != "io_reserved" or current.io_attempt != attempt:
+                raise RuntimeError(
+                    f"cannot start attempt={attempt} on {current.state} "
+                    f"workset {snapshot_id} owned_by={current.io_attempt}"
+                )
+            current.state = "io_inflight"
+
+    def cancel_io_attempt(
+        self,
+        snapshot_id: str,
+        lease: AgenticPWorksetLease,
+        attempt: str,
+    ) -> bool:
+        """Drop an exclusive attempt before any remote write can begin."""
+
+        with self._lock:
+            current = self._leases.get(snapshot_id)
+            if current is None or current.lease_id != lease.lease_id:
+                return False
+            if current.state != "io_reserved" or current.io_attempt != attempt:
+                return False
+            current.state = "active"
+            current.io_attempt = None
+            return True
+
+    def mark_io_quiesced(
+        self,
+        snapshot_id: str,
+        lease: AgenticPWorksetLease,
+        attempt: str,
+    ) -> bool:
+        """Publish a definitive transport terminal state to the allocator."""
+
+        with self._lock:
+            current = self._leases.get(snapshot_id)
+            if current is None or current.lease_id != lease.lease_id:
+                return False
+            if current.io_attempt != attempt:
+                return False
+            if current.state == "io_inflight":
+                current.state = "active"
+                current.io_attempt = None
+                return True
+            if current.state == "release_pending":
+                current.state = "releasing"
+                current.io_attempt = None
+                self._release_requested[snapshot_id] = current.lease_id
+                return True
+            return False
+
+    def commit_parent_bound(
+        self, snapshot_id: str, lease: AgenticPWorksetLease
+    ) -> None:
+        with self._lock:
+            current = self._leases.get(snapshot_id)
+            if current is None or current.lease_id != lease.lease_id:
+                raise RuntimeError(f"workset lease disappeared for {snapshot_id}")
+            if current.state != "binding":
+                raise RuntimeError(
+                    f"cannot bind {current.state} workset lease for {snapshot_id}"
+                )
+            current.parent_bound = True
+
+    def abort_bind(
+        self,
+        snapshot_id: str,
+        lease: AgenticPWorksetLease,
+        *,
+        parent_bound: bool,
+    ) -> bool:
+        """Release a scheduler-owned bind after its Radix mutation is undone."""
+
+        with self._lock:
+            current = self._leases.get(snapshot_id)
+            if current is None or current.lease_id != lease.lease_id:
+                return False
+            if current.state != "binding":
+                return False
+            current.parent_bound = bool(parent_bound)
+            current.state = "releasing"
+            self._release_requested[snapshot_id] = current.lease_id
+            return True
+
+    def cancel_unstarted(
+        self, snapshot_id: str, *, owner: Optional[str] = None
+    ) -> bool:
+        """Atomically cancel work that has not started physical I/O.
+
+        The scheduler can grant an intent between two progress-worker passes.
+        Cancellation must therefore cover both representations: a pending
+        intent and an ``active`` lease.  Once I/O, binding, or request handoff
+        begins, the corresponding owner-specific terminal path is solely
+        responsible for release.
+        """
+
+        with self._lock:
+            cancelled = False
+            pending = self._intents.get(snapshot_id)
+            if pending is not None and (owner is None or pending[0] == owner):
+                self._intents.pop(snapshot_id, None)
+                cancelled = True
+            lease = self._leases.get(snapshot_id)
+            if (
+                lease is not None
+                and lease.state == "active"
+                and (owner is None or lease.owner == owner)
+            ):
+                lease.state = "releasing"
+                self._release_requested[snapshot_id] = lease.lease_id
+                cancelled = True
+            return cancelled
+
+    @property
+    def leased_tokens(self) -> int:
+        with self._lock:
+            return sum(lease.allocated_tokens for lease in self._leases.values())
+
+    @property
+    def stats(self) -> Tuple[int, int, int]:
+        """Return pending intents, grants, and allocation misses."""
+
+        with self._lock:
+            return len(self._intents), self._grants, self._allocation_failures
+
+    @property
+    def lease_state_summary(self) -> str:
+        """Compact count/token ownership summary for progress diagnostics."""
+
+        with self._lock:
+            counts: Dict[str, int] = {}
+            tokens: Dict[str, int] = {}
+            for lease in self._leases.values():
+                counts[lease.state] = counts.get(lease.state, 0) + 1
+                tokens[lease.state] = tokens.get(lease.state, 0) + int(
+                    lease.allocated_tokens
+                )
+            return ",".join(
+                f"{state}:{counts[state]}/{tokens[state]}"
+                for state in sorted(counts)
+            ) or "empty"
 
     @property
     def unaccounted_tokens(self) -> int:
-        """Reserved pages not already represented by a Radix node."""
+        """Lease pages not already represented by a bound Radix parent."""
 
         with self._lock:
-            prebind = sum(
-                allocation.allocated_tokens
-                for allocation in self._allocations.values()
-                if not allocation.bound
+            return sum(
+                (
+                    lease.remaining_suffix_indices.numel()
+                    if lease.parent_bound
+                    else lease.allocated_tokens
+                )
+                for lease in self._leases.values()
             )
-            return self.free_tokens + prebind
-
-    def allocate(self, token_count: int) -> Optional[AgenticDirectCreditAllocation]:
-        token_count = int(token_count)
-        pages_needed = (token_count + self.page_size - 1) // self.page_size
-        with self._lock:
-            if pages_needed > sum(count for _, count in self._free):
-                return None
-            remaining = pages_needed
-            segments: List[Tuple[int, int]] = []
-            next_free: List[Tuple[int, int]] = []
-            for start, count in self._free:
-                take = min(count, remaining)
-                if take:
-                    segments.append((start, take))
-                    start += take
-                    count -= take
-                    remaining -= take
-                if count:
-                    next_free.append((start, count))
-            if remaining:
-                raise RuntimeError("Direct credit interval accounting is inconsistent")
-            self._free = next_free
-            pages = np.concatenate(
-                [self.page_indices[start : start + count] for start, count in segments]
-            ).astype(np.int32, copy=False)
-            allocation = AgenticDirectCreditAllocation(
-                allocation_id=self._next_allocation_id,
-                segments=tuple(segments),
-                page_indices=pages,
-                token_count=token_count,
-                allocated_tokens=pages_needed * self.page_size,
-            )
-            self._next_allocation_id += 1
-            self._allocations[allocation.allocation_id] = allocation
-            return allocation
-
-    def device_view(self, allocation: AgenticDirectCreditAllocation) -> torch.Tensor:
-        pieces = [
-            self.device_indices[
-                start * self.page_size : (start + count) * self.page_size
-            ]
-            for start, count in allocation.segments
-        ]
-        result = pieces[0] if len(pieces) == 1 else torch.cat(pieces)
-        return result[: allocation.token_count]
-
-    def mark_bound(self, allocation: AgenticDirectCreditAllocation) -> None:
-        with self._lock:
-            current = self._allocations.get(allocation.allocation_id)
-            if current is not None:
-                current.bound = True
-
-    def promote_to_ordinary(
-        self,
-        allocation: AgenticDirectCreditAllocation,
-        replacement_indices: torch.Tensor,
-    ) -> None:
-        """Detach received KV pages and replenish their reserve slots.
-
-        ``replacement_indices`` are unused pages from the ordinary allocator.
-        The received pages remain unchanged and are subsequently owned by the
-        Radix branch.  Only this pool's small page-id table is rewritten.
-        """
-
-        if replacement_indices.numel() != allocation.allocated_tokens:
-            raise ValueError("Direct reserve replacement has the wrong size")
-        replacement_pages = kv_to_page_indices(
-            replacement_indices.cpu().numpy(), self.page_size
-        )
-        if len(replacement_pages) != allocation.allocated_tokens // self.page_size:
-            raise ValueError("Direct reserve replacement is not page aligned")
-
-        with self._lock:
-            current = self._allocations.get(allocation.allocation_id)
-            if current is not allocation or current.bound:
-                raise RuntimeError("Direct reserve allocation cannot be promoted")
-            cursor_pages = 0
-            cursor_tokens = 0
-            for start, count in allocation.segments:
-                old_pages = self.page_indices[start : start + count].tolist()
-                for page in old_pages:
-                    self._page_to_slot.pop(int(page), None)
-
-                token_count = count * self.page_size
-                new_indices = replacement_indices[
-                    cursor_tokens : cursor_tokens + token_count
-                ]
-                new_pages = replacement_pages[cursor_pages : cursor_pages + count]
-                self.device_indices[
-                    start * self.page_size : (start + count) * self.page_size
-                ] = new_indices
-                self.page_indices[start : start + count] = new_pages
-                for offset, page in enumerate(new_pages.tolist()):
-                    self._page_to_slot[int(page)] = start + offset
-                cursor_pages += count
-                cursor_tokens += token_count
-
-            self._allocations.pop(allocation.allocation_id)
-            self._free.extend(allocation.segments)
-            self._coalesce_free_locked()
-
-    def release(self, allocation: AgenticDirectCreditAllocation) -> None:
-        with self._lock:
-            current = self._allocations.pop(allocation.allocation_id, None)
-            if current is None:
-                return
-            self._free.extend(current.segments)
-            self._coalesce_free_locked()
-
-    def reclaim_node_indices(self, indices: torch.Tensor, allocator) -> int:
-        """Return reserve pages from one released Radix node.
-
-        Agentic branches normally keep the restored parent and newly computed
-        suffix in separate nodes.  The mixed case is still handled explicitly.
-        """
-
-        if indices.numel() == 0:
-            return 0
-        page_ids = torch.unique_consecutive(
-            indices // self.page_size
-        ).cpu().tolist()
-        reserve_slots = [
-            self._page_to_slot[int(page)]
-            for page in page_ids
-            if int(page) in self._page_to_slot
-        ]
-        if not reserve_slots:
-            allocator.free(indices)
-            return 0
-        reserve_pages = {int(self.page_indices[slot]) for slot in reserve_slots}
-        normal_pages = [int(page) for page in page_ids if int(page) not in reserve_pages]
-        if normal_pages:
-            pages = torch.tensor(
-                normal_pages, dtype=torch.int64, device=indices.device
-            )
-            normal_indices = (
-                pages[:, None] * self.page_size
-                + torch.arange(self.page_size, device=indices.device)
-            ).reshape(-1)
-            allocator.free(normal_indices)
-        with self._lock:
-            # Convert arbitrary returned slots into intervals, then merge.
-            for slot in sorted(reserve_slots):
-                self._free.append((slot, 1))
-            self._coalesce_free_locked()
-            free_slots = {
-                slot
-                for start, count in self._free
-                for slot in range(start, start + count)
-            }
-            for allocation_id, allocation in tuple(self._allocations.items()):
-                allocated_slots = {
-                    slot
-                    for start, count in allocation.segments
-                    for slot in range(start, start + count)
-                }
-                if allocated_slots.issubset(free_slots):
-                    self._allocations.pop(allocation_id, None)
-        return len(reserve_slots) * self.page_size
-
-    def _coalesce_free_locked(self) -> None:
-        merged: List[List[int]] = []
-        for start, count in sorted(self._free):
-            if merged and merged[-1][0] + merged[-1][1] == start:
-                merged[-1][1] += count
-            elif merged and start < merged[-1][0] + merged[-1][1]:
-                raise RuntimeError("Direct credit page was released twice")
-            else:
-                merged.append([start, count])
-        self._free = [(start, count) for start, count in merged]
 
 
 @dataclass
@@ -529,9 +817,14 @@ class AgenticEarlyDirectReceive:
     started_at: float
     arrived_at: float
     prefill_domain: Optional[int] = None
-    credit_allocation: Optional[AgenticDirectCreditAllocation] = None
+    workset_lease: Optional[AgenticPWorksetLease] = None
+    io_attempt: Optional[str] = None
+    io_quiesced: bool = False
     completed_at: Optional[float] = None
     group_committed: bool = False
+    abort_requested: bool = False
+    abort_release_claim: bool = False
+    abort_reason: Optional[str] = None
     route_published: bool = False
     # TP binds are two-phase.  A scheduler tick may install and pin the
     # received shard in the local Radix tree, but the request is not admitted
@@ -543,6 +836,7 @@ class AgenticEarlyDirectReceive:
     # metadata-only and also progresses there; HBM ownership and Radix
     # insertion remain scheduler-owned.
     transport_poll: Optional[Any] = None
+
 
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
@@ -658,8 +952,7 @@ class Scheduler(
             )
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = (
-            server_args.hicache_storage_backend is not None
-            and not custom_storage_only
+            server_args.hicache_storage_backend is not None and not custom_storage_only
         )
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.enable_hisparse = server_args.enable_hisparse
@@ -1169,10 +1462,7 @@ class Scheduler(
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
 
     def init_running_status(self):
-        if (
-            envs.SGLANG_AGENTIC_KV_LIFECYCLE.get()
-            and self.server_args.page_size < 64
-        ):
+        if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get() and self.server_args.page_size < 64:
             raise ValueError(
                 "SGLANG_AGENTIC_KV_LIFECYCLE V1 requires --page-size >= 64; "
                 "smaller pages make request-level manifests unnecessarily large"
@@ -1185,9 +1475,7 @@ class Scheduler(
         # lightweight arrival marker, before a tokenized Req exists.  Entries
         # remain allocator-owned until that Req arrives and binds the KV into
         # the P Radix cache.
-        self.agentic_early_direct_receives: Dict[
-            str, AgenticEarlyDirectReceive
-        ] = {}
+        self.agentic_early_direct_receives: Dict[str, AgenticEarlyDirectReceive] = {}
         self.agentic_early_direct_terminal: Dict[str, float] = {}
         # Router arrivals are delivered by inotify into a FIFO admission
         # queue.  Transport completion has a separate queue consumed by the
@@ -1197,13 +1485,26 @@ class Scheduler(
         ] = deque()
         self.agentic_early_direct_admission_ids: set[str] = set()
         self.agentic_early_direct_completion_queue: Deque[str] = deque()
+        # Direct and Slow restore share the ordinary P KV pool.  Background
+        # workers publish intents; only the scheduler services physical page
+        # allocation and release, preserving allocator/Radix ownership rules.
+        self.agentic_p_workset_broker = AgenticPWorksetLeaseBroker(
+            self.server_args.page_size
+        )
         # TP rank 0 owns one ordered set of Direct admissions.  A dedicated
         # tmpfs mailbox grants the same request-generation to every rank's
         # background progress worker; each receives only its physical KV-head
         # shard.  Native scheduler broadcast is retained only for the final
         # synchronized Radix bind/clear boundary.
         self.agentic_tp_direct_admission_active: Dict[
-            str, Tuple[RequestGeneration, float, Optional[int], int]
+            str,
+            Tuple[
+                RequestGeneration,
+                float,
+                Optional[int],
+                int,
+                Optional[AgenticPWorksetLease],
+            ],
         ] = {}
         self.agentic_tp_direct_visible_order: List[str] = []
         self.agentic_tp_direct_command_visible = False
@@ -1232,13 +1533,9 @@ class Scheduler(
             # Snapshot/room identities are globally unique within one run, so
             # namespaces need not encode a rank-local engine id.  This lets P
             # and D exchange one logical receipt without another collective.
-            self.agentic_tp_direct_mailbox = TPGroupMailbox(
-                "d2p-direct", **common
-            )
+            self.agentic_tp_direct_mailbox = TPGroupMailbox("d2p-direct", **common)
             self.agentic_tp_host_mailbox = TPGroupMailbox("d2p-host", **common)
-            self.agentic_tp_p2d_sender_mailbox = TPGroupMailbox(
-                "p2d-sender", **common
-            )
+            self.agentic_tp_p2d_sender_mailbox = TPGroupMailbox("p2d-sender", **common)
             self.agentic_tp_p2d_receiver_mailbox = TPGroupMailbox(
                 "p2d-receiver", **common
             )
@@ -1257,7 +1554,6 @@ class Scheduler(
             self.agentic_tp_p2d_cleanup_mailbox = None
         self.agentic_early_direct_arrival_watcher = None
         self.agentic_early_claim_store = None
-        self.agentic_direct_credit_pool = None
         self.agentic_early_direct_poll_lock = threading.RLock()
         # P->D sender completion polling and reverse D->P Direct progress use
         # the same NIXL agent.  The Python binding performs manager-wide
@@ -1553,9 +1849,7 @@ class Scheduler(
                 if not early_claim_dir:
                     p_ready_dir = os.environ.get("SGLANG_PD_P_READY_DIR", "")
                     if p_ready_dir:
-                        early_claim_dir = os.path.join(
-                            p_ready_dir, "early-claims"
-                        )
+                        early_claim_dir = os.path.join(p_ready_dir, "early-claims")
                 if early_claim_dir:
                     self.agentic_early_claim_store = AgenticEarlyClaimStore(
                         early_claim_dir
@@ -1577,22 +1871,9 @@ class Scheduler(
                             max_age_seconds=marker_max_age
                         )
                     )
-                    direct_reserve_tokens = int(
-                        os.environ.get(
-                            "SGLANG_AGENTIC_KV_P_DIRECT_RESERVE_TOKENS", "40000"
-                        )
-                    )
-                    self.agentic_direct_credit_pool = AgenticDirectPageCreditPool(
-                        self.token_to_kv_pool_allocator,
-                        capacity_tokens=direct_reserve_tokens,
-                        page_size=self.server_args.page_size,
-                    )
                     logger.info(
-                        "Agentic P Direct page-credit reserve enabled "
-                        "capacity_tokens=%d ordinary_tokens=%d",
-                        self.agentic_direct_credit_pool.capacity_tokens,
-                        self.max_total_num_tokens
-                        - self.agentic_direct_credit_pool.capacity_tokens,
+                        "Agentic P unified workset leases enabled total_tokens=%d",
+                        self.max_total_num_tokens,
                     )
                 if envs.SGLANG_AGENTIC_KV_HOST_STAGING.get():
                     ledger_base = envs.SGLANG_AGENTIC_KV_LEDGER_PATH.get()
@@ -1600,7 +1881,10 @@ class Scheduler(
                         envs.SGLANG_AGENTIC_KV_STAGING_LEDGER_PATH.get()
                         or f"{ledger_base}.staging"
                     )
-                    if not ledger_base and not envs.SGLANG_AGENTIC_KV_STAGING_LEDGER_PATH.get():
+                    if (
+                        not ledger_base
+                        and not envs.SGLANG_AGENTIC_KV_STAGING_LEDGER_PATH.get()
+                    ):
                         raise ValueError(
                             "P Host staging requires SGLANG_AGENTIC_KV_LEDGER_PATH "
                             "or SGLANG_AGENTIC_KV_STAGING_LEDGER_PATH"
@@ -1617,9 +1901,7 @@ class Scheduler(
                         )
                         self.agentic_storage_controller = controller
                     else:
-                        controller = getattr(
-                            self.tree_cache, "cache_controller", None
-                        )
+                        controller = getattr(self.tree_cache, "cache_controller", None)
                         if controller is None:
                             raise ValueError(
                                 "P Host staging requires a storage controller"
@@ -1630,27 +1912,28 @@ class Scheduler(
                             envs.SGLANG_AGENTIC_KV_TOOL_MEAN_SECONDS.get()
                         ).items()
                     }
-                    snapshot_store = (
-                        controller.storage_backend.agentic_snapshot_store()
-                    )
-                    eviction_controller = SharedSnapshotEvictionController(
-                        snapshot_store,
-                        ledger_path=ledger_base,
-                        capacity_bytes=int(
-                            envs.SGLANG_AGENTIC_KV_CAPACITY_GIB.get() * 1024**3
-                        ),
-                        high_watermark=(
-                            envs.SGLANG_AGENTIC_KV_HIGH_WATERMARK.get()
-                        ),
-                        expected_tool_seconds=expected_tool_seconds,
-                        reservation_ttl_seconds=(
-                            envs.SGLANG_AGENTIC_KV_STALE_SECONDS.get()
-                        ),
-                    )
+                    snapshot_store = controller.storage_backend.agentic_snapshot_store()
+                    eviction_controller = None
+                    if supports_agentic_kv_spill(controller.storage_backend):
+                        eviction_controller = SharedSnapshotEvictionController(
+                            snapshot_store,
+                            ledger_path=ledger_base,
+                            capacity_bytes=int(
+                                envs.SGLANG_AGENTIC_KV_CAPACITY_GIB.get() * 1024**3
+                            ),
+                            high_watermark=(
+                                envs.SGLANG_AGENTIC_KV_HIGH_WATERMARK.get()
+                            ),
+                            expected_tool_seconds=expected_tool_seconds,
+                            reservation_ttl_seconds=(
+                                envs.SGLANG_AGENTIC_KV_STALE_SECONDS.get()
+                            ),
+                        )
                     self.agentic_host_staging_manager = AgenticPHostStagingManager(
                         ledger=SharedHostStagingLedger(staging_ledger_path),
                         runtime=self.agentic_direct_runtime,
                         token_allocator=self.token_to_kv_pool_allocator,
+                        workset_broker=self.agentic_p_workset_broker,
                         cache_controller=controller,
                         tree_cache=self.tree_cache,
                         page_size=self.server_args.page_size,
@@ -1668,8 +1951,7 @@ class Scheduler(
                             ),
                         ),
                         arena_capacity_bytes=int(
-                            envs.SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_GIB.get()
-                            * 1024**3
+                            envs.SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_GIB.get() * 1024**3
                         ),
                         high_watermark=envs.SGLANG_AGENTIC_KV_P_HOST_HIGH_WATERMARK.get(),
                         low_watermark=envs.SGLANG_AGENTIC_KV_P_HOST_LOW_WATERMARK.get(),
@@ -1687,9 +1969,12 @@ class Scheduler(
                         expected_tool_seconds=expected_tool_seconds,
                         eviction_controller=eviction_controller,
                     )
-                if os.getenv(
-                    "SGLANG_AGENTIC_KV_P2D_HOST_STAGING", "0"
-                ).lower() in {"1", "true", "yes", "on"}:
+                if os.getenv("SGLANG_AGENTIC_KV_P2D_HOST_STAGING", "0").lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }:
                     p2d_ledger_path = os.getenv(
                         "SGLANG_AGENTIC_KV_P2D_STAGING_LEDGER_PATH",
                         f"{envs.SGLANG_AGENTIC_KV_STAGING_LEDGER_PATH.get()}.p2d",
@@ -2668,28 +2953,39 @@ class Scheduler(
             return None
         return factory()
 
-    def _agentic_direct_hbm_fits(self, token_count: int) -> bool:
-        try:
-            direct_high = float(
-                os.environ.get(
-                    "SGLANG_PD_P_READY_DIRECT_HBM_HIGH_WATERMARK", "0.85"
+    def _agentic_service_p_workset_leases(self) -> None:
+        """Service background restore intents at an allocator-safe boundary."""
+
+        broker = getattr(self, "agentic_p_workset_broker", None)
+        if broker is not None:
+            reserve_tokens = 0
+            chunked_req = getattr(self, "chunked_req", None)
+            private_suffix = (
+                None
+                if chunked_req is None
+                else getattr(chunked_req, "_agentic_workset_suffix_indices", None)
+            )
+            if (
+                chunked_req is not None
+                and (private_suffix is None or private_suffix.numel() == 0)
+            ):
+                # ``fill_ids`` is the prefix through the chunk that just ran;
+                # ``origin_input_ids + output_ids`` is the complete logical
+                # prompt.  Page-round the unprocessed suffix exactly as the
+                # allocator will do on subsequent chunks.
+                remaining = max(
+                    0,
+                    len(chunked_req.origin_input_ids)
+                    + len(chunked_req.output_ids)
+                    - len(chunked_req.fill_ids),
                 )
+                reserve_tokens = (
+                    (remaining + self.page_size - 1) // self.page_size
+                ) * self.page_size
+            broker.service(
+                self.token_to_kv_pool_allocator,
+                reserve_tokens=reserve_tokens,
             )
-        except ValueError:
-            logger.exception("Invalid P-ready direct HBM watermark")
-            raise
-        if not (0.0 < direct_high < 1.0):
-            raise ValueError(
-                "SGLANG_PD_P_READY_DIRECT_HBM_HIGH_WATERMARK must be in (0, 1), "
-                f"got {direct_high}"
-            )
-        physical_used = (
-            self.max_total_num_tokens
-            - self.token_to_kv_pool_allocator.available_size()
-        )
-        return physical_used + token_count <= int(
-            self.max_total_num_tokens * direct_high
-        )
 
     def _agentic_start_early_direct_receive(
         self,
@@ -2699,6 +2995,7 @@ class Scheduler(
         *,
         arrived_at: float,
         prefill_domain: Optional[int] = None,
+        workset_lease: Optional[AgenticPWorksetLease] = None,
     ) -> bool:
         """Reserve P pages and start reverse NIXL before a Req exists."""
 
@@ -2721,23 +3018,11 @@ class Scheduler(
                 runtime.layout_hash,
             )
             return False
-        credit_pool = getattr(self, "agentic_direct_credit_pool", None)
-        credit_allocation = (
-            None if credit_pool is None else credit_pool.allocate(manifest.token_count)
-        )
-        if credit_pool is not None and credit_allocation is None:
+        if workset_lease is None:
             return False
-        device_indices = None
-        if credit_pool is None:
-            # Compatibility path for focused tests and lifecycle-disabled
-            # deployments. Production agentic serving always owns a reserve.
-            if not self._agentic_direct_hbm_fits(manifest.token_count):
-                return False
-            device_indices = self.token_to_kv_pool_allocator.alloc(
-                manifest.token_count
-            )
-            if device_indices is None:
-                return False
+        if workset_lease.parent_tokens < manifest.token_count:
+            raise RuntimeError("Direct workset parent slice is too small")
+        device_indices = workset_lease.parent_indices[: manifest.token_count]
         if self.tp_size == 1:
             claim_id = (
                 f"direct-early-p:{os.getpid()}:{request.snapshot_id}:"
@@ -2748,6 +3033,18 @@ class Scheduler(
             # only its own physical KV-head shard.
             engine_id = os.getenv("SGLANG_AGENTIC_KV_ENGINE_ID", "prefill")
             claim_id = f"direct-early-tp:{engine_id}:{request.snapshot_id}"
+        with getattr(self, "agentic_early_direct_poll_lock", nullcontext()):
+            if request.snapshot_id in getattr(
+                self, "agentic_early_direct_terminal", ()
+            ):
+                return False
+        if not self.agentic_p_workset_broker.begin_io_attempt(
+            request.snapshot_id, workset_lease, claim_id
+        ):
+            # Another Direct attempt already owns this exact workset.  It is
+            # the only attempt allowed to claim, quiesce, or release the DMA
+            # destination; this caller leaves both lifecycle and pages alone.
+            return False
         receiver = None
         claimed = None
         direct_requested = getattr(self, "agentic_direct_poll_requested", None)
@@ -2769,19 +3066,60 @@ class Scheduler(
                 receiver.init(prefill_dp_rank=0)
                 if receiver.poll() == KVPoll.Failed:
                     raise SnapshotLifecycleError("reverse receiver init failed")
-                page_indices = (
-                    credit_allocation.page_indices
-                    if credit_allocation is not None
-                    else kv_to_page_indices(
-                        device_indices.cpu().numpy(), self.server_args.page_size
-                    )
+                self.agentic_p_workset_broker.mark_io_inflight(
+                    request.snapshot_id, workset_lease, claim_id
                 )
-                receiver.send_metadata(page_indices, aux_index=0)
+                receiver.send_metadata(workset_lease.parent_page_indices, aux_index=0)
         except Exception as exc:
-            if credit_allocation is not None:
-                credit_pool.release(credit_allocation)
-            elif device_indices is not None:
-                self.token_to_kv_pool_allocator.free(device_indices)
+            transport_may_write = bool(
+                receiver is not None
+                and getattr(receiver, "started_transfer", False)
+                and workset_lease.io_attempt == claim_id
+                and workset_lease.state in {"io_inflight", "release_pending"}
+            )
+            if transport_may_write:
+                self.agentic_p_workset_broker.request_release(
+                    request.snapshot_id,
+                    workset_lease,
+                    io_attempt=claim_id,
+                )
+                entry = AgenticEarlyDirectReceive(
+                    request=request,
+                    manifest=claimed if claimed is not None else manifest,
+                    claim_id=claim_id,
+                    receiver=receiver,
+                    device_indices=device_indices,
+                    started_at=time.monotonic(),
+                    arrived_at=arrived_at,
+                    prefill_domain=prefill_domain,
+                    workset_lease=workset_lease,
+                    io_attempt=claim_id,
+                    abort_requested=True,
+                    abort_release_claim=True,
+                    abort_reason="metadata_publication_failed",
+                )
+                with getattr(self, "agentic_early_direct_poll_lock", nullcontext()):
+                    self.agentic_early_direct_receives[request.snapshot_id] = entry
+                logger.exception(
+                    "Direct metadata publication may be partially visible; "
+                    "quarantining workset snapshot=%s",
+                    request.snapshot_id,
+                )
+                return True
+            if (
+                workset_lease.state in {"io_inflight", "release_pending"}
+                and workset_lease.io_attempt == claim_id
+            ):
+                self.agentic_p_workset_broker.mark_io_quiesced(
+                    request.snapshot_id, workset_lease, claim_id
+                )
+            else:
+                self.agentic_p_workset_broker.cancel_io_attempt(
+                    request.snapshot_id, workset_lease, claim_id
+                )
+            self.agentic_p_workset_broker.request_release(
+                request.snapshot_id, workset_lease
+            )
             if receiver is not None:
                 try:
                     receiver.clear()
@@ -2835,17 +3173,30 @@ class Scheduler(
             started_at=time.monotonic(),
             arrived_at=arrived_at,
             prefill_domain=prefill_domain,
-            credit_allocation=credit_allocation,
+            workset_lease=workset_lease,
+            io_attempt=claim_id,
         )
         with getattr(self, "agentic_early_direct_poll_lock", nullcontext()):
+            cancelled = request.snapshot_id in getattr(
+                self, "agentic_early_direct_terminal", ()
+            )
+            if cancelled:
+                entry.abort_requested = True
+                entry.abort_release_claim = True
+                entry.abort_reason = "tp_control_cancelled_during_start"
+                self.agentic_p_workset_broker.request_release(
+                    request.snapshot_id,
+                    workset_lease,
+                    io_attempt=claim_id,
+                )
             self.agentic_early_direct_receives[request.snapshot_id] = entry
         logger.info(
             "AgenticKV early_direct_start snapshot=%s tokens=%d "
-            "arrival_to_start_ms=%.3f reserve_free_tokens=%d",
+            "arrival_to_start_ms=%.3f workset_tokens=%d",
             request.snapshot_id,
             claimed.token_count,
             max(0.0, (time.time() - arrived_at) * 1000.0),
-            -1 if credit_pool is None else credit_pool.free_tokens,
+            workset_lease.allocated_tokens,
         )
         return True
 
@@ -2857,44 +3208,64 @@ class Scheduler(
         release_claim: bool,
         reason: str,
     ) -> None:
+        transport_terminal = entry.completed_at is not None or entry.transport_poll in {
+            KVPoll.Success,
+            KVPoll.Failed,
+        }
+        if (
+            not transport_terminal
+            and entry.workset_lease is not None
+            and entry.workset_lease.state in {"io_inflight", "release_pending"}
+        ):
+            # Logical timeout/TP abort is not a DMA fence. Keep the receiver
+            # pollable and quarantine its pages until NIXL reports a terminal
+            # result; otherwise a late remote WRITE could corrupt a new Req.
+            entry.abort_requested = True
+            entry.abort_release_claim = entry.abort_release_claim or release_claim
+            entry.abort_reason = reason
+            self.agentic_p_workset_broker.request_release(
+                entry.request.snapshot_id,
+                entry.workset_lease,
+                io_attempt=entry.io_attempt,
+            )
+            logger.warning(
+                "AgenticKV early_direct_abort_deferred snapshot=%s reason=%s",
+                entry.request.snapshot_id,
+                reason,
+            )
+            return
         if entry.completed_at is None:
             try:
                 entry.receiver.clear()
-                self._agentic_clear_direct_receiver(
-                    entry.receiver, entry.manifest
-                )
+                self._agentic_clear_direct_receiver(entry.receiver, entry.manifest)
             except Exception:
                 logger.exception(
                     "Failed to clear early Direct receiver for %s",
                     entry.request.snapshot_id,
                 )
-        credit_pool = getattr(self, "agentic_direct_credit_pool", None)
-        if entry.credit_allocation is not None and credit_pool is not None:
-            credit_pool.release(entry.credit_allocation)
-        elif entry.device_indices is not None:
-            self.token_to_kv_pool_allocator.free(entry.device_indices)
+        self.agentic_p_workset_broker.request_release(
+            entry.request.snapshot_id, entry.workset_lease
+        )
         if release_claim:
             try:
-                current = snapshot_store.load(
-                    entry.request, require_ready=False
-                )
+                current = snapshot_store.load(entry.request, require_ready=False)
                 if (
                     current is not None
                     and current.state is SnapshotState.DIRECT_LOADING
                     and current.claim_id == entry.claim_id
                 ):
-                    snapshot_store.release_direct_claim(
-                        current, entry.claim_id
-                    )
+                    snapshot_store.release_direct_claim(current, entry.claim_id)
             except Exception:
                 logger.exception(
                     "Failed to release early Direct claim for %s",
                     entry.request.snapshot_id,
                 )
         with getattr(self, "agentic_early_direct_poll_lock", nullcontext()):
-            self.agentic_early_direct_receives.pop(
-                entry.request.snapshot_id, None
-            )
+            if (
+                self.agentic_early_direct_receives.get(entry.request.snapshot_id)
+                is entry
+            ):
+                self.agentic_early_direct_receives.pop(entry.request.snapshot_id, None)
             self.agentic_early_direct_terminal[entry.request.snapshot_id] = (
                 time.monotonic()
             )
@@ -2937,9 +3308,9 @@ class Scheduler(
     def _agentic_early_direct_progress_worker(self) -> None:
         """Own Direct discovery and transport progress off the GPU scheduler.
 
-        The worker allocates only from the fixed Direct page-credit reserve;
-        it never touches the shared SGLang allocator or Radix tree. The
-        scheduler later performs only the cheap completed-Req binding step.
+        The worker consumes scheduler-granted complete-workset leases; it
+        never mutates the shared SGLang allocator or Radix tree. The scheduler
+        later performs only the completed-request binding step.
         """
 
         try:
@@ -2974,30 +3345,34 @@ class Scheduler(
                 with getattr(self, "agentic_early_direct_poll_lock", nullcontext()):
                     active = sum(
                         entry.completed_at is None
-                        and entry.transport_poll
-                        not in {KVPoll.Success, KVPoll.Failed}
+                        and entry.transport_poll not in {KVPoll.Success, KVPoll.Failed}
                         for entry in self.agentic_early_direct_receives.values()
                     )
                     ready = sum(
                         entry.completed_at is not None
                         for entry in self.agentic_early_direct_receives.values()
                     )
-                    admission_pending = len(
-                        self.agentic_early_direct_admission_queue
-                    )
+                    admission_pending = len(self.agentic_early_direct_admission_queue)
+                workset_pending, workset_grants, workset_alloc_misses = (
+                    self.agentic_p_workset_broker.stats
+                )
                 logger.info(
                     "Agentic P Direct progress stats cycles=%d avg_us=%.1f "
                     "max_ms=%.3f admission_pending=%d active=%d ready=%d "
-                    "reserve_free_tokens=%d",
+                    "leased_workset_tokens=%d workset_pending=%d "
+                    "workset_grants=%d workset_alloc_misses=%d "
+                    "lease_states=%s",
                     cycles,
                     total_seconds / max(cycles, 1) * 1e6,
                     max_seconds * 1e3,
                     admission_pending,
                     active,
                     ready,
-                    -1
-                    if getattr(self, "agentic_direct_credit_pool", None) is None
-                    else self.agentic_direct_credit_pool.free_tokens,
+                    self.agentic_p_workset_broker.leased_tokens,
+                    workset_pending,
+                    workset_grants,
+                    workset_alloc_misses,
+                    self.agentic_p_workset_broker.lease_state_summary,
                 )
                 cycles = 0
                 total_seconds = 0.0
@@ -3005,9 +3380,7 @@ class Scheduler(
                 last_stats = now
             self.agentic_early_direct_progress_stop.wait(interval)
 
-    def _agentic_poll_early_direct_receives(
-        self, now: Optional[float] = None
-    ) -> None:
+    def _agentic_poll_early_direct_receives(self, now: Optional[float] = None) -> None:
         cycle_lock = getattr(self, "agentic_early_direct_cycle_lock", None)
         if cycle_lock is None:
             return self._agentic_poll_early_direct_receives_once(now)
@@ -3051,9 +3424,7 @@ class Scheduler(
             return
         marker_max_age = max(
             5.0,
-            envs.SGLANG_AGENTIC_KV_FAST_TOOL_THRESHOLD.get()
-            + direct_timeout
-            + 1.0,
+            envs.SGLANG_AGENTIC_KV_FAST_TOOL_THRESHOLD.get() + direct_timeout + 1.0,
         )
         dynamic_domains = os.environ.get(
             "SGLANG_PD_LATE_BIND_DYNAMIC_PREFILL_DOMAINS", ""
@@ -3070,11 +3441,6 @@ class Scheduler(
         if not isinstance(tp_active, dict):
             tp_active = {}
             self.agentic_tp_direct_admission_active = tp_active
-        pending_credit_tokens = sum(
-            int(active[3])
-            for snapshot_id, active in tp_active.items()
-            if snapshot_id not in self.agentic_early_direct_receives
-        )
         # Examine each currently queued request once.  A large snapshot with
         # insufficient credit is rotated behind smaller requests instead of
         # causing head-of-line blocking; FIFO order is otherwise preserved.
@@ -3094,6 +3460,10 @@ class Scheduler(
 
             arrived_at = float(payload["arrived_at"])
             if arrived_at + marker_max_age < time.time():
+                self.agentic_p_workset_broker.cancel_unstarted(
+                    request.snapshot_id,
+                    owner=AgenticPWorksetLeaseBroker.direct_owner(request.snapshot_id),
+                )
                 continue
             target_domain = payload.get("target_prefill_domain")
             if dynamic_domains:
@@ -3116,22 +3486,51 @@ class Scheduler(
                 continue
             if arrived_at + 0.05 < manifest.created_at:
                 continue
-            credit_pool = getattr(self, "agentic_direct_credit_pool", None)
-            required_tokens = 0
-            if credit_pool is not None:
-                required_tokens = (
-                    (manifest.token_count + self.server_args.page_size - 1)
-                    // self.server_args.page_size
-                    * self.server_args.page_size
+            prompt_tokens = payload.get("prompt_token_count")
+            if prompt_tokens is None:
+                # Without the next prompt length P cannot atomically reserve
+                # parent+tool suffix.  Leave DIRECT_READY unclaimed so D takes
+                # the ordinary timeout-to-Slow path rather than overcommitting.
+                continue
+            prompt_tokens = int(prompt_tokens)
+            if prompt_tokens < int(manifest.token_count):
+                logger.warning(
+                    "AgenticKV invalid workset marker snapshot=%s parent=%d prompt=%d",
+                    request.snapshot_id,
+                    int(manifest.token_count),
+                    prompt_tokens,
                 )
+                continue
+            eligible_states = (
+                {SnapshotState.DIRECT_READY, SnapshotState.DIRECT_LOADING}
+                if tp_size > 1 and tp_rank != 0
+                else {SnapshotState.DIRECT_READY}
+            )
+            if manifest.state not in eligible_states:
+                # A stale arrival can outlive D's Direct->Slow transition.
+                # Reject it before touching the shared workset broker so it
+                # cannot contend with or cancel the Slow restore owner.
+                continue
+            broker = self.agentic_p_workset_broker
+            workset_owner = AgenticPWorksetLeaseBroker.direct_owner(request.snapshot_id)
+            broker.request(
+                request.snapshot_id,
+                int(manifest.token_count),
+                prompt_tokens,
+                owner=workset_owner,
+            )
+            workset_lease = broker.get(request.snapshot_id, owner=workset_owner)
+            if workset_lease is None:
+                with poll_lock:
+                    queue.append((request, payload, manifest))
+                    pending.add(request.snapshot_id)
+                continue
             if tp_size > 1 and tp_rank != 0:
                 # TP0 publishes one exact request-generation grant through
                 # the dedicated tmpfs mailbox.  Followers never choose work
                 # independently; they merely mirror that grant and let their
                 # background progress worker start the local KV-head shard.
-                receipt = self.agentic_tp_direct_mailbox.receipt(
-                    request.snapshot_id
-                )
+                receipt = self.agentic_tp_direct_mailbox.receipt(request.snapshot_id)
                 if receipt is None:
                     if manifest.state not in {
                         SnapshotState.DIRECT_READY,
@@ -3143,72 +3542,32 @@ class Scheduler(
                         pending.add(request.snapshot_id)
                     continue
                 if int(receipt) < 0 or int(receipt) >= 4:
-                    self.agentic_early_direct_terminal[
-                        request.snapshot_id
-                    ] = time.monotonic()
+                    broker.request_release(request.snapshot_id, workset_lease)
+                    self.agentic_early_direct_terminal[request.snapshot_id] = (
+                        time.monotonic()
+                    )
                     continue
                 if manifest.state not in {
                     SnapshotState.DIRECT_READY,
                     SnapshotState.DIRECT_LOADING,
                 }:
-                    self.agentic_tp_direct_local_failed.add(
-                        request.snapshot_id
-                    )
+                    broker.request_release(request.snapshot_id, workset_lease)
+                    self.agentic_tp_direct_local_failed.add(request.snapshot_id)
                     continue
-                tp_active[request.snapshot_id] = (
-                    request,
-                    arrived_at,
-                    None if target_domain is None else int(target_domain),
-                    required_tokens,
-                )
+                with poll_lock:
+                    if request.snapshot_id in self.agentic_early_direct_terminal:
+                        broker.request_release(request.snapshot_id, workset_lease)
+                        continue
+                    tp_active[request.snapshot_id] = (
+                        request,
+                        arrived_at,
+                        None if target_domain is None else int(target_domain),
+                        prompt_tokens,
+                        workset_lease,
+                    )
                 continue
             if manifest.state is not SnapshotState.DIRECT_READY:
-                continue
-            # The fixed Direct pool is only a transit area.  After reception
-            # the snapshot is promoted into the ordinary P KV pool so Prefill
-            # can append the tool result.  Reserve that eventual working-set
-            # space before granting the transfer; checking only the transit
-            # pool lets a burst of fast tools promote snapshots until ordinary
-            # HBM reaches 100%, at which point none of them can Prefill.  TP0
-            # owns this decision and followers mirror its exact grant.
-            if credit_pool is not None and not self._agentic_direct_hbm_fits(
-                pending_credit_tokens + required_tokens
-            ):
-                with poll_lock:
-                    queue.append((request, payload, manifest))
-                    pending.add(request.snapshot_id)
-                continue
-            if credit_pool is not None and (
-                credit_pool.free_tokens - pending_credit_tokens < required_tokens
-            ):
-                may_fail_for_capacity = self.tp_size == 1 or (
-                    tp_rank == 0
-                    and manifest.state is SnapshotState.DIRECT_READY
-                )
-                if may_fail_for_capacity and os.environ.get(
-                    "SGLANG_AGENTIC_KV_RECOMPUTE_ON_DIRECT_CAPACITY", "0"
-                ).strip().lower() in {"1", "true", "yes", "on"}:
-                    failed = snapshot_store.fail_direct_offer(
-                        manifest,
-                        owner_id=f"p-capacity:{os.getpid()}:{configured_domain}",
-                        reason="p_direct_capacity",
-                    )
-                    if failed is not None:
-                        self.agentic_early_direct_terminal[
-                            request.snapshot_id
-                        ] = time.monotonic()
-                        logger.info(
-                            "AgenticKV direct_capacity_recompute snapshot=%s "
-                            "tokens=%d required_tokens=%d reserve_free_tokens=%d",
-                            request.snapshot_id,
-                            manifest.token_count,
-                            required_tokens,
-                            credit_pool.free_tokens,
-                        )
-                        continue
-                with poll_lock:
-                    queue.append((request, payload, manifest))
-                    pending.add(request.snapshot_id)
+                broker.request_release(request.snapshot_id, workset_lease)
                 continue
             if tp_size > 1:
                 # TP0 owns admission order and publishes the grant before any
@@ -3218,12 +3577,16 @@ class Scheduler(
                     request,
                     arrived_at,
                     None if target_domain is None else int(target_domain),
-                    required_tokens,
+                    prompt_tokens,
+                    workset_lease,
                 )
-                self.agentic_tp_direct_admission_active[request.snapshot_id] = (
-                    active_item
-                )
-                pending_credit_tokens += required_tokens
+                with poll_lock:
+                    if request.snapshot_id in self.agentic_early_direct_terminal:
+                        broker.request_release(request.snapshot_id, workset_lease)
+                        continue
+                    self.agentic_tp_direct_admission_active[request.snapshot_id] = (
+                        active_item
+                    )
                 try:
                     self.agentic_tp_direct_mailbox.publish_receipt(
                         request.snapshot_id, 1
@@ -3237,15 +3600,17 @@ class Scheduler(
                         request.snapshot_id,
                     )
                     with poll_lock:
-                        if self.agentic_tp_direct_admission_active.get(
-                            request.snapshot_id
-                        ) == active_item:
+                        if (
+                            self.agentic_tp_direct_admission_active.get(
+                                request.snapshot_id
+                            )
+                            == active_item
+                        ):
                             self.agentic_tp_direct_admission_active.pop(
                                 request.snapshot_id, None
                             )
                         queue.appendleft((request, payload, manifest))
                         pending.add(request.snapshot_id)
-                    pending_credit_tokens -= required_tokens
                 continue
 
             if self._agentic_start_early_direct_receive(
@@ -3253,9 +3618,8 @@ class Scheduler(
                 manifest,
                 snapshot_store,
                 arrived_at=arrived_at,
-                prefill_domain=(
-                    None if target_domain is None else int(target_domain)
-                ),
+                prefill_domain=(None if target_domain is None else int(target_domain)),
+                workset_lease=workset_lease,
             ):
                 continue
 
@@ -3266,6 +3630,14 @@ class Scheduler(
                 with poll_lock:
                     queue.append((request, payload, current))
                     pending.add(request.snapshot_id)
+            else:
+                # Validation can reject a Direct attempt before begin_io_attempt
+                # mutates the lease.  Once D no longer offers DIRECT_READY,
+                # there is no future queue entry that could own that grant.
+                self.agentic_p_workset_broker.cancel_unstarted(
+                    request.snapshot_id,
+                    owner=workset_owner,
+                )
 
     def _agentic_poll_early_direct_receives_once(
         self, now: Optional[float] = None
@@ -3281,9 +3653,7 @@ class Scheduler(
         if snapshot_store is None:
             return
 
-        direct_timeout = max(
-            0.1, envs.SGLANG_AGENTIC_KV_DIRECT_HANDSHAKE_TIMEOUT.get()
-        )
+        direct_timeout = max(0.1, envs.SGLANG_AGENTIC_KV_DIRECT_HANDSHAKE_TIMEOUT.get())
         bind_timeout = max(
             direct_timeout,
             envs.SGLANG_AGENTIC_KV_READY_TIMEOUT.get(),
@@ -3309,15 +3679,22 @@ class Scheduler(
         # receivers without a batch API retain their original behavior.
         batched_groups = {}
         for snapshot_id, entry in receive_entries:
-            if (
-                entry.completed_at is not None
-                or entry.transport_poll in {KVPoll.Success, KVPoll.Failed}
-            ):
+            if entry.completed_at is not None or entry.transport_poll in {
+                KVPoll.Success,
+                KVPoll.Failed,
+            }:
                 continue
-            poll_many = getattr(type(entry.receiver), "poll_many", None)
+            poll_many = getattr(
+                type(entry.receiver),
+                "poll_many_agentic",
+                getattr(type(entry.receiver), "poll_many", None),
+            )
             if not callable(poll_many):
                 continue
-            group_key = (type(entry.receiver), id(getattr(entry.receiver, "kv_mgr", None)))
+            group_key = (
+                type(entry.receiver),
+                id(getattr(entry.receiver, "kv_mgr", None)),
+            )
             batched_groups.setdefault(group_key, []).append(
                 (snapshot_id, entry, poll_many)
             )
@@ -3345,7 +3722,10 @@ class Scheduler(
                     "Early Direct batch poll failed for %d receivers",
                     len(grouped_entries),
                 )
-                polls = [KVPoll.Failed] * len(grouped_entries)
+                # A control-plane exception is not a DMA completion fence.
+                # Retain and retry every receiver instead of reusing pages
+                # that a remote WRITE may still target.
+                polls = [KVPoll.WaitingForInput] * len(grouped_entries)
             finally:
                 if hasattr(direct_requested, "clear"):
                     direct_requested.clear()
@@ -3399,14 +3779,6 @@ class Scheduler(
                             reason="request_bind_timeout",
                         )
                 continue
-            if (
-                self.tp_size > 1
-                and snapshot_id in self.agentic_tp_direct_local_failed
-            ):
-                # The owner scheduler will apply the group abort.  Keeping
-                # the entry intact preserves its page ownership until both TP
-                # ranks reach the same safe boundary.
-                continue
             try:
                 poll = entry.transport_poll
                 if poll not in {KVPoll.Success, KVPoll.Failed}:
@@ -3417,7 +3789,10 @@ class Scheduler(
                     if batched is not None and batched[0] is entry:
                         poll = batched[1]
                     else:
-                        poll = entry.receiver.poll()
+                        poll_agentic = getattr(
+                            entry.receiver, "poll_agentic", entry.receiver.poll
+                        )
+                        poll = poll_agentic()
                     with poll_lock:
                         if (
                             self.agentic_early_direct_receives.get(snapshot_id)
@@ -3426,18 +3801,34 @@ class Scheduler(
                             continue
                         entry.transport_poll = poll
             except Exception:
-                logger.exception(
-                    "Early Direct D->P receive failed for %s", snapshot_id
-                )
-                poll = KVPoll.Failed
-            if (
-                poll not in {KVPoll.Success, KVPoll.Failed}
-                and now - entry.started_at >= direct_timeout
-            ):
-                poll = KVPoll.Failed
-                with poll_lock:
-                    entry.transport_poll = poll
+                logger.exception("Early Direct D->P receive failed for %s", snapshot_id)
+                # Retrying is safe; treating a Python/NIXL polling exception
+                # as terminal is not, because the remote WRITE may continue.
+                poll = KVPoll.WaitingForInput
             if poll in {KVPoll.Success, KVPoll.Failed}:
+                if entry.workset_lease is not None and not entry.io_quiesced:
+                    if entry.io_attempt is None or not (
+                        self.agentic_p_workset_broker.mark_io_quiesced(
+                            snapshot_id,
+                            entry.workset_lease,
+                            entry.io_attempt,
+                        )
+                    ):
+                        # A terminal notification without the matching
+                        # attempt token cannot authorize page reuse or bind.
+                        entry.abort_requested = True
+                        entry.abort_release_claim = True
+                        entry.abort_reason = "direct_io_attempt_mismatch"
+                        continue
+                    entry.io_quiesced = True
+                if entry.abort_requested:
+                    self._agentic_drop_early_direct_receive(
+                        entry,
+                        snapshot_store,
+                        release_claim=entry.abort_release_claim,
+                        reason=entry.abort_reason or "deferred_abort",
+                    )
+                    continue
                 if terminal_commits >= terminal_commit_budget:
                     continue
                 terminal_commits += 1
@@ -3514,9 +3905,7 @@ class Scheduler(
                     # ingress thread. The token digest is validated when the
                     # tokenized Req binds on the scheduler thread.
                     entry.receiver.clear()
-                    self._agentic_clear_direct_receiver(
-                        entry.receiver, entry.manifest
-                    )
+                    self._agentic_clear_direct_receiver(entry.receiver, entry.manifest)
                     completed_at = time.monotonic()
                     with poll_lock:
                         if (
@@ -3525,9 +3914,7 @@ class Scheduler(
                         ):
                             continue
                         entry.completed_at = completed_at
-                        self.agentic_early_direct_completion_queue.append(
-                            snapshot_id
-                        )
+                        self.agentic_early_direct_completion_queue.append(snapshot_id)
                     logger.info(
                         "AgenticKV early_direct_complete snapshot=%s tokens=%d "
                         "transfer_ms=%.3f",
@@ -3593,11 +3980,13 @@ class Scheduler(
         with poll_lock:
             active = tuple(self.agentic_tp_direct_admission_active.items())
         for snapshot_id, active_item in active:
-            request, arrived_at, prefill_domain, _ = active_item
+            request, arrived_at, prefill_domain, _ = active_item[:4]
+            workset_lease = active_item[4]
             receipt = mailbox.receipt(snapshot_id)
             if receipt is None:
                 continue
             receipt = int(receipt)
+            entry = self.agentic_early_direct_receives.get(snapshot_id)
             if receipt < 0:
                 # A peer can fail after this rank has already inserted and
                 # pinned its received pages in Radix.  The background worker
@@ -3605,19 +3994,22 @@ class Scheduler(
                 # branch still references them.  The next native TP control
                 # boundary applies one ordered rollback+drop on every rank.
                 self.agentic_tp_direct_local_failed.add(snapshot_id)
+                self.agentic_p_workset_broker.request_release(
+                    snapshot_id,
+                    workset_lease,
+                    io_attempt=(
+                        None if entry is None else getattr(entry, "io_attempt", None)
+                    ),
+                )
                 continue
             if receipt >= 3:
-                entry = self.agentic_early_direct_receives.get(snapshot_id)
                 if entry is not None:
                     entry.group_committed = True
                 continue
             start_timeout = max(
                 0.1, envs.SGLANG_AGENTIC_KV_DIRECT_HANDSHAKE_TIMEOUT.get()
             )
-            if (
-                self.tp_rank == 0
-                and time.time() - arrived_at >= start_timeout
-            ):
+            if self.tp_rank == 0 and time.time() - arrived_at >= start_timeout:
                 # A worker may have completed its last local DMA immediately
                 # before this timeout observation.  The rank files are the
                 # physical truth; never roll back a fully received group just
@@ -3703,6 +4095,20 @@ class Scheduler(
                     expected_claim_id,
                 )
         self.agentic_tp_direct_local_failed.add(snapshot_id)
+        if active_item[4] is not None:
+            entry = self.agentic_early_direct_receives.get(snapshot_id)
+            self.agentic_p_workset_broker.request_release(
+                snapshot_id,
+                active_item[4],
+                io_attempt=(
+                    None if entry is None else getattr(entry, "io_attempt", None)
+                ),
+            )
+        else:
+            self.agentic_p_workset_broker.cancel_unstarted(
+                snapshot_id,
+                owner=AgenticPWorksetLeaseBroker.direct_owner(snapshot_id),
+            )
         mailbox.publish_local_progress(snapshot_id, -1)
         mailbox.publish_receipt(snapshot_id, -1)
         logger.warning(
@@ -3736,9 +4142,7 @@ class Scheduler(
                 if snapshot_id not in self.agentic_tp_direct_admission_active:
                     continue
                 entry = receives.get(snapshot_id)
-                if snapshot_id in getattr(
-                    self, "agentic_tp_direct_local_failed", ()
-                ):
+                if snapshot_id in getattr(self, "agentic_tp_direct_local_failed", ()):
                     mailbox.publish_local_progress(snapshot_id, -1)
                 elif snapshot_id in getattr(
                     self, "agentic_tp_direct_local_admitted", ()
@@ -3854,15 +4258,8 @@ class Scheduler(
             if entry.prepared_req is req:
                 return True
 
-        if entry.device_indices is None:
-            credit_pool = getattr(self, "agentic_direct_credit_pool", None)
-            if credit_pool is None or entry.credit_allocation is None:
-                raise RuntimeError("completed Direct receive lost its page credit")
-            # Keep a stable view of the received reserve pages while Radix
-            # takes request-generation ownership.
-            entry.device_indices = credit_pool.device_view(
-                entry.credit_allocation
-            ).clone()
+        if entry.device_indices is None or entry.workset_lease is None:
+            raise RuntimeError("completed Direct receive lost its workset lease")
 
         # The independent ingress worker deliberately avoids launching GPU
         # diagnostics.  Run the opt-in exact byte digest here, on the
@@ -3900,15 +4297,39 @@ class Scheduler(
             req._agentic_kv_gate_complete = True
             req._agentic_kv_fallback = "early_direct_token_digest_mismatch"
             return False
+        if len(req.origin_input_ids) > entry.workset_lease.prompt_tokens:
+            if tp_size > 1:
+                return self._agentic_fail_tp_direct_bind(
+                    entry, req, reason="workset_marker_underestimated"
+                )
+            self._agentic_drop_early_direct_receive(
+                entry,
+                self._agentic_snapshot_store(),
+                release_claim=False,
+                reason="workset_marker_underestimated",
+            )
+            req._agentic_kv_gate_complete = True
+            req._agentic_kv_fallback = "workset_marker_underestimated"
+            return False
 
+        if not self.agentic_p_workset_broker.begin_bind(
+            request.snapshot_id, entry.workset_lease
+        ):
+            self._agentic_drop_early_direct_receive(
+                entry,
+                self._agentic_snapshot_store(),
+                release_claim=False,
+                reason="workset_ownership_lost",
+            )
+            req._agentic_kv_gate_complete = True
+            req._agentic_kv_fallback = "early_direct_workset_ownership_lost"
+            return False
+
+        # Record ownership before the first Radix mutation so every exception
+        # path can remove the exact request-generation branch.
         if tp_size > 1:
-            # Record ownership before the first Radix mutation so every
-            # exception path can remove the exact request-generation branch.
             entry.prepared_req = req
-            req._agentic_direct_parent_token_count = len(parent_tokens)
-            if entry.credit_allocation is not None:
-                req._agentic_direct_credit_pool = self.agentic_direct_credit_pool
-                req._agentic_direct_credit_allocation = entry.credit_allocation
+        req._agentic_direct_parent_token_count = len(parent_tokens)
         try:
             result = self.tree_cache.insert(
                 InsertParams(
@@ -3918,9 +4339,12 @@ class Scheduler(
                 )
             )
         except Exception:
-            logger.exception(
-                "Failed to bind early Direct KV for %s", req.rid
+            self.agentic_p_workset_broker.abort_bind(
+                request.snapshot_id,
+                entry.workset_lease,
+                parent_bound=False,
             )
+            logger.exception("Failed to bind early Direct KV for %s", req.rid)
             if tp_size > 1:
                 return self._agentic_fail_tp_direct_bind(
                     entry,
@@ -3936,6 +4360,9 @@ class Scheduler(
             req._agentic_kv_gate_complete = True
             req._agentic_kv_fallback = "early_direct_radix_insert_failed"
             return False
+        self.agentic_p_workset_broker.commit_parent_bound(
+            request.snapshot_id, entry.workset_lease
+        )
         # insert() makes the restored parent visible to the Radix LRU.  Pin the
         # exact request-generation before returning to the queue.  Native
         # Prefill acquires its ordinary request lock first and only then drops
@@ -3964,14 +4391,34 @@ class Scheduler(
                 admit=tp_size == 1,
             )
         except Exception:
-            if tp_size <= 1:
-                raise
-            logger.exception("Failed to prepare TP Direct bind for %s", req.rid)
-            return self._agentic_fail_tp_direct_bind(
+            logger.exception("Failed to prepare Direct bind for %s", req.rid)
+            if tp_size > 1:
+                return self._agentic_fail_tp_direct_bind(
+                    entry,
+                    req,
+                    reason="radix_prepare_failed",
+                )
+            release = getattr(self.tree_cache, "release_agentic_request_cache", None)
+            if release is not None:
+                release(
+                    req,
+                    committed_len=len(parent_tokens),
+                    _defer_if_blocked=False,
+                )
+            self.agentic_p_workset_broker.abort_bind(
+                request.snapshot_id,
+                entry.workset_lease,
+                parent_bound=True,
+            )
+            self._agentic_drop_early_direct_receive(
                 entry,
-                req,
+                self._agentic_snapshot_store(),
+                release_claim=False,
                 reason="radix_prepare_failed",
             )
+            req._agentic_kv_gate_complete = True
+            req._agentic_kv_fallback = "early_direct_radix_prepare_failed"
+            return False
 
     def _agentic_finalize_early_direct_bind(
         self,
@@ -3987,56 +4434,21 @@ class Scheduler(
         """Commit one prepared Direct shard after every TP rank is ready."""
 
         if existing_tokens:
-            if entry.credit_allocation is not None:
-                # A trajectory-unique extra_key normally makes this zero. Keep
-                # duplicate handling correct without leaking reserve pages.
-                getattr(self, "agentic_direct_credit_pool").reclaim_node_indices(
-                    entry.device_indices[:existing_tokens],
-                    self.token_to_kv_pool_allocator,
-                )
-            else:
-                self.token_to_kv_pool_allocator.free(
-                    entry.device_indices[:existing_tokens]
-                )
-        promoted = False
-        if (
-            entry.credit_allocation is not None
-            and existing_tokens == 0
-            and entry.credit_allocation.allocated_tokens
-            == entry.credit_allocation.token_count
-        ):
-            replacement = self.token_to_kv_pool_allocator.alloc(
-                entry.credit_allocation.allocated_tokens
+            # A trajectory-unique extra_key normally makes this zero.  Keep
+            # duplicate-prefix handling correct with ordinary allocator pages.
+            self.token_to_kv_pool_allocator.free(entry.device_indices[:existing_tokens])
+        if admit:
+            self.agentic_p_workset_broker.handoff_to_req(
+                request.snapshot_id, req, entry.workset_lease
             )
-            if replacement is not None:
-                try:
-                    self.agentic_direct_credit_pool.promote_to_ordinary(
-                        entry.credit_allocation, replacement
-                    )
-                    promoted = True
-                except Exception:
-                    self.token_to_kv_pool_allocator.free(replacement)
-                    logger.exception(
-                        "Failed to replenish Direct reserve for %s", req.rid
-                    )
-        if entry.credit_allocation is not None and not promoted:
-            # Near full occupancy there may be no ordinary page available to
-            # replenish the transit reserve. Keep these pages reserve-owned
-            # until the request's P->D handoff releases its Radix branch.
-            self.agentic_direct_credit_pool.mark_bound(entry.credit_allocation)
-            req._agentic_direct_credit_pool = self.agentic_direct_credit_pool
-            req._agentic_direct_credit_allocation = entry.credit_allocation
-
-        credit_pool = getattr(self, "agentic_direct_credit_pool", None)
+            entry.workset_lease = None
         logger.info(
             "AgenticKV early_direct_bind snapshot=%s tokens=%d existing_tokens=%d "
-            "arrival_to_bind_ms=%.3f promoted=%s reserve_free_tokens=%d req=%s",
+            "arrival_to_bind_ms=%.3f workset_committed=true req=%s",
             request.snapshot_id,
             entry.manifest.token_count,
             existing_tokens,
             max(0.0, (time.time() - entry.arrived_at) * 1000.0),
-            promoted,
-            credit_pool.free_tokens if credit_pool is not None else 0,
             req.rid,
         )
         if not admit:
@@ -4069,8 +4481,15 @@ class Scheduler(
     ) -> bool:
         """Expose one already group-committed Direct parent to Prefill."""
 
+        if getattr(entry, "workset_lease", None) is not None:
+            self.agentic_p_workset_broker.handoff_to_req(
+                request.snapshot_id, req, entry.workset_lease
+            )
+            entry.workset_lease = None
+
         with getattr(self, "agentic_early_direct_poll_lock", nullcontext()):
-            self.agentic_early_direct_receives.pop(request.snapshot_id, None)
+            if self.agentic_early_direct_receives.get(request.snapshot_id) is entry:
+                self.agentic_early_direct_receives.pop(request.snapshot_id, None)
             self.agentic_early_direct_terminal[request.snapshot_id] = time.monotonic()
         req._agentic_kv_gate_complete = True
         req._agentic_kv_direct_hit_tokens = entry.manifest.token_count
@@ -4096,15 +4515,19 @@ class Scheduler(
         if pin is not None:
             self.tree_cache.dec_lock_ref(pin)
             del req._agentic_direct_parent_pin_node
-        committed_len = int(
-            getattr(req, "_agentic_direct_parent_token_count", 0)
-        )
+        committed_len = int(getattr(req, "_agentic_direct_parent_token_count", 0))
         release = getattr(self.tree_cache, "release_agentic_request_cache", None)
         if committed_len and release is not None:
             release(
                 req,
                 committed_len=committed_len,
                 _defer_if_blocked=False,
+            )
+        if getattr(entry, "workset_lease", None) is not None:
+            self.agentic_p_workset_broker.abort_bind(
+                entry.request.snapshot_id,
+                entry.workset_lease,
+                parent_bound=True,
             )
         entry.prepared_req = None
 
@@ -4137,9 +4560,7 @@ class Scheduler(
         )
         return True
 
-    def _agentic_start_direct_load(
-        self, req: Req, snapshot_store, manifest
-    ) -> bool:
+    def _agentic_start_direct_load(self, req: Req, snapshot_store, manifest) -> bool:
         runtime = getattr(self, "agentic_direct_runtime", None)
         if runtime is None or getattr(self.tree_cache, "is_eagle", False):
             return False
@@ -4151,8 +4572,7 @@ class Scheduler(
             req._agentic_direct_disabled = True
             return False
         if manifest.tp_size != self.tp_size or (
-            manifest.kv_layout_hash
-            and manifest.kv_layout_hash != runtime.layout_hash
+            manifest.kv_layout_hash and manifest.kv_layout_hash != runtime.layout_hash
         ):
             req._agentic_kv_fallback = "direct_tp_layout_mismatch"
             logger.error(
@@ -4173,45 +4593,33 @@ class Scheduler(
             req._agentic_kv_fallback = "direct_token_digest_mismatch"
             return False
 
-        # A direct snapshot is inserted into the P Radix cache before its
-        # request is scheduled.  Limit this staging population by *physical*
-        # HBM occupancy; otherwise many simultaneous fast tools can fill P HBM
-        # with evictable snapshots and make direct admission bursty or fail.
-        try:
-            direct_high = float(
-                os.environ.get(
-                    "SGLANG_PD_P_READY_DIRECT_HBM_HIGH_WATERMARK", "0.85"
-                )
-            )
-        except ValueError:
-            logger.exception("Invalid P-ready direct HBM watermark")
-            raise
-        if not (0.0 < direct_high < 1.0):
-            raise ValueError(
-                "SGLANG_PD_P_READY_DIRECT_HBM_HIGH_WATERMARK must be in (0, 1), "
-                f"got {direct_high}"
-            )
-        physical_used = (
-            self.max_total_num_tokens
-            - self.token_to_kv_pool_allocator.available_size()
+        workset_owner = AgenticPWorksetLeaseBroker.direct_owner(manifest.snapshot_id)
+        self.agentic_p_workset_broker.request(
+            manifest.snapshot_id,
+            manifest.token_count,
+            len(req.origin_input_ids),
+            owner=workset_owner,
         )
-        if physical_used + manifest.token_count > int(
-            self.max_total_num_tokens * direct_high
-        ):
-            # Keep DIRECT_READY unclaimed.  This request remains metadata-only
-            # and retries after P->D releases space; D retains the source KV.
-            return True
-
-        device_indices = self.token_to_kv_pool_allocator.alloc(
-            manifest.token_count
+        workset_lease = self.agentic_p_workset_broker.get(
+            manifest.snapshot_id, owner=workset_owner
         )
-        if device_indices is None:
-            # The design requires a successful P-HBM reservation before D is
-            # asked to transfer.  Leave DIRECT_READY untouched so D can take
-            # the normal timeout-to-Mooncake path.
+        if workset_lease is None:
+            # The scheduler services the physical intent on its next safe
+            # boundary.  D retains source KV and may independently time out to
+            # Slow if a complete workset cannot be granted in time.
             return True
+        device_indices = workset_lease.parent_indices[: manifest.token_count]
 
         claim_id = f"direct-p:{req.rid}"
+        if not self.agentic_p_workset_broker.begin_io_attempt(
+            manifest.snapshot_id, workset_lease, claim_id
+        ):
+            # Another concrete Direct attempt owns this destination.  This
+            # compatibility path must not claim lifecycle or recycle pages
+            # belonging to that attempt.
+            return True
+        receiver = None
+        claimed = None
         try:
             claimed = snapshot_store.claim_direct(manifest.request, claim_id)
             if not runtime.manager.try_ensure_parallel_info(
@@ -4226,12 +4634,60 @@ class Scheduler(
             receiver.init(prefill_dp_rank=0)
             if receiver.poll() == KVPoll.Failed:
                 raise SnapshotLifecycleError("reverse receiver init failed")
-            page_indices = kv_to_page_indices(
-                device_indices.cpu().numpy(), self.server_args.page_size
+            self.agentic_p_workset_broker.mark_io_inflight(
+                manifest.snapshot_id, workset_lease, claim_id
             )
-            receiver.send_metadata(page_indices, aux_index=0)
+            receiver.send_metadata(workset_lease.parent_page_indices, aux_index=0)
         except Exception as exc:
-            self.token_to_kv_pool_allocator.free(device_indices)
+            transport_may_write = bool(
+                receiver is not None
+                and getattr(receiver, "started_transfer", False)
+                and workset_lease.io_attempt == claim_id
+                and workset_lease.state in {"io_inflight", "release_pending"}
+            )
+            if transport_may_write:
+                self.agentic_p_workset_broker.request_release(
+                    manifest.snapshot_id,
+                    workset_lease,
+                    io_attempt=claim_id,
+                )
+                entry = AgenticEarlyDirectReceive(
+                    request=manifest.request,
+                    manifest=claimed if claimed is not None else manifest,
+                    claim_id=claim_id,
+                    receiver=receiver,
+                    device_indices=device_indices,
+                    started_at=time.monotonic(),
+                    arrived_at=time.time(),
+                    workset_lease=workset_lease,
+                    io_attempt=claim_id,
+                    abort_requested=True,
+                    abort_release_claim=True,
+                    abort_reason="request_bound_metadata_failed",
+                )
+                with getattr(self, "agentic_early_direct_poll_lock", nullcontext()):
+                    self.agentic_early_direct_receives[manifest.snapshot_id] = entry
+                req._agentic_direct_disabled = True
+                logger.exception(
+                    "Request-bound Direct metadata may be partially visible; "
+                    "quarantining workset snapshot=%s",
+                    manifest.snapshot_id,
+                )
+                return True
+            if (
+                workset_lease.state in {"io_inflight", "release_pending"}
+                and workset_lease.io_attempt == claim_id
+            ):
+                self.agentic_p_workset_broker.mark_io_quiesced(
+                    manifest.snapshot_id, workset_lease, claim_id
+                )
+            else:
+                self.agentic_p_workset_broker.cancel_io_attempt(
+                    manifest.snapshot_id, workset_lease, claim_id
+                )
+            self.agentic_p_workset_broker.request_release(
+                manifest.snapshot_id, workset_lease
+            )
             # The producer will cross the fast-tool threshold and publish a
             # complete Host snapshot.  Retrying a failed metadata transition
             # every scheduler pass only churns Mooncake and P HBM.
@@ -4245,9 +4701,7 @@ class Scheduler(
                 try:
                     snapshot_store.release_direct_claim(current, claim_id)
                 except Exception:
-                    logger.exception(
-                        "Failed to release direct claim for %s", req.rid
-                    )
+                    logger.exception("Failed to release direct claim for %s", req.rid)
             if isinstance(exc, SnapshotNotReadyError):
                 # This is normal contention at the fast-window boundary: D
                 # acquired the fallback claim first or the offer already
@@ -4263,8 +4717,10 @@ class Scheduler(
 
         req._agentic_direct_receiver = receiver
         req._agentic_direct_indices = device_indices
+        req._agentic_direct_workset_lease = workset_lease
         req._agentic_direct_manifest = claimed
         req._agentic_direct_claim_id = claim_id
+        req._agentic_direct_io_attempt = claim_id
         req._agentic_kv_snapshot_store = snapshot_store
         req._agentic_direct_started_at = time.monotonic()
         logger.info(
@@ -4285,6 +4741,11 @@ class Scheduler(
             current = snapshot_store.load(manifest.request, require_ready=False)
             if current is None or current.state is not SnapshotState.CONSUMED:
                 return True
+            self.agentic_p_workset_broker.handoff_to_req(
+                manifest.snapshot_id,
+                req,
+                req._agentic_direct_workset_lease,
+            )
             req._agentic_kv_gate_complete = True
             req._agentic_kv_direct_hit_tokens = manifest.token_count
             for name in (
@@ -4292,44 +4753,20 @@ class Scheduler(
                 "_agentic_direct_indices",
                 "_agentic_direct_manifest",
                 "_agentic_direct_claim_id",
+                "_agentic_direct_io_attempt",
                 "_agentic_direct_started_at",
                 "_agentic_direct_rank_received",
+                "_agentic_direct_workset_lease",
             ):
                 if hasattr(req, name):
                     delattr(req, name)
             return False
-        # D may cross the fast-tool threshold while P is claiming the direct
-        # offer.  In that race D can commit the same snapshot to the shared
-        # Host arena while this reverse-NIXL receiver waits forever for a
-        # sender that no longer exists.  Bound the receiver lifetime and let
-        # the next scheduler pass claim the complete Host snapshot instead.
-        direct_started_at = getattr(
-            req, "_agentic_direct_started_at", time.monotonic()
-        )
-        direct_timeout = max(
-            0.1, envs.SGLANG_AGENTIC_KV_DIRECT_HANDSHAKE_TIMEOUT.get()
-        )
         try:
-            poll = receiver.poll()
+            poll_agentic = getattr(receiver, "poll_agentic", receiver.poll)
+            poll = poll_agentic()
         except Exception:
             logger.exception("Direct D->P receive failed for %s", req.rid)
-            poll = KVPoll.Failed
-        if (
-            poll not in {KVPoll.Success, KVPoll.Failed}
-            and time.monotonic() - direct_started_at >= direct_timeout
-        ):
-            logger.warning(
-                "AgenticKV direct_load_timeout snapshot=%s elapsed_s=%.6f; "
-                "retrying via Host snapshot",
-                req._agentic_direct_manifest.snapshot_id,
-                time.monotonic() - direct_started_at,
-            )
-            # Do not repeatedly reclaim the same DIRECT_READY generation
-            # while D's complete Host snapshot is queued behind other D2H
-            # copies.  The Host staging gate above will consume it as soon as
-            # HOST_READY becomes visible.
-            req._agentic_direct_disabled = True
-            poll = KVPoll.Failed
+            poll = KVPoll.WaitingForInput
         if poll not in {KVPoll.Success, KVPoll.Failed}:
             return True
 
@@ -4337,11 +4774,21 @@ class Scheduler(
         manifest = req._agentic_direct_manifest
         claim_id = req._agentic_direct_claim_id
         device_indices = req._agentic_direct_indices
+        io_attempt = req._agentic_direct_io_attempt
+        if not self.agentic_p_workset_broker.mark_io_quiesced(
+            manifest.snapshot_id,
+            req._agentic_direct_workset_lease,
+            io_attempt,
+        ):
+            # A terminal callback carrying the wrong attempt token has no
+            # authority over this destination.  Abort cleanup quarantines the
+            # concrete receiver instead of binding or recycling its pages.
+            req._agentic_kv_fallback = "direct_io_attempt_mismatch"
+            self._agentic_abort_cleanup(req)
+            return True
         if poll == KVPoll.Success:
             debug_settle = float(
-                os.getenv(
-                    "SGLANG_AGENTIC_KV_DEBUG_RECEIVE_SETTLE_SECONDS", "0"
-                )
+                os.getenv("SGLANG_AGENTIC_KV_DEBUG_RECEIVE_SETTLE_SECONDS", "0")
             )
             if debug_settle > 0:
                 time.sleep(debug_settle)
@@ -4356,6 +4803,17 @@ class Scheduler(
                     restored_digest,
                 )
             keys = req.origin_input_ids[: manifest.token_count]
+            workset_lease = req._agentic_direct_workset_lease
+            if not self.agentic_p_workset_broker.begin_bind(
+                manifest.snapshot_id, workset_lease
+            ):
+                receiver.clear()
+                self._agentic_clear_direct_receiver(receiver, manifest)
+                req._agentic_kv_gate_complete = True
+                req._agentic_kv_fallback = "direct_workset_ownership_lost"
+                return False
+            inserted = False
+            req._agentic_direct_parent_token_count = len(keys)
             try:
                 result = self.tree_cache.insert(
                     InsertParams(
@@ -4364,11 +4822,17 @@ class Scheduler(
                         priority=getattr(req, "priority", 0) or 0,
                     )
                 )
-            except Exception:
-                self.token_to_kv_pool_allocator.free(device_indices)
-                current = snapshot_store.load(
-                    manifest.request, require_ready=False
+                inserted = True
+                self.agentic_p_workset_broker.commit_parent_bound(
+                    manifest.snapshot_id, workset_lease
                 )
+            except Exception:
+                self.agentic_p_workset_broker.abort_bind(
+                    manifest.snapshot_id,
+                    workset_lease,
+                    parent_bound=inserted,
+                )
+                current = snapshot_store.load(manifest.request, require_ready=False)
                 if (
                     current is not None
                     and current.state is SnapshotState.DIRECT_LOADING
@@ -4388,7 +4852,9 @@ class Scheduler(
                     "_agentic_direct_indices",
                     "_agentic_direct_manifest",
                     "_agentic_direct_claim_id",
+                    "_agentic_direct_io_attempt",
                     "_agentic_direct_started_at",
+                    "_agentic_direct_workset_lease",
                 ):
                     if hasattr(req, name):
                         delattr(req, name)
@@ -4407,16 +4873,38 @@ class Scheduler(
                 result.prefix_len,
                 req.extra_key,
             )
-            immediate_match = self.tree_cache.match_prefix(
-                MatchPrefixParams(key=RadixKey(keys, req.extra_key), req=req)
-            )
-            if len(immediate_match.device_indices) != len(keys):
-                raise RuntimeError(
-                    "Direct parent disappeared before request protection"
+            try:
+                immediate_match = self.tree_cache.match_prefix(
+                    MatchPrefixParams(key=RadixKey(keys, req.extra_key), req=req)
                 )
-            self.tree_cache.inc_lock_ref(immediate_match.last_device_node)
-            req._agentic_direct_parent_pin_node = immediate_match.last_device_node
-            req._agentic_direct_parent_token_count = len(keys)
+                if len(immediate_match.device_indices) != len(keys):
+                    raise RuntimeError(
+                        "Direct parent disappeared before request protection"
+                    )
+                self.tree_cache.inc_lock_ref(immediate_match.last_device_node)
+                req._agentic_direct_parent_pin_node = immediate_match.last_device_node
+            except Exception:
+                if inserted:
+                    release = getattr(
+                        self.tree_cache, "release_agentic_request_cache", None
+                    )
+                    if release is not None:
+                        release(
+                            req,
+                            committed_len=len(keys),
+                            _defer_if_blocked=False,
+                        )
+                self.agentic_p_workset_broker.abort_bind(
+                    manifest.snapshot_id,
+                    workset_lease,
+                    parent_bound=True,
+                )
+                receiver.clear()
+                self._agentic_clear_direct_receiver(receiver, manifest)
+                req._agentic_kv_gate_complete = True
+                req._agentic_kv_fallback = "direct_radix_prepare_failed"
+                logger.exception("Failed to protect direct KV for %s", req.rid)
+                return False
             logger.info(
                 "AgenticKV direct_radix_verify snapshot=%s device_tokens=%d "
                 "host_tokens=%d",
@@ -4426,10 +4914,7 @@ class Scheduler(
             )
             current = snapshot_store.load(manifest.request, require_ready=False)
             completed = current
-            if (
-                current is not None
-                and current.state is SnapshotState.DIRECT_LOADING
-            ):
+            if current is not None and current.state is SnapshotState.DIRECT_LOADING:
                 try:
                     if self.tp_size != 1:
                         raise RuntimeError(
@@ -4489,18 +4974,28 @@ class Scheduler(
                 return True
             req._agentic_kv_gate_complete = True
             req._agentic_kv_direct_hit_tokens = manifest.token_count
+            self.agentic_p_workset_broker.handoff_to_req(
+                manifest.snapshot_id,
+                req,
+                req._agentic_direct_workset_lease,
+            )
             for name in (
                 "_agentic_direct_receiver",
                 "_agentic_direct_indices",
                 "_agentic_direct_manifest",
                 "_agentic_direct_claim_id",
+                "_agentic_direct_io_attempt",
                 "_agentic_direct_started_at",
+                "_agentic_direct_workset_lease",
             ):
                 if hasattr(req, name):
                     delattr(req, name)
             return False
 
-        self.token_to_kv_pool_allocator.free(device_indices)
+        self.agentic_p_workset_broker.request_release(
+            manifest.snapshot_id,
+            getattr(req, "_agentic_direct_workset_lease", None),
+        )
         current = snapshot_store.load(manifest.request, require_ready=False)
         if (
             current is not None
@@ -4510,7 +5005,9 @@ class Scheduler(
             try:
                 snapshot_store.release_direct_claim(current, claim_id)
             except Exception:
-                logger.exception("Failed to release failed direct claim for %s", req.rid)
+                logger.exception(
+                    "Failed to release failed direct claim for %s", req.rid
+                )
         receiver.clear()
         self._agentic_clear_direct_receiver(receiver, manifest)
         for name in (
@@ -4518,7 +5015,9 @@ class Scheduler(
             "_agentic_direct_indices",
             "_agentic_direct_manifest",
             "_agentic_direct_claim_id",
+            "_agentic_direct_io_attempt",
             "_agentic_direct_started_at",
+            "_agentic_direct_workset_lease",
         ):
             if hasattr(req, name):
                 delattr(req, name)
@@ -4581,9 +5080,7 @@ class Scheduler(
         # that allocator-owned KV before consulting Host/Mooncake state (the
         # Direct manifest is intentionally CONSUMED as soon as D may release
         # its source pages).
-        early_direct = self._agentic_bind_early_direct_receive(
-            req, metadata.parent
-        )
+        early_direct = self._agentic_bind_early_direct_receive(req, metadata.parent)
         if early_direct is not None:
             return early_direct
         if (
@@ -4607,9 +5104,18 @@ class Scheduler(
         host_staging = getattr(self, "agentic_host_staging_manager", None)
         if host_staging is not None:
             if getattr(self, "tp_size", 1) > 1:
-                host_action = getattr(
-                    self, "_agentic_tp_host_actions", {}
-                ).get(metadata.parent.snapshot_id)
+                host_action = getattr(self, "_agentic_tp_host_actions", {}).get(
+                    metadata.parent.snapshot_id
+                )
+                if host_action == "abort":
+                    host_staging.abort_request(req.rid, metadata.parent)
+                    host_staging.rollback_bound_parent(req, metadata.parent)
+                    if hasattr(req, "_agentic_tp_host_failed"):
+                        delattr(req, "_agentic_tp_host_failed")
+                    req._agentic_kv_gate_complete = True
+                    req._agentic_kv_fallback = "tp_shared_host_group_failed"
+                    self.agentic_tp_host_local_admitted.add(metadata.parent.snapshot_id)
+                    return False
                 allow_prepare_io = bool(
                     allow_start_io
                     and host_action is not None
@@ -4621,8 +5127,7 @@ class Scheduler(
                     and host_action in {"start", "bind", "commit"}
                 )
                 allow_bind_io = bool(
-                    host_action is not None
-                    and host_action in {"bind", "commit"}
+                    host_action is not None and host_action in {"bind", "commit"}
                 )
             else:
                 allow_prepare_io = allow_start_io
@@ -4637,9 +5142,7 @@ class Scheduler(
             if host_gate is not None:
                 req._agentic_kv_queue_class = "slow"
                 if host_gate is False and getattr(self, "tp_size", 1) > 1:
-                    self.agentic_tp_host_local_admitted.add(
-                        metadata.parent.snapshot_id
-                    )
+                    self.agentic_tp_host_local_admitted.add(metadata.parent.snapshot_id)
                 # A shared-Host ledger entry can remain HOST_WRITING,
                 # SPILLING, etc. after its producer fails to publish the final
                 # ready state.  gate_request() intentionally reports such an
@@ -4719,9 +5222,7 @@ class Scheduler(
                     return True
             if not allow_start_io:
                 return True
-            started = self._agentic_start_direct_load(
-                req, snapshot_store, manifest
-            )
+            started = self._agentic_start_direct_load(req, snapshot_store, manifest)
             if started:
                 return True
             req._agentic_kv_gate_complete = True
@@ -4736,17 +5237,14 @@ class Scheduler(
         }
         if (
             stale_seconds > 0
-            and
-            manifest is not None
+            and manifest is not None
             and manifest.state in recoverable_states
             and time.time() - manifest.updated_at >= stale_seconds
         ):
             try:
                 result = snapshot_store.recover_stale(manifest)
                 if not result.removed:
-                    retry = getattr(
-                        self.tree_cache, "queue_agentic_delete_retry", None
-                    )
+                    retry = getattr(self.tree_cache, "queue_agentic_delete_retry", None)
                     if retry is not None:
                         retry(snapshot_store, manifest.request)
             except Exception:
@@ -4898,9 +5396,8 @@ class Scheduler(
         """Bind completed Direct ingress independently of Prefill admission.
 
         The request may remain in the priority queue until a later admission
-        batch.  Binding now moves its received pages out of the 40k transit
-        reserve immediately, so that compute throttling cannot exhaust Direct
-        receive credit.
+        batch. Binding now converts the full physical workset lease into a
+        protected parent plus immediately usable Prefill suffix capacity.
         """
 
         receives = getattr(self, "agentic_early_direct_receives", None)
@@ -4933,9 +5430,7 @@ class Scheduler(
         for snapshot_id in completed:
             waiter = waiting_by_parent.get(snapshot_id)
             if waiter is not None:
-                self._agentic_bind_early_direct_receive(
-                    *waiter, allow_tp_commit=False
-                )
+                self._agentic_bind_early_direct_receive(*waiter, allow_tp_commit=False)
             else:
                 # Transport progress is independent of tokenizer/scheduler
                 # progress.  In particular, a non-primary TP rank can finish
@@ -4944,14 +5439,10 @@ class Scheduler(
                 # pending until the matching request is actually bindable;
                 # dropping it here permanently strands that rank's Direct
                 # reserve allocation.
-                with getattr(
-                    self, "agentic_early_direct_poll_lock", nullcontext()
-                ):
+                with getattr(self, "agentic_early_direct_poll_lock", nullcontext()):
                     entry = self.agentic_early_direct_receives.get(snapshot_id)
                     if entry is not None and entry.completed_at is not None:
-                        self.agentic_early_direct_completion_queue.append(
-                            snapshot_id
-                        )
+                        self.agentic_early_direct_completion_queue.append(snapshot_id)
 
     _AGENTIC_TP_CONTROL_KEY = "__sglang_agentic_tp_admission_v1__"
 
@@ -4961,9 +5452,7 @@ class Scheduler(
         if not getattr(self, "agentic_tp_direct_command_visible", False):
             return
         active = getattr(self, "agentic_tp_direct_admission_active", {})
-        visible_order = list(
-            getattr(self, "agentic_tp_direct_visible_order", ())
-        )
+        visible_order = list(getattr(self, "agentic_tp_direct_visible_order", ()))
         if not visible_order:
             self.agentic_tp_direct_command_visible = False
             return
@@ -4979,9 +5468,11 @@ class Scheduler(
                 self, "agentic_tp_direct_local_failed", ()
             ):
                 local_status = -1
-            if request.snapshot_id in getattr(
-                self, "agentic_tp_direct_local_admitted", ()
-            ) and local_status >= 0:
+            if (
+                request.snapshot_id
+                in getattr(self, "agentic_tp_direct_local_admitted", ())
+                and local_status >= 0
+            ):
                 local_status = 5
             entry = getattr(self, "agentic_early_direct_receives", {}).get(
                 request.snapshot_id
@@ -5013,9 +5504,7 @@ class Scheduler(
 
         if not getattr(self, "agentic_tp_host_command_visible", False):
             return
-        active_requests = getattr(
-            self, "agentic_tp_host_active_requests", {}
-        )
+        active_requests = getattr(self, "agentic_tp_host_active_requests", {})
         visible = list(getattr(self, "_agentic_tp_host_actions", {}))
         if not visible:
             return
@@ -5038,6 +5527,9 @@ class Scheduler(
                 parent = metadata.parent if metadata is not None else None
                 if parent != request:
                     continue
+                if getattr(req, "_agentic_tp_host_failed", False):
+                    local_status = -1
+                    break
                 if getattr(req, "_agentic_host_rank_loaded", False):
                     local_status = max(local_status, 3)
                 if host_staging is not None and req.rid in host_staging.loads:
@@ -5047,7 +5539,7 @@ class Scheduler(
                         2 if load.get("io_complete") else 1,
                     )
                 if getattr(req, "_agentic_kv_gate_complete", False):
-                    local_status = 3
+                    local_status = max(local_status, 3)
                 break
             mailbox.publish_local(snapshot_id, local_status)
             if self.tp_rank == 0:
@@ -5064,6 +5556,8 @@ class Scheduler(
     def _agentic_tp_host_next_action(group_status: int) -> str:
         """Map the all-rank minimum status to one group-owned transition."""
 
+        if int(group_status) < 0:
+            return "abort"
         if int(group_status) >= 4:
             return "clear"
         if int(group_status) >= 3:
@@ -5108,14 +5602,15 @@ class Scheduler(
                     for entry in transfer_queue.queue
                 ]
             decode_transfer_statuses = []
+            decode_transfer_cancel_keys = []
             receiver_mailbox = self.agentic_tp_p2d_receiver_mailbox
             for rid, room in decode_transfer_keys:
                 key = request_generation_key(rid, room)
-                status = receiver_mailbox.group_status(key)
+                status, cancel_requested = receiver_mailbox.transfer_group_status(key)
+                if cancel_requested:
+                    decode_transfer_cancel_keys.append((rid, room))
                 logical_status = (
-                    int(KVPoll.Transferring)
-                    if status is None
-                    else int(status)
+                    int(KVPoll.Transferring) if status is None else int(status)
                 )
                 decode_transfer_statuses.append(logical_status)
                 if logical_status in (int(KVPoll.Success), int(KVPoll.Failed)):
@@ -5147,9 +5642,7 @@ class Scheduler(
                     0,
                     limit
                     - len(self.disagg_decode_transfer_queue.queue)
-                    - int(
-                        getattr(prealloc_queue, "_async_metadata_pending_count", 0)
-                    ),
+                    - int(getattr(prealloc_queue, "_async_metadata_pending_count", 0)),
                 )
                 for decode_req in prealloc_queue.queue:
                     if len(decode_admit_keys) >= available:
@@ -5175,9 +5668,7 @@ class Scheduler(
                             decode_req.req.rid,
                             decode_req.req.bootstrap_room,
                         )
-                        if admission_mailbox.group_status(key) != int(
-                            KVPoll.Success
-                        ):
+                        if admission_mailbox.group_status(key) != int(KVPoll.Success):
                             continue
                     decode_admit_keys.append(
                         (
@@ -5193,14 +5684,13 @@ class Scheduler(
                 "decode_admit_keys": decode_admit_keys,
                 "decode_transfer_keys": decode_transfer_keys,
                 "decode_transfer_statuses": decode_transfer_statuses,
+                "decode_transfer_cancel_keys": decode_transfer_cancel_keys,
                 "decode_transfer_rid": decode_transfer_rid,
                 "decode_transfer_room": decode_transfer_room,
                 "decode_agentic_commands": (
                     []
                     if offload_manager is None
-                    else getattr(
-                        offload_manager, "tp_candidate_commands", lambda: []
-                    )()
+                    else getattr(offload_manager, "tp_candidate_commands", lambda: [])()
                 ),
             }
 
@@ -5210,11 +5700,9 @@ class Scheduler(
         direct_commands = []
         direct_mailbox = getattr(self, "agentic_tp_direct_mailbox", None)
         for snapshot_id, active in tuple(active_direct.items()):
-            direct_request, direct_arrived_at, direct_domain, _ = active
+            direct_request, direct_arrived_at, direct_domain, _ = active[:4]
             receipt = (
-                None
-                if direct_mailbox is None
-                else direct_mailbox.receipt(snapshot_id)
+                None if direct_mailbox is None else direct_mailbox.receipt(snapshot_id)
             )
             entry = self.agentic_early_direct_receives.get(snapshot_id)
             if receipt is not None and int(receipt) < 0:
@@ -5264,8 +5752,7 @@ class Scheduler(
             # to different D engines; a single local head can be waiting for D0
             # while D0 is polling an older entry produced by another P.
             prefill_transfer_keys = [
-                (str(req.rid), int(req.bootstrap_room))
-                for req in prefill_inflight
+                (str(req.rid), int(req.bootstrap_room)) for req in prefill_inflight
             ]
         prefill_transfer_statuses = []
         prefill_submit_keys = []
@@ -5278,13 +5765,15 @@ class Scheduler(
         for index, (rid, room) in enumerate(prefill_transfer_keys):
             req = prefill_inflight[index]
             key = request_generation_key(rid, room)
-            sender_status = sender_mailbox.group_status(key)
+            raw_sender_status = sender_mailbox.group_status(key)
+            sender_status, _ = sender_mailbox.transfer_group_status(key)
             # Every TP rank has prepared an immutable local sender payload.
             # Only now may TP0 expose one logical P-ready marker to Router/D.
             # This ordering prevents a transient rank-local preparation delay
             # from permanently splitting the TP group.
             if (
-                sender_status is not None
+                raw_sender_status is not None
+                and raw_sender_status >= int(KVPoll.Bootstrapping)
                 and not getattr(req, "disagg_p_ready_notified", False)
             ):
                 self._publish_deferred_prefill_ready(req)
@@ -5318,8 +5807,7 @@ class Scheduler(
                 # polls or submits its shard.
                 logical_status = (
                     int(KVPoll.Transferring)
-                    if sender_status
-                    not in (int(KVPoll.Success), int(KVPoll.Failed))
+                    if sender_status not in (int(KVPoll.Success), int(KVPoll.Failed))
                     else int(sender_status)
                 )
             elif sender_status == int(KVPoll.Failed):
@@ -5343,7 +5831,7 @@ class Scheduler(
                 if (
                     not tp_p2d_background
                     and len(prefill_submit_keys) < submit_limit
-                    and sender_status == int(KVPoll.WaitingForInput)
+                    and raw_sender_status == int(KVPoll.WaitingForInput)
                     and not getattr(req, "disagg_p_ready_transfer_started", False)
                 ):
                     prefill_submit_keys.append((rid, room))
@@ -5389,9 +5877,7 @@ class Scheduler(
                     int(
                         os.getenv(
                             "SGLANG_AGENTIC_KV_TP_HOST_PIPELINE_DEPTH",
-                            os.getenv(
-                                "SGLANG_AGENTIC_KV_P_H2D_MAX_INFLIGHT", "1"
-                            ),
+                            os.getenv("SGLANG_AGENTIC_KV_P_H2D_MAX_INFLIGHT", "1"),
                         )
                     ),
                 )
@@ -5497,9 +5983,7 @@ class Scheduler(
             "host_generation": (
                 None if not host_commands else host_commands[0]["generation"]
             ),
-            "host_action": (
-                None if not host_commands else host_commands[0]["action"]
-            ),
+            "host_action": (None if not host_commands else host_commands[0]["action"]),
             "host_timeout_snapshot": host_timeout_snapshot,
             "direct_arrived_at": (
                 0.0 if not direct_commands else direct_commands[0]["arrived_at"]
@@ -5560,6 +6044,10 @@ class Scheduler(
                     control.get("decode_transfer_statuses", ()),
                 )
             }
+            transfer_queue = getattr(self, "disagg_decode_transfer_queue", None)
+            cancel_keys = control.get("decode_transfer_cancel_keys", ())
+            if transfer_queue is not None and cancel_keys:
+                transfer_queue.abort_agentic_host_transfers(cancel_keys)
             return ordinary
         direct_commands = control.get("direct_commands")
         if direct_commands is None:
@@ -5585,13 +6073,23 @@ class Scheduler(
         direct_poll_lock = getattr(
             self, "agentic_early_direct_poll_lock", nullcontext()
         )
+        direct_terminal = getattr(self, "agentic_early_direct_terminal", None)
+        if direct_terminal is None:
+            direct_terminal = {}
+            self.agentic_early_direct_terminal = direct_terminal
         for command in direct_commands:
             snapshot_id = str(command["snapshot"])
             direct_action = command.get("action")
             if direct_action in {"clear", "abort"}:
+                with direct_poll_lock:
+                    entry = self.agentic_early_direct_receives.get(snapshot_id)
+                    active_item = active_direct.get(snapshot_id)
+                    # This terminal marker closes the start-vs-abort race.  A
+                    # shard that has not begun observes it before claiming;
+                    # one already publishing DMA registers an aborting entry
+                    # and remains polled until its physical fence arrives.
+                    direct_terminal[snapshot_id] = time.monotonic()
                 if direct_action == "abort":
-                    with direct_poll_lock:
-                        entry = self.agentic_early_direct_receives.get(snapshot_id)
                     if entry is not None:
                         self._agentic_rollback_prepared_direct_bind(entry)
                         self._agentic_drop_early_direct_receive(
@@ -5600,10 +6098,19 @@ class Scheduler(
                             release_claim=False,
                             reason="tp_group_abort",
                         )
+                    elif active_item is not None and active_item[4] is not None:
+                        # No receiver owns the lease yet.  If a concurrent
+                        # start already reserved it, request_release refuses
+                        # the tokenless release and that start observes the
+                        # terminal marker above before registering.
+                        self.agentic_p_workset_broker.request_release(
+                            snapshot_id, active_item[4]
+                        )
                 with direct_poll_lock:
                     self.agentic_tp_direct_local_admitted.discard(snapshot_id)
                     self.agentic_tp_direct_local_failed.discard(snapshot_id)
-                    active_direct.pop(snapshot_id, None)
+                    if active_direct.get(snapshot_id) is active_item:
+                        active_direct.pop(snapshot_id, None)
                     group_status.pop(snapshot_id, None)
                     mailbox = getattr(self, "agentic_tp_direct_mailbox", None)
                     if mailbox is not None:
@@ -5614,19 +6121,33 @@ class Scheduler(
             request = RequestGeneration(
                 str(command["request_id"]), int(command["generation"])
             )
-            current = active_direct.get(snapshot_id)
-            required_tokens = int(
-                command.get(
-                    "required_tokens",
-                    0 if current is None else int(current[3]),
+            with direct_poll_lock:
+                current = active_direct.get(snapshot_id)
+                required_tokens = int(
+                    command.get(
+                        "required_tokens",
+                        0 if current is None else int(current[3]),
+                    )
                 )
-            )
-            active_direct[snapshot_id] = (
-                request,
-                float(command.get("arrived_at", 0.0)),
-                command.get("domain"),
-                required_tokens,
-            )
+                # Logical TP commands never replace rank-local allocator
+                # identity.  Background admission uses this same lock, so the
+                # merge is a single compare/read/write operation and a None
+                # observation cannot overwrite a concurrently granted lease.
+                workset_lease = (
+                    current[4]
+                    if current is not None and current[4] is not None
+                    else self.agentic_p_workset_broker.get(
+                        snapshot_id,
+                        owner=AgenticPWorksetLeaseBroker.direct_owner(snapshot_id),
+                    )
+                )
+                active_direct[snapshot_id] = (
+                    request,
+                    float(command.get("arrived_at", 0.0)),
+                    command.get("domain"),
+                    required_tokens,
+                    workset_lease,
+                )
             visible_order.append(snapshot_id)
             direct_actions[snapshot_id] = direct_action
         self.agentic_tp_direct_visible_order = visible_order
@@ -5689,9 +6210,7 @@ class Scheduler(
             if legacy_active is not None:
                 active_host[legacy_active.snapshot_id] = legacy_active
             self.agentic_tp_host_active_requests = active_host
-        active_since = getattr(
-            self, "agentic_tp_host_active_since_by_snapshot", None
-        )
+        active_since = getattr(self, "agentic_tp_host_active_since_by_snapshot", None)
         if active_since is None:
             active_since = {}
             legacy_active = getattr(self, "agentic_tp_host_active", None)
@@ -5756,9 +6275,7 @@ class Scheduler(
         host_staging = getattr(self, "agentic_host_staging_manager", None)
         if host_staging is not None:
             host_staging.tp_host_commit_snapshots = commit_snapshots
-            host_staging.tp_host_commit_snapshot = (
-                self._agentic_tp_host_commit_snapshot
-            )
+            host_staging.tp_host_commit_snapshot = self._agentic_tp_host_commit_snapshot
         host_timeout_snapshot = control.get("host_timeout_snapshot")
         self._agentic_tp_host_timeout_snapshot = (
             None if host_timeout_snapshot is None else str(host_timeout_snapshot)
@@ -5774,9 +6291,7 @@ class Scheduler(
     ) -> bool:
         """Execute TP0's Direct-start command for this rank's KV-head shard."""
 
-        if request.snapshot_id in getattr(
-            self, "agentic_tp_direct_local_admitted", ()
-        ):
+        if request.snapshot_id in getattr(self, "agentic_tp_direct_local_admitted", ()):
             return True
         receives = getattr(self, "agentic_early_direct_receives", {})
         if request.snapshot_id in receives:
@@ -5800,20 +6315,41 @@ class Scheduler(
             # become ready later.  Report it to rank 0 so the group command
             # is aborted and the existing Host/Mooncake path can proceed.
             self.agentic_tp_direct_local_failed.add(request.snapshot_id)
+            active_item = getattr(self, "agentic_tp_direct_admission_active", {}).get(
+                request.snapshot_id
+            )
+            entry = getattr(self, "agentic_early_direct_receives", {}).get(
+                request.snapshot_id
+            )
+            self.agentic_p_workset_broker.request_release(
+                request.snapshot_id,
+                None if active_item is None else active_item[4],
+                io_attempt=(
+                    None if entry is None else getattr(entry, "io_attempt", None)
+                ),
+            )
             logger.info(
                 "AgenticKV tp_direct_stale_abort snapshot=%s state=%s",
                 request.snapshot_id,
                 manifest.state.value,
             )
             return False
+        workset_lease = self.agentic_p_workset_broker.get(
+            request.snapshot_id,
+            owner=AgenticPWorksetLeaseBroker.direct_owner(request.snapshot_id),
+        )
+        if workset_lease is None:
+            # The rank-local scheduler has not granted the complete workset
+            # yet.  Keep the TP command pending without claiming lifecycle or
+            # allocating from the transport worker.
+            return False
         started = self._agentic_start_early_direct_receive(
             request,
             manifest,
             snapshot_store,
             arrived_at=arrived_at,
-            prefill_domain=(
-                None if prefill_domain is None else int(prefill_domain)
-            ),
+            prefill_domain=(None if prefill_domain is None else int(prefill_domain)),
+            workset_lease=workset_lease,
         )
         return bool(started)
 
@@ -5827,8 +6363,7 @@ class Scheduler(
         amortizes scheduler ticks that contain long Prefill kernels.
         """
         # This sweep is intentionally outside admission_batch.  Admission
-        # limits Prefill compute; it must not make the Direct transit reserve
-        # retain already-received KV.
+        # limits Prefill compute; it must not retain a completed workset lease.
         if getattr(self, "tp_size", 1) == 1:
             self._agentic_bind_completed_waiters()
 
@@ -5924,9 +6459,7 @@ class Scheduler(
         # that both ranks mutate the same request generations.
         forced_tp_snapshots = list(tp_bind_snapshots)
         for snapshot_id in (
-            tp_host_commit_snapshots
-            + tp_host_snapshots
-            + [tp_host_timeout_snapshot]
+            tp_host_commit_snapshots + tp_host_snapshots + [tp_host_timeout_snapshot]
         ):
             if snapshot_id is not None and snapshot_id not in forced_tp_snapshots:
                 forced_tp_snapshots.append(snapshot_id)
@@ -5964,10 +6497,7 @@ class Scheduler(
                 return
         else:
             inactive = sorted(fast + slow + new, key=lambda entry: entry[1])
-            selected = (
-                active
-                + inactive[:scan_limit]
-            )
+            selected = active + inactive[:scan_limit]
             untouched = inactive[scan_limit:]
         still_waiting = []
         new_io_started = 0
@@ -5976,12 +6506,8 @@ class Scheduler(
         # Prefill batch, but requests that have not been selected remain
         # metadata-only.  This is a global cap, not a per-tick cap: an active
         # receive from an earlier scheduler iteration consumes the slot.
-        active_direct = sum(
-            self._agentic_io_kind(req) == "direct" for req, _ in active
-        )
-        active_slow = sum(
-            self._agentic_io_kind(req) == "slow" for req, _ in active
-        )
+        active_direct = sum(self._agentic_io_kind(req) == "direct" for req, _ in active)
+        active_slow = sum(self._agentic_io_kind(req) == "slow" for req, _ in active)
         direct_starts_left = max(0, direct_io_cap - active_direct)
         slow_starts_left = max(0, slow_io_cap - active_slow)
         for req, started_at in selected:
@@ -5998,7 +6524,7 @@ class Scheduler(
             elif queue_class == "fast":
                 # A fresh parent request can discover either a DIRECT_READY
                 # marker or a previously-fallen-back shared-Host record.
-                # Probe without starting when Direct credits are exhausted;
+                # Probe without starting when Direct I/O slots are exhausted;
                 # gate_request() will still reclassify an owned Host record as
                 # slow, allowing it to use the slow budget on the next pass.
                 allow_start_io = direct_starts_left > 0
@@ -6050,7 +6576,9 @@ class Scheduler(
                 # Treat either an active receiver or a claimed manifest as the
                 # one selected I/O start for this scheduler pass.
                 current_kind = self._agentic_io_kind(req)
-                claimed_mooncake = getattr(req, "_agentic_kv_manifest", None) is not None
+                claimed_mooncake = (
+                    getattr(req, "_agentic_kv_manifest", None) is not None
+                )
                 if not was_active and (current_kind is not None or claimed_mooncake):
                     new_io_started += 1
                     if current_kind == "direct":
@@ -6071,25 +6599,44 @@ class Scheduler(
         self.agentic_kv_waiting_queue = untouched + still_waiting
 
     def _prioritize_agentic_prefill_ready(self) -> None:
-        """Keep strict fast > slow > new priority while remaining stable."""
+        """Prioritize requests that can make progress with their own KV pages.
+
+        ``fast`` describes where a parent snapshot came from, not whether the
+        request is currently runnable.  A failed Direct parent may retain the
+        fast label while requiring ordinary KV for full recomputation.  It
+        must never head-of-line block a handed Direct/Slow workset whose
+        suffix pages are already owned by that exact request.
+        """
 
         combined = self.waiting_queue
+        owned = [
+            req
+            for req in combined
+            if (
+                getattr(req, "_agentic_workset_suffix_indices", None) is not None
+                and req._agentic_workset_suffix_indices.numel() > 0
+            )
+        ]
+        owned_ids = {id(req) for req in owned}
         fast = [
             req
             for req in combined
+            if id(req) not in owned_ids
             if getattr(req, "_agentic_kv_queue_class", None) == "fast"
         ]
         slow = [
             req
             for req in combined
+            if id(req) not in owned_ids
             if getattr(req, "_agentic_kv_queue_class", None) == "slow"
         ]
         new = [
             req
             for req in combined
+            if id(req) not in owned_ids
             if getattr(req, "_agentic_kv_queue_class", None) not in {"fast", "slow"}
         ]
-        self.waiting_queue = fast + slow + new
+        self.waiting_queue = owned + fast + slow + new
 
     def _merge_disagg_prefill_ready(self, reqs: List[Req]) -> None:
         """Maintain stable fast > slow > new priority without head-of-line blocking."""
@@ -6117,9 +6664,7 @@ class Scheduler(
         if manifest is None or manifest.state is not SnapshotState.P_LOADING:
             return
         snapshot_store = req._agentic_kv_snapshot_store
-        result = snapshot_store.abandon_load(
-            manifest, req._agentic_kv_claim_id
-        )
+        result = snapshot_store.abandon_load(manifest, req._agentic_kv_claim_id)
         if not result.removed:
             retry = getattr(self.tree_cache, "queue_agentic_delete_retry", None)
             if retry is not None:
@@ -6163,14 +6708,16 @@ class Scheduler(
     def _agentic_abort_cleanup(self, req: Req) -> None:
         """Release a P load claim and its complete snapshot on cancellation."""
 
-        direct_parent_pin = getattr(req, "_agentic_direct_parent_pin_node", None)
-        if direct_parent_pin is not None:
-            self.tree_cache.dec_lock_ref(direct_parent_pin)
-            del req._agentic_direct_parent_pin_node
+        for pin_attr in (
+            "_agentic_direct_parent_pin_node",
+            "_agentic_kv_host_pin_node",
+        ):
+            parent_pin = getattr(req, pin_attr, None)
+            if parent_pin is not None:
+                self.tree_cache.dec_lock_ref(parent_pin)
+                delattr(req, pin_attr)
 
-        direct_parent_tokens = getattr(
-            req, "_agentic_direct_parent_token_count", 0
-        )
+        direct_parent_tokens = getattr(req, "_agentic_direct_parent_token_count", 0)
         release_agentic_cache = getattr(
             self.tree_cache, "release_agentic_request_cache", None
         )
@@ -6184,41 +6731,95 @@ class Scheduler(
 
         direct_receiver = getattr(req, "_agentic_direct_receiver", None)
         if direct_receiver is not None:
-            try:
-                direct_receiver.abort()
-            except Exception:
-                logger.exception("Failed to abort direct receiver for %s", req.rid)
-            direct_indices = getattr(req, "_agentic_direct_indices", None)
-            if direct_indices is not None:
-                self.token_to_kv_pool_allocator.free(direct_indices)
             direct_manifest = req._agentic_direct_manifest
-            self._agentic_clear_direct_receiver(
-                direct_receiver, direct_manifest
+            direct_workset = getattr(req, "_agentic_direct_workset_lease", None)
+            self.agentic_p_workset_broker.request_release(
+                direct_manifest.snapshot_id,
+                direct_workset,
+                io_attempt=getattr(req, "_agentic_direct_io_attempt", None),
             )
             direct_store = req._agentic_kv_snapshot_store
-            current = direct_store.load(
-                direct_manifest.request, require_ready=False
-            )
-            if (
-                current is not None
-                and current.state is SnapshotState.DIRECT_LOADING
-            ):
-                try:
-                    direct_store.release_direct_claim(
-                        current, req._agentic_direct_claim_id
+            if direct_workset is not None and direct_workset.state == "release_pending":
+                # CommonKVReceiver.abort() only changes local bookkeeping; it
+                # does not cancel or fence a remote NIXL WRITE.  Preserve the
+                # receiver and its destination pages until the transport
+                # itself reports a terminal state.
+                entry = AgenticEarlyDirectReceive(
+                    request=direct_manifest.request,
+                    manifest=direct_manifest,
+                    claim_id=req._agentic_direct_claim_id,
+                    receiver=direct_receiver,
+                    device_indices=req._agentic_direct_indices,
+                    started_at=getattr(
+                        req, "_agentic_direct_started_at", time.monotonic()
+                    ),
+                    arrived_at=time.time(),
+                    workset_lease=direct_workset,
+                    io_attempt=getattr(req, "_agentic_direct_io_attempt", None),
+                    abort_requested=True,
+                    abort_release_claim=True,
+                    abort_reason="request_aborted",
+                )
+                with getattr(self, "agentic_early_direct_poll_lock", nullcontext()):
+                    self.agentic_early_direct_receives[direct_manifest.snapshot_id] = (
+                        entry
                     )
+            else:
+                try:
+                    direct_receiver.abort()
                 except Exception:
                     logger.exception(
-                        "Failed to release aborted direct claim for %s", req.rid
+                        "Failed to abort inactive direct receiver for %s", req.rid
                     )
+                self._agentic_clear_direct_receiver(direct_receiver, direct_manifest)
+                current = direct_store.load(
+                    direct_manifest.request, require_ready=False
+                )
+                if (
+                    current is not None
+                    and current.state is SnapshotState.DIRECT_LOADING
+                ):
+                    try:
+                        direct_store.release_direct_claim(
+                            current, req._agentic_direct_claim_id
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to release aborted direct claim for %s", req.rid
+                        )
             for name in (
                 "_agentic_direct_receiver",
                 "_agentic_direct_indices",
                 "_agentic_direct_manifest",
                 "_agentic_direct_claim_id",
+                "_agentic_direct_io_attempt",
+                "_agentic_direct_started_at",
+                "_agentic_direct_workset_lease",
             ):
                 if hasattr(req, name):
                     delattr(req, name)
+
+        workset_lease = getattr(req, "_agentic_p_workset_lease", None)
+        if workset_lease is not None:
+            self.agentic_p_workset_broker.release_handed(
+                workset_lease.snapshot_id, workset_lease, req=req
+            )
+        for name in (
+            "_agentic_p_workset_lease",
+            "_agentic_p_workset_broker",
+            "_agentic_workset_suffix_indices",
+        ):
+            if hasattr(req, name):
+                delattr(req, name)
+
+        metadata = AgenticRequestMetadata.from_req(req)
+        host_staging = getattr(self, "agentic_host_staging_manager", None)
+        if (
+            host_staging is not None
+            and metadata is not None
+            and metadata.parent is not None
+        ):
+            host_staging.abort_request(req.rid, metadata.parent)
 
         snapshot_store = getattr(req, "_agentic_kv_snapshot_store", None)
         manifest = getattr(req, "_agentic_kv_manifest", None)
@@ -6234,17 +6835,13 @@ class Scheduler(
         result = None
         try:
             if observed.state in {SnapshotState.P_LOADING, SnapshotState.P_HOST}:
-                result = snapshot_store.abandon_load(
-                    observed, req._agentic_kv_claim_id
-                )
+                result = snapshot_store.abandon_load(observed, req._agentic_kv_claim_id)
             elif observed.state is SnapshotState.P_GPU:
                 result = snapshot_store.delete_snapshot(
                     observed, final_state=SnapshotState.CONSUMED
                 )
             elif observed.state is SnapshotState.DELETE_PENDING:
-                retry = getattr(
-                    self.tree_cache, "queue_agentic_delete_retry", None
-                )
+                retry = getattr(self.tree_cache, "queue_agentic_delete_retry", None)
                 if retry is not None:
                     retry(snapshot_store, observed.request)
                 return
@@ -6280,13 +6877,9 @@ class Scheduler(
             metadata = AgenticRequestMetadata.from_req(req)
             if metadata is not None:
                 if metadata.parent is not None:
-                    receives = getattr(
-                        self, "agentic_early_direct_receives", None
-                    )
+                    receives = getattr(self, "agentic_early_direct_receives", None)
                     entry = (
-                        receives.get(metadata.parent.snapshot_id)
-                        if receives
-                        else None
+                        receives.get(metadata.parent.snapshot_id) if receives else None
                     )
                     if entry is not None and entry.completed_at is not None:
                         self._agentic_bind_early_direct_receive(
@@ -6321,12 +6914,17 @@ class Scheduler(
             host_staging = getattr(self, "agentic_host_staging_manager", None)
             try:
                 self._prefetch_kvcache(req)
-            finally:
+                self.disagg_prefill_bootstrap_queue.add(
+                    req, self.model_config.num_key_value_heads
+                )
+            except Exception:
+                # Normal ownership crosses the bootstrap queue and ends only
+                # after PrefillAdder has acquired req.last_node.  Release the
+                # temporary Host pin here solely when that handoff cannot be
+                # established at all.
                 if host_staging is not None:
                     host_staging.release_request_pin(req)
-            self.disagg_prefill_bootstrap_queue.add(
-                req, self.model_config.num_key_value_heads
-            )
+                raise
             req.time_stats.set_prefill_bootstrap_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
@@ -6591,6 +7189,10 @@ class Scheduler(
         return batch
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        # Physical workset allocation/free is intentionally confined to this
+        # scheduler-safe point.  Direct and Slow I/O workers remain fully
+        # asynchronous and consume only immutable grants.
+        self._agentic_service_p_workset_leases()
         self._abort_on_waiting_timeout()
         self._abort_on_running_timeout()
         if self.dllm_config is not None:
@@ -6827,9 +7429,19 @@ class Scheduler(
             # some P KV instead of forcing a chunk into an empty allocator.
             # There is deliberately no percentage watermark here: any real
             # allocatable capacity remains usable.
+            workset_suffix_indices = getattr(
+                self.chunked_req,
+                "_agentic_workset_suffix_indices",
+                None,
+            )
+            has_workset_suffix = (
+                workset_suffix_indices is not None
+                and workset_suffix_indices.numel() > 0
+            )
             if (
                 self.disaggregation_mode == DisaggregationMode.PREFILL
                 and adder.rem_total_tokens <= 0
+                and not has_workset_suffix
             ):
                 logger.info(
                     "Deferring disaggregated Prefill chunk: no allocatable "
@@ -6886,40 +7498,32 @@ class Scheduler(
                 req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
                     req.rid
                 )
-                pop_failed = getattr(
-                    self.tree_cache, "pop_prefetch_failed", None
-                )
+                pop_failed = getattr(self.tree_cache, "pop_prefetch_failed", None)
                 if pop_failed is not None and pop_failed(req.rid):
                     self._agentic_abandon_load(req)
 
             req.init_next_round_input(self.tree_cache)
-            p_ready_credit = getattr(
-                self, "_p_ready_compute_credit_tokens", None
-            )
+            p_ready_credit = getattr(self, "_p_ready_compute_credit_tokens", None)
             # Once scheduled, the request's complete matched + new Prompt KV
             # becomes protected until P->D transfer finishes.  Account for the
             # full prompt, including device/Host cache hits, not only the new
             # tokens sent through the model.  This is deliberately conservative
             # when two requests share a prefix; V1 values smooth bounded
             # admission over squeezing the final few cache pages from a batch.
-            p_ready_is_new = (
-                getattr(req, "_agentic_kv_queue_class", "new") == "new"
-            )
+            p_ready_is_new = getattr(req, "_agentic_kv_queue_class", "new") == "new"
             p_ready_protected_tokens = (
                 -(-len(req.fill_ids) // self.page_size) * self.page_size
                 if p_ready_credit is not None and p_ready_is_new
                 else 0
             )
-            if (
-                p_ready_credit is not None
-                and p_ready_protected_tokens > p_ready_credit
-            ):
+            if p_ready_credit is not None and p_ready_protected_tokens > p_ready_credit:
                 # Do not let a large head-of-line prompt prevent smaller work
                 # later in the queue from using the available credit.
                 continue
-            if getattr(req, "_agentic_kv_direct_hit_tokens", 0) or getattr(
-                req, "_agentic_kv_manifest", None
-            ) is not None:
+            if (
+                getattr(req, "_agentic_kv_direct_hit_tokens", 0)
+                or getattr(req, "_agentic_kv_manifest", None) is not None
+            ):
                 logger.info(
                     "AgenticKV p_rematch req=%s device_tokens=%d host_tokens=%d "
                     "storage_tokens=%d expected_tokens=%d extra_key=%s",
@@ -6935,9 +7539,10 @@ class Scheduler(
                     req.extra_key,
                 )
             self._agentic_mark_p_host(req)
-            if getattr(
-                getattr(req, "_agentic_kv_manifest", None), "state", None
-            ) is SnapshotState.P_LOADING:
+            if (
+                getattr(getattr(req, "_agentic_kv_manifest", None), "state", None)
+                is SnapshotState.P_LOADING
+            ):
                 # No operation, a revoked operation, or an incomplete GET.
                 # The request continues by recomputing, but the claimed
                 # snapshot must not remain pinned indefinitely.
@@ -6949,10 +7554,7 @@ class Scheduler(
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
-            if (
-                p_ready_credit is not None
-                and len(adder.can_run_list) > can_run_before
-            ):
+            if p_ready_credit is not None and len(adder.can_run_list) > can_run_before:
                 p_ready_credit -= p_ready_protected_tokens
                 self._p_ready_compute_credit_tokens = p_ready_credit
 

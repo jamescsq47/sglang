@@ -354,8 +354,94 @@ def alloc_for_extend(
     req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
+    # A restored agentic parent may carry a physical full-workset lease.  Its
+    # suffix pages were removed from the allocator before D->P/Host->P I/O and
+    # must be consumed by this exact Prefill rather than returned to the free
+    # pool and raced by another request.
+    leased_suffixes = [
+        getattr(req, "_agentic_workset_suffix_indices", None)
+        for req in batch.reqs
+    ]
+
     # Allocate KV cache (throws exception on failure)
-    if batch.tree_cache.page_size == 1:
+    if any(indices is not None for indices in leased_suffixes):
+        if batch.tree_cache.page_size == 1:
+            raise RuntimeError("agentic workset leases require paged KV allocation")
+        allocator = batch.tree_cache.token_to_kv_pool_allocator
+        page_size = int(allocator.page_size)
+        chunks = []
+        for index, req in enumerate(batch.reqs):
+            extend_len = int(batch.extend_lens[index])
+            reserved = leased_suffixes[index]
+            if reserved is not None:
+                prefix_len = int(batch.prefix_lens[index])
+                if prefix_len % page_size:
+                    raise RuntimeError(
+                        "agentic restored parent must be page aligned before Prefill"
+                    )
+                broker = getattr(req, "_agentic_p_workset_broker", None)
+                lease = getattr(req, "_agentic_p_workset_lease", None)
+                if broker is None or lease is None:
+                    raise RuntimeError(
+                        f"agentic workset owner is missing for {req.rid}"
+                    )
+                if reserved.numel() < extend_len:
+                    raise RuntimeError(
+                        f"agentic workset suffix is too small for {req.rid}: "
+                        f"reserved={reserved.numel()} required={extend_len}"
+                    )
+                consumed = broker.consume_suffix(
+                    lease,
+                    extend_len,
+                    final_prompt_chunk=(
+                        prefix_len + extend_len >= lease.prompt_tokens
+                    ),
+                )
+                chunks.append(consumed)
+                req._agentic_workset_suffix_allocated_tokens = (
+                    int(
+                        getattr(
+                            req,
+                            "_agentic_workset_suffix_allocated_tokens",
+                            0,
+                        )
+                    )
+                    + extend_len
+                )
+                remaining = lease.remaining_suffix_indices
+                if remaining.numel():
+                    req._agentic_workset_suffix_indices = remaining
+                else:
+                    delattr(req, "_agentic_workset_suffix_indices")
+                continue
+
+            prefix_len = int(batch.prefix_lens[index])
+            seq_len = int(batch.seq_lens_cpu[index])
+            prefix_cpu = prefix_lens_cpu[index : index + 1]
+            seq_cpu = batch.seq_lens_cpu[index : index + 1]
+            prefix_device = prefix_lens_device[index : index + 1]
+            seq_device = batch.seq_lens[index : index + 1]
+            prefix_indices = prefix_tensors[index]
+            last_loc = (
+                prefix_indices[-1:]
+                if len(prefix_indices)
+                else torch.tensor([-1], device=batch.device)
+            )
+            chunks.append(
+                alloc_paged_token_slots_extend(
+                    tree_cache=batch.tree_cache,
+                    prefix_lens=prefix_device,
+                    prefix_lens_cpu=prefix_cpu,
+                    seq_lens=seq_device,
+                    seq_lens_cpu=seq_cpu,
+                    last_loc=last_loc,
+                    extend_num_tokens=seq_len - prefix_len,
+                )
+            )
+        out_cache_loc = torch.cat(chunks) if chunks else torch.empty(
+            0, dtype=torch.int64, device=batch.device
+        )
+    elif batch.tree_cache.page_size == 1:
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     else:
         # Paged allocation - build last_loc

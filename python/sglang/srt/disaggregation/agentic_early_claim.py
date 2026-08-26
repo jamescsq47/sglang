@@ -327,17 +327,22 @@ class AgenticEarlyClaimStore:
         request: RequestGeneration,
         *,
         target_prefill_domain: Optional[int] = None,
+        prompt_token_count: Optional[int] = None,
         arrived_at: Optional[float] = None,
     ) -> dict[str, Any]:
+        extra: dict[str, Any] = {}
+        if target_prefill_domain is not None:
+            extra["target_prefill_domain"] = int(target_prefill_domain)
+        if prompt_token_count is not None:
+            prompt_token_count = int(prompt_token_count)
+            if prompt_token_count <= 0:
+                raise ValueError("prompt_token_count must be positive")
+            extra["prompt_token_count"] = prompt_token_count
         payload = self._publish(
             self.marker_path(request),
             request,
             "arrival",
-            extra=(
-                None
-                if target_prefill_domain is None
-                else {"target_prefill_domain": int(target_prefill_domain)}
-            ),
+            extra=extra or None,
             published_at=arrived_at,
         )
         return payload

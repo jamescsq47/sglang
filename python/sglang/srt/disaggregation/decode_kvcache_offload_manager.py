@@ -7,6 +7,7 @@ import os
 import queue
 import threading
 import time
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -21,6 +22,8 @@ from sglang.srt.disaggregation.agentic_host_staging import (
     AgenticDHostStagingClient,
     AgenticDRelayWorker,
     SharedHostStagingLedger,
+    create_agentic_node_local_metadata_backend,
+    supports_agentic_kv_spill,
 )
 from sglang.srt.disaggregation.agentic_tp import rank_env_int
 from sglang.srt.disaggregation.base import KVPoll
@@ -121,30 +124,41 @@ class DecodeKVCacheOffloadManager:
         self.cache_controller = None
         self.agentic_metadata_backend = None
         if self.agentic_hostless:
-            if server_args.hicache_storage_backend != "mooncake":
-                raise ValueError("D-hostless agentic staging requires Mooncake metadata")
-            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
-                MooncakeStore,
-            )
+            if self.agentic_custom_storage_only:
+                self.agentic_metadata_backend = (
+                    create_agentic_node_local_metadata_backend()
+                )
+                logger.info(
+                    "Agentic D-hostless mode enabled: skipped decode Host KV "
+                    "pool; node-local lifecycle metadata only"
+                )
+            else:
+                if server_args.hicache_storage_backend != "mooncake":
+                    raise ValueError(
+                        "D-hostless native agentic staging requires Mooncake metadata"
+                    )
+                from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+                    MooncakeStore,
+                )
 
-            storage_config = HiCacheStorageConfig(
-                tp_rank=torch.distributed.get_rank(group=self.tp_group),
-                tp_size=self.tp_world_size,
-                pp_rank=0,
-                pp_size=1,
-                is_mla_model=isinstance(kv_cache, MLATokenToKVPool),
-                enable_storage_metrics=False,
-                is_page_first_layout=True,
-                model_name=server_args.served_model_name,
-                extra_config=hicache_storage_backend_extra_config,
-            )
-            self.agentic_metadata_backend = MooncakeStore(
-                storage_config=storage_config, mem_pool=None
-            )
-            logger.info(
-                "Agentic D-hostless mode enabled: skipped decode Host KV pool; "
-                "Mooncake client is metadata-only"
-            )
+                storage_config = HiCacheStorageConfig(
+                    tp_rank=torch.distributed.get_rank(group=self.tp_group),
+                    tp_size=self.tp_world_size,
+                    pp_rank=0,
+                    pp_size=1,
+                    is_mla_model=isinstance(kv_cache, MLATokenToKVPool),
+                    enable_storage_metrics=False,
+                    is_page_first_layout=True,
+                    model_name=server_args.served_model_name,
+                    extra_config=hicache_storage_backend_extra_config,
+                )
+                self.agentic_metadata_backend = MooncakeStore(
+                    storage_config=storage_config, mem_pool=None
+                )
+                logger.info(
+                    "Agentic D-hostless mode enabled: skipped decode Host KV "
+                    "pool; Mooncake client is metadata-only"
+                )
         else:
             if isinstance(kv_cache, MHATokenToKVPool):
                 self.decode_host_mem_pool = MHATokenToKVPoolHost(
@@ -191,6 +205,17 @@ class DecodeKVCacheOffloadManager:
         self.agentic_direct_runtime = None
         self.agentic_relay_runtime = None
         self.agentic_direct_candidates = {}
+        self._agentic_candidates_lock = threading.RLock()
+        # TP rank-local release intents are published by transport workers and
+        # consumed by the scheduler's existing native broadcast.  Protect the
+        # container itself; request/allocator mutation still happens only in
+        # ``commit_tp_release`` on the scheduler thread.
+        self._agentic_pending_release_lock = threading.RLock()
+        self._agentic_tp_pending_releases = {}
+        # Ordered, de-duplicated local retry queue.  A follower observes each
+        # rank-0 release broadcast only once, so a busy local I/O lane must not
+        # let a later snapshot overwrite an earlier deferred release.
+        self._agentic_tp_deferred_releases = {}
         # TP0's native scheduler broadcast can arrive a few microseconds before
         # a follower has published the matching rank-local candidate.  Keep the
         # latest command by request-generation instead of dropping that edge;
@@ -207,18 +232,23 @@ class DecodeKVCacheOffloadManager:
             and os.getenv("SGLANG_DECODE_IO_ASYNC_PROGRESS", "1").lower()
             in {"1", "true", "yes", "on"}
         )
-        # TP1 keeps the proven fully asynchronous lifecycle.  TP>1 moves only
-        # P->D handshake/polling off the scheduler; D->P path selection and
-        # allocator mutation remain rank0-broadcast scheduler commands.
-        self._decode_io_async_enabled = (
-            self._decode_transport_async_enabled and self.tp_world_size == 1
-        )
+        # Every TP rank owns one independent physical KV shard.  Rank 0 still
+        # decides the logical lifecycle, while all ranks progress their local
+        # Direct/Slow I/O outside Decode Forward.
+        self._decode_io_async_enabled = self._decode_transport_async_enabled
         self._decode_io_events: queue.SimpleQueue = queue.SimpleQueue()
         self._decode_io_stop = threading.Event()
         self._decode_io_threads = {}
         self._decode_io_wakeups = {
             name: threading.Event()
-            for name in ("transfer", "prealloc", "agentic", "relay")
+            for name in (
+                "transfer",
+                "prealloc",
+                "prealloc_metadata",
+                "agentic_direct",
+                "agentic_slow",
+                "relay",
+            )
         }
         self._decode_prealloc_queue = None
         self._decode_transfer_queue = None
@@ -242,9 +272,22 @@ class DecodeKVCacheOffloadManager:
                     )
                 ),
             ),
-            "agentic": max(
+            "prealloc_metadata": max(
+                0.001,
+                float(
+                    os.getenv(
+                        "SGLANG_DECODE_PREALLOC_METADATA_PROGRESS_INTERVAL_SECONDS",
+                        "0.005",
+                    )
+                ),
+            ),
+            "agentic_direct": max(
                 0.001,
                 float(os.getenv("SGLANG_AGENTIC_KV_D_CONTROL_POLL_SECONDS", "0.02")),
+            ),
+            "agentic_slow": max(
+                0.001,
+                float(os.getenv("SGLANG_AGENTIC_KV_D_SLOW_POLL_SECONDS", "0.005")),
             ),
             "relay": max(
                 0.001,
@@ -305,7 +348,7 @@ class DecodeKVCacheOffloadManager:
             snapshot_store_factory = getattr(backend, "agentic_snapshot_store", None)
             if snapshot_store_factory is None:
                 raise ValueError(
-                    "SGLANG_AGENTIC_KV_LIFECYCLE requires the Mooncake HiCache backend"
+                    "SGLANG_AGENTIC_KV_LIFECYCLE requires lifecycle metadata"
                 )
             self.agentic_snapshot_store = snapshot_store_factory()
             try:
@@ -405,6 +448,7 @@ class DecodeKVCacheOffloadManager:
                         arena_domain=arena_domain,
                         tp_rank=self.tp_rank,
                         tp_size=self.tp_world_size,
+                        retain_logical_hashes=supports_agentic_kv_spill(backend),
                         direct_cross_numa_gib_per_second=(
                             envs.SGLANG_AGENTIC_KV_DIRECT_CROSS_NUMA_GIBPS.get()
                         ),
@@ -500,9 +544,9 @@ class DecodeKVCacheOffloadManager:
     def start_decode_io_progress_worker(self, prealloc_queue, transfer_queue) -> None:
         """Move transport/control progress off the Decode scheduler thread.
 
-        V1 is TP=1, so no cross-rank collective is required by the background
-        poller.  Allocator and request-state commits deliberately remain on the
-        scheduler thread and arrive through ``_decode_io_events``.
+        Workers remain rank-local and never issue a cross-rank collective.
+        Allocator and request-state commits deliberately stay on the scheduler
+        thread and arrive through ``_decode_io_events``.
         """
 
         transport_async = getattr(
@@ -518,10 +562,11 @@ class DecodeKVCacheOffloadManager:
         transfer_queue.enable_async_progress()
         steps = {
             "transfer": self._decode_transfer_progress,
-            "prealloc": prealloc_queue.background_progress,
+            "prealloc": prealloc_queue.background_control_progress,
+            "prealloc_metadata": prealloc_queue.background_metadata_progress,
+            "agentic_direct": self._decode_agentic_direct_progress,
+            "agentic_slow": self._decode_agentic_slow_progress,
         }
-        if getattr(self, "tp_world_size", 1) == 1:
-            steps["agentic"] = self._decode_agentic_progress
         if (
             self.agentic_relay_worker is not None
             and getattr(self, "_agentic_relay_progress_isolated", False)
@@ -538,10 +583,14 @@ class DecodeKVCacheOffloadManager:
             thread.start()
         logger.info(
             "Decode I/O async progress enabled transfer_ms=%.3f "
-            "prealloc_ms=%.3f agentic_ms=%.3f relay_isolated=%s tp=%d",
+            "prealloc_ms=%.3f prealloc_metadata_ms=%.3f "
+            "direct_ms=%.3f slow_ms=%.3f "
+            "relay_isolated=%s tp=%d",
             self._decode_io_intervals["transfer"] * 1000.0,
             self._decode_io_intervals["prealloc"] * 1000.0,
-            self._decode_io_intervals["agentic"] * 1000.0,
+            self._decode_io_intervals["prealloc_metadata"] * 1000.0,
+            self._decode_io_intervals["agentic_direct"] * 1000.0,
+            self._decode_io_intervals["agentic_slow"] * 1000.0,
             "relay" in steps,
             getattr(self, "tp_world_size", 1),
         )
@@ -560,20 +609,78 @@ class DecodeKVCacheOffloadManager:
             # stock P->D intentionally share one NIXL manager.
             relay_worker.poll()
 
-    def _decode_agentic_progress(self) -> None:
-        self._check_agentic_direct_progress(progress_relay=False)
+    def _decode_agentic_direct_progress(self) -> None:
+        self._check_agentic_direct_progress(
+            progress_relay=False, progress_class="direct"
+        )
+
+    def _decode_agentic_slow_progress(self) -> None:
+        self._check_agentic_direct_progress(
+            progress_relay=False, progress_class="slow"
+        )
 
     def _decode_progress_pending(self, name: str) -> int:
         if name == "transfer":
             return len(getattr(self._decode_transfer_queue, "queue", ()))
         if name == "prealloc":
-            return len(getattr(self._decode_prealloc_queue, "queue", ())) + int(
+            return len(getattr(self._decode_prealloc_queue, "queue", ()))
+        if name == "prealloc_metadata":
+            return int(
                 getattr(self._decode_prealloc_queue, "_async_metadata_pending_count", 0)
             )
         if name == "relay":
             worker = getattr(self, "agentic_relay_worker", None)
             return int(worker is not None and worker.active is not None)
-        return len(self.agentic_direct_candidates)
+        with self._agentic_candidates_lock:
+            candidates = tuple(self.agentic_direct_candidates.values())
+        if name == "agentic_direct":
+            return sum(
+                1
+                for item in candidates
+                if not item.get("staging")
+            )
+        if name == "agentic_slow":
+            return sum(
+                1
+                for item in candidates
+                if item.get("staging")
+            )
+        return len(candidates)
+
+    def _agentic_candidate_items(self):
+        with getattr(self, "_agentic_candidates_lock", nullcontext()):
+            return tuple(self.agentic_direct_candidates.items())
+
+    def _agentic_candidate_get(self, snapshot_id: str):
+        with getattr(self, "_agentic_candidates_lock", nullcontext()):
+            return self.agentic_direct_candidates.get(snapshot_id)
+
+    def _agentic_candidate_pop(self, snapshot_id: str):
+        with getattr(self, "_agentic_candidates_lock", nullcontext()):
+            return self.agentic_direct_candidates.pop(snapshot_id, None)
+
+    def _agentic_candidate_is_live_locked(self, snapshot_id: str, candidate) -> bool:
+        """Validate a worker snapshot while its per-candidate I/O lock is held."""
+
+        if candidate.get("retired", False):
+            return False
+        with getattr(self, "_agentic_candidates_lock", nullcontext()):
+            return self.agentic_direct_candidates.get(snapshot_id) is candidate
+
+    def _agentic_pending_release_items(self):
+        with getattr(self, "_agentic_pending_release_lock", nullcontext()):
+            pending = getattr(self, "_agentic_tp_pending_releases", None) or {}
+            return tuple(pending.items())
+
+    def _agentic_pending_release_get(self, snapshot_id: str):
+        with getattr(self, "_agentic_pending_release_lock", nullcontext()):
+            pending = getattr(self, "_agentic_tp_pending_releases", None) or {}
+            return pending.get(snapshot_id)
+
+    def _agentic_pending_release_pop(self, snapshot_id: str):
+        with getattr(self, "_agentic_pending_release_lock", nullcontext()):
+            pending = getattr(self, "_agentic_tp_pending_releases", None) or {}
+            return pending.pop(snapshot_id, None)
 
     def _decode_progress_loop(self, name: str, step) -> None:
         """Run one non-scheduler progress domain without cross-domain HOL."""
@@ -623,18 +730,22 @@ class DecodeKVCacheOffloadManager:
     def _enqueue_agentic_release(self, req, start_offset: int) -> None:
         """Queue the only scheduler-owned mutation needed by D->P progress."""
 
-        if not getattr(self, "_decode_io_async_enabled", False):
-            if self.tp_world_size > 1:
-                metadata = AgenticRequestMetadata.from_req(req)
-                if metadata is None:
-                    raise RuntimeError("TP agentic release lost request metadata")
+        if self.tp_world_size > 1:
+            # TP source shards are one logical snapshot.  Background workers
+            # may finish at different times, but only the native rank-0
+            # scheduler command releases all shards together.
+            metadata = AgenticRequestMetadata.from_req(req)
+            if metadata is None:
+                raise RuntimeError("TP agentic release lost request metadata")
+            with getattr(self, "_agentic_pending_release_lock", nullcontext()):
                 pending = getattr(self, "_agentic_tp_pending_releases", None)
                 if pending is None:
                     pending = self._agentic_tp_pending_releases = {}
                 pending.setdefault(
                     metadata.current.snapshot_id, (req, int(start_offset))
                 )
-                return
+            return
+        if not getattr(self, "_decode_io_async_enabled", False):
             self._release_finished_req(req, start_offset)
             return
         start_offset = int(start_offset)
@@ -659,10 +770,10 @@ class DecodeKVCacheOffloadManager:
     def tp_pending_release_snapshot(self):
         """Return TP0's oldest release ready for the native recv broadcast."""
 
-        pending = getattr(self, "_agentic_tp_pending_releases", None)
-        if not pending:
+        items = DecodeKVCacheOffloadManager._agentic_pending_release_items(self)
+        if not items:
             return None
-        return next(iter(pending))
+        return items[0][0]
 
     def tp_candidate_commands(self) -> list[dict]:
         """Return TP0's authoritative D->P command for each live generation.
@@ -676,7 +787,9 @@ class DecodeKVCacheOffloadManager:
         if self.tp_world_size <= 1 or self.tp_rank != 0:
             return []
         commands = []
-        for snapshot_id, candidate in self.agentic_direct_candidates.items():
+        for snapshot_id, candidate in (
+            DecodeKVCacheOffloadManager._agentic_candidate_items(self)
+        ):
             manifest = candidate.get("manifest")
             if candidate.get("staging"):
                 action = "slow"
@@ -714,7 +827,9 @@ class DecodeKVCacheOffloadManager:
         """Apply one TP0 command, or retain it until the local shard exists."""
 
         snapshot_id = str(command["snapshot_id"])
-        candidate = self.agentic_direct_candidates.get(snapshot_id)
+        candidate = DecodeKVCacheOffloadManager._agentic_candidate_get(
+            self, snapshot_id
+        )
         if candidate is None:
             pending = getattr(self, "_agentic_tp_pending_candidate_commands", None)
             if pending is None:
@@ -816,7 +931,7 @@ class DecodeKVCacheOffloadManager:
         candidate["selected_prefill_domain"] = domain
         candidate["selected_arena_numa_nodes"] = numa_nodes
 
-    def commit_tp_release(self, snapshot_id: str) -> None:
+    def commit_tp_release(self, snapshot_id: str) -> bool:
         """Apply a TP release selected by the scheduler's native broadcast.
 
         No collective is introduced here: ``Scheduler.recv_requests`` already
@@ -826,27 +941,56 @@ class DecodeKVCacheOffloadManager:
         """
 
         snapshot_id = str(snapshot_id)
-        pending = getattr(self, "_agentic_tp_pending_releases", None)
-        item = None if not pending else pending.pop(snapshot_id, None)
-        candidate = self.agentic_direct_candidates.pop(snapshot_id, None)
-        req = item[0] if item is not None else (
-            None if candidate is None else candidate.get("req")
+        item = DecodeKVCacheOffloadManager._agentic_pending_release_get(
+            self, snapshot_id
         )
-        start_offset = int(item[1]) if item is not None else 0
-        if req is None:
-            raise RuntimeError(
-                f"TP Decode release {snapshot_id} has no local request"
+        candidate = DecodeKVCacheOffloadManager._agentic_candidate_get(
+            self, snapshot_id
+        )
+        io_lock = None if candidate is None else candidate.get("io_lock")
+        if io_lock is not None and not io_lock.acquire(blocking=False):
+            # Decode scheduler commands are repeated while TP0 retains the
+            # pending release.  Never wait inside Decode Forward for a local
+            # NIXL poll or D2H commit to leave its critical section.
+            deferred = getattr(self, "_agentic_tp_deferred_releases", None)
+            if deferred is None:
+                deferred = self._agentic_tp_deferred_releases = {}
+            deferred.setdefault(snapshot_id, None)
+            return False
+        try:
+            if candidate is not None:
+                candidate["retired"] = True
+            DecodeKVCacheOffloadManager._agentic_pending_release_pop(
+                self, snapshot_id
             )
-        if req.req_pool_idx != -1:
-            self._release_finished_req(req, start_offset)
-        if candidate is not None:
-            self._cleanup_agentic_direct_sender(candidate)
-            self._agentic_release_early_claim(candidate, "tp_release_commit")
+            candidate = DecodeKVCacheOffloadManager._agentic_candidate_pop(
+                self, snapshot_id
+            )
+            req = item[0] if item is not None else (
+                None if candidate is None else candidate.get("req")
+            )
+            start_offset = int(item[1]) if item is not None else 0
+            if req is None:
+                raise RuntimeError(
+                    f"TP Decode release {snapshot_id} has no local request"
+                )
+            if candidate is not None:
+                self._cleanup_agentic_direct_sender(candidate)
+                self._agentic_release_early_claim(candidate, "tp_release_commit")
+            if req.req_pool_idx != -1:
+                self._release_finished_req(req, start_offset)
+        finally:
+            if io_lock is not None:
+                io_lock.release()
         logger.info(
             "AgenticKV tp_decode_release_commit snapshot=%s req=%s",
             snapshot_id,
             req.rid,
         )
+        deferred = getattr(self, "_agentic_tp_deferred_releases", None)
+        if deferred is not None:
+            deferred.pop(snapshot_id, None)
+        return True
 
     def _drain_decode_io_events(self) -> None:
         """Apply bounded, allocator-safe commits without doing transport work."""
@@ -931,8 +1075,10 @@ class DecodeKVCacheOffloadManager:
         # by Radix, but its uncached/overallocated tail is owned by neither the
         # active batch nor Radix.  Include only that tail here so the idle
         # memory checker does not mistake the short hand-off window for a leak.
-        pending = getattr(self, "_agentic_tp_pending_releases", None) or {}
-        for req, _start_offset in pending.values():
+        pending_items = DecodeKVCacheOffloadManager._agentic_pending_release_items(
+            self
+        )
+        for _snapshot_id, (req, _start_offset) in pending_items:
             allocated_len = int(
                 getattr(req, "kv_allocated_len", getattr(req, "kv_committed_len", 0))
             )
@@ -946,8 +1092,12 @@ class DecodeKVCacheOffloadManager:
     def agentic_pending_release_req_count(self) -> int:
         """Request slots awaiting the same native TP release broadcast."""
 
-        pending = getattr(self, "_agentic_tp_pending_releases", None) or {}
-        return sum(1 for req, _ in pending.values() if req.req_pool_idx != -1)
+        pending_items = DecodeKVCacheOffloadManager._agentic_pending_release_items(
+            self
+        )
+        return sum(
+            1 for _snapshot_id, (req, _) in pending_items if req.req_pool_idx != -1
+        )
 
     def offload_kv_cache(self, req) -> bool:
         """Offload incremental KV cache for decode side."""
@@ -1092,10 +1242,10 @@ class DecodeKVCacheOffloadManager:
         # Length/abort completions and explicit terminal markers end the
         # trajectory.  UNKNOWN is not necessarily terminal: application
         # parsers can append a repair observation after malformed output.  In
-        # that case keep the same short-lived Direct candidate as a tool call;
-        # the application confirmation channel decides whether to continue or
-        # release it, and unconfirmed candidates still fail soft without
-        # entering Shared Arena/Mooncake.
+        # that case keep the same provisional Direct candidate as a tool call.
+        # If the application decision is not visible before the Direct window
+        # closes, preserve the complete request-generation in Shared Arena;
+        # absence of a parser ACK is not evidence that the parent may be lost.
         if finish_type in {"length", "abort"} or output_kind.value == "terminal":
             logger.info(
                 "AgenticKV final_skip snapshot=%s output_tokens=%d "
@@ -1207,6 +1357,15 @@ class DecodeKVCacheOffloadManager:
                 manifest.snapshot_id,
                 source_digest,
             )
+        # Freeze the scheduler-owned mapping before publishing the candidate.
+        # I/O workers may run while later Decode scheduler iterations mutate
+        # req_to_token; they consume only this immutable CPU payload.
+        frozen_token_indices = source_indices.to(
+            device="cpu", dtype=torch.int64
+        ).clone()
+        frozen_page_indices = kv_to_page_indices(
+            frozen_token_indices.numpy(), self.page_size
+        )
         sender = self.agentic_direct_runtime.sender_class(
             mgr=self.agentic_direct_runtime.manager,
             bootstrap_addr=self.agentic_direct_runtime.bootstrap_addr,
@@ -1214,7 +1373,7 @@ class DecodeKVCacheOffloadManager:
             dest_tp_ranks=[self.tp_rank],
             pp_rank=0,
         )
-        self.agentic_direct_candidates[manifest.snapshot_id] = {
+        candidate = {
             "req": req,
             "metadata": metadata,
             "tokens": list(all_tokens),
@@ -1224,6 +1383,9 @@ class DecodeKVCacheOffloadManager:
             "claimed_at": None,
             "sent": False,
             "fallback_retry_at": 0.0,
+            "source_token_indices": frozen_token_indices,
+            "source_page_indices": frozen_page_indices,
+            "io_lock": threading.RLock(),
             # Mooncake manifest lookup is synchronous.  Do not put one RPC per
             # pending candidate on every Decode scheduler tick: with many D
             # workers that control-plane work can leave an otherwise healthy
@@ -1233,6 +1395,8 @@ class DecodeKVCacheOffloadManager:
             "fast_arrival_seen": False,
             "fast_arrival_seen_at": None,
         }
+        with self._agentic_candidates_lock:
+            self.agentic_direct_candidates[manifest.snapshot_id] = candidate
         pending_command = self._agentic_tp_pending_candidate_commands.pop(
             manifest.snapshot_id, None
         )
@@ -1412,50 +1576,13 @@ class DecodeKVCacheOffloadManager:
             return False
         else:
             return False
-        self._enqueue_agentic_release(candidate["req"], 0)
         self._cleanup_agentic_direct_sender(candidate)
         self._agentic_release_early_claim(candidate, "app_final")
         self._agentic_release_final_confirmation(candidate)
-        self.agentic_direct_candidates.pop(manifest.snapshot_id, None)
+        self._agentic_candidate_pop(manifest.snapshot_id)
+        self._enqueue_agentic_release(candidate["req"], 0)
         logger.info(
             "AgenticKV app_final_release snapshot=%s elapsed_s=%.6f",
-            manifest.snapshot_id,
-            now - candidate["created_at"],
-        )
-        return True
-
-    def _agentic_fail_unconfirmed_tool_candidate(
-        self, candidate, manifest, now: float
-    ) -> bool:
-        """Release an unconfirmed snapshot without declaring it terminal.
-
-        A missing parser-level tool ACK only means that this generation is not
-        eligible for Host/Mooncake preservation.  The application may still
-        issue a repair generation, so publishing ``FINAL`` here would make a
-        valid next turn contradict its parent state.  ``FAILED`` tells P to
-        recompute that parent while preserving the trajectory semantics.
-        """
-
-        if candidate.get("staging") or candidate.get("sent"):
-            return False
-        if manifest.state is SnapshotState.DIRECT_LOADING:
-            return False
-        if manifest.state is not SnapshotState.DIRECT_READY:
-            return False
-        failed = self.agentic_snapshot_store.fail_direct_offer(
-            manifest,
-            owner_id=f"d-unconfirmed:{candidate['metadata'].current.storage_id}",
-            reason="application_tool_unconfirmed",
-        )
-        if failed is None:
-            return False
-        self._enqueue_agentic_release(candidate["req"], 0)
-        self._cleanup_agentic_direct_sender(candidate)
-        self._agentic_release_early_claim(candidate, "unconfirmed_tool")
-        self._agentic_release_final_confirmation(candidate)
-        self.agentic_direct_candidates.pop(manifest.snapshot_id, None)
-        logger.info(
-            "AgenticKV unconfirmed_tool_recompute snapshot=%s elapsed_s=%.6f",
             manifest.snapshot_id,
             now - candidate["created_at"],
         )
@@ -1618,13 +1745,13 @@ class DecodeKVCacheOffloadManager:
         # instead of trying to reacquire its own persistent claim.
         candidate["manifest"] = fallback
         token_count = len(candidate["tokens"])
-        token_indices = self.req_to_token_pool.req_to_token[
-            candidate["req"].req_pool_idx, :token_count
-        ]
-        source_pages = kv_to_page_indices(
-            token_indices.cpu().numpy(), self.page_size
+        token_indices = candidate["source_token_indices"]
+        source_pages = candidate["source_page_indices"]
+        logical_hashes = (
+            self._compute_prefix_hash(candidate["tokens"])
+            if self.agentic_host_staging_client.retain_logical_hashes
+            else []
         )
-        logical_hashes = self._compute_prefix_hash(candidate["tokens"])
         bytes_per_page = sum(
             int(value)
             for value in self.agentic_direct_runtime.manager.kv_args.kv_item_lens
@@ -1651,7 +1778,6 @@ class DecodeKVCacheOffloadManager:
             ),
         )
         candidate["staging"] = True
-        candidate["source_token_indices"] = token_indices
         logger.info(
             "AgenticKV host_staging_offer snapshot=%s tokens=%d pages=%d",
             fallback.snapshot_id,
@@ -1755,6 +1881,14 @@ class DecodeKVCacheOffloadManager:
 
     def check_offload_progress(self):
         """Check the progress of offload from device to host and backup from host to storage."""
+        # Retry every locally deferred follower release in original broadcast
+        # order.  The snapshot id remains present until its I/O lane quiesces;
+        # later completions therefore cannot overwrite or strand it.
+        deferred_tp_releases = getattr(
+            self, "_agentic_tp_deferred_releases", None
+        ) or {}
+        for deferred_tp_release in tuple(deferred_tp_releases)[:32]:
+            self.commit_tp_release(deferred_tp_release)
         if getattr(self, "_decode_io_async_enabled", False):
             # One O(1) allocator read and bounded commit drain replace the old
             # synchronous O(pending snapshots) transport/control scan.
@@ -1891,9 +2025,19 @@ class DecodeKVCacheOffloadManager:
         candidate["manifest_next_poll_at"] = now + poll_interval
         return manifest
 
-    def _check_agentic_direct_progress(self, *, progress_relay: bool = True) -> None:
+    def _check_agentic_direct_progress(
+        self,
+        *,
+        progress_relay: bool = True,
+        progress_class: str = "all",
+    ) -> None:
+        if progress_class not in {"all", "direct", "slow"}:
+            raise ValueError(f"invalid agentic progress class {progress_class}")
         if self.tp_world_size > 1 and self.tp_rank != 0:
-            self._check_agentic_tp_follower_progress(progress_relay=progress_relay)
+            self._check_agentic_tp_follower_progress(
+                progress_relay=progress_relay,
+                progress_class=progress_class,
+            )
             return
         relay_worker = getattr(self, "agentic_relay_worker", None)
         if progress_relay and relay_worker is not None:
@@ -1904,7 +2048,8 @@ class DecodeKVCacheOffloadManager:
                 # retain their original KV and the ledger falls back to direct
                 # cross-NUMA D2H after the relay drains its DMA.
                 logger.exception("Agentic relay worker poll failed")
-        if not self.agentic_direct_candidates:
+        candidate_items = self._agentic_candidate_items()
+        if not candidate_items:
             return
         now = time.monotonic()
         handshake_timeout = max(
@@ -1912,7 +2057,12 @@ class DecodeKVCacheOffloadManager:
             envs.SGLANG_AGENTIC_KV_DIRECT_HANDSHAKE_TIMEOUT.get(),
         )
         staging_entries = None
-        for snapshot_id, candidate in list(self.agentic_direct_candidates.items()):
+        for snapshot_id, candidate in candidate_items:
+            is_slow = bool(candidate.get("staging"))
+            if progress_class == "direct" and is_slow:
+                continue
+            if progress_class == "slow" and not is_slow:
+                continue
             req = candidate["req"]
             metadata = candidate["metadata"]
             if self._agentic_try_final_confirmation(
@@ -1923,21 +2073,58 @@ class DecodeKVCacheOffloadManager:
                 staging_ledger = getattr(
                     self.agentic_host_staging_client, "ledger", None
                 )
-                if staging_ledger is None:
-                    outcome = self.agentic_host_staging_client.progress(
-                        candidate, candidate["source_token_indices"]
-                    )
+                if self.agentic_host_staging_client.has_active_local_write(candidate):
+                    # The extent, source pages and physical CUDA fence are now
+                    # immutable.  Advance chunks without serializing on the
+                    # global Shared-Arena ledger; the final HOST_READY commit
+                    # remains the single cross-process durability boundary.
+                    with candidate["io_lock"]:
+                        if not self._agentic_candidate_is_live_locked(
+                            snapshot_id, candidate
+                        ):
+                            continue
+                        outcome = self.agentic_host_staging_client.progress(
+                            candidate,
+                            candidate["source_token_indices"],
+                            local_write_only=True,
+                        )
+                elif staging_ledger is None:
+                    with candidate["io_lock"]:
+                        if not self._agentic_candidate_is_live_locked(
+                            snapshot_id, candidate
+                        ):
+                            continue
+                        outcome = self.agentic_host_staging_client.progress(
+                            candidate, candidate["source_token_indices"]
+                        )
                 else:
                     if staging_entries is None:
                         # All D-side staging candidates share one /dev/shm ledger.
                         # Decode must not reread and reparse that complete JSON
                         # document once per candidate on every scheduler tick.
                         staging_entries = staging_ledger.snapshot_entries()
-                    outcome = self.agentic_host_staging_client.progress(
-                        candidate,
-                        candidate["source_token_indices"],
-                        entry_snapshot=staging_entries.get(snapshot_id),
-                    )
+                    with candidate["io_lock"]:
+                        if not self._agentic_candidate_is_live_locked(
+                            snapshot_id, candidate
+                        ):
+                            continue
+                        cached_entry = staging_entries.get(snapshot_id)
+                        outcome = self.agentic_host_staging_client.progress(
+                            candidate,
+                            candidate["source_token_indices"],
+                            # The batch snapshot may have been captured just
+                            # before this candidate published its offer in the
+                            # same progress cycle.  Treat that as a cache miss,
+                            # not as proof that the ledger entry disappeared.
+                            # The sentinel makes progress() perform one exact
+                            # keyed read; passing None would incorrectly fail
+                            # the fresh snapshot and force full recomputation.
+                            **(
+                                {}
+                                if cached_entry is None
+                                else {"entry_snapshot": cached_entry}
+                            ),
+                        )
                 if outcome == "host_ready":
                     # This is the only slow-path release point: P has ACKed all
                     # chunk D2H events and committed the complete Host snapshot.
@@ -1951,33 +2138,38 @@ class DecodeKVCacheOffloadManager:
                         # destination.  Retain D KV and retry if publishing it
                         # fails instead of routing the next turn incorrectly.
                         continue
-                    self._enqueue_agentic_release(req, 0)
                     self._cleanup_agentic_direct_sender(candidate)
                     self._agentic_release_early_claim(candidate, "host_ready")
-                    self.agentic_direct_candidates.pop(snapshot_id, None)
+                    self._agentic_candidate_pop(snapshot_id)
+                    self._enqueue_agentic_release(req, 0)
                     logger.info("AgenticKV d_release_after_p_host snapshot=%s", snapshot_id)
                 elif outcome == "failed":
                     # D still owns the complete HBM copy here.  Hostless mode
                     # deliberately has no large emergency D Host pool: mark
                     # this generation unavailable, then release it intact so
                     # the next P turn safely recomputes rather than deadlocking.
-                    if self.agentic_hostless:
+                    if self.agentic_hostless or getattr(
+                        self, "_decode_io_async_enabled", False
+                    ):
                         self._publish_agentic_failure(
                             metadata, "p_host_staging_failed", candidate["manifest"]
                         )
-                        self._enqueue_agentic_release(req, 0)
                         self._cleanup_agentic_direct_sender(candidate)
                         self._agentic_release_early_claim(
                             candidate, "host_staging_failed"
                         )
-                        self.agentic_direct_candidates.pop(snapshot_id, None)
+                        self._agentic_candidate_pop(snapshot_id)
+                        self._enqueue_agentic_release(req, 0)
                         logger.warning(
                             "AgenticKV host_staging_fail_soft snapshot=%s; "
                             "next turn will recompute",
                             snapshot_id,
                         )
                         continue
-                    # Compatibility mode retains the original emergency path.
+                    # Synchronous compatibility mode retains the original
+                    # native storage fallback.  Background workers never enter
+                    # it because it reads live req_to_token and mutates the
+                    # cache-controller queues owned by the scheduler.
                     try:
                         started = self._start_agentic_slow_snapshot(
                             req,
@@ -1996,22 +2188,39 @@ class DecodeKVCacheOffloadManager:
                         self._agentic_release_early_claim(
                             candidate, "emergency_slow_path"
                         )
-                        self.agentic_direct_candidates.pop(snapshot_id, None)
+                        self._agentic_candidate_pop(snapshot_id)
                     elif started is False and req.req_pool_idx != -1:
-                        self._enqueue_agentic_release(req, 0)
                         self._agentic_release_early_claim(
                             candidate, "emergency_recompute"
                         )
-                        self.agentic_direct_candidates.pop(snapshot_id, None)
+                        self._agentic_candidate_pop(snapshot_id)
+                        self._enqueue_agentic_release(req, 0)
                 continue
             should_fallback = False
             try:
-                poll = candidate["sender"].poll()
+                with candidate["io_lock"]:
+                    if not self._agentic_candidate_is_live_locked(
+                        snapshot_id, candidate
+                    ):
+                        continue
+                    poll = candidate["sender"].poll()
             except Exception:
-                logger.exception("Direct D->P sender failed for %s", snapshot_id)
-                poll = KVPoll.Failed
+                # An unreadable sender does not prove that an already-posted
+                # DMA is terminal.  Quarantine the source pages and retry the
+                # physical fence instead of releasing them through fallback.
+                logger.exception(
+                    "Direct D->P sender status unavailable for %s; retaining D KV",
+                    snapshot_id,
+                )
+                poll = KVPoll.Transferring
 
             if candidate["sent"]:
+                if poll == KVPoll.Transferring:
+                    # Once a DMA has been posted, no manifest transition may
+                    # recycle its source pages before the local NIXL handle is
+                    # terminal.  This also prevents a remote CONSUMED marker
+                    # or fallback race from bypassing the physical fence.
+                    continue
                 if poll == KVPoll.Success:
                     if not candidate.get("local_send_complete"):
                         candidate["local_send_complete"] = True
@@ -2025,15 +2234,17 @@ class DecodeKVCacheOffloadManager:
                         )
                 elif poll == KVPoll.Failed:
                     should_fallback = True
-                # TP=1 retains the old zero-metadata completion path.  TP>1
-                # keeps every source shard pinned until the logical manifest
-                # records ACKs from all destination ranks, so a late rank
-                # failure can still fall back without losing half a snapshot.
-                if not should_fallback and self.tp_world_size == 1:
-                    self._enqueue_agentic_release(req, 0)
+                # TP=1 has no cross-rank ACK barrier, but it still must retain
+                # the source pages until the local NIXL handle is physically
+                # DONE.  Treating Transferring as completion recycles D pages
+                # underneath an in-flight DMA and leaves the P receiver stuck.
+                # TP>1 additionally waits for the logical manifest to record
+                # ACKs from every destination rank below.
+                if poll == KVPoll.Success and self.tp_world_size == 1:
                     self._cleanup_agentic_direct_sender(candidate)
                     self._agentic_release_early_claim(candidate, "direct_complete")
-                    self.agentic_direct_candidates.pop(snapshot_id, None)
+                    self._agentic_candidate_pop(snapshot_id)
+                    self._enqueue_agentic_release(req, 0)
                     continue
 
             manifest = self._agentic_direct_manifest(candidate, metadata, now)
@@ -2041,29 +2252,15 @@ class DecodeKVCacheOffloadManager:
                 if candidate["claimed_at"] is None:
                     candidate["claimed_at"] = now
                 if poll == KVPoll.WaitingForInput:
-                    token_indices = self.req_to_token_pool.req_to_token[
-                        req.req_pool_idx, : len(candidate["tokens"])
-                    ]
-                    send_digest = debug_kv_digest(
-                        self.agentic_direct_runtime.kv_pool, token_indices
-                    )
-                    if send_digest is not None:
-                        debug_page_indices = kv_to_page_indices(
-                            token_indices.cpu().numpy(), self.page_size
-                        ).tolist()
-                        logger.info(
-                            "AgenticKV d_send_digest snapshot=%s digest=%s "
-                            "page_indices=%s",
-                            snapshot_id,
-                            send_digest,
-                            debug_page_indices,
-                        )
-                    page_indices = kv_to_page_indices(
-                        token_indices.cpu().numpy(), self.page_size
-                    )
-                    candidate["sender"].init(len(page_indices), aux_index=0)
-                    candidate["sender"].send(page_indices)
-                    candidate["sent"] = True
+                    with candidate["io_lock"]:
+                        if not self._agentic_candidate_is_live_locked(
+                            snapshot_id, candidate
+                        ):
+                            continue
+                        page_indices = candidate["source_page_indices"]
+                        candidate["sender"].init(len(page_indices), aux_index=0)
+                        candidate["sender"].send(page_indices)
+                        candidate["sent"] = True
                 elif poll == KVPoll.Failed or (
                     now - candidate["claimed_at"] >= handshake_timeout
                 ):
@@ -2099,22 +2296,32 @@ class DecodeKVCacheOffloadManager:
                         )
             elif manifest.state is SnapshotState.CONSUMED:
                 # P marks CONSUMED only after its receiver observed success.
-                self._enqueue_agentic_release(req, 0)
                 self._cleanup_agentic_direct_sender(candidate)
                 self._agentic_release_early_claim(candidate, "consumed")
-                self.agentic_direct_candidates.pop(snapshot_id, None)
+                self._agentic_candidate_pop(snapshot_id)
+                self._enqueue_agentic_release(req, 0)
 
             elif (
                 manifest.state is SnapshotState.SLOW_FALLBACK
-                and getattr(self, "tp_world_size", 1) > 1
                 and self.agentic_host_staging_client is not None
                 and not candidate.get("staging")
             ):
-                # Another D rank won the request-level fallback transition.
-                # This rank still owns its physical KV-head shard and must
-                # join the same Shared-Arena group before releasing D HBM.
+                # SLOW_FALLBACK is an in-progress ownership state, never a
+                # release boundary.  TP0/TP1 may have completed the lifecycle
+                # CAS and then failed before publishing its Host offer; TP
+                # followers may observe the same group transition before
+                # publishing their shard.  Every rank retries its idempotent
+                # Host offer until ``staging`` is established.  D source pages
+                # remain pinned until the later all-shard HOST_READY commit.
                 try:
-                    started = self._start_agentic_host_staging(candidate, manifest)
+                    with candidate["io_lock"]:
+                        if not self._agentic_candidate_is_live_locked(
+                            snapshot_id, candidate
+                        ):
+                            continue
+                        started = self._start_agentic_host_staging(
+                            candidate, manifest
+                        )
                 except Exception:
                     candidate["fallback_retry_at"] = now + 0.1
                     logger.exception(
@@ -2139,11 +2346,11 @@ class DecodeKVCacheOffloadManager:
                     snapshot_id,
                     manifest.state.value,
                 )
-                self._enqueue_agentic_release(req, 0)
                 self._agentic_release_early_claim(
                     candidate, f"manifest_{manifest.state.value}"
                 )
-                self.agentic_direct_candidates.pop(snapshot_id, None)
+                self._agentic_candidate_pop(snapshot_id)
+                self._enqueue_agentic_release(req, 0)
 
             if should_fallback:
                 if now < candidate["fallback_retry_at"]:
@@ -2162,18 +2369,6 @@ class DecodeKVCacheOffloadManager:
                 manifest = self._agentic_direct_manifest(
                     candidate, metadata, now, force=True
                 )
-                if not self._agentic_try_tool_confirmation(candidate):
-                    # A configured suffix is only a provisional hint.  Native
-                    # serving continues a trajectory only after its tool
-                    # parser accepts the call.  Without that application ACK,
-                    # fail soft to recomputation; never allocate Shared Arena
-                    # or Mooncake storage for the generation.
-                    if self._agentic_fail_unconfirmed_tool_candidate(
-                        candidate, manifest, now
-                    ):
-                        continue
-                    candidate["fallback_retry_at"] = now + 0.05
-                    continue
                 if (
                     not candidate["sent"]
                     and manifest.state is SnapshotState.DIRECT_LOADING
@@ -2183,15 +2378,38 @@ class DecodeKVCacheOffloadManager:
                 self._agentic_release_early_claim(candidate, "slow_fallback")
                 logger.info(
                     "AgenticKV direct_fallback snapshot=%s elapsed_s=%.6f "
-                    "state=%s d_kv_usage=%.4f",
+                    "state=%s tool_confirmed=%s d_kv_usage=%.4f",
                     snapshot_id,
                     now - candidate["created_at"],
                     manifest.state.value,
+                    self._agentic_try_tool_confirmation(candidate),
                     self._agentic_direct_kv_usage(),
                 )
                 try:
                     if self.agentic_host_staging_client is not None:
-                        started = self._start_agentic_host_staging(candidate, manifest)
+                        with candidate["io_lock"]:
+                            if not self._agentic_candidate_is_live_locked(
+                                snapshot_id, candidate
+                            ):
+                                continue
+                            started = self._start_agentic_host_staging(
+                                candidate, manifest
+                            )
+                    elif getattr(self, "_decode_io_async_enabled", False):
+                        self._publish_agentic_failure(
+                            metadata,
+                            "shared_host_staging_unavailable",
+                            manifest,
+                        )
+                        self._cleanup_agentic_direct_sender(candidate)
+                        self._agentic_candidate_pop(snapshot_id)
+                        self._enqueue_agentic_release(req, 0)
+                        logger.warning(
+                            "AgenticKV no Shared Arena for async fallback "
+                            "snapshot=%s; next turn will recompute",
+                            snapshot_id,
+                        )
+                        continue
                     else:
                         started = self._start_agentic_slow_snapshot(
                             req,
@@ -2225,56 +2443,71 @@ class DecodeKVCacheOffloadManager:
                     # The original reverse-NIXL room is reused by relay chunk
                     # zero.  It is cleaned after HOST_READY or direct fallback.
                     continue
+                self._cleanup_agentic_direct_sender(candidate)
+                self._agentic_candidate_pop(snapshot_id)
                 if not started and req.req_pool_idx != -1:
                     self._enqueue_agentic_release(req, 0)
-                self._cleanup_agentic_direct_sender(candidate)
-                self.agentic_direct_candidates.pop(snapshot_id, None)
 
     def _check_agentic_tp_follower_progress(
-        self, *, progress_relay: bool = True
+        self,
+        *,
+        progress_relay: bool = True,
+        progress_class: str = "all",
     ) -> None:
         """Execute TP0 commands without making route or lifecycle decisions."""
 
         relay_worker = getattr(self, "agentic_relay_worker", None)
         if progress_relay and relay_worker is not None:
             relay_worker.poll()
-        for candidate in list(self.agentic_direct_candidates.values()):
+        for snapshot_id, candidate in self._agentic_candidate_items():
             action = candidate.get("tp_command", "wait")
+            if progress_class == "direct" and action == "slow":
+                continue
+            if progress_class == "slow" and action != "slow":
+                continue
             if action == "wait":
                 continue
             if action == "slow":
-                manifest = candidate.get("manifest")
-                if not candidate.get("staging"):
-                    if (
-                        manifest is None
-                        or manifest.state is not SnapshotState.SLOW_FALLBACK
+                with candidate["io_lock"]:
+                    if not self._agentic_candidate_is_live_locked(
+                        snapshot_id, candidate
                     ):
                         continue
-                    if not self._start_agentic_host_staging(candidate, manifest):
-                        continue
-                client = self.agentic_host_staging_client
-                if client is not None:
-                    client.progress(candidate, candidate["source_token_indices"])
+                    manifest = candidate.get("manifest")
+                    if not candidate.get("staging"):
+                        if (
+                            manifest is None
+                            or manifest.state is not SnapshotState.SLOW_FALLBACK
+                        ):
+                            continue
+                        if not self._start_agentic_host_staging(
+                            candidate, manifest
+                        ):
+                            continue
+                    client = self.agentic_host_staging_client
+                    if client is not None:
+                        client.progress(
+                            candidate, candidate["source_token_indices"]
+                        )
                 continue
 
             # DIRECT means rank 0 observed the group-visible P claim.  The
             # follower performs only its local NIXL send and never times out,
             # falls back, publishes a route, or frees KV independently.
-            sender = candidate["sender"]
-            poll = sender.poll()
-            if not candidate.get("sent") and poll == KVPoll.WaitingForInput:
-                req = candidate["req"]
-                token_indices = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, : len(candidate["tokens"])
-                ]
-                page_indices = kv_to_page_indices(
-                    token_indices.cpu().numpy(), self.page_size
-                )
-                sender.init(len(page_indices), aux_index=0)
-                sender.send(page_indices)
-                candidate["sent"] = True
-            elif candidate.get("sent") and poll == KVPoll.Success:
-                candidate["local_send_complete"] = True
+            with candidate["io_lock"]:
+                if not self._agentic_candidate_is_live_locked(
+                    snapshot_id, candidate
+                ):
+                    continue
+                sender = candidate["sender"]
+                poll = sender.poll()
+                if not candidate.get("sent") and poll == KVPoll.WaitingForInput:
+                    page_indices = candidate["source_page_indices"]
+                    sender.init(len(page_indices), aux_index=0)
+                    sender.send(page_indices)
+                    candidate["sent"] = True
+                elif candidate.get("sent") and poll == KVPoll.Success:
+                    candidate["local_send_complete"] = True
 
     def _cleanup_agentic_direct_sender(self, candidate) -> None:
         runtime = getattr(self, "agentic_direct_runtime", None)

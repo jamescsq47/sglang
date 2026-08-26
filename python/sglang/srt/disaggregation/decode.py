@@ -138,6 +138,7 @@ def reconcile_pd_decode_imported_prefix(scheduler, req) -> int:
         )
     return prefix_len
 
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
@@ -355,9 +356,7 @@ class DecodePreallocQueue:
             "8" if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get() else "0"
         )
         self.max_transfer_inflight = int(
-            os.environ.get(
-                "SGLANG_PD_MAX_TRANSFER_INFLIGHT", default_transfer_inflight
-            )
+            os.environ.get("SGLANG_PD_MAX_TRANSFER_INFLIGHT", default_transfer_inflight)
         )
         self.p_ready_dir = os.environ.get("SGLANG_PD_P_READY_DIR", "")
         if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get() and not self.p_ready_dir:
@@ -373,12 +372,8 @@ class DecodePreallocQueue:
         self.pending_reqs: List[DecodeRequest] = []
         self._async_progress_enabled = False
         self._async_pending_lock = threading.Lock()
-        self._async_metadata_work: thread_queue.SimpleQueue = (
-            thread_queue.SimpleQueue()
-        )
-        self._async_metadata_done: thread_queue.SimpleQueue = (
-            thread_queue.SimpleQueue()
-        )
+        self._async_metadata_work: thread_queue.SimpleQueue = thread_queue.SimpleQueue()
+        self._async_metadata_done: thread_queue.SimpleQueue = thread_queue.SimpleQueue()
         self._async_metadata_pending_count = 0
         self._async_metadata_count_lock = threading.Lock()
         self._async_control_next_at = 0.0
@@ -410,9 +405,7 @@ class DecodePreallocQueue:
                 ledger=SharedHostStagingLedger(p2d_ledger_path),
                 device_pool=self.token_to_kv_pool,
                 page_size=self.token_to_kv_pool_allocator.page_size,
-                decode_domain=int(
-                    os.getenv("SGLANG_AGENTIC_KV_PREFILL_DOMAIN", "0")
-                ),
+                decode_domain=int(os.getenv("SGLANG_AGENTIC_KV_PREFILL_DOMAIN", "0")),
                 numa_node=rank_env_int(
                     "SGLANG_AGENTIC_KV_GPU_NUMA_NODE",
                     "SGLANG_AGENTIC_KV_TP_NUMA_NODES",
@@ -439,7 +432,19 @@ class DecodePreallocQueue:
         self._async_progress_enabled = True
 
     def background_progress(self) -> None:
-        """Run network discovery and receiver polling outside Decode scheduling."""
+        """Compatibility entry point for callers without split I/O workers."""
+
+        self.background_control_progress()
+        self.background_metadata_progress()
+
+    def background_control_progress(self) -> None:
+        """Advance only lightweight receiver discovery and readiness state.
+
+        Destination-index preparation may synchronize a CUDA tensor to the
+        host for several seconds under Decode load.  It must not share this
+        worker: otherwise one already-admitted request prevents every later
+        request from completing its handshake or observing its P-ready marker.
+        """
 
         if not self._async_progress_enabled:
             return
@@ -455,6 +460,12 @@ class DecodePreallocQueue:
             self._update_handshake_waiters()
             self._background_update_p_ready()
             self._publish_tp_admission_readiness()
+
+    def background_metadata_progress(self) -> None:
+        """Prepare admitted requests' destination metadata on its own worker."""
+
+        if not self._async_progress_enabled:
+            return
         self._background_prepare_metadata()
 
     def _publish_tp_admission_readiness(self) -> None:
@@ -462,15 +473,12 @@ class DecodePreallocQueue:
 
         if getattr(self, "tp_size", 1) <= 1:
             return
-        mailbox = getattr(
-            self.scheduler, "agentic_tp_p2d_admission_mailbox", None
-        )
+        mailbox = getattr(self.scheduler, "agentic_tp_p2d_admission_mailbox", None)
         if mailbox is None:
             return
         for decode_req in list(self.queue):
-            p_ready = (
-                decode_req.req.bootstrap_host == FAKE_BOOTSTRAP_HOST
-                or getattr(decode_req, "_async_p_ready", False)
+            p_ready = decode_req.req.bootstrap_host == FAKE_BOOTSTRAP_HOST or getattr(
+                decode_req, "_async_p_ready", False
             )
             status = (
                 KVPoll.Success
@@ -530,9 +538,7 @@ class DecodePreallocQueue:
         # Metadata setup includes CPU index conversion and NIXL publication.
         # One item per 2 ms data-plane tick is already far above the admission
         # rate and avoids a burst of eight Python-heavy setups delaying Decode.
-        max_batch = max(
-            1, int(os.getenv("SGLANG_DECODE_IO_METADATA_BATCH", "1"))
-        )
+        max_batch = max(1, int(os.getenv("SGLANG_DECODE_IO_METADATA_BATCH", "1")))
         for _ in range(max_batch):
             try:
                 decode_req, page_size = self._async_metadata_work.get_nowait()
@@ -569,8 +575,7 @@ class DecodePreallocQueue:
             return
 
         ack_paths = [
-            f"{ready_path}.tp-rank-{rank}.admitted"
-            for rank in range(self.tp_size)
+            f"{ready_path}.tp-rank-{rank}.admitted" for rank in range(self.tp_size)
         ]
         ack_path = ack_paths[self.tp_rank]
         fd = os.open(ack_path, os.O_CREAT | os.O_WRONLY, 0o600)
@@ -610,7 +615,9 @@ class DecodePreallocQueue:
             try:
                 decode_req.kv_receiver.abort()
             except Exception:
-                logger.debug("Receiver abort after metadata failure failed", exc_info=True)
+                logger.debug(
+                    "Receiver abort after metadata failure failed", exc_info=True
+                )
             if decode_req.metadata_buffer_index != -1:
                 self.req_to_metadata_buffer_idx_allocator.free(
                     decode_req.metadata_buffer_index
@@ -688,7 +695,10 @@ class DecodePreallocQueue:
         )
         ready_path = getattr(decode_req, "_async_p_ready_path", None)
         self._consume_p_ready_marker(ready_path)
-        if self.transfer_queue.enable_staging and decode_req.kv_receiver.require_staging:
+        if (
+            self.transfer_queue.enable_staging
+            and decode_req.kv_receiver.require_staging
+        ):
             self.transfer_queue.staging_handler.register_decode_req(
                 decode_req.req.bootstrap_room, decode_req
             )
@@ -933,9 +943,7 @@ class DecodePreallocQueue:
         # The scheduler may then bind the receiver and move the request to the
         # transfer queue concurrently, so prealloc must never poll it again.
         queue_snapshot = [
-            decode_req
-            for decode_req in self.queue
-            if not decode_req.waiting_for_input
+            decode_req for decode_req in self.queue if not decode_req.waiting_for_input
         ]
         if not queue_snapshot:
             return
@@ -1084,9 +1092,11 @@ class DecodePreallocQueue:
         )
 
         def selected(decode_req) -> bool:
-            return selected_keys is None or (
-                str(decode_req.req.rid), int(decode_req.req.bootstrap_room)
-            ) in selected_keys
+            return (
+                selected_keys is None
+                or (str(decode_req.req.rid), int(decode_req.req.bootstrap_room))
+                in selected_keys
+            )
 
         if not self._async_progress_enabled:
             self._resolve_pending_reqs()
@@ -1359,14 +1369,16 @@ class DecodePreallocQueue:
                     self._async_metadata_pending_count,
                     req.waiting_for_input,
                     getattr(req, "_async_p_ready", False),
-                    os.path.exists(
-                        os.path.join(
-                            self.p_ready_dir,
-                            f"{req.req.bootstrap_room}.ready",
+                    (
+                        os.path.exists(
+                            os.path.join(
+                                self.p_ready_dir,
+                                f"{req.req.bootstrap_room}.ready",
+                            )
                         )
-                    )
-                    if self.p_ready_dir
-                    else False,
+                        if self.p_ready_dir
+                        else False
+                    ),
                 )
 
         return preallocated_reqs, failed_reqs
@@ -1546,6 +1558,25 @@ class DecodeTransferQueue:
     def enable_async_progress(self) -> None:
         self._async_progress_enabled = True
 
+    def abort_agentic_host_transfers(self, keys) -> None:
+        """Request TP peer cancellation without fabricating DMA completion.
+
+        Only the custom Host receiver has manager-owned delayed-abort
+        semantics.  Native Direct receivers are left to reach their own
+        physical terminal state.  The group status remains Transferring until
+        every rank reports Success/Failed.
+        """
+
+        targets = {(str(rid), int(room)) for rid, room in keys}
+        if not targets:
+            return
+        with self._async_poll_lock:
+            for decode_req in self.queue:
+                key = (str(decode_req.req.rid), int(decode_req.req.bootstrap_room))
+                receiver = decode_req.kv_receiver
+                if key in targets and isinstance(receiver, AgenticPToDHostReceiver):
+                    receiver.abort()
+
     def background_progress(self) -> None:
         """Poll P->D DMA off the scheduler; commits remain scheduler-owned."""
 
@@ -1575,8 +1606,9 @@ class DecodeTransferQueue:
                         receiver = decode_req.kv_receiver
                         if receiver is None:
                             continue
-                        if receiver.require_staging and not self.staging_handler.is_done(
-                            decode_req
+                        if (
+                            receiver.require_staging
+                            and not self.staging_handler.is_done(decode_req)
                         ):
                             self.staging_handler.advance_scatter(decode_req)
                     polls = [
@@ -1779,9 +1811,7 @@ class DecodeTransferQueue:
         # here only closes that publication tail.  TP=1 deliberately keeps the
         # original non-blocking behavior to avoid coupling Decode Forward to a
         # slow transport poll.
-        tp_group_commit = getattr(
-            getattr(self, "scheduler", None), "tp_size", 1
-        ) > 1
+        tp_group_commit = getattr(getattr(self, "scheduler", None), "tp_size", 1) > 1
         if not self._async_poll_lock.acquire(blocking=tp_group_commit):
             return []
         try:
@@ -1818,9 +1848,7 @@ class DecodeTransferQueue:
             # means the background worker has not completed its next poll.
             polls = []
             for dr in selected_queue:
-                poll = getattr(
-                    dr, "_async_transfer_poll", int(KVPoll.Transferring)
-                )
+                poll = getattr(dr, "_async_transfer_poll", int(KVPoll.Transferring))
                 if getattr(dr, "_async_transfer_poll", None) is not None:
                     dr._async_transfer_poll_claimed = True
                 polls.append(poll)
@@ -1850,10 +1878,7 @@ class DecodeTransferQueue:
         indices_to_remove = set()
         for i, decode_req, poll in zip(selected_indices, selected_queue, polls):
             if poll == KVPoll.Failed:
-                if (
-                    self.tp_rank == 0
-                    and getattr(self.scheduler, "tp_size", 1) > 1
-                ):
+                if self.tp_rank == 0 and getattr(self.scheduler, "tp_size", 1) > 1:
                     self.scheduler.agentic_tp_p2d_receiver_mailbox.publish_receipt(
                         request_generation_key(
                             decode_req.req.rid,
@@ -1906,10 +1931,7 @@ class DecodeTransferQueue:
                     # forever on a transfer that D has already consumed.
                     # This does not change P->D ordering or staging policy; it
                     # only closes the completion-notification race.
-                    if (
-                        self.tp_rank == 0
-                        and getattr(self.scheduler, "tp_size", 1) > 1
-                    ):
+                    if self.tp_rank == 0 and getattr(self.scheduler, "tp_size", 1) > 1:
                         self.scheduler.agentic_tp_p2d_receiver_mailbox.publish_receipt(
                             request_generation_key(
                                 decode_req.req.rid,
@@ -2172,9 +2194,7 @@ class SchedulerDisaggregationDecodeMixin:
             )
             self.disagg_decode_transfer_queue.extend(req_conns)
             if self.tp_size > 1:
-                transfer_keys = getattr(
-                    self, "_agentic_tp_decode_transfer_keys", ()
-                )
+                transfer_keys = getattr(self, "_agentic_tp_decode_transfer_keys", ())
                 transferred_reqs = (
                     []
                     if not transfer_keys

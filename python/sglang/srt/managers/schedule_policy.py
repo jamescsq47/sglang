@@ -499,8 +499,26 @@ class PrefillAdder:
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
 
-    def budget_state(self):
-        if self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0:
+    @staticmethod
+    def _agentic_lease_credit(req: Req) -> int:
+        """KV tokens reserved exclusively for this request's Prefill."""
+
+        indices = getattr(req, "_agentic_workset_suffix_indices", None)
+        return 0 if indices is None else int(indices.numel())
+
+    def _insufficient_total_tokens(
+        self, required_tokens: int, lease_credit: int
+    ) -> bool:
+        if lease_credit <= 0:
+            return required_tokens >= self.rem_total_tokens
+        ordinary_required = max(0, int(required_tokens) - int(lease_credit))
+        return ordinary_required > 0 and ordinary_required >= self.rem_total_tokens
+
+    def budget_state(self, *, allow_reserved_kv: bool = False):
+        if (
+            not allow_reserved_kv
+            and (self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0)
+        ):
             return AddReqResult.NO_TOKEN
 
         if self.rem_input_tokens <= 0:
@@ -516,15 +534,25 @@ class PrefillAdder:
         return AddReqResult.CONTINUE
 
     def _update_prefill_budget(
-        self, prefix_len: int, extend_input_len: int, max_new_tokens: int
+        self,
+        prefix_len: int,
+        extend_input_len: int,
+        max_new_tokens: int,
+        *,
+        kv_input_tokens: Optional[int] = None,
     ):
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
+        kv_input_tokens = (
+            extend_input_len
+            if kv_input_tokens is None
+            else self.ceil_paged_tokens(kv_input_tokens)
+        )
 
         # alloc_extend reserves an extra page_size per request to make sure the budget doesn't over-commit
-        page_overhead = self.page_size
-        self.rem_total_token_offset += extend_input_len + max_new_tokens + page_overhead
-        self.cur_rem_token_offset += extend_input_len + page_overhead
+        page_overhead = self.page_size if kv_input_tokens else 0
+        self.rem_total_token_offset += kv_input_tokens + max_new_tokens + page_overhead
+        self.cur_rem_token_offset += kv_input_tokens + page_overhead
         self.rem_input_tokens -= extend_input_len
 
         if self.dllm_config is not None:
@@ -565,10 +593,19 @@ class PrefillAdder:
 
     def _req_inc_lock_ref(self, req: Req):
         result = self.tree_cache.inc_lock_ref(req.last_node)
-        direct_parent_pin = getattr(req, "_agentic_direct_parent_pin_node", None)
-        if direct_parent_pin is not None:
-            self.tree_cache.dec_lock_ref(direct_parent_pin)
-            del req._agentic_direct_parent_pin_node
+        # Direct and Slow restore both bridge ownership with a temporary pin:
+        # the restored parent must stay non-evictable from Radix insertion
+        # until native Prefill admission has acquired the request lock above.
+        # Releasing either pin before this point opens an eviction gap while
+        # the request is still waiting in the bootstrap queue.
+        for pin_attr in (
+            "_agentic_direct_parent_pin_node",
+            "_agentic_kv_host_pin_node",
+        ):
+            parent_pin = getattr(req, pin_attr, None)
+            if parent_pin is not None:
+                self.tree_cache.dec_lock_ref(parent_pin)
+                delattr(req, pin_attr)
         if self.is_hybrid_swa:
             req.swa_uuid_for_lock = result.swa_uuid_for_lock
 
@@ -604,7 +641,25 @@ class PrefillAdder:
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
-            _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
+            lease_credit = self._agentic_lease_credit(req)
+            if lease_credit:
+                _rem_tokens = min(
+                    int(self.rem_chunk_tokens),
+                    int(req.extend_input_len),
+                    lease_credit,
+                )
+                if req.extend_input_len > _rem_tokens:
+                    _rem_tokens = _rem_tokens // self.page_size * self.page_size
+                    if _rem_tokens <= 0:
+                        _rem_tokens = min(
+                            self.page_size,
+                            int(req.extend_input_len),
+                            lease_credit,
+                        )
+            else:
+                _rem_tokens = min(
+                    self.rem_chunk_tokens, int(self.rem_total_tokens)
+                )
             # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
             # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
             if _rem_tokens <= 0:
@@ -619,8 +674,11 @@ class PrefillAdder:
             req.extend_input_len,
             (
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
-                if not truncated
+                if not truncated and not self._agentic_lease_credit(req)
                 else 0
+            ),
+            kv_input_tokens=(
+                0 if self._agentic_lease_credit(req) else None
             ),
         )
 
@@ -764,8 +822,9 @@ class PrefillAdder:
         real_input_tokens = req.extend_input_len - req.host_hit_length
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
-
-        if total_tokens >= self.rem_total_tokens:
+        lease_credit = self._agentic_lease_credit(req)
+        capacity_tokens = req.extend_input_len if lease_credit else total_tokens
+        if self._insufficient_total_tokens(capacity_tokens, lease_credit):
             return AddReqResult.NO_TOKEN
 
         if real_input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
@@ -773,7 +832,9 @@ class PrefillAdder:
 
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
-            if total_tokens >= self.rem_total_tokens:
+            lease_credit = self._agentic_lease_credit(req)
+            capacity_tokens = req.extend_input_len if lease_credit else total_tokens
+            if self._insufficient_total_tokens(capacity_tokens, lease_credit):
                 return AddReqResult.NO_TOKEN
 
             if req.host_hit_length > 0:
@@ -815,7 +876,10 @@ class PrefillAdder:
                     min(
                         req.sampling_params.max_new_tokens,
                         CLIP_MAX_NEW_TOKENS,
-                    ),
+                    )
+                    if not lease_credit
+                    else 0,
+                    kv_input_tokens=max(0, input_tokens - lease_credit),
                 )
             else:
                 # Make sure at least one page is available
@@ -843,9 +907,14 @@ class PrefillAdder:
                 self.new_chunked_req = req
 
                 self._req_inc_lock_ref(req)
-                self._update_prefill_budget(prefix_len, trunc_len, 0)
+                self._update_prefill_budget(
+                    prefix_len,
+                    trunc_len,
+                    0,
+                    kv_input_tokens=max(0, trunc_len - lease_credit),
+                )
 
-        return self.budget_state()
+        return self.budget_state(allow_reserved_kv=bool(lease_credit))
 
     def preempt_to_schedule(self, req: Req, server_args: ServerArgs) -> bool:
         """

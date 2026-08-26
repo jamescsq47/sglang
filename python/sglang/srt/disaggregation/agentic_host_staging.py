@@ -7,9 +7,12 @@ through it: D publishes an offer in /dev/shm, P atomically reserves one complete
 snapshot extent in a shared pinned Host arena, and D writes that extent with its
 own CUDA D2H engine.  P later restores it with its own H2D engine.  D may release
 its source snapshot only after its CUDA event completed and HOST_READY was
-committed.  Cold Host snapshots retain the existing Mooncake spill lifecycle.
+committed.  The custom path keeps KV bytes exclusively in GPU or Shared Arena;
+its node-local metadata store contains manifests and claims only.
 """
 
+import ctypes
+import errno
 import fcntl
 import hashlib
 import json
@@ -17,9 +20,11 @@ import logging
 import math
 import mmap
 import os
+import queue
 import threading
 import time
-from dataclasses import replace
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Optional
 
@@ -27,6 +32,7 @@ import torch
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.agentic_kv_lifecycle import (
+    MooncakeSnapshotStore,
     SharedSnapshotEvictionController,
     SnapshotManifest,
     SnapshotState,
@@ -37,6 +43,232 @@ from sglang.srt.mem_cache.hicache_storage import HiCacheStorageExtraInfo
 
 logger = logging.getLogger(__name__)
 _LEDGER_ENTRY_UNSET = object()
+_HOST_LIBC = ctypes.CDLL(None, use_errno=True)
+_HOST_MEMMOVE = _HOST_LIBC.memmove
+_HOST_MEMMOVE.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t)
+_HOST_MEMMOVE.restype = ctypes.c_void_p
+_HOST_MADVISE = _HOST_LIBC.madvise
+_HOST_MADVISE.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+_HOST_MADVISE.restype = ctypes.c_int
+_HOST_MEMSET = _HOST_LIBC.memset
+_HOST_MEMSET.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t)
+_HOST_MEMSET.restype = ctypes.c_void_p
+_MADV_POPULATE_WRITE = 23
+
+
+def supports_agentic_kv_spill(storage_backend) -> bool:
+    """Return the authoritative Shared-Arena spill capability.
+
+    Existing SGLang storage backends predate this opt-out attribute and are
+    spill-capable.  The request-level node-local backend explicitly sets it to
+    ``False``.  D metadata, P admission and scheduler construction must all
+    use this same compatibility rule.
+    """
+
+    return bool(getattr(storage_backend, "supports_kv_spill", True))
+
+
+def _copy_layer_first_host_range(
+    destination: torch.Tensor,
+    source: torch.Tensor,
+    *,
+    destination_start: int,
+    source_start: int,
+    token_count: int,
+) -> None:
+    """Copy a token range between CPU layer-first KV buffers.
+
+    A slice across ``[K/V, layer, token, head, dim]`` is strided at every
+    layer boundary. PyTorch's generic CPU TensorIterator path is especially
+    slow when one side is pinned memory (the Shared-Arena bounce-buffer case).
+    Each individual ``[token, head, dim]`` layer range is contiguous, so copy
+    those ranges with libc. ``CDLL`` releases the GIL while memmove runs,
+    keeping transport progress independent of the model scheduler thread.
+    """
+
+    destination_start = int(destination_start)
+    source_start = int(source_start)
+    token_count = int(token_count)
+    if token_count < 0:
+        raise ValueError("Host KV copy token_count must be non-negative")
+    if token_count == 0:
+        return
+    if destination.device.type != "cpu" or source.device.type != "cpu":
+        raise ValueError("Host KV copy requires CPU tensors")
+    if destination.dtype != source.dtype:
+        raise ValueError("Host KV copy dtype mismatch")
+    if destination.ndim != 5 or source.ndim != 5:
+        raise ValueError("Host KV copy requires [K/V, layer, token, head, dim]")
+    if (
+        destination.shape[:2] != source.shape[:2]
+        or destination.shape[3:] != source.shape[3:]
+    ):
+        raise ValueError("Host KV copy layout mismatch")
+    if (
+        destination_start < 0
+        or destination_start + token_count > destination.shape[2]
+    ):
+        raise ValueError("Host KV destination range is out of bounds")
+    if source_start < 0 or source_start + token_count > source.shape[2]:
+        raise ValueError("Host KV source range is out of bounds")
+
+    bytes_per_layer_range = (
+        token_count
+        * int(destination.shape[3])
+        * int(destination.shape[4])
+        * int(destination.element_size())
+    )
+    for kv_index in range(int(destination.shape[0])):
+        for layer_index in range(int(destination.shape[1])):
+            destination_view = destination[
+                kv_index,
+                layer_index,
+                destination_start : destination_start + token_count,
+            ]
+            source_view = source[
+                kv_index,
+                layer_index,
+                source_start : source_start + token_count,
+            ]
+            if (
+                not destination_view.is_contiguous()
+                or not source_view.is_contiguous()
+            ):
+                raise ValueError("Host KV per-layer token range must be contiguous")
+            _HOST_MEMMOVE(
+                destination_view.data_ptr(),
+                source_view.data_ptr(),
+                bytes_per_layer_range,
+            )
+
+
+@dataclass
+class H2DLaunchFence:
+    """Physical completion authority for one asynchronously launched H2D.
+
+    ``submitted`` becomes true before the first CUDA operation. ``armed`` is
+    true only after the completion event has been recorded behind every
+    operation on the stream.  A submitted but unarmed launch is permanently
+    quarantined because no allocator-safe completion proof exists.
+    """
+
+    event: Any
+    submitted: bool = False
+    armed: bool = False
+    unavailable: bool = False
+    copy_refs: list[Any] = field(default_factory=list)
+
+
+class AgenticNodeLocalRawStore:
+    """Tiny cross-process metadata store backed by tmpfs files.
+
+    Shared Arena owns the KV bytes.  The request-generation state machine only
+    needs create-if-absent, replace, read, and remove for small manifests and
+    claim records; using this store keeps the custom path independent of
+    native HiCache/Mooncake without putting KV data on the filesystem.
+    """
+
+    def __init__(self, directory: str):
+        if not directory:
+            raise ValueError("agentic metadata directory must be non-empty")
+        self.directory = os.path.abspath(directory)
+        os.makedirs(self.directory, exist_ok=True)
+
+    def _path(self, key: str) -> str:
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        return os.path.join(self.directory, digest)
+
+    @contextmanager
+    def _locked(self, key: str):
+        lock_path = f"{self._path(key)}.lock"
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield self._path(key)
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    @staticmethod
+    def _replace(path: str, value: bytes) -> None:
+        temp = f"{path}.tmp-{os.getpid()}-{threading.get_ident()}"
+        try:
+            with open(temp, "wb") as handle:
+                handle.write(value)
+                handle.flush()
+            os.replace(temp, path)
+        finally:
+            try:
+                os.unlink(temp)
+            except FileNotFoundError:
+                pass
+
+    def put(self, key: str, value: bytes) -> int:
+        with self._locked(key) as path:
+            if os.path.exists(path):
+                return -1
+            self._replace(path, bytes(value))
+        return 0
+
+    def upsert(self, key: str, value: bytes) -> int:
+        with self._locked(key) as path:
+            self._replace(path, bytes(value))
+        return 0
+
+    def get(self, key: str) -> bytes:
+        with self._locked(key) as path:
+            try:
+                with open(path, "rb") as handle:
+                    return handle.read()
+            except FileNotFoundError:
+                return b""
+
+    def is_exist(self, key: str) -> int:
+        with self._locked(key) as path:
+            return int(os.path.exists(path))
+
+    def batch_is_exist(self, keys: list[str]) -> list[int]:
+        return [self.is_exist(key) for key in keys]
+
+    def remove(self, key: str, force: bool = False) -> int:
+        del force
+        with self._locked(key) as path:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                return -1
+        return 0
+
+    def batch_remove(self, keys: list[str], force: bool = False) -> list[int]:
+        return [self.remove(key, force=force) for key in keys]
+
+
+class AgenticNodeLocalMetadataBackend:
+    """Manifest backend for Shared-Arena-only deployments."""
+
+    supports_kv_spill = False
+
+    def __init__(self, directory: str):
+        self._raw_store = AgenticNodeLocalRawStore(directory)
+
+    def agentic_snapshot_store(self):
+        return MooncakeSnapshotStore(self._raw_store)
+
+    def close(self) -> None:
+        pass
+
+
+def create_agentic_node_local_metadata_backend():
+    ready_dir = os.environ.get("SGLANG_PD_P_READY_DIR", "")
+    directory = os.environ.get("SGLANG_AGENTIC_KV_METADATA_DIR", "")
+    if not directory:
+        if not ready_dir:
+            raise ValueError(
+                "Shared-Arena metadata requires SGLANG_PD_P_READY_DIR or "
+                "SGLANG_AGENTIC_KV_METADATA_DIR"
+            )
+        directory = os.path.join(ready_dir, "snapshot-metadata")
+    return AgenticNodeLocalMetadataBackend(directory)
 
 
 class AgenticStorageController:
@@ -121,7 +353,13 @@ def create_agentic_storage_controller(
 
     backend_name = server_args.hicache_storage_backend
     if backend_name is None:
-        raise ValueError("agentic Host staging requires a storage backend")
+        backend = create_agentic_node_local_metadata_backend()
+        logger.info(
+            "Agentic Shared-Arena metadata enabled directory=%s "
+            "native_hicache=false mooncake=false",
+            backend._raw_store.directory,
+        )
+        return AgenticStorageController(None, backend)
     device_pool = token_allocator.get_kvcache()
     common = (
         device_pool,
@@ -327,6 +565,7 @@ class SharedHostStagingLedger:
 
     def offer(self, entry: dict[str, Any]) -> dict[str, Any]:
         snapshot_id = str(entry["snapshot_id"])
+        control_offer = bool(entry.get("control_offer", False))
 
         def callback(entries):
             current = entries.get(snapshot_id)
@@ -352,6 +591,17 @@ class SharedHostStagingLedger:
                     or current.get("token_digest") != entry.get("token_digest")
                 ):
                     raise ValueError("host-staging TP ranks disagree on tokens")
+                current_is_control = bool(current.get("control_offer", False))
+                if current_is_control or control_offer:
+                    if not (current_is_control and control_offer):
+                        raise ValueError(
+                            "host-staging snapshot cannot mix control and rank offers"
+                        )
+                    # Router publication is an idempotent notification.  Once
+                    # any P rank has claimed the snapshot, replaying the same
+                    # notification must never recreate rank metadata or move
+                    # HOST_RESERVED/HOST_WRITING/HOST_READY back to OFFERED.
+                    return dict(current), False
                 rank_offers = current.setdefault("rank_offers", {})
                 rank_key = str(tp_rank)
                 incoming = {
@@ -374,11 +624,13 @@ class SharedHostStagingLedger:
                     for value in rank_offers.values()
                 )
                 current["updated_at"] = now
-                if len(rank_offers) == tp_size:
+                if (
+                    len(rank_offers) == tp_size
+                    and current.get("state") == "tp_collecting"
+                ):
                     current["state"] = HostStageState.OFFERED.value
                 return dict(current), True
             value = dict(entry)
-            control_offer = bool(entry.get("control_offer", False))
             rank_offer = {
                 "tp_rank": tp_rank,
                 "d_pid": int(entry.get("d_pid", -1)),
@@ -789,6 +1041,76 @@ class SharedHostStagingLedger:
 
         return self._mutate(callback)
 
+    def claim_p2d_write_rank(
+        self,
+        snapshot_id: str,
+        owner: str,
+        grant: dict[str, Any],
+        *,
+        tp_rank: int,
+        tp_size: int,
+    ) -> Optional[dict[str, Any]]:
+        """Atomically give one P->D shard and its Host extent to staging.
+
+        A P->D writer must not expose an intermediate ``HOST_RESERVED`` state
+        without also publishing the immutable physical extent that it owns.
+        Native transfer arbitration and Router cleanup run in other processes;
+        splitting claim and grant into two ledger mutations lets one of those
+        processes terminate the offer between the mutations.  The P worker
+        would then own GPU/Host resources for a snapshot whose grant can no
+        longer be committed.
+
+        This operation is the ownership boundary for one TP shard.  Before it
+        returns, native transfer may still win.  After it returns successfully,
+        Host owns the complete request-generation snapshot and all later code
+        may only wait for the physical write or fail it closed.
+        """
+
+        def callback(entries):
+            current = entries.get(snapshot_id)
+            if current is None or int(current.get("tp_size", 1)) != int(tp_size):
+                return None, False
+            if current.get("state") not in {
+                HostStageState.OFFERED.value,
+                HostStageState.HOST_RESERVED.value,
+                HostStageState.HOST_WRITING.value,
+            }:
+                return None, False
+            if current.get("p_owner") not in {None, owner}:
+                return None, False
+
+            rank_key = str(int(tp_rank))
+            normalized = dict(grant, tp_rank=int(tp_rank))
+            rank_grants = current.setdefault("rank_grants", {})
+            previous = rank_grants.get(rank_key)
+            if previous is not None and previous != normalized:
+                return None, False
+
+            claimed = set(int(value) for value in current.get("claimed_ranks", []))
+            claimed.add(int(tp_rank))
+            rank_grants[rank_key] = normalized
+            current["p_owner"] = owner
+            current["claimed_ranks"] = sorted(claimed)
+            current["grants"] = [
+                dict(rank_grants[str(rank)])
+                for rank in range(int(tp_size))
+                if str(rank) in rank_grants
+            ]
+            # HOST_RESERVED means Host already owns every claimed shard, while
+            # peer TP ranks may still join the same transaction.  Only the
+            # complete grant set advances to HOST_WRITING.  ``p_owner`` and
+            # ``claimed_ranks`` make both states non-preemptible by native
+            # transfer or Router cleanup.
+            current["state"] = (
+                HostStageState.HOST_WRITING.value
+                if len(rank_grants) == int(tp_size)
+                else HostStageState.HOST_RESERVED.value
+            )
+            current["updated_at"] = time.time()
+            return dict(current), True
+
+        return self._mutate(callback)
+
     def reject_unclaimed_offer(
         self, snapshot_id: str, *, reason: Optional[str] = None
     ) -> bool:
@@ -810,6 +1132,53 @@ class SharedHostStagingLedger:
             return True, True
 
         return bool(self._mutate(callback))
+
+    def abort_unsubmitted_p2d(
+        self, snapshot_id: str, *, reason: Optional[str] = None
+    ) -> str:
+        """Cancel P->D Host ownership before a Decode request is submitted.
+
+        The Router owns this boundary. An untouched offer can be rejected
+        immediately. A claimed writer must first enter ABORTING so the P-side
+        staging worker keeps the source pages and Host extent until its CUDA
+        fence drains; that worker then publishes FAILED and releases storage.
+        HOST_READY has no live writer and can fail directly. H2D_LOADING means
+        responsibility has already crossed to Decode and is never cancelled
+        by this pre-submit operation.
+        """
+
+        def callback(entries):
+            current = entries.get(snapshot_id)
+            if current is None:
+                return "missing", False
+            state = current.get("state")
+            changed = False
+            if (
+                state == HostStageState.OFFERED.value
+                and current.get("p_owner") is None
+                and not current.get("claimed_ranks")
+            ):
+                current["state"] = HostStageState.REJECTED.value
+                state = current["state"]
+                changed = True
+            elif state in {
+                HostStageState.HOST_RESERVED.value,
+                HostStageState.HOST_WRITING.value,
+            }:
+                current["state"] = HostStageState.ABORTING.value
+                state = current["state"]
+                changed = True
+            elif state == HostStageState.HOST_READY.value:
+                current["state"] = HostStageState.FAILED.value
+                state = current["state"]
+                changed = True
+            if changed:
+                current["updated_at"] = time.time()
+                if reason:
+                    current["reason"] = str(reason)[:256]
+            return str(state), changed
+
+        return str(self._mutate(callback))
 
     def arbitrate_p2d_release(self, snapshot_id: str, *, tp_size: int) -> str:
         """Resolve whether one untouched P shard may release its source pages.
@@ -876,9 +1245,6 @@ class SharedHostStagingLedger:
         tp_rank: int,
         tp_size: int,
     ) -> bool:
-        if int(tp_size) == 1:
-            return self.publish_grants(snapshot_id, owner, [grant])
-
         def callback(entries):
             current = entries.get(snapshot_id)
             if (
@@ -1408,6 +1774,7 @@ class SharedMHAHostSnapshot:
         device_pool,
         byte_size: int,
         create: bool,
+        file_offset: int = 0,
     ):
         if not path.startswith("/dev/shm/"):
             raise ValueError("shared Host snapshot must reside in /dev/shm")
@@ -1431,14 +1798,24 @@ class SharedMHAHostSnapshot:
                 f"shared Host extent size mismatch: expected={expected_bytes} actual={byte_size}"
             )
         self.byte_size = expected_bytes
+        self.file_offset = int(file_offset)
+        if self.file_offset < 0 or self.file_offset % mmap.ALLOCATIONGRANULARITY:
+            raise ValueError("shared Host extent offset must be mmap-aligned")
         flags = os.O_RDWR | (os.O_CREAT | os.O_EXCL if create else 0)
         fd = os.open(path, flags, 0o600)
         try:
             if create:
+                if self.file_offset:
+                    raise ValueError("new standalone Host snapshots require offset zero")
                 os.ftruncate(fd, self.byte_size)
-            elif os.fstat(fd).st_size != self.byte_size:
-                raise ValueError("shared Host extent file has the wrong size")
-            self.mapping = mmap.mmap(fd, self.byte_size, access=mmap.ACCESS_WRITE)
+            elif os.fstat(fd).st_size < self.file_offset + self.byte_size:
+                raise ValueError("shared Host extent file is smaller than the snapshot")
+            self.mapping = mmap.mmap(
+                fd,
+                self.byte_size,
+                access=mmap.ACCESS_WRITE,
+                offset=self.file_offset,
+            )
         finally:
             os.close(fd)
         raw = torch.frombuffer(self.mapping, dtype=torch.uint8, count=self.byte_size)
@@ -1483,6 +1860,7 @@ class SharedMHAHostSnapshot:
         stream,
         staging=None,
         host_bounce=None,
+        launch_fence: Optional[H2DLaunchFence] = None,
     ):
         """Launch one D2H chunk into a fixed pinned bounce buffer.
 
@@ -1511,50 +1889,68 @@ class SharedMHAHostSnapshot:
         if len(source_indices) > host_bounce.token_capacity:
             raise ValueError("D2H chunk is larger than the pinned Host bounce")
         start_event = torch.cuda.Event(enable_timing=True)
-        event = torch.cuda.Event(enable_timing=True)
-        with torch.cuda.stream(stream):
-            if not source_indices.is_cuda or source_indices.dtype != torch.int64:
-                source_indices = source_indices.to(
-                    device=self.device_pool.device,
-                    dtype=torch.int64,
-                    non_blocking=True,
-                )
-            start_event.record(stream)
-            for start in range(0, len(source_indices), staging.token_capacity):
-                count = min(staging.token_capacity, len(source_indices) - start)
-                source_chunk = source_indices[start : start + count]
-                local_indices = staging.local_indices[:count]
-                transfer_kv_all_layer(
-                    src_k_layers=self.device_pool.k_data_ptrs,
-                    dst_k_layers=staging.k_data_ptrs,
-                    src_v_layers=self.device_pool.v_data_ptrs,
-                    dst_v_layers=staging.v_data_ptrs,
-                    src_indices=source_chunk,
-                    dst_indices=local_indices,
-                    item_size=self.item_size,
-                    num_layers=self.layer_num,
-                    block_quota=8,
-                    num_warps_per_block=32,
-                )
-                for layer_id in range(self.layer_num):
-                    host_bounce.k_buffer[layer_id, start : start + count].copy_(
-                        staging.k_buffer[layer_id][:count], non_blocking=True
+        if launch_fence is None:
+            launch_fence = H2DLaunchFence(event=torch.cuda.Event(enable_timing=True))
+        event = launch_fence.event
+        copy_refs = [source_indices, original_source_indices, staging, host_bounce]
+        launch_fence.copy_refs = copy_refs
+        try:
+            with torch.cuda.stream(stream):
+                # The event is the release authority if CUDA accepts any part
+                # of this D2H launch and a later submission raises.
+                launch_fence.submitted = True
+                if not source_indices.is_cuda or source_indices.dtype != torch.int64:
+                    source_indices = source_indices.to(
+                        device=self.device_pool.device,
+                        dtype=torch.int64,
+                        non_blocking=True,
                     )
-                    host_bounce.v_buffer[layer_id, start : start + count].copy_(
-                        staging.v_buffer[layer_id][:count], non_blocking=True
+                    copy_refs.append(source_indices)
+                start_event.record(stream)
+                for start in range(0, len(source_indices), staging.token_capacity):
+                    count = min(staging.token_capacity, len(source_indices) - start)
+                    source_chunk = source_indices[start : start + count]
+                    local_indices = staging.local_indices[:count]
+                    transfer_kv_all_layer(
+                        src_k_layers=self.device_pool.k_data_ptrs,
+                        dst_k_layers=staging.k_data_ptrs,
+                        src_v_layers=self.device_pool.v_data_ptrs,
+                        dst_v_layers=staging.v_data_ptrs,
+                        src_indices=source_chunk,
+                        dst_indices=local_indices,
+                        item_size=self.item_size,
+                        num_layers=self.layer_num,
+                        block_quota=8,
+                        num_warps_per_block=32,
                     )
-            event.record(stream)
-            source_indices.record_stream(stream)
-            if hasattr(original_source_indices, "record_stream"):
-                original_source_indices.record_stream(stream)
+                    for layer_id in range(self.layer_num):
+                        host_bounce.k_buffer[layer_id, start : start + count].copy_(
+                            staging.k_buffer[layer_id][:count], non_blocking=True
+                        )
+                        host_bounce.v_buffer[layer_id, start : start + count].copy_(
+                            staging.v_buffer[layer_id][:count], non_blocking=True
+                        )
+                event.record(stream)
+                launch_fence.armed = True
+                source_indices.record_stream(stream)
+                if bool(getattr(original_source_indices, "is_cuda", False)):
+                    original_source_indices.record_stream(stream)
+        except Exception:
+            if launch_fence.submitted and not launch_fence.armed:
+                try:
+                    # Recording behind all work already accepted by this
+                    # private stream gives the caller a physical quiescence
+                    # proof even when the original launch only partly formed.
+                    with torch.cuda.stream(stream):
+                        event.record(stream)
+                    launch_fence.armed = True
+                except Exception:
+                    launch_fence.unavailable = True
+            raise
         self._last_d2h_start_event = start_event
-        return event, (
-            source_indices,
-            original_source_indices,
-            staging,
-            host_bounce,
-            start_event,
-        )
+        copy_refs.append(start_event)
+        launch_fence.copy_refs = copy_refs
+        return event, tuple(copy_refs)
 
     def commit_backup_range_from_bounce(
         self, host_bounce, *, destination_start: int, token_count: int
@@ -1566,8 +1962,12 @@ class SharedMHAHostSnapshot:
         destination_end = destination_start + token_count
         if destination_start < 0 or destination_end > self.token_count:
             raise ValueError("D2H bounce commit falls outside shared Host extent")
-        self.kv_buffer[:, :, destination_start:destination_end].copy_(
-            host_bounce.kv_buffer[:, :, :token_count]
+        _copy_layer_first_host_range(
+            self.kv_buffer,
+            host_bounce.kv_buffer,
+            destination_start=destination_start,
+            source_start=0,
+            token_count=token_count,
         )
 
     def start_load_range_to_device(
@@ -1578,6 +1978,7 @@ class SharedMHAHostSnapshot:
         source_start: int,
         staging=None,
         host_bounce=None,
+        launch_fence: Optional[H2DLaunchFence] = None,
     ):
         """Launch one pageable Host -> pinned bounce -> P-HBM chunk.
 
@@ -1608,50 +2009,77 @@ class SharedMHAHostSnapshot:
             raise ValueError("H2D staging buffer is smaller than the chunk")
         # CPU copy happens before CUDA submission and touches only a bounded,
         # already-pinned allocation.  No CUDA driver registration is needed.
-        host_bounce.kv_buffer[:, :, :token_count].copy_(
-            self.kv_buffer[
-                :, :, source_start : source_start + token_count
-            ]
+        _copy_layer_first_host_range(
+            host_bounce.kv_buffer,
+            self.kv_buffer,
+            destination_start=0,
+            source_start=source_start,
+            token_count=token_count,
         )
         start_event = torch.cuda.Event(enable_timing=True)
-        event = torch.cuda.Event(enable_timing=True)
-        copy_refs = [device_indices, staging, host_bounce]
-        with torch.cuda.stream(stream):
-            if not device_indices.is_cuda or device_indices.dtype != torch.int64:
-                device_indices = device_indices.to(
-                    device=self.device_pool.device,
-                    dtype=torch.int64,
-                    non_blocking=True,
-                )
-            start_event.record(stream)
-            source_indices = staging.local_indices[:token_count]
-            for layer_id in range(self.layer_num):
-                staging.k_buffer[layer_id][:token_count].copy_(
-                    host_bounce.k_buffer[layer_id, :token_count], non_blocking=True
-                )
-                staging.v_buffer[layer_id][:token_count].copy_(
-                    host_bounce.v_buffer[layer_id, :token_count], non_blocking=True
-                )
-            transfer_kv_all_layer(
-                src_k_layers=staging.k_data_ptrs,
-                dst_k_layers=self.device_pool.k_data_ptrs,
-                src_v_layers=staging.v_data_ptrs,
-                dst_v_layers=self.device_pool.v_data_ptrs,
-                src_indices=source_indices,
-                dst_indices=device_indices,
-                item_size=self.item_size,
-                num_layers=self.layer_num,
-                block_quota=4,
-                num_warps_per_block=32,
+        if launch_fence is None:
+            launch_fence = H2DLaunchFence(
+                event=torch.cuda.Event(enable_timing=True)
             )
-            source_indices.record_stream(stream)
-            copy_refs.append(source_indices)
-            event.record(stream)
-            device_indices.record_stream(stream)
-            if hasattr(original_device_indices, "record_stream"):
-                original_device_indices.record_stream(stream)
+        event = launch_fence.event
+        copy_refs = [device_indices, staging, host_bounce]
+        launch_fence.copy_refs = copy_refs
+        try:
+            with torch.cuda.stream(stream):
+                # From this point onward an exception may follow a partially
+                # submitted copy.  The pre-created event is the only release
+                # authority for both Host and destination HBM.
+                launch_fence.submitted = True
+                if not device_indices.is_cuda or device_indices.dtype != torch.int64:
+                    device_indices = device_indices.to(
+                        device=self.device_pool.device,
+                        dtype=torch.int64,
+                        non_blocking=True,
+                    )
+                    copy_refs.append(device_indices)
+                start_event.record(stream)
+                source_indices = staging.local_indices[:token_count]
+                for layer_id in range(self.layer_num):
+                    staging.k_buffer[layer_id][:token_count].copy_(
+                        host_bounce.k_buffer[layer_id, :token_count], non_blocking=True
+                    )
+                    staging.v_buffer[layer_id][:token_count].copy_(
+                        host_bounce.v_buffer[layer_id, :token_count], non_blocking=True
+                    )
+                transfer_kv_all_layer(
+                    src_k_layers=staging.k_data_ptrs,
+                    dst_k_layers=self.device_pool.k_data_ptrs,
+                    src_v_layers=staging.v_data_ptrs,
+                    dst_v_layers=self.device_pool.v_data_ptrs,
+                    src_indices=source_indices,
+                    dst_indices=device_indices,
+                    item_size=self.item_size,
+                    num_layers=self.layer_num,
+                    block_quota=4,
+                    num_warps_per_block=32,
+                )
+                source_indices.record_stream(stream)
+                copy_refs.append(source_indices)
+                event.record(stream)
+                launch_fence.armed = True
+                device_indices.record_stream(stream)
+                if bool(getattr(original_device_indices, "is_cuda", False)):
+                    original_device_indices.record_stream(stream)
+        except BaseException:
+            if launch_fence.submitted and not launch_fence.armed:
+                try:
+                    # Record behind every operation that was accepted before
+                    # the exception.  If even this fails, no physical fence is
+                    # available and the caller must quarantine ownership.
+                    with torch.cuda.stream(stream):
+                        event.record(stream)
+                    launch_fence.armed = True
+                except BaseException:
+                    launch_fence.unavailable = True
+            raise
         self._last_h2d_start_event = start_event
         copy_refs.extend((original_device_indices, start_event))
+        launch_fence.copy_refs = copy_refs
         return event, tuple(copy_refs)
 
     def copy_into_hicache(self, host_pool, host_indices, page_size: int) -> None:
@@ -1724,21 +2152,94 @@ class LazySharedMHAHostSnapshot:
     independently after D has begun writing it.
     """
 
-    def __init__(self, *, path: str, token_count: int, device_pool, byte_size: int):
+    def __init__(
+        self,
+        *,
+        path: str,
+        token_count: int,
+        device_pool,
+        byte_size: int,
+        allocation_bytes: Optional[int] = None,
+        create: bool = True,
+    ):
         if not path.startswith("/dev/shm/"):
             raise ValueError("shared Host snapshot must reside in /dev/shm")
         self.path = path
         self.token_count = int(token_count)
         self.device_pool = device_pool
         self.byte_size = int(byte_size)
+        self.allocation_bytes = max(
+            self.byte_size,
+            self.byte_size if allocation_bytes is None else int(allocation_bytes),
+        )
+        self.requires_prefault = bool(create)
         self._materialized = None
         self._closed = False
         self._lock = threading.Lock()
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        flags = os.O_RDWR | (os.O_CREAT | os.O_EXCL if create else 0)
+        fd = os.open(path, flags, 0o600)
         try:
-            os.ftruncate(fd, self.byte_size)
+            if create:
+                os.ftruncate(fd, self.allocation_bytes)
+            elif os.fstat(fd).st_size < self.byte_size:
+                raise ValueError("recycled Host extent is smaller than the snapshot")
         finally:
             os.close(fd)
+
+    def prefault_for_write(self) -> None:
+        """Populate tmpfs pages before publishing the D2H grant.
+
+        A freshly truncated tmpfs file is sparse.  Letting the D transport
+        thread take tens of thousands of 4-KiB write faults while committing
+        each KV chunk reduces an otherwise memory-bandwidth copy to roughly
+        1 GiB/s.  P owns extent creation, so it prepares the pages on a bounded
+        background worker before D can see the grant.  Linux
+        MADV_POPULATE_WRITE performs that work in-kernel; the portable memset
+        fallback preserves the same lifetime and correctness contract.
+        """
+
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("cannot prefault a released Host extent")
+            # Recycled extents retain their tmpfs pages.  Re-populating them
+            # would reintroduce the extra full-memory write that the arena
+            # pool exists to avoid.
+            if not self.requires_prefault:
+                return
+            fd = os.open(self.path, os.O_RDWR)
+        try:
+            # ftruncate creates a sparse tmpfs file.  Reserve the complete
+            # backing store before touching any page so capacity exhaustion is
+            # reported as an ordinary admission failure instead of SIGBUS in
+            # the background worker.
+            os.posix_fallocate(fd, 0, self.byte_size)
+            mapping = mmap.mmap(fd, self.byte_size, access=mmap.ACCESS_WRITE)
+        finally:
+            os.close(fd)
+        anchor = ctypes.c_char.from_buffer(mapping)
+        address = ctypes.addressof(anchor)
+        try:
+            ctypes.set_errno(0)
+            if _HOST_MADVISE(address, self.byte_size, _MADV_POPULATE_WRITE) != 0:
+                error_number = ctypes.get_errno()
+                unsupported = {
+                    errno.EINVAL,
+                    errno.ENOSYS,
+                    getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+                }
+                if error_number not in unsupported:
+                    raise OSError(
+                        error_number,
+                        os.strerror(error_number),
+                        self.path,
+                    )
+                # The extent is already fully reserved, so this compatibility
+                # fallback cannot fault into an overcommitted sparse file.
+                _HOST_MEMSET(address, 0, self.byte_size)
+            self.requires_prefault = False
+        finally:
+            del anchor
+            mapping.close()
 
     def materialize(self):
         with self._lock:
@@ -1753,6 +2254,14 @@ class LazySharedMHAHostSnapshot:
                     create=False,
                 )
             return self
+
+    def mark_populated(self) -> None:
+        """Publish that every byte in the logical snapshot was written."""
+
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("cannot populate a released Host extent")
+            self.requires_prefault = False
 
     def __getattr__(self, name):
         materialized = object.__getattribute__(self, "_materialized")
@@ -1777,7 +2286,15 @@ class LazySharedMHAHostSnapshot:
 
 
 class SharedHostSnapshotArena:
-    """P-owned capacity and lifecycle for snapshot-scoped shared extents."""
+    """P-owned capacity and lifecycle for snapshot-scoped shared extents.
+
+    Consumed extents are recycled instead of unlinked.  Creating a sparse
+    tmpfs file for every generation makes the first KV write pay one page
+    fault per 4-KiB page; on long-running agent workloads that cost dominates
+    PCIe DMA.  A recycled extent contains no live snapshot state and is not
+    visible in the ledger, but its already-backed pages can serve the next
+    complete request-generation without changing request-level ownership.
+    """
 
     def __init__(self, directory: str, capacity_bytes: int):
         if not directory.startswith("/dev/shm/"):
@@ -1788,7 +2305,13 @@ class SharedHostSnapshotArena:
             raise ValueError("shared Host arena capacity must be positive")
         os.makedirs(self.directory, mode=0o700, exist_ok=True)
         self.used_bytes = 0
+        self.committed_bytes = 0
         self._lock = threading.Lock()
+        self._free_extents: list[tuple[int, str]] = []
+        self._active_extents: dict[
+            str, tuple[LazySharedMHAHostSnapshot, int, int]
+        ] = {}
+        self._extent_sequence = 0
 
     def path_for(self, snapshot_id: str) -> str:
         digest = hashlib.sha256(snapshot_id.encode("utf-8")).hexdigest()
@@ -1802,23 +2325,107 @@ class SharedHostSnapshotArena:
             )
 
     def create(self, snapshot_id: str, token_count: int, device_pool, byte_size: int):
-        snapshot = LazySharedMHAHostSnapshot(
-            path=self.path_for(snapshot_id),
-            token_count=token_count,
-            device_pool=device_pool,
-            byte_size=byte_size,
-        )
         with self._lock:
+            requested = int(byte_size)
+            reusable = [
+                (capacity, path, index)
+                for index, (capacity, path) in enumerate(self._free_extents)
+                if capacity >= requested
+            ]
+            if reusable:
+                capacity, path, index = min(reusable, key=lambda item: item[0])
+                self._free_extents.pop(index)
+                create = False
+            else:
+                # Free extents that are too small are not useful for this
+                # request.  Reclaim enough of them before growing the physical
+                # tmpfs footprint, while keeping active snapshot accounting
+                # independent from the reusable backing pool.
+                while (
+                    self.committed_bytes + requested > self.capacity_bytes
+                    and self._free_extents
+                ):
+                    capacity, stale_path = self._free_extents.pop()
+                    try:
+                        os.unlink(stale_path)
+                    except FileNotFoundError:
+                        pass
+                    self.committed_bytes = max(
+                        0, self.committed_bytes - int(capacity)
+                    )
+                if self.committed_bytes + requested > self.capacity_bytes:
+                    raise RuntimeError("shared Host arena has no physical extent capacity")
+                self._extent_sequence += 1
+                path = os.path.join(
+                    self.directory,
+                    f"extent-{os.getpid()}-{self._extent_sequence}-"
+                    f"{hashlib.sha256(snapshot_id.encode('utf-8')).hexdigest()}.kv",
+                )
+                capacity = requested
+                create = True
+                self.committed_bytes += capacity
+            try:
+                if not create and capacity > requested:
+                    # Reuse the already-backed prefix, but return the unused
+                    # tail to tmpfs.  Otherwise logical watermark admission
+                    # can succeed after hidden internal fragmentation has
+                    # exhausted the arena's physical capacity.
+                    os.truncate(path, requested)
+                    self.committed_bytes -= capacity - requested
+                    capacity = requested
+                snapshot = LazySharedMHAHostSnapshot(
+                    path=path,
+                    token_count=token_count,
+                    device_pool=device_pool,
+                    byte_size=requested,
+                    allocation_bytes=capacity,
+                    create=create,
+                )
+            except Exception:
+                # A failed reopen means the recycled extent can no longer be
+                # trusted.  Destroy it instead of poisoning the free pool.
+                self.committed_bytes = max(
+                    0, self.committed_bytes - int(capacity)
+                )
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+                raise
             self.used_bytes += snapshot.byte_size
+            self._active_extents[path] = (
+                snapshot,
+                capacity,
+                snapshot.byte_size,
+            )
         return snapshot
 
     def release(self, snapshot: SharedMHAHostSnapshot) -> None:
-        if snapshot._closed:
-            return
-        byte_size = snapshot.byte_size
-        snapshot.close(unlink=True)
+        path = snapshot.path
         with self._lock:
-            self.used_bytes = max(0, self.used_bytes - byte_size)
+            active = self._active_extents.get(path)
+            # Identity is the extent lease.  A stale release from the prior
+            # request must not pop a newer request that recycled the path.
+            if active is None or active[0] is not snapshot:
+                return
+            self._active_extents.pop(path)
+            _, allocation_bytes, byte_size = active
+            reusable = not bool(getattr(snapshot, "requires_prefault", False))
+            self.used_bytes = max(0, self.used_bytes - int(byte_size))
+            try:
+                snapshot.close(unlink=not reusable)
+            except Exception:
+                # The mapping may still own physical pages.  Lose this extent
+                # from the usable pool but retain committed accounting so a
+                # close failure cannot make the arena overcommit tmpfs.
+                logger.exception("Failed to close shared Host extent %s", path)
+                return
+            if not reusable:
+                self.committed_bytes = max(
+                    0, self.committed_bytes - int(allocation_bytes)
+                )
+                return
+            self._free_extents.append((int(allocation_bytes), path))
 
     def usage(self) -> float:
         with self._lock:
@@ -1826,7 +2433,7 @@ class SharedHostSnapshotArena:
 
 
 class AgenticPHostStagingManager:
-    """P-side shared Host arena, demand restore, and cold-spill manager."""
+    """P-side Shared Arena and demand-restore manager."""
 
     def _get_state_lock(self):
         # A few focused lifecycle tests construct the manager with __new__ to
@@ -1844,6 +2451,7 @@ class AgenticPHostStagingManager:
         ledger: SharedHostStagingLedger,
         runtime,
         token_allocator,
+        workset_broker,
         cache_controller,
         tree_cache,
         page_size: int,
@@ -1864,9 +2472,14 @@ class AgenticPHostStagingManager:
         self.ledger = ledger
         self.runtime = runtime
         self.token_allocator = token_allocator
+        self.workset_broker = workset_broker
         self.cache_controller = cache_controller
         self.tree_cache = tree_cache
         self.host_pool = cache_controller.mem_pool_host
+        self.storage_spill_enabled = bool(
+            supports_agentic_kv_spill(cache_controller.storage_backend)
+            and self.host_pool is not None
+        )
         self.device_pool = token_allocator.get_kvcache()
         self.page_size = int(page_size)
         self.tp_rank = int(tp_rank)
@@ -1921,6 +2534,7 @@ class AgenticPHostStagingManager:
         # only the latency-sensitive demand H2D stream.
         current_device = torch.cuda.current_device()
         self._h2d_stream = torch.cuda.Stream(device=current_device, priority=-1)
+        self._h2d_poisoned = False
         self._h2d_staging = LayerFirstD2HStaging(
             self.device_pool, self.h2d_chunk_tokens
         )
@@ -1977,6 +2591,25 @@ class AgenticPHostStagingManager:
             ),
         )
         self._control_wakeup = threading.Event()
+        # Extent population is CPU/DRAM work only.  A small daemon pool keeps
+        # sparse-tmpfs page faults off both the P scheduler and every D copy
+        # progress thread.  The grant is published only after one worker has
+        # populated the complete request-generation extent.
+        self._prefault_queue: queue.Queue = queue.Queue()
+        self._prefault_results: queue.SimpleQueue = queue.SimpleQueue()
+        self._prefault_worker_count = max(
+            1,
+            int(os.getenv("SGLANG_AGENTIC_KV_HOST_PREFAULT_WORKERS", "4")),
+        )
+        self._prefault_threads = []
+        for worker_index in range(self._prefault_worker_count):
+            thread = threading.Thread(
+                target=self._prefault_worker,
+                name=f"agentic-host-prefault-{os.getpid()}-{worker_index}",
+                daemon=True,
+            )
+            self._prefault_threads.append(thread)
+            thread.start()
         self._control_cycles = 0
         self._control_errors = 0
         self._control_total_seconds = 0.0
@@ -2002,10 +2635,12 @@ class AgenticPHostStagingManager:
             self._control_thread.start()
             logger.info(
                 "Agentic P async control enabled interval_ms=%.3f "
-                "admission_batch=%d capacity_wait_timeout_s=%.3f "
+                "admission_batch=%d prefault_workers=%d "
+                "capacity_wait_timeout_s=%.3f "
                 "pageable_snapshot_mmap=true",
                 self._control_interval * 1000.0,
                 self._admission_batch,
+                self._prefault_worker_count,
                 self._capacity_wait_timeout_seconds,
             )
 
@@ -2044,6 +2679,81 @@ class AgenticPHostStagingManager:
             and offer_domain >= 0
             and offer_domain != configured_domain
         )
+
+    def _prefault_worker(self) -> None:
+        """Prepare sparse tmpfs extents without touching P/D CUDA state."""
+
+        while True:
+            snapshot_id, record = self._prefault_queue.get()
+            error = None
+            try:
+                record["snapshot"].prefault_for_write()
+            except Exception as exc:
+                error = exc
+            self._prefault_results.put((snapshot_id, record, error))
+            self._control_wakeup.set()
+
+    def _publish_prefaulted_grant(
+        self, snapshot_id: str, record: dict[str, Any], error
+    ) -> None:
+        with self._get_state_lock():
+            if self.active.get(snapshot_id) is not record:
+                return
+        claimed = record["offer"]
+        snapshot = record["snapshot"]
+        if error is not None:
+            with self._get_state_lock():
+                self.active.pop(snapshot_id, None)
+            self.arena.release(snapshot)
+            self._reject(claimed, f"shared_host_extent_prefault_failed:{error}")
+            logger.exception(
+                "Failed to populate shared Host extent for %s",
+                snapshot_id,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+            return
+
+        grant = {
+            "kind": "shared_host_extent",
+            "seq": 0,
+            "tp_rank": self.tp_rank,
+            "arena_path": snapshot.path,
+            "byte_size": snapshot.byte_size,
+            "token_count": snapshot.token_count,
+            "arena_numa_node": self.arena_numa_node,
+        }
+        published = (
+            self.ledger.publish_grants(snapshot_id, self.owner, [grant])
+            if self.tp_size == 1
+            else self.ledger.publish_rank_grant(
+                snapshot_id,
+                self.owner,
+                grant,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+            )
+        )
+        if not published:
+            with self._get_state_lock():
+                self.active.pop(snapshot_id, None)
+            self.arena.release(snapshot)
+            self._reject(claimed, "shared_host_grant_publish_failed")
+            return
+        record["prefault_pending"] = False
+        logger.info(
+            "AgenticKV shared_host_extent_ready snapshot=%s bytes=%d "
+            "prefaulted=true",
+            snapshot_id,
+            snapshot.byte_size,
+        )
+
+    def _progress_prefaults(self) -> None:
+        while True:
+            try:
+                result = self._prefault_results.get_nowait()
+            except queue.Empty:
+                return
+            self._publish_prefaulted_grant(*result)
 
     def _admit_one(self, ledger_entries=None) -> bool:
         if ledger_entries is None:
@@ -2140,36 +2850,14 @@ class AgenticPHostStagingManager:
             self._reject(claimed, "shared_host_extent_allocation_failed")
             return True
         with self._get_state_lock():
-            self.active[claimed["snapshot_id"]] = {
+            record = {
                 "offer": claimed,
                 "snapshot": snapshot,
                 "loading": False,
+                "prefault_pending": True,
             }
-        grant = {
-            "kind": "shared_host_extent",
-            "seq": 0,
-            "tp_rank": tp_rank,
-            "arena_path": snapshot.path,
-            "byte_size": snapshot.byte_size,
-            "token_count": snapshot.token_count,
-            "arena_numa_node": self.arena_numa_node,
-        }
-        published = (
-            self.ledger.publish_grants(claimed["snapshot_id"], self.owner, [grant])
-            if tp_size == 1
-            else self.ledger.publish_rank_grant(
-                claimed["snapshot_id"],
-                self.owner,
-                grant,
-                tp_rank=tp_rank,
-                tp_size=tp_size,
-            )
-        )
-        if not published:
-            with self._get_state_lock():
-                self.active.pop(claimed["snapshot_id"], None)
-            self.arena.release(snapshot)
-            self._reject(claimed, "shared_host_grant_publish_failed")
+            self.active[claimed["snapshot_id"]] = record
+        self._prefault_queue.put((claimed["snapshot_id"], record))
         return True
 
     def _admit_batch(self, ledger_entries=None) -> int:
@@ -2452,6 +3140,10 @@ class AgenticPHostStagingManager:
                 self.spills.pop(snapshot_id, None)
 
     def _maybe_spill(self) -> None:
+        if not getattr(self, "storage_spill_enabled", True):
+            # Shared-Arena-only mode evicts/fails soft at its own hard capacity;
+            # it never creates a hidden native HiCache/Mooncake data path.
+            return
         if int(getattr(self, "tp_size", 1)) > 1:
             # A Mooncake generation must publish all TP rank page-key sets as
             # one manifest.  Until that storage transaction is group-aware,
@@ -2508,6 +3200,9 @@ class AgenticPHostStagingManager:
         if now < self._next_poll_at:
             return
         self._next_poll_at = now + self._poll_interval
+        # Publish populated extents before taking the shared ledger snapshot so
+        # D can observe every new grant in this same control cycle.
+        self._progress_prefaults()
         # One shared read per P scheduler tick replaces one complete JSON read
         # per active snapshot (and another per aborting snapshot/request gate).
         ledger_entries = self.ledger.snapshot_entries()
@@ -2609,17 +3304,33 @@ class AgenticPHostStagingManager:
         device_indices = load["device_indices"]
         start = int(load.get("offset", 0))
         end = min(start + self.h2d_chunk_tokens, len(device_indices))
+        if not load.get("io_inflight"):
+            self.workset_broker.mark_io_inflight(
+                load["request_generation"].snapshot_id,
+                load["workset_lease"],
+                load["io_attempt"],
+            )
+            load["io_inflight"] = True
+        launch_fence = H2DLaunchFence(
+            event=torch.cuda.Event(enable_timing=True)
+        )
+        # Publish the fence object before submitting CUDA work.  Therefore an
+        # exception anywhere in launch still leaves cleanup enough physical
+        # state to prove completion or quarantine the complete snapshot.
+        load["launch_fence"] = launch_fence
+        load["event"] = launch_fence.event
+        record["loading"] = "h2d"
         event, copy_refs = record["snapshot"].start_load_range_to_device(
             device_indices[start:end],
             self._h2d_stream,
             source_start=start,
             staging=self._h2d_staging,
             host_bounce=self._h2d_host_bounce,
+            launch_fence=launch_fence,
         )
         load["event"] = event
         load["copy_refs"] = copy_refs
         load["chunk_end"] = end
-        record["loading"] = "h2d"
         if start == 0:
             logger.info(
                 "AgenticKV shared_host_h2d_start snapshot=%s tokens=%d "
@@ -2655,21 +3366,65 @@ class AgenticPHostStagingManager:
     def _discard_failed_h2d_load(self, rid: str, load: dict[str, Any]) -> bool:
         """Release one failed TP shard after any outstanding DMA is quiescent."""
 
-        event = load.get("event")
+        launch_fence = load.get("launch_fence")
+        if launch_fence is not None and launch_fence.submitted:
+            if launch_fence.unavailable or not launch_fence.armed:
+                load["dma_quarantined"] = True
+                self._h2d_poisoned = True
+                logger.error(
+                    "AgenticKV Slow H2D has no completion fence snapshot=%s; "
+                    "quarantining Host and HBM ownership",
+                    load["request_generation"].snapshot_id,
+                )
+                return False
+            event = launch_fence.event
+        else:
+            event = load.get("event") if launch_fence is None else None
         if event is not None:
             try:
                 if not event.query():
                     return False
                 event.synchronize()
-            except Exception:
-                # The copy has already failed; continue fail-closed cleanup.
-                pass
+            except Exception as exc:
+                # A CUDA API exception is not a DMA completion fence.  Keep
+                # both the Host source and HBM destination owned until engine
+                # teardown; otherwise a late H2D could corrupt reused pages.
+                load["dma_quarantined"] = True
+                self._h2d_poisoned = True
+                load.setdefault("io_error", exc)
+                logger.error(
+                    "AgenticKV Slow H2D fence unavailable snapshot=%s; "
+                    "quarantining Host and HBM ownership",
+                    load["request_generation"].snapshot_id,
+                )
+                return False
+        workset_lease = load.get("workset_lease")
+        io_attempt = load.get("io_attempt")
+        if not load.get("io_quiesced"):
+            if load.get("io_inflight"):
+                if not self.workset_broker.mark_io_quiesced(
+                    load["request_generation"].snapshot_id,
+                    workset_lease,
+                    io_attempt,
+                ):
+                    return False
+            else:
+                if not self.workset_broker.cancel_io_attempt(
+                    load["request_generation"].snapshot_id,
+                    workset_lease,
+                    io_attempt,
+                ):
+                    return False
+            load["io_quiesced"] = True
         with self._get_state_lock():
             if self.loads.get(rid) is not load:
                 return True
             self.loads.pop(rid, None)
             if not load.get("device_released"):
-                self.token_allocator.free(load["device_indices"])
+                self.workset_broker.request_release(
+                    load["request_generation"].snapshot_id,
+                    workset_lease,
+                )
                 load["device_released"] = True
             if not load.get("host_released"):
                 self._release_record(load["record"])
@@ -2686,9 +3441,14 @@ class AgenticPHostStagingManager:
         waits for the other queue's transport progress.
         """
 
+        if self._h2d_poisoned:
+            return
         with self._get_state_lock():
             loads = list(self.loads.items())
         for rid, load in loads:
+            if load.get("abort_requested"):
+                self._discard_failed_h2d_load(rid, load)
+                continue
             snapshot_id = load["request_generation"].snapshot_id
             entry = self.ledger.get(snapshot_id)
             if entry is not None and entry.get("state") == HostStageState.FAILED.value:
@@ -2738,6 +3498,15 @@ class AgenticPHostStagingManager:
 
                 request_generation = load["request_generation"]
                 snapshot_id = request_generation.snapshot_id
+                if not self.workset_broker.mark_io_quiesced(
+                    snapshot_id,
+                    load["workset_lease"],
+                    load["io_attempt"],
+                ):
+                    raise RuntimeError(
+                        f"Slow H2D lost I/O ownership for {snapshot_id}"
+                    )
+                load["io_quiesced"] = True
                 if self.tp_size == 1:
                     self._complete_shared_host_manifest(request_generation)
                     self.ledger.transition(
@@ -2777,6 +3546,62 @@ class AgenticPHostStagingManager:
                     "Agentic asynchronous Slow H2D failed for %s",
                     load["request_generation"].snapshot_id,
                 )
+
+    def abort_request(self, rid: str, request_generation) -> None:
+        """Cancel one Slow restore without racing an in-flight H2D."""
+
+        snapshot_id = request_generation.snapshot_id
+        with self._get_state_lock():
+            load = self.loads.get(rid)
+            if load is not None:
+                load["abort_requested"] = True
+                load.setdefault("io_error", RuntimeError("request aborted"))
+            else:
+                record = self.host_ready.pop(snapshot_id, None)
+                if record is not None:
+                    self._release_record(record)
+                self.workset_broker.cancel_unstarted(
+                    snapshot_id,
+                    owner=self.workset_broker.slow_owner(snapshot_id, rid),
+                )
+        self._control_wakeup.set()
+
+    def rollback_bound_parent(self, req, request_generation) -> None:
+        """Undo a locally bound TP parent after a peer restore failure."""
+
+        pin = getattr(req, "_agentic_kv_host_pin_node", None)
+        if pin is not None:
+            self.tree_cache.dec_lock_ref(pin)
+            delattr(req, "_agentic_kv_host_pin_node")
+        committed_len = int(getattr(req, "_agentic_host_rank_token_count", 0))
+        release = getattr(self.tree_cache, "release_agentic_request_cache", None)
+        if committed_len and release is not None:
+            release(
+                req,
+                committed_len=committed_len,
+                _defer_if_blocked=False,
+            )
+        workset_lease = getattr(req, "_agentic_host_workset_lease", None)
+        if workset_lease is not None:
+            self.workset_broker.abort_bind(
+                request_generation.snapshot_id,
+                workset_lease,
+                parent_bound=True,
+            )
+            delattr(req, "_agentic_host_workset_lease")
+        else:
+            self.workset_broker.cancel_unstarted(
+                request_generation.snapshot_id,
+                owner=self.workset_broker.slow_owner(
+                    request_generation.snapshot_id, req.rid
+                ),
+            )
+        for name in (
+            "_agentic_host_rank_loaded",
+            "_agentic_host_rank_token_count",
+        ):
+            if hasattr(req, name):
+                delattr(req, name)
 
     def gate_request(
         self,
@@ -2857,6 +3682,15 @@ class AgenticPHostStagingManager:
                         int(getattr(self, "tp_rank", 0)),
                     )
             delattr(req, "_agentic_host_rank_loaded")
+            workset_lease = getattr(req, "_agentic_host_workset_lease", None)
+            if workset_lease is None:
+                raise RuntimeError(
+                    f"TP Host workset lease disappeared for {snapshot_id}"
+                )
+            self.workset_broker.handoff_to_req(
+                snapshot_id, req, workset_lease
+            )
+            delattr(req, "_agentic_host_workset_lease")
             req._agentic_kv_gate_complete = True
             req._agentic_kv_host_hit_tokens = int(
                 getattr(req, "_agentic_host_rank_token_count", 0)
@@ -2871,6 +3705,9 @@ class AgenticPHostStagingManager:
         if load is not None:
             if load.get("io_error") is not None:
                 if not self._discard_failed_h2d_load(req.rid, load):
+                    return True
+                if int(getattr(self, "tp_size", 1)) > 1:
+                    req._agentic_tp_host_failed = True
                     return True
                 req._agentic_kv_gate_complete = True
                 req._agentic_kv_fallback = "shared_host_h2d_failed"
@@ -2893,6 +3730,19 @@ class AgenticPHostStagingManager:
             record = load["record"]
             device_indices = load["device_indices"]
             keys = req.origin_input_ids[: int(record["offer"]["token_count"])]
+            workset_lease = load["workset_lease"]
+            if not self.workset_broker.begin_bind(snapshot_id, workset_lease):
+                with self._get_state_lock():
+                    self.loads.pop(req.rid, None)
+                req._agentic_kv_gate_complete = True
+                req._agentic_kv_fallback = "shared_host_workset_cancelled"
+                logger.error(
+                    "Slow workset lost ownership before Radix bind snapshot=%s req=%s",
+                    snapshot_id,
+                    req.rid,
+                )
+                return False
+            inserted = False
             try:
                 from sglang.srt.mem_cache.base_prefix_cache import (
                     InsertParams,
@@ -2908,6 +3758,10 @@ class AgenticPHostStagingManager:
                         priority=getattr(req, "priority", 0) or 0,
                     )
                 )
+                inserted = True
+                self.workset_broker.commit_parent_bound(
+                    snapshot_id, workset_lease
+                )
                 if result.prefix_len:
                     self.token_allocator.free(device_indices[: result.prefix_len])
                 matched = self.tree_cache.match_prefix(
@@ -2918,7 +3772,21 @@ class AgenticPHostStagingManager:
                 self.tree_cache.inc_lock_ref(matched.last_device_node)
                 req._agentic_kv_host_pin_node = matched.last_device_node
             except Exception:
-                self.token_allocator.free(device_indices)
+                if inserted:
+                    release = getattr(
+                        self.tree_cache, "release_agentic_request_cache", None
+                    )
+                    if release is not None:
+                        release(
+                            req,
+                            committed_len=len(keys),
+                            _defer_if_blocked=False,
+                        )
+                self.workset_broker.abort_bind(
+                    snapshot_id,
+                    workset_lease,
+                    parent_bound=inserted,
+                )
                 record["loading"] = False
                 with self._get_state_lock():
                     self.loads.pop(req.rid, None)
@@ -2945,7 +3813,11 @@ class AgenticPHostStagingManager:
                 req._agentic_host_rank_token_count = int(
                     record["offer"]["token_count"]
                 )
+                req._agentic_host_workset_lease = load["workset_lease"]
                 return True
+            self.workset_broker.handoff_to_req(
+                snapshot_id, req, load["workset_lease"]
+            )
             req._agentic_kv_gate_complete = True
             req._agentic_kv_host_hit_tokens = int(record["offer"]["token_count"])
             return False
@@ -3035,11 +3907,31 @@ class AgenticPHostStagingManager:
             with self._get_state_lock():
                 record["loading"] = False
             return None
-        device_indices = self.token_allocator.alloc(int(offer["token_count"]))
-        if device_indices is None:
+        prompt_tokens = len(req.origin_input_ids)
+        workset_owner = self.workset_broker.slow_owner(snapshot_id, req.rid)
+        self.workset_broker.request(
+            snapshot_id,
+            int(offer["token_count"]),
+            prompt_tokens,
+            owner=workset_owner,
+        )
+        workset_lease = self.workset_broker.get(
+            snapshot_id, owner=workset_owner
+        )
+        if workset_lease is None:
             with self._get_state_lock():
                 record["loading"] = False
             return True
+        io_attempt = (
+            f"slow-h2d:{self.owner}:{req.rid}:{workset_lease.lease_id}"
+        )
+        if not self.workset_broker.begin_io_attempt(
+            snapshot_id, workset_lease, io_attempt
+        ):
+            with self._get_state_lock():
+                record["loading"] = False
+            return True
+        device_indices = workset_lease.parent_indices[: int(offer["token_count"])]
         tp_rank = int(getattr(self, "tp_rank", 0))
         tp_size = int(getattr(self, "tp_size", 1))
         with self._get_state_lock():
@@ -3048,6 +3940,10 @@ class AgenticPHostStagingManager:
                 "record": record,
                 "request_generation": request_generation,
                 "device_indices": device_indices,
+                "workset_lease": workset_lease,
+                "io_attempt": io_attempt,
+                "io_inflight": False,
+                "io_quiesced": False,
                 "event": None,
                 "copy_refs": None,
                 "offset": 0,
@@ -3069,7 +3965,10 @@ class AgenticPHostStagingManager:
                 snapshot_id, HostStageState.H2D_LOADING, owner=self.owner
             )
         if not prepared:
-            self.token_allocator.free(device_indices)
+            self.workset_broker.cancel_io_attempt(
+                snapshot_id, workset_lease, io_attempt
+            )
+            self.workset_broker.request_release(snapshot_id, workset_lease)
             with self._get_state_lock():
                 self.loads.pop(req.rid, None)
                 record["loading"] = False
@@ -3458,6 +4357,7 @@ class AgenticDHostStagingClient:
         arena_domain: int = -1,
         tp_rank: int = 0,
         tp_size: int = 1,
+        retain_logical_hashes: bool = False,
         direct_cross_numa_gib_per_second: float = 7.45,
         nvlink_gib_per_second: float = 220.0,
         relay_stale_seconds: float = 5.0,
@@ -3479,6 +4379,9 @@ class AgenticDHostStagingClient:
         self.tp_size = int(tp_size)
         if not 0 <= self.tp_rank < self.tp_size:
             raise ValueError("invalid D Host staging TP rank")
+        # Page hashes are needed only by the optional storage-spill backend.
+        # Shared-Arena control should not carry hundreds of unused hashes.
+        self.retain_logical_hashes = bool(retain_logical_hashes)
         self.direct_cross_numa_gib_per_second = float(
             direct_cross_numa_gib_per_second
         )
@@ -3486,13 +4389,6 @@ class AgenticDHostStagingClient:
         self.relay_stale_seconds = float(relay_stale_seconds)
         d2h_priority = int(
             os.getenv("SGLANG_AGENTIC_KV_D2H_STREAM_PRIORITY", "0")
-        )
-        self._d2h_stream = torch.cuda.Stream(
-            device=torch.cuda.current_device(), priority=d2h_priority
-        )
-        self._d2h_staging = LayerFirstD2HStaging(
-            self.device_pool,
-            int(os.getenv("SGLANG_AGENTIC_KV_D2H_STAGING_TOKENS", "256")),
         )
         # Never enqueue an entire multi-GiB snapshot on the D copy stream.
         # CUDA stream priority only chooses among *pending* kernels/copies; a
@@ -3506,15 +4402,32 @@ class AgenticDHostStagingClient:
         self._d2h_chunk_tokens = (
             self._d2h_chunk_tokens // self.page_size * self.page_size
         )
-        self._d2h_host_bounce = PinnedMHAHostBounce(
-            self.device_pool, self._d2h_chunk_tokens
+        lane_count = max(
+            1, int(os.getenv("SGLANG_AGENTIC_KV_D2H_INFLIGHT", "4"))
         )
-        self._active_write_snapshot_id: Optional[str] = None
+        staging_tokens = int(
+            os.getenv("SGLANG_AGENTIC_KV_D2H_STAGING_TOKENS", "256")
+        )
+        self._d2h_lanes = [
+            {
+                "stream": torch.cuda.Stream(
+                    device=torch.cuda.current_device(), priority=d2h_priority
+                ),
+                "staging": LayerFirstD2HStaging(
+                    self.device_pool, staging_tokens
+                ),
+                "host_bounce": PinnedMHAHostBounce(
+                    self.device_pool, self._d2h_chunk_tokens
+                ),
+                "snapshot_id": None,
+            }
+            for _ in range(lane_count)
+        ]
 
     def set_target(self, *, prefill_domain: int, arena_numa_node: int) -> None:
         """Apply TP0's route before this rank publishes its shard offer."""
 
-        if self._active_write_snapshot_id is not None:
+        if any(lane["snapshot_id"] is not None for lane in self._d2h_lanes):
             raise RuntimeError("cannot retarget an active Host snapshot")
         self.arena_domain = int(prefill_domain)
         self.arena_numa_node = int(arena_numa_node)
@@ -3542,32 +4455,49 @@ class AgenticDHostStagingClient:
             if arena_numa_node is None
             else int(arena_numa_node)
         )
-        return self.ledger.offer(
-            {
-                "snapshot_id": manifest.snapshot_id,
-                "request_id": metadata.current.request_id,
-                "generation": metadata.current.generation,
-                "token_count": int(token_count),
-                "token_digest": token_digest,
-                "logical_hashes": list(logical_hashes),
-                "byte_size": int(byte_size),
-                "storage_namespace": page_namespace(metadata.current),
-                "tool_type": metadata.tool_type,
-                "tool_started_at": manifest.tool_started_at or time.time(),
-                "d_pid": os.getpid(),
-                "source_numa_node": self.source_numa_node,
-                "arena_numa_node": target_numa,
-                "arena_domain": target_domain,
-                "source_bootstrap_addr": (
-                    None
-                    if self.direct_runtime is None
-                    else self.direct_runtime.bootstrap_addr
-                ),
-                "source_room": manifest.direct_room,
-                "tp_rank": int(getattr(self, "tp_rank", 0)),
-                "tp_size": int(getattr(self, "tp_size", 1)),
-                "kv_layout_hash": manifest.kv_layout_hash,
-            }
+        offer = {
+            "snapshot_id": manifest.snapshot_id,
+            "request_id": metadata.current.request_id,
+            "generation": metadata.current.generation,
+            "token_count": int(token_count),
+            "token_digest": token_digest,
+            "byte_size": int(byte_size),
+            "storage_namespace": page_namespace(metadata.current),
+            "tool_type": metadata.tool_type,
+            "tool_started_at": manifest.tool_started_at or time.time(),
+            "d_pid": os.getpid(),
+            "source_numa_node": self.source_numa_node,
+            "arena_numa_node": target_numa,
+            "arena_domain": target_domain,
+            "source_bootstrap_addr": (
+                None
+                if self.direct_runtime is None
+                else self.direct_runtime.bootstrap_addr
+            ),
+            "source_room": manifest.direct_room,
+            "tp_rank": int(getattr(self, "tp_rank", 0)),
+            "tp_size": int(getattr(self, "tp_size", 1)),
+            "kv_layout_hash": manifest.kv_layout_hash,
+        }
+        if self.retain_logical_hashes:
+            offer["logical_hashes"] = list(logical_hashes)
+        return self.ledger.offer(offer)
+
+    @staticmethod
+    def has_active_local_write(candidate: dict[str, Any]) -> bool:
+        """Whether D2H can advance using only its local CUDA fence.
+
+        Once the Host extent has been granted and the first chunk has started,
+        P cannot consume it before D publishes HOST_READY.  Re-reading the
+        shared ledger for every 512-token chunk therefore adds only global
+        flock/JSON contention.  A concurrent abort remains safe: D retains its
+        source pages, finishes (or drains) the bounded local I/O, and the final
+        atomic ledger commit rejects the stale writer.
+        """
+
+        return bool(
+            candidate.get("arena_write") is not None
+            and not candidate.get("rank_host_write_complete", False)
         )
 
     def _cleanup_write(self, candidate: dict[str, Any]) -> bool:
@@ -3578,10 +4508,11 @@ class AgenticDHostStagingClient:
         if event is not None and not event.query():
             return False
         candidate.pop("arena_write", None)
-        if getattr(self, "_active_write_snapshot_id", None) == candidate[
-            "manifest"
-        ].snapshot_id:
-            self._active_write_snapshot_id = None
+        lane_id = write.pop("lane_id", None)
+        if lane_id is not None:
+            lane = self._d2h_lanes[int(lane_id)]
+            if lane["snapshot_id"] == candidate["manifest"].snapshot_id:
+                lane["snapshot_id"] = None
         write["snapshot"].close(unlink=False)
         return True
 
@@ -3738,14 +4669,23 @@ class AgenticDHostStagingClient:
         candidate: dict[str, Any],
         source_token_indices,
     ) -> bool:
-        """Submit at most one bounded D2H chunk across all candidates."""
+        """Submit one bounded chunk on any free independent D2H lane."""
 
         snapshot_id = candidate["manifest"].snapshot_id
-        if self._active_write_snapshot_id not in {None, snapshot_id}:
-            return False
         write = candidate["arena_write"]
         if write["event"] is not None:
             return False
+        lane_id = next(
+            (
+                index
+                for index, lane in enumerate(self._d2h_lanes)
+                if lane["snapshot_id"] is None
+            ),
+            None,
+        )
+        if lane_id is None:
+            return False
+        lane = self._d2h_lanes[lane_id]
         start = int(write["offset"])
         if start >= len(source_token_indices):
             return False
@@ -3753,14 +4693,15 @@ class AgenticDHostStagingClient:
         event, refs = write["snapshot"].start_backup_range_from_device(
             source_token_indices[start:end],
             destination_start=start,
-            stream=self._d2h_stream,
-            staging=self._d2h_staging,
-            host_bounce=self._d2h_host_bounce,
+            stream=lane["stream"],
+            staging=lane["staging"],
+            host_bounce=lane["host_bounce"],
         )
         write["event"] = event
         write["copy_refs"] = refs
         write["chunk_end"] = end
-        self._active_write_snapshot_id = snapshot_id
+        write["lane_id"] = lane_id
+        lane["snapshot_id"] = snapshot_id
         return True
 
     def progress(
@@ -3769,13 +4710,24 @@ class AgenticDHostStagingClient:
         source_token_indices,
         *,
         entry_snapshot=_LEDGER_ENTRY_UNSET,
+        local_write_only: bool = False,
     ) -> str:
         snapshot_id = candidate["manifest"].snapshot_id
-        entry = (
-            self.ledger.get(snapshot_id)
-            if entry_snapshot is _LEDGER_ENTRY_UNSET
-            else entry_snapshot
-        )
+        if local_write_only:
+            if not self.has_active_local_write(candidate):
+                raise ValueError("local D2H progress requires an active Host write")
+            # The immutable extent and transfer mode were captured before the
+            # first chunk.  No remote state is needed until the final commit.
+            entry = {
+                "state": HostStageState.HOST_WRITING.value,
+                "write_mode": "direct_local_progress",
+            }
+        else:
+            entry = (
+                self.ledger.get(snapshot_id)
+                if entry_snapshot is _LEDGER_ENTRY_UNSET
+                else entry_snapshot
+            )
         if entry is None:
             if not self._cleanup_write(candidate):
                 return "waiting"
@@ -3883,8 +4835,10 @@ class AgenticDHostStagingClient:
         )
         chunk_start = int(write["offset"])
         chunk_end = int(write["chunk_end"])
+        lane_id = int(write.pop("lane_id"))
+        lane = self._d2h_lanes[lane_id]
         write["snapshot"].commit_backup_range_from_bounce(
-            self._d2h_host_bounce,
+            lane["host_bounce"],
             destination_start=chunk_start,
             token_count=chunk_end - chunk_start,
         )
@@ -3892,7 +4846,7 @@ class AgenticDHostStagingClient:
         write["offset"] = int(write["chunk_end"])
         write["event"] = None
         write["copy_refs"] = None
-        self._active_write_snapshot_id = None
+        lane["snapshot_id"] = None
         if write["offset"] < len(source_token_indices):
             # Do not submit the next chunk in this call.  Returning to the
             # progress loop gives the default-priority Decode stream a chance
@@ -3924,8 +4878,14 @@ class AgenticDHostStagingClient:
             d2h_elapsed_ms,
             d2h_bytes / max(d2h_elapsed_ms / 1000.0, 1e-9) / (1024**3),
         )
-        committed = self.ledger.get(snapshot_id)
-        ready = committed is not None and committed.get("state") == HostStageState.HOST_READY.value
+        if self.tp_size == 1:
+            ready = True
+        else:
+            committed = self.ledger.get(snapshot_id)
+            ready = (
+                committed is not None
+                and committed.get("state") == HostStageState.HOST_READY.value
+            )
         if not ready:
             candidate["rank_host_write_complete"] = True
         return "host_ready" if ready else "waiting"

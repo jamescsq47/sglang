@@ -18,6 +18,8 @@ import threading
 from pathlib import Path
 from typing import Optional
 
+from sglang.srt.disaggregation.base import KVPoll
+
 
 class TPGroupMailbox:
     """Rank-local reports and one rank-zero logical receipt.
@@ -146,6 +148,29 @@ class TPGroupMailbox:
         if any(status is None for status in statuses):
             return None
         return min(int(status) for status in statuses if status is not None)
+
+    def transfer_group_status(self, key: object) -> tuple[Optional[int], bool]:
+        """Reduce a KV transfer without turning peer failure into a fake fence.
+
+        Returns ``(status, cancel_requested)``.  One failed rank requests
+        cancellation, but group failure is terminal only after every rank is
+        physically terminal.  Until then the logical transfer remains in
+        ``Transferring`` so no peer's destination pages can be recycled.
+        """
+
+        statuses = [self.local_status(key, rank) for rank in range(self.tp_size)]
+        if any(status is None for status in statuses):
+            return None, False
+        observed = [int(status) for status in statuses if status is not None]
+        cancel_requested = KVPoll.Failed in observed
+        terminal = {int(KVPoll.Failed), int(KVPoll.Success)}
+        if cancel_requested:
+            if all(status in terminal for status in observed):
+                return int(KVPoll.Failed), True
+            return int(KVPoll.Transferring), True
+        if all(status == int(KVPoll.Success) for status in observed):
+            return int(KVPoll.Success), False
+        return min(observed), False
 
     def publish_receipt(self, key: object, status: int) -> None:
         if self.tp_rank != 0:
