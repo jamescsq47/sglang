@@ -39,3 +39,35 @@ outcome, and the code issue exposed by the run.
   TP1/TP2 Host ledger ownership transitions. Remaining non-blocking risk:
   sustained Direct traffic has no strict fairness bound for an unsubmitted
   legacy P-to-D sender; monitor oldest-active age during the GPU run.
+
+## 2026-08-26 TP1 recovered-state short validation (`r39`)
+
+- UTC time: 2026-08-26 17:53--18:08.
+- Commit tested: `e71ed426f6`.
+- Status: `completed`.
+- Model/workload/topology/concurrency: Qwen3-8B, fixed source-order pure
+  BrowseComp, TP=1, 4P:4D, closed-loop c512.
+- Warmup/measurement: 60.65 s / 180.00 s.
+- Configuration: native HiCache/Mooncake disabled; D target KV fraction 1.0;
+  2 s tool/Direct windows; 128 GiB per-P D-to-P arena; 32 GiB per-P P-to-D
+  arena; max Prefill inflight 12; 24 P-to-D consumers.
+- Slime artifact path:
+  `slime/examples/pd/runs-host/new-method/smoke-unified-workset-tp1-4p4d-c512-20260826-r39-recovered`.
+- Result: 314 agents completed during measurement; Decode 3611.48 token/s
+  total (902.87 token/s/D); D Forward 96.21% per GPU. All 164 completed later
+  turns fully reused their page-aligned parent prefix: 891,136/891,136 parent
+  tokens, 100.00% reuse, and zero extra Prefill tokens from parent-KV loss.
+  The old `unconfirmed_tool_recompute`, `parent_snapshot_terminal_fallback`,
+  Host-capacity timeout, and shared-Host ready timeout paths did not occur.
+  Runtime observed 480 completed D-to-P Direct receives and 524 completed
+  D-to-P Shared-Host D2H copies; the latter were predominantly snapshots whose
+  application/tool result had not arrived within the 2 s fast window.
+- Problem found: the shortened warmup is not performance-comparable to the
+  300+1200 s reference. The measurement completion set averaged only 1.52
+  model calls per agent, versus about 3.55 in the 4660 token/s reference, so
+  the run remained dominated by initial-Prefill/transient trajectory mix.
+  Shutdown also left the experiment Router alive until it was explicitly
+  terminated; no GPU worker was orphaned.
+- Follow-up: audit all remaining transient-failure-to-recompute branches,
+  then run the canonical 300+1200 s validation. Fix process ownership in the
+  launcher separately from the serving state machine.
