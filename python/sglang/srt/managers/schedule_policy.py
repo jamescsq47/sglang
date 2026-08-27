@@ -503,6 +503,8 @@ class PrefillAdder:
     def _agentic_lease_credit(req: Req) -> int:
         """KV tokens reserved exclusively for this request's Prefill."""
 
+        if not getattr(req, "_agentic_workset_backed", False):
+            return 0
         indices = getattr(req, "_agentic_workset_suffix_indices", None)
         return 0 if indices is None else int(indices.numel())
 

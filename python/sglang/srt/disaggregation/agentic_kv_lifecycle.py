@@ -155,6 +155,11 @@ class SnapshotState(str, Enum):
     D_GPU = "d_gpu"
     DIRECT_READY = "direct_ready"
     DIRECT_LOADING = "direct_loading"
+    # The complete page-aligned snapshot is resident in a P-owned workset,
+    # but the tokenized child request has not yet inserted and pinned that
+    # workset in Radix.  Keeping this distinct from CONSUMED prevents a
+    # control timeout from discarding the only recoverable parent copy.
+    P_RECEIVED = "p_received"
     SLOW_FALLBACK = "slow_fallback"
     OFFLOADING = "offloading"
     MOONCAKE_READY = "mooncake_ready"
@@ -199,7 +204,14 @@ _ALLOWED_TRANSITIONS: Mapping[SnapshotState, frozenset[SnapshotState]] = {
         {
             SnapshotState.DIRECT_READY,
             SnapshotState.SLOW_FALLBACK,
+            SnapshotState.P_RECEIVED,
+            SnapshotState.FAILED,
+        }
+    ),
+    SnapshotState.P_RECEIVED: frozenset(
+        {
             SnapshotState.CONSUMED,
+            SnapshotState.DIRECT_READY,
             SnapshotState.FAILED,
         }
     ),
@@ -504,6 +516,7 @@ class SnapshotManifest:
             SnapshotState.FINAL,
             SnapshotState.DIRECT_READY,
             SnapshotState.DIRECT_LOADING,
+            SnapshotState.P_RECEIVED,
             SnapshotState.SLOW_FALLBACK,
             SnapshotState.CONSUMED,
         }:
@@ -522,7 +535,11 @@ class SnapshotManifest:
             raise ValueError("deletion_target must be CONSUMED or EVICTED")
         if self.state is SnapshotState.DELETE_PENDING and self.deletion_target is None:
             raise ValueError("DELETE_PENDING requires deletion_target")
-        if self.state in {SnapshotState.DIRECT_READY, SnapshotState.DIRECT_LOADING}:
+        if self.state in {
+            SnapshotState.DIRECT_READY,
+            SnapshotState.DIRECT_LOADING,
+            SnapshotState.P_RECEIVED,
+        }:
             if not self.direct_bootstrap_addr or self.direct_room is None:
                 raise ValueError("direct snapshot requires bootstrap address and room")
             if not self.token_digest:
@@ -994,13 +1011,39 @@ class MooncakeSnapshotStore:
             raise SnapshotLifecycleError(
                 f"invalid direct completion for {manifest.snapshot_id}"
             )
+        received = manifest.transition(SnapshotState.P_RECEIVED)
+        self._update_claimed_transition(
+            received,
+            expected_states=(SnapshotState.DIRECT_LOADING,),
+            owner_claim_id=claim_id,
+        )
+        return received
+
+    def commit_direct_bound(
+        self, manifest: SnapshotManifest, claim_id: str
+    ) -> SnapshotManifest:
+        """Release D ownership only after P inserted and pinned the parent.
+
+        DMA completion makes the exact workset a valid P-owned copy, but the
+        request cannot consume it until Radix ownership is established.  The
+        claim therefore remains live in P_RECEIVED and is removed only by this
+        scheduler-owned bind commit.
+        """
+
+        if (
+            manifest.state is not SnapshotState.P_RECEIVED
+            or manifest.claim_id != claim_id
+        ):
+            raise SnapshotLifecycleError(
+                f"invalid direct bind commit for {manifest.snapshot_id}"
+            )
         terminal = replace(
             manifest.transition(SnapshotState.CONSUMED),
             terminal_at=time.time(),
         )
         self._update_claimed_transition(
             terminal,
-            expected_states=(SnapshotState.DIRECT_LOADING,),
+            expected_states=(SnapshotState.P_RECEIVED,),
             owner_claim_id=claim_id,
         )
         self.store.remove(terminal.request.claim_key, force=False)
@@ -1040,7 +1083,10 @@ class MooncakeSnapshotStore:
             or manifest.claim_id != claim_id
         ):
             current = self.load(manifest.request, require_ready=False)
-            if current is not None and current.state is SnapshotState.CONSUMED:
+            if current is not None and current.state in {
+                SnapshotState.P_RECEIVED,
+                SnapshotState.CONSUMED,
+            }:
                 return current
             raise SnapshotLifecycleError(
                 f"invalid TP direct completion for {manifest.snapshot_id}"
@@ -1077,27 +1123,22 @@ class MooncakeSnapshotStore:
             )
             if done_path is None or finalize_path is None:
                 raise RuntimeError("local TP Direct completion path disappeared")
-            terminal = replace(
-                manifest.transition(SnapshotState.CONSUMED),
-                terminal_at=time.time(),
-            )
+            received = manifest.transition(SnapshotState.P_RECEIVED)
             if os.path.exists(done_path):
-                return terminal
+                current = self.load(manifest.request, require_ready=False)
+                return current if current is not None else received
             if not self._create_local_marker(
                 finalize_path, str(tp_rank).encode()
             ):
                 return manifest
             try:
                 self._update_claimed_transition(
-                    terminal,
+                    received,
                     expected_states=(SnapshotState.DIRECT_LOADING,),
                     owner_claim_id=claim_id,
                 )
                 self._create_local_marker(done_path)
-                self.store.remove(terminal.request.claim_key, force=False)
-                self._release_local_claim(terminal.request, claim_id)
-                _discard_shared_ledger_snapshot(terminal.snapshot_id)
-                return terminal
+                return received
             except Exception:
                 try:
                     os.unlink(finalize_path)
@@ -1127,14 +1168,20 @@ class MooncakeSnapshotStore:
             deadline = time.monotonic() + 1.0
             while time.monotonic() < deadline:
                 current = self.load(manifest.request, require_ready=False)
-                if current is not None and current.state is SnapshotState.CONSUMED:
+                if current is not None and current.state in {
+                    SnapshotState.P_RECEIVED,
+                    SnapshotState.CONSUMED,
+                }:
                     return current
                 time.sleep(0.005)
             return manifest
 
         try:
             current = self.load(manifest.request, require_ready=False)
-            if current is not None and current.state is SnapshotState.CONSUMED:
+            if current is not None and current.state in {
+                SnapshotState.P_RECEIVED,
+                SnapshotState.CONSUMED,
+            }:
                 return current
             if (
                 current is None
@@ -1144,19 +1191,13 @@ class MooncakeSnapshotStore:
                 raise SnapshotLifecycleError(
                     f"lost TP direct group claim for {manifest.snapshot_id}"
                 )
-            terminal = replace(
-                current.transition(SnapshotState.CONSUMED),
-                terminal_at=time.time(),
-            )
+            received = current.transition(SnapshotState.P_RECEIVED)
             self._update_claimed_transition(
-                terminal,
+                received,
                 expected_states=(SnapshotState.DIRECT_LOADING,),
                 owner_claim_id=claim_id,
             )
-            self.store.remove(terminal.request.claim_key, force=False)
-            self._release_local_claim(terminal.request, claim_id)
-            _discard_shared_ledger_snapshot(terminal.snapshot_id)
-            return terminal
+            return received
         finally:
             self.store.batch_remove(ack_keys + [finalize_key], force=False)
 
@@ -1173,7 +1214,10 @@ class MooncakeSnapshotStore:
         if manifest.tp_size <= 1:
             return self.complete_direct(manifest, claim_id)
         current = self.load(manifest.request, require_ready=False)
-        if current is not None and current.state is SnapshotState.CONSUMED:
+        if current is not None and current.state in {
+            SnapshotState.P_RECEIVED,
+            SnapshotState.CONSUMED,
+        }:
             return current
         if (
             current is None
@@ -1183,18 +1227,13 @@ class MooncakeSnapshotStore:
             raise SnapshotLifecycleError(
                 f"invalid TP direct group completion for {manifest.snapshot_id}"
             )
-        terminal = replace(
-            current.transition(SnapshotState.CONSUMED), terminal_at=time.time()
-        )
+        received = current.transition(SnapshotState.P_RECEIVED)
         self._update_claimed_transition(
-            terminal,
+            received,
             expected_states=(SnapshotState.DIRECT_LOADING,),
             owner_claim_id=claim_id,
         )
-        self.store.remove(terminal.request.claim_key, force=False)
-        self._release_local_claim(terminal.request, claim_id)
-        _discard_shared_ledger_snapshot(terminal.snapshot_id)
-        return terminal
+        return received
 
     def release_direct_claim(
         self, manifest: SnapshotManifest, claim_id: str
@@ -1212,6 +1251,30 @@ class MooncakeSnapshotStore:
         self._update_claimed_transition(
             ready,
             expected_states=(SnapshotState.DIRECT_LOADING,),
+            owner_claim_id=claim_id,
+        )
+        self.store.remove(manifest.request.claim_key, force=False)
+        self._release_local_claim(manifest.request, claim_id)
+        return ready
+
+    def release_received_direct(
+        self, manifest: SnapshotManifest, claim_id: str
+    ) -> SnapshotManifest:
+        """Return an unbound, physically quiescent P copy to D ownership."""
+
+        if (
+            manifest.state is not SnapshotState.P_RECEIVED
+            or manifest.claim_id != claim_id
+        ):
+            raise SnapshotLifecycleError(
+                f"invalid received direct release for {manifest.snapshot_id}"
+            )
+        ready = replace(manifest, claim_id=None).transition(
+            SnapshotState.DIRECT_READY
+        )
+        self._update_claimed_transition(
+            ready,
+            expected_states=(SnapshotState.P_RECEIVED,),
             owner_claim_id=claim_id,
         )
         self.store.remove(manifest.request.claim_key, force=False)

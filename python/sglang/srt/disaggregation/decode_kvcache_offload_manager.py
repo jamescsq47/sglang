@@ -791,7 +791,9 @@ class DecodeKVCacheOffloadManager:
             DecodeKVCacheOffloadManager._agentic_candidate_items(self)
         ):
             manifest = candidate.get("manifest")
-            if candidate.get("staging"):
+            if not candidate.get("setup_committed", True):
+                action = "wait"
+            elif candidate.get("staging"):
                 action = "slow"
             elif candidate.get("sent") or (
                 manifest is not None
@@ -1270,18 +1272,15 @@ class DecodeKVCacheOffloadManager:
             producer_id = f"{engine_id}:{req.rid}"
         owns_generation = True
         if producer_store is not None:
-            if int(getattr(self, "tp_world_size", 1)) > 1 and self.tp_rank != 0:
-                # Logical producer election belongs to rank 0.  Followers wait
-                # for its atomically-published decision, then only pin and
-                # transfer their local KV-head shard when the same D engine won.
-                owns_generation = producer_store.wait_generation_producer(
-                    metadata.current,
-                    producer_id,
-                )
-            else:
-                owns_generation = producer_store.claim_generation_producer(
-                    metadata.current, producer_id=producer_id
-                )
+            # Every rank in one logical TP engine uses the same deterministic
+            # producer id.  The atomic O_EXCL tombstone may therefore be
+            # created by whichever rank arrives first; peers join the same
+            # owner, while a genuinely different D engine loses on every
+            # rank.  This removes the former one-second follower timeout that
+            # could release one shard before a delayed rank zero arrived.
+            owns_generation = producer_store.claim_generation_producer(
+                metadata.current, producer_id=producer_id
+            )
         if not owns_generation:
             # The original execution remains authoritative. This duplicate
             # still returns its deterministic model response to unblock the
@@ -1299,15 +1298,18 @@ class DecodeKVCacheOffloadManager:
                     return True
             except Exception:
                 logger.exception(
-                    "Failed to publish direct D->P candidate %s; falling back",
+                    "Failed to retain direct D->P candidate %s",
                     metadata.current.snapshot_id,
                 )
         if self.agentic_hostless:
-            # There is intentionally no D Host data path in this mode.  A
-            # metadata/direct setup failure is fail-soft: release the finished
-            # request normally and let the next P turn recompute its prefix.
-            self._publish_agentic_failure(metadata, "direct_setup_failed")
-            return False
+            # Hostless is the custom Shared-Arena mode: once a complete D
+            # snapshot exists, a transient Direct control-plane failure must
+            # never turn into full-prefix recomputation.  Candidate creation
+            # below is deliberately allocation-free; reaching this branch is
+            # therefore a permanent programming/configuration error.
+            raise RuntimeError(
+                "failed to retain complete agentic D snapshot for asynchronous setup"
+            )
         return self._start_agentic_slow_snapshot(req, metadata, all_tokens)
 
     def _publish_agentic_direct_candidate(
@@ -1316,6 +1318,17 @@ class DecodeKVCacheOffloadManager:
         metadata: AgenticRequestMetadata,
         all_tokens,
     ) -> bool:
+        """Retain a complete D snapshot and enqueue two-phase Direct setup.
+
+        This scheduler-side phase publishes no route and starts no transport.
+        It only installs a request-generation candidate while the request's D
+        pages are still owned by ``req``.  The independent Direct I/O worker
+        freezes the rank-local source and creates its sender; TP rank zero then
+        commits the group-visible manifest and route.  Consequently a
+        transient metadata, route, sender, or CPU-freeze failure cannot release
+        the parent KV or make TP ranks choose different paths.
+        """
+
         room = int.from_bytes(
             hashlib.sha256(metadata.current.storage_id.encode()).digest()[:8],
             "little",
@@ -1334,59 +1347,27 @@ class DecodeKVCacheOffloadManager:
             tp_size=self.tp_world_size,
             kv_layout_hash=self.agentic_direct_runtime.layout_hash,
         )
-        # Multi-P routing is fixed by the D worker's NUMA domain.  Publish the
-        # destination together with DIRECT_READY so Router ingress never waits
-        # on a P load query before acknowledging the next turn.
-        if self.tp_rank == 0:
-            if not self._publish_agentic_route(
-                metadata.current,
-                route="direct_ready",
-                snapshot_tokens=len(all_tokens),
-            ):
-                return False
-            self.agentic_snapshot_store.publish_direct_offer(manifest)
-        source_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(all_tokens)
-        ]
-        source_digest = debug_kv_digest(
-            self.agentic_direct_runtime.kv_pool, source_indices
-        )
-        if source_digest is not None:
-            logger.info(
-                "AgenticKV d_source_digest snapshot=%s digest=%s",
-                manifest.snapshot_id,
-                source_digest,
-            )
-        # Freeze the scheduler-owned mapping before publishing the candidate.
-        # I/O workers may run while later Decode scheduler iterations mutate
-        # req_to_token; they consume only this immutable CPU payload.
-        frozen_token_indices = source_indices.to(
-            device="cpu", dtype=torch.int64
-        ).clone()
-        frozen_page_indices = kv_to_page_indices(
-            frozen_token_indices.numpy(), self.page_size
-        )
-        sender = self.agentic_direct_runtime.sender_class(
-            mgr=self.agentic_direct_runtime.manager,
-            bootstrap_addr=self.agentic_direct_runtime.bootstrap_addr,
-            bootstrap_room=room,
-            dest_tp_ranks=[self.tp_rank],
-            pp_rank=0,
-        )
         candidate = {
             "req": req,
             "metadata": metadata,
             "tokens": list(all_tokens),
             "manifest": manifest,
-            "sender": sender,
+            "sender": None,
             "created_at": time.monotonic(),
             "claimed_at": None,
             "sent": False,
             "fallback_retry_at": 0.0,
-            "source_token_indices": frozen_token_indices,
-            "source_page_indices": frozen_page_indices,
+            "source_token_indices": None,
+            "source_page_indices": None,
             "io_lock": threading.RLock(),
-            # Mooncake manifest lookup is synchronous.  Do not put one RPC per
+            # Local preparation and rank-zero publication are separate commit
+            # points.  Both are idempotently retried by the Direct worker.
+            "local_prepared": False,
+            "offer_published": False,
+            "route_published": False,
+            "setup_committed": False,
+            "setup_retry_at": 0.0,
+            # Lifecycle-manifest lookup is synchronous.  Do not put one read per
             # pending candidate on every Decode scheduler tick: with many D
             # workers that control-plane work can leave an otherwise healthy
             # Decode batch waiting between token forwards.
@@ -1403,14 +1384,114 @@ class DecodeKVCacheOffloadManager:
         if pending_command is not None:
             self._apply_tp_candidate_command(pending_command)
         self.wake_decode_io_progress()
-        logger.info(
-            "AgenticKV direct_offer snapshot=%s tokens=%d room=%d threshold_s=%.3f",
-            manifest.snapshot_id,
-            manifest.token_count,
-            room,
-            self.agentic_fast_threshold,
-        )
         return True
+
+    def _progress_agentic_direct_candidate_setup(
+        self, candidate, now: float
+    ) -> bool:
+        """Prepare one local TP shard, then let rank zero publish the offer.
+
+        Returning ``False`` means only "retry later".  The finished Decode
+        request and all of its KV pages remain owned by the candidate.
+        """
+
+        if now < float(candidate.get("setup_retry_at", 0.0)):
+            return False
+        # Candidates created before this two-phase protocol already published
+        # their route/offer synchronously.  Preserve compatibility for tests
+        # and rolling process restarts that still hold such an object.
+        if "local_prepared" not in candidate:
+            candidate["local_prepared"] = candidate.get("sender") is not None
+            candidate.setdefault("offer_published", True)
+            candidate.setdefault("route_published", True)
+            candidate.setdefault("setup_committed", candidate["local_prepared"])
+
+        try:
+            with candidate["io_lock"]:
+                if candidate.get("retired", False):
+                    return False
+                manifest = candidate["manifest"]
+                if not candidate.get("local_prepared"):
+                    req = candidate["req"]
+                    if req.req_pool_idx == -1:
+                        raise RuntimeError(
+                            f"D source released before Direct setup {manifest.snapshot_id}"
+                        )
+                    source_indices = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, : manifest.token_count
+                    ]
+                    source_digest = debug_kv_digest(
+                        self.agentic_direct_runtime.kv_pool, source_indices
+                    )
+                    # Freeze scheduler-owned page mapping before any route is
+                    # externally visible.  Later scheduler iterations cannot
+                    # change the worker's immutable transfer source.
+                    frozen_token_indices = source_indices.to(
+                        device="cpu", dtype=torch.int64
+                    ).clone()
+                    frozen_page_indices = kv_to_page_indices(
+                        frozen_token_indices.numpy(), self.page_size
+                    )
+                    sender = self.agentic_direct_runtime.sender_class(
+                        mgr=self.agentic_direct_runtime.manager,
+                        bootstrap_addr=self.agentic_direct_runtime.bootstrap_addr,
+                        bootstrap_room=manifest.direct_room,
+                        dest_tp_ranks=[self.tp_rank],
+                        pp_rank=0,
+                    )
+                    candidate["source_token_indices"] = frozen_token_indices
+                    candidate["source_page_indices"] = frozen_page_indices
+                    candidate["sender"] = sender
+                    candidate["local_prepared"] = True
+                    if source_digest is not None:
+                        logger.info(
+                            "AgenticKV d_source_digest snapshot=%s digest=%s",
+                            manifest.snapshot_id,
+                            source_digest,
+                        )
+
+                if self.tp_rank == 0:
+                    # Publish data-plane metadata before exposing the Router
+                    # commit marker.  If either operation has an uncertain
+                    # result, repeating the same immutable payload is safe.
+                    if not candidate.get("offer_published"):
+                        self.agentic_snapshot_store.publish_direct_offer(manifest)
+                        candidate["offer_published"] = True
+                    if not candidate.get("route_published"):
+                        if not self._publish_agentic_route(
+                            manifest.request,
+                            route="direct_ready",
+                            snapshot_tokens=manifest.token_count,
+                        ):
+                            candidate["setup_retry_at"] = now + 0.05
+                            return False
+                        candidate["route_published"] = True
+                candidate["setup_committed"] = True
+        except Exception:
+            candidate["setup_retry_at"] = now + 0.05
+            logger.exception(
+                "AgenticKV Direct setup retry snapshot=%s rank=%d/%d",
+                getattr(candidate.get("manifest"), "snapshot_id", "unknown"),
+                self.tp_rank,
+                self.tp_world_size,
+            )
+            return False
+
+        if not candidate.get("setup_logged"):
+            candidate["setup_logged"] = True
+            manifest = candidate["manifest"]
+            logger.info(
+                "AgenticKV direct_offer snapshot=%s tokens=%d room=%d "
+                "threshold_s=%.3f rank=%d/%d",
+                getattr(manifest, "snapshot_id", "unknown"),
+                int(getattr(manifest, "token_count", 0)),
+                int(getattr(manifest, "direct_room", 0)),
+                self.agentic_fast_threshold,
+                self.tp_rank,
+                self.tp_world_size,
+            )
+        return True
+
 
     def _agentic_try_early_claim(self, candidate, now: float) -> str:
         """Return absent or arrived for the next-turn ingress marker."""
@@ -1560,6 +1641,23 @@ class DecodeKVCacheOffloadManager:
         if candidate.get("staging") or candidate.get("sent"):
             return False
         metadata = candidate["metadata"]
+        # Final is an application-authoritative lifecycle decision and must
+        # not wait behind Direct setup.  If the immutable offer was not yet
+        # published, publish it without exposing a Router route, then retire
+        # it atomically.  A transient metadata failure simply retains D KV and
+        # retries; no P can observe a route to this generation meanwhile.
+        if not candidate.get("offer_published", True):
+            try:
+                self.agentic_snapshot_store.publish_direct_offer(
+                    candidate["manifest"]
+                )
+                candidate["offer_published"] = True
+            except Exception:
+                logger.exception(
+                    "AgenticKV final offer publication retry snapshot=%s",
+                    metadata.current.snapshot_id,
+                )
+                return False
         manifest = self._agentic_direct_manifest(
             candidate, metadata, now, force=True
         )
@@ -1990,11 +2088,11 @@ class DecodeKVCacheOffloadManager:
         *,
         force: bool = False,
     ) -> SnapshotManifest:
-        """Return a cached direct manifest, periodically refreshing Mooncake.
+        """Return a cached Direct manifest from the configured metadata store.
 
         Direct claims are control-plane state and do not need token-rate
         polling.  A bounded polling interval preserves prompt handoff latency
-        while preventing O(pending direct offers) synchronous Mooncake reads
+        while preventing O(pending direct offers) synchronous metadata reads
         on every Decode scheduler iteration.  Callers force one final refresh
         at a fallback boundary so a concurrent P claim is never ignored.
         """
@@ -2065,9 +2163,16 @@ class DecodeKVCacheOffloadManager:
                 continue
             req = candidate["req"]
             metadata = candidate["metadata"]
+            # Final/cancel decisions outrank transport setup.  Rank zero owns
+            # this logical transition and uses the existing TP release command
+            # to free every physical shard together.
             if self._agentic_try_final_confirmation(
                 candidate
             ) and self._agentic_complete_final_candidate(candidate, now):
+                continue
+            if not DecodeKVCacheOffloadManager._progress_agentic_direct_candidate_setup(
+                self, candidate, now
+            ):
                 continue
             if candidate.get("staging"):
                 staging_ledger = getattr(
@@ -2240,14 +2345,26 @@ class DecodeKVCacheOffloadManager:
                 # underneath an in-flight DMA and leaves the P receiver stuck.
                 # TP>1 additionally waits for the logical manifest to record
                 # ACKs from every destination rank below.
-                if poll == KVPoll.Success and self.tp_world_size == 1:
-                    self._cleanup_agentic_direct_sender(candidate)
-                    self._agentic_release_early_claim(candidate, "direct_complete")
-                    self._agentic_candidate_pop(snapshot_id)
-                    self._enqueue_agentic_release(req, 0)
-                    continue
+                # DMA completion is only a transport fence.  D remains the
+                # authoritative source until P has inserted and pinned the
+                # received pages in Radix and atomically commits CONSUMED.
 
             manifest = self._agentic_direct_manifest(candidate, metadata, now)
+            if (
+                candidate["sent"]
+                and manifest.state is SnapshotState.DIRECT_READY
+            ):
+                # P received the bytes but could not safely bind the complete
+                # request-generation into Radix, so it returned lifecycle
+                # ownership after the NIXL fence became terminal.  This is a
+                # failed Direct session, not a fresh offer: retain the D source
+                # and immediately move it to Shared-Host Slow recovery.
+                should_fallback = True
+                logger.warning(
+                    "AgenticKV direct_session_returned snapshot=%s; "
+                    "falling back with D source intact",
+                    snapshot_id,
+                )
             if not candidate["sent"] and manifest.state is SnapshotState.DIRECT_LOADING:
                 if candidate["claimed_at"] is None:
                     candidate["claimed_at"] = now
@@ -2294,8 +2411,13 @@ class DecodeKVCacheOffloadManager:
                             ready_timeout,
                             d_kv_usage,
                         )
+            elif manifest.state is SnapshotState.P_RECEIVED:
+                # P owns a complete workset, but its child request has not yet
+                # bound that workset into Radix.  Retain D pages as the retry
+                # source; scheduler latency is not a data-loss deadline.
+                continue
             elif manifest.state is SnapshotState.CONSUMED:
-                # P marks CONSUMED only after its receiver observed success.
+                # P marks CONSUMED only after Radix bind and pin succeed.
                 self._cleanup_agentic_direct_sender(candidate)
                 self._agentic_release_early_claim(candidate, "consumed")
                 self._agentic_candidate_pop(snapshot_id)
@@ -2340,6 +2462,7 @@ class DecodeKVCacheOffloadManager:
             elif manifest.state not in {
                 SnapshotState.DIRECT_READY,
                 SnapshotState.DIRECT_LOADING,
+                SnapshotState.P_RECEIVED,
             }:
                 logger.warning(
                     "Direct snapshot %s moved to %s before transfer; releasing D KV",
@@ -2375,6 +2498,14 @@ class DecodeKVCacheOffloadManager:
                 ):
                     candidate["claimed_at"] = candidate["claimed_at"] or now
                     continue
+                # Capture confirmation before releasing the tmpfs marker.
+                # release_early_claim removes both arrival and tool files for
+                # TP=1, so querying afterwards falsely reported
+                # tool_confirmed=False even when fast_arrival_seen had already
+                # been logged for this exact request-generation.
+                tool_confirmed = bool(candidate.get("fast_arrival_seen")) or bool(
+                    self._agentic_try_tool_confirmation(candidate)
+                )
                 self._agentic_release_early_claim(candidate, "slow_fallback")
                 logger.info(
                     "AgenticKV direct_fallback snapshot=%s elapsed_s=%.6f "
@@ -2382,7 +2513,7 @@ class DecodeKVCacheOffloadManager:
                     snapshot_id,
                     now - candidate["created_at"],
                     manifest.state.value,
-                    self._agentic_try_tool_confirmation(candidate),
+                    tool_confirmed,
                     self._agentic_direct_kv_usage(),
                 )
                 try:
@@ -2464,6 +2595,10 @@ class DecodeKVCacheOffloadManager:
             if progress_class == "direct" and action == "slow":
                 continue
             if progress_class == "slow" and action != "slow":
+                continue
+            if not DecodeKVCacheOffloadManager._progress_agentic_direct_candidate_setup(
+                self, candidate, time.monotonic()
+            ):
                 continue
             if action == "wait":
                 continue

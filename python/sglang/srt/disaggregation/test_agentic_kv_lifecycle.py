@@ -253,14 +253,16 @@ def test_tp_direct_completion_is_group_atomic():
         is SnapshotState.DIRECT_LOADING
     )
 
-    complete = rank1.complete_direct_rank(
+    received = rank1.complete_direct_rank(
         claimed1, claim_id, tp_rank=1, tp_size=2
     )
-    assert complete.state is SnapshotState.CONSUMED
+    assert received.state is SnapshotState.P_RECEIVED
     assert (
         rank0.load(offer.request, require_ready=False).state
-        is SnapshotState.CONSUMED
+        is SnapshotState.P_RECEIVED
     )
+    complete = rank0.commit_direct_bound(received, claim_id)
+    assert complete.state is SnapshotState.CONSUMED
 
 
 def test_tp_direct_completion_uses_node_local_group_fence(
@@ -287,15 +289,16 @@ def test_tp_direct_completion_uses_node_local_group_fence(
     assert rank0.complete_direct_rank(
         claimed0, claim_id, tp_rank=0, tp_size=2
     ).state is SnapshotState.DIRECT_LOADING
-    terminal = rank1.complete_direct_rank(
+    received = rank1.complete_direct_rank(
         claimed1, claim_id, tp_rank=1, tp_size=2
     )
-    assert terminal.state is SnapshotState.CONSUMED
+    assert received.state is SnapshotState.P_RECEIVED
     # A client with a stale DIRECT_LOADING object observes the local done
     # marker without attempting a second manifest finalization.
     assert rank0.complete_direct_rank(
         claimed0, claim_id, tp_rank=0, tp_size=2
-    ).state is SnapshotState.CONSUMED
+    ).state is SnapshotState.P_RECEIVED
+    assert rank0.commit_direct_bound(received, claim_id).state is SnapshotState.CONSUMED
 
 
 def test_tp_direct_join_tolerates_duplicate_claim_put_success():
@@ -486,9 +489,36 @@ def test_direct_offer_claim_release_and_complete_are_single_consumer():
     ready = store.release_direct_claim(loading, "p0")
     assert ready.state is SnapshotState.DIRECT_READY
     loading = store.claim_direct(request, "p1")
-    consumed = store.complete_direct(loading, "p1")
+    received = store.complete_direct(loading, "p1")
+    assert received.state is SnapshotState.P_RECEIVED
+    assert raw.is_exist(request.claim_key) == 1
+    consumed = store.commit_direct_bound(received, "p1")
     assert consumed.state is SnapshotState.CONSUMED
     assert raw.is_exist(request.claim_key) == 0
+
+
+def test_received_direct_retains_claim_until_radix_bind_or_safe_release():
+    raw = FakeMooncakeStore()
+    store = MooncakeSnapshotStore(raw)
+    offer = SnapshotManifest(
+        request=RequestGeneration("direct-bind", 2),
+        page_keys=(),
+        token_count=256,
+        byte_size=0,
+        state=SnapshotState.DIRECT_READY,
+        token_digest="digest",
+        direct_bootstrap_addr="127.0.0.1:45501",
+        direct_room=77,
+    )
+    store.publish_direct_offer(offer)
+    loading = store.claim_direct(offer.request, "p0")
+    received = store.complete_direct(loading, "p0")
+
+    assert received.state is SnapshotState.P_RECEIVED
+    assert raw.is_exist(offer.request.claim_key) == 1
+    ready = store.release_received_direct(received, "p0")
+    assert ready.state is SnapshotState.DIRECT_READY
+    assert raw.is_exist(offer.request.claim_key) == 0
 
 
 def test_direct_fallback_does_not_overwrite_an_active_p_claim():

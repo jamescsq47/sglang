@@ -105,6 +105,7 @@ class TestPrefillAdder(CustomTestCase):
         req.prefix_indices = torch.empty(0, dtype=torch.int64)
         req.fill_ids = list(range(8))
         req.last_node = MagicMock()
+        req._agentic_workset_backed = True
         req._agentic_workset_suffix_indices = torch.arange(8)
         adder = self.create_adder(
             self.create_running_batch(), page_size=4, rem_chunk_tokens=None
@@ -125,6 +126,7 @@ class TestPrefillAdder(CustomTestCase):
         second.prefix_indices = torch.empty(0, dtype=torch.int64)
         second.fill_ids = list(range(8))
         second.last_node = MagicMock()
+        second._agentic_workset_backed = True
         second._agentic_workset_suffix_indices = torch.arange(8, 16)
         second_result = adder.add_one_req(
             second, has_chunked_req=False, truncation_align_size=None
@@ -141,6 +143,7 @@ class TestPrefillAdder(CustomTestCase):
             fill_ids=list(range(12)),
             prefix_indices=[],
             sampling_params=SimpleNamespace(max_new_tokens=0),
+            _agentic_workset_backed=True,
             _agentic_workset_suffix_indices=torch.arange(12),
         )
 
@@ -157,6 +160,27 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIs(chunked, req)
         self.assertEqual(req.extend_input_len, 4)
         self.assertEqual(adder.rem_total_token_offset, 0)
+
+    def test_suffix_indices_without_workset_marker_do_not_bypass_admission(self):
+        self.mock_token_allocator.available_size.return_value = 0
+        req = self.create_mock_req("unowned-suffix", priority=0, max_new_tokens=1)
+        req.sampling_params.ignore_eos = False
+        req.extend_input_len = 8
+        req.host_hit_length = 0
+        req.prefix_indices = torch.empty(0, dtype=torch.int64)
+        req.fill_ids = list(range(8))
+        req.last_node = MagicMock()
+        req._agentic_workset_suffix_indices = torch.arange(8)
+        adder = self.create_adder(
+            self.create_running_batch(), page_size=4, rem_chunk_tokens=None
+        )
+
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+        self.assertNotIn(req, adder.can_run_list)
 
     def test_agentic_slow_parent_pin_bridges_to_native_request_lock(self):
         direct_pin = object()

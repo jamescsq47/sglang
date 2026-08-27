@@ -359,7 +359,11 @@ def alloc_for_extend(
     # must be consumed by this exact Prefill rather than returned to the free
     # pool and raced by another request.
     leased_suffixes = [
-        getattr(req, "_agentic_workset_suffix_indices", None)
+        (
+            getattr(req, "_agentic_workset_suffix_indices", None)
+            if getattr(req, "_agentic_workset_backed", False)
+            else None
+        )
         for req in batch.reqs
     ]
 

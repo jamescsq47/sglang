@@ -607,6 +607,7 @@ class SchedulerDisaggregationPrefillMixin:
         if hasattr(req, "_async_prefill_transfer_payload"):
             delattr(req, "_async_prefill_transfer_payload")
         for name in (
+            "_agentic_workset_backed",
             "_agentic_p_workset_lease",
             "_agentic_p_workset_broker",
             "_agentic_workset_suffix_allocated_tokens",
@@ -1940,6 +1941,7 @@ class SchedulerDisaggregationPrefillMixin:
                             req.extra_key,
                         )
                 for name in (
+                    "_agentic_workset_backed",
                     "_agentic_p_workset_lease",
                     "_agentic_p_workset_broker",
                     "_agentic_workset_suffix_allocated_tokens",
