@@ -31,7 +31,11 @@ from sglang.srt.disaggregation.agentic_host_staging import (
     create_agentic_storage_controller,
     supports_agentic_kv_spill,
 )
-from sglang.srt.disaggregation.agentic_early_claim import AgenticEarlyClaimStore
+from sglang.srt.disaggregation.agentic_early_claim import (
+    AgenticDirectoryChangeWatcher,
+    AgenticEarlyClaimStore,
+    AgenticFileChangeWatcher,
+)
 from sglang.srt.disaggregation.agentic_kv_lifecycle import (
     AgenticRequestMetadata,
     MooncakeSnapshotStore,
@@ -83,6 +87,122 @@ def _ledger():
     os.close(fd)
     os.unlink(path)
     return SharedHostStagingLedger(path), path
+
+
+def test_agentic_file_change_watcher_is_edge_triggered(tmp_path):
+    path = tmp_path / "ledger.json"
+    path.write_text("{}")
+    with AgenticFileChangeWatcher(path) as watcher:
+        assert watcher.poll(0.0) is False
+        path.write_text('{"changed":true}')
+        assert watcher.poll(1.0) is True
+        assert watcher.poll(0.0) is False
+
+
+def test_agentic_file_change_watcher_marks_poll_failure_unhealthy():
+    class BrokenPoller:
+        @staticmethod
+        def poll(_timeout_ms):
+            raise OSError("watch failed")
+
+    watcher = AgenticFileChangeWatcher.__new__(AgenticFileChangeWatcher)
+    watcher._closed = False
+    watcher.healthy = True
+    watcher.poller = BrokenPoller()
+
+    assert watcher.poll(0.0) is True
+    assert watcher.healthy is False
+
+
+def test_host_ledger_publishes_versioned_snapshot_delta():
+    ledger, path = _ledger()
+    try:
+        with AgenticDirectoryChangeWatcher(ledger.event_directory) as watcher:
+            offered = ledger.offer(_rank_offer(0))
+            paths, overflow = watcher.poll(1.0)
+            assert overflow is False
+            assert len(paths) == 1
+            event = ledger.read_entry_event(paths[0])
+            assert event["snapshot_id"] == offered["snapshot_id"]
+            assert event["revision"] == 1
+            assert event["entry"]["state"] == "tp_collecting"
+
+            ledger.offer(_rank_offer(1))
+            paths, overflow = watcher.poll(1.0)
+            assert overflow is False
+            event = ledger.read_entry_event(paths[0])
+            assert event["revision"] == 2
+            assert event["entry"]["state"] == HostStageState.OFFERED.value
+
+            claimed = ledger.claim(offered["snapshot_id"], "p:test")
+            assert claimed is not None
+            paths, overflow = watcher.poll(1.0)
+            assert overflow is False
+            assert len(paths) == 1
+            event = ledger.read_entry_event(paths[0])
+            assert event["revision"] == 3
+            assert event["entry"]["state"] == HostStageState.HOST_RESERVED.value
+    finally:
+        try:
+            for name in os.listdir(ledger.event_directory):
+                os.unlink(os.path.join(ledger.event_directory, name))
+            os.rmdir(ledger.event_directory)
+        except FileNotFoundError:
+            pass
+        os.unlink(path)
+
+
+def test_host_control_applies_only_new_snapshot_delta():
+    manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
+    manager._ledger_event_queue = queue.SimpleQueue()
+    manager._ledger_event_ready = threading.Event()
+    manager._ledger_entries_cache = {
+        "request:3": {"snapshot_id": "request:3", "_event_revision": 2}
+    }
+    manager._ledger_event_queue.put(
+        {
+            "snapshot_id": "request:3",
+            "revision": 1,
+            "entry": {
+                "snapshot_id": "request:3",
+                "_event_revision": 1,
+                "state": HostStageState.OFFERED.value,
+            },
+        }
+    )
+    manager._ledger_event_queue.put(
+        {
+            "snapshot_id": "request:4",
+            "revision": 1,
+            "entry": {
+                "snapshot_id": "request:4",
+                "_event_revision": 1,
+                "state": HostStageState.HOST_READY.value,
+            },
+        }
+    )
+    manager._ledger_event_ready.set()
+
+    assert manager._apply_ledger_events() is True
+    assert manager._ledger_entries_cache["request:3"]["_event_revision"] == 2
+    assert (
+        manager._ledger_entries_cache["request:4"]["state"]
+        == HostStageState.HOST_READY.value
+    )
+    assert manager._ledger_event_ready.is_set() is False
+
+
+def test_ledger_force_refresh_bypasses_cross_process_cache(monkeypatch):
+    monkeypatch.setenv("SGLANG_AGENTIC_KV_LEDGER_CACHE_SECONDS", "60")
+    ledger, path = _ledger()
+    peer = SharedHostStagingLedger(path)
+    try:
+        assert ledger.snapshot_entries() == {}
+        peer.offer(_rank_offer(0))
+        assert ledger.snapshot_entries() == {}
+        assert "request:3" in ledger.snapshot_entries(force_refresh=True)
+    finally:
+        os.unlink(path)
 
 
 def _rank_offer(rank: int):

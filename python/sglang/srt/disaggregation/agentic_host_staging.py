@@ -30,6 +30,9 @@ from typing import Any, Optional
 
 import torch
 
+from sglang.srt.disaggregation.agentic_early_claim import (
+    AgenticDirectoryChangeWatcher,
+)
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.agentic_kv_lifecycle import (
     MooncakeSnapshotStore,
@@ -504,7 +507,9 @@ class SharedHostStagingLedger:
         if directory != "/dev/shm" and not directory.startswith("/dev/shm/"):
             raise ValueError("host staging ledger must reside in /dev/shm")
         os.makedirs(directory, exist_ok=True)
-        self.path = path
+        self.path = os.path.abspath(path)
+        self.event_directory = f"{self.path}.events"
+        os.makedirs(self.event_directory, exist_ok=True)
         # The ledger contains page hashes for every live request-generation.
         # Re-decoding the complete JSON document on every P/D scheduler step
         # makes Decode CPU-bound after a few hundred long-lived snapshots.
@@ -524,6 +529,15 @@ class SharedHostStagingLedger:
             file_obj.seek(0)
             raw = file_obj.read()
             if not raw:
+                # A fresh authoritative ledger starts a fresh event epoch.
+                # Stale per-snapshot deltas from an earlier server lifetime
+                # must never be replayed after the new initial resync.
+                for item in os.scandir(self.event_directory):
+                    if item.is_file() and item.name.endswith(".json"):
+                        try:
+                            os.unlink(item.path)
+                        except FileNotFoundError:
+                            pass
                 self._write_locked(
                     file_obj,
                     {"version": self.VERSION, "entries": {}, "relays": {}},
@@ -542,7 +556,53 @@ class SharedHostStagingLedger:
         file_obj.flush()
         # /dev/shm is memory-backed; fsync is intentionally omitted from the hot path.
 
-    def _mutate(self, callback):
+    def _event_path(self, snapshot_id: str) -> str:
+        digest = hashlib.sha256(str(snapshot_id).encode("utf-8")).hexdigest()
+        return os.path.join(self.event_directory, f"{digest}.json")
+
+    def _publish_entry_event_locked(
+        self, snapshot_id: str, entry: Optional[dict[str, Any]]
+    ) -> None:
+        """Publish one complete request-generation delta while holding flock.
+
+        Publishing before releasing the ledger lock preserves revision order
+        across writers.  Atomic rename means an inotify consumer observes
+        either the previous complete event or the new complete event, never a
+        partially serialized manifest.
+        """
+
+        event_path = self._event_path(snapshot_id)
+        temporary_path = (
+            f"{event_path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        payload = {
+            "version": self.VERSION,
+            "snapshot_id": str(snapshot_id),
+            "revision": int((entry or {}).get("_event_revision", 0)),
+            "entry": None if entry is None else dict(entry),
+        }
+        try:
+            with open(temporary_path, "w", encoding="utf-8") as file_obj:
+                json.dump(payload, file_obj, separators=(",", ":"), sort_keys=True)
+                file_obj.flush()
+            os.replace(temporary_path, event_path)
+        finally:
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
+
+    def read_entry_event(self, path: str | os.PathLike) -> dict[str, Any]:
+        with open(path, "r", encoding="utf-8") as file_obj:
+            event = json.load(file_obj)
+        if event.get("version") != self.VERSION:
+            raise ValueError("unsupported host staging event version")
+        snapshot_id = str(event.get("snapshot_id", ""))
+        if not snapshot_id or self._event_path(snapshot_id) != os.fspath(path):
+            raise ValueError("host staging event path does not match snapshot")
+        return event
+
+    def _mutate(self, callback, *, event_snapshot_id: Optional[str] = None):
         with open(self.path, "r+", encoding="utf-8") as file_obj:
             fcntl.flock(file_obj.fileno(), fcntl.LOCK_EX)
             try:
@@ -552,7 +612,18 @@ class SharedHostStagingLedger:
                     raise ValueError("corrupt host staging ledger")
                 result, changed = callback(data.setdefault("entries", {}))
                 if changed:
+                    if event_snapshot_id is not None:
+                        current = data["entries"].get(str(event_snapshot_id))
+                        if current is not None:
+                            current["_event_revision"] = (
+                                int(current.get("_event_revision", 0)) + 1
+                            )
                     self._write_locked(file_obj, data)
+                    if event_snapshot_id is not None:
+                        self._publish_entry_event_locked(
+                            str(event_snapshot_id),
+                            data["entries"].get(str(event_snapshot_id)),
+                        )
                     with self._snapshot_cache_lock:
                         self._snapshot_cache_at = 0.0
                         self._snapshot_cache = {}
@@ -560,7 +631,9 @@ class SharedHostStagingLedger:
             finally:
                 fcntl.flock(file_obj.fileno(), fcntl.LOCK_UN)
 
-    def _mutate_document(self, callback):
+    def _mutate_document(
+        self, callback, *, event_snapshot_id: Any = None
+    ):
         """Mutate entries plus the node-local relay registry atomically."""
 
         with open(self.path, "r+", encoding="utf-8") as file_obj:
@@ -574,7 +647,23 @@ class SharedHostStagingLedger:
                 data.setdefault("relays", {})
                 result, changed = callback(data)
                 if changed:
+                    resolved_event_id = (
+                        event_snapshot_id(result)
+                        if callable(event_snapshot_id)
+                        else event_snapshot_id
+                    )
+                    if resolved_event_id is not None:
+                        current = data["entries"].get(str(resolved_event_id))
+                        if current is not None:
+                            current["_event_revision"] = (
+                                int(current.get("_event_revision", 0)) + 1
+                            )
                     self._write_locked(file_obj, data)
+                    if resolved_event_id is not None:
+                        self._publish_entry_event_locked(
+                            str(resolved_event_id),
+                            data["entries"].get(str(resolved_event_id)),
+                        )
                     with self._snapshot_cache_lock:
                         self._snapshot_cache_at = 0.0
                         self._snapshot_cache = {}
@@ -679,7 +768,7 @@ class SharedHostStagingLedger:
             entries[snapshot_id] = value
             return dict(value), True
 
-        return self._mutate(callback)
+        return self._mutate(callback, event_snapshot_id=snapshot_id)
 
     def get(self, snapshot_id: str) -> Optional[dict[str, Any]]:
         def callback(entries):
@@ -688,7 +777,9 @@ class SharedHostStagingLedger:
 
         return self._mutate(callback)
 
-    def snapshot_entries(self) -> dict[str, dict[str, Any]]:
+    def snapshot_entries(
+        self, *, force_refresh: bool = False
+    ) -> dict[str, dict[str, Any]]:
         """Read all staging states under one shared lock.
 
         Scheduler callers commonly need the state of tens of snapshots at
@@ -700,7 +791,8 @@ class SharedHostStagingLedger:
         now = time.monotonic()
         with self._snapshot_cache_lock:
             if (
-                self._snapshot_cache_seconds > 0
+                not force_refresh
+                and self._snapshot_cache_seconds > 0
                 and now - self._snapshot_cache_at < self._snapshot_cache_seconds
             ):
                 return {
@@ -858,7 +950,7 @@ class SharedHostStagingLedger:
             )
             return dict(current), True
 
-        return self._mutate_document(callback)
+        return self._mutate_document(callback, event_snapshot_id=snapshot_id)
 
     def claim_relay_job(self, relay_id: str, pid: int) -> Optional[dict[str, Any]]:
         def callback(data):
@@ -886,7 +978,12 @@ class SharedHostStagingLedger:
             relay["updated_at"] = time.time()
             return dict(current), True
 
-        return self._mutate_document(callback)
+        return self._mutate_document(
+            callback,
+            event_snapshot_id=lambda result: (
+                None if result is None else result.get("snapshot_id")
+            ),
+        )
 
     def relay_prepare_chunk(
         self,
@@ -918,7 +1015,9 @@ class SharedHostStagingLedger:
             current["updated_at"] = time.time()
             return True, True
 
-        return bool(self._mutate_document(callback))
+        return bool(
+            self._mutate_document(callback, event_snapshot_id=snapshot_id)
+        )
 
     def relay_mark_source_sent(self, snapshot_id: str, seq: int, source_pid: int) -> bool:
         def callback(data):
@@ -939,7 +1038,9 @@ class SharedHostStagingLedger:
             current["updated_at"] = time.time()
             return True, True
 
-        return bool(self._mutate_document(callback))
+        return bool(
+            self._mutate_document(callback, event_snapshot_id=snapshot_id)
+        )
 
     def relay_complete_chunk(self, snapshot_id: str, relay_id: str, seq: int) -> bool:
         """Commit one relay D2H chunk; the final chunk publishes HOST_READY."""
@@ -976,7 +1077,9 @@ class SharedHostStagingLedger:
                     relay["updated_at"] = time.time()
             return True, True
 
-        return bool(self._mutate_document(callback))
+        return bool(
+            self._mutate_document(callback, event_snapshot_id=snapshot_id)
+        )
 
     def relay_fail_to_direct(
         self, snapshot_id: str, relay_id: str, reason: str
@@ -1004,7 +1107,9 @@ class SharedHostStagingLedger:
             current["updated_at"] = time.time()
             return True, True
 
-        return bool(self._mutate_document(callback))
+        return bool(
+            self._mutate_document(callback, event_snapshot_id=snapshot_id)
+        )
 
     def list_state(self, *states: HostStageState) -> list[dict[str, Any]]:
         wanted = {state.value for state in states}
@@ -1033,7 +1138,7 @@ class SharedHostStagingLedger:
             current["updated_at"] = time.time()
             return dict(current), True
 
-        return self._mutate(callback)
+        return self._mutate(callback, event_snapshot_id=snapshot_id)
 
     def claim_rank(
         self,
@@ -1065,7 +1170,7 @@ class SharedHostStagingLedger:
             current["updated_at"] = time.time()
             return dict(current), True
 
-        return self._mutate(callback)
+        return self._mutate(callback, event_snapshot_id=snapshot_id)
 
     def claim_p2d_write_rank(
         self,
@@ -1135,7 +1240,7 @@ class SharedHostStagingLedger:
             current["updated_at"] = time.time()
             return dict(current), True
 
-        return self._mutate(callback)
+        return self._mutate(callback, event_snapshot_id=snapshot_id)
 
     def reject_unclaimed_offer(
         self, snapshot_id: str, *, reason: Optional[str] = None
@@ -1157,7 +1262,7 @@ class SharedHostStagingLedger:
                 current["reason"] = str(reason)[:256]
             return True, True
 
-        return bool(self._mutate(callback))
+        return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
 
     def abort_unsubmitted_p2d(
         self, snapshot_id: str, *, reason: Optional[str] = None
@@ -1204,7 +1309,7 @@ class SharedHostStagingLedger:
                     current["reason"] = str(reason)[:256]
             return str(state), changed
 
-        return str(self._mutate(callback))
+        return str(self._mutate(callback, event_snapshot_id=snapshot_id))
 
     def arbitrate_p2d_release(self, snapshot_id: str, *, tp_size: int) -> str:
         """Resolve whether one untouched P shard may release its source pages.
@@ -1252,7 +1357,7 @@ class SharedHostStagingLedger:
             current["updated_at"] = now
             return P2D_RELEASE_NATIVE_WON, True
 
-        return str(self._mutate(callback))
+        return str(self._mutate(callback, event_snapshot_id=snapshot_id))
 
     def arbitrate_p2d_native(self, snapshot_id: str, *, tp_size: int) -> bool:
         """Compatibility bool for callers that only distinguish native/Host."""
@@ -1308,7 +1413,7 @@ class SharedHostStagingLedger:
             current["updated_at"] = time.time()
             return True, True
 
-        return bool(self._mutate(callback))
+        return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
 
     def publish_grants(self, snapshot_id: str, owner: str, grants: list[dict[str, Any]]) -> bool:
         def callback(entries):
@@ -1325,7 +1430,7 @@ class SharedHostStagingLedger:
             current["updated_at"] = time.time()
             return True, True
 
-        return bool(self._mutate(callback))
+        return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
 
     def complete_host_write(
         self,
@@ -1366,7 +1471,7 @@ class SharedHostStagingLedger:
             current["updated_at"] = time.time()
             return True, True
 
-        return bool(self._mutate(callback))
+        return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
 
     def complete_host_load_rank(
         self,
@@ -1397,7 +1502,7 @@ class SharedHostStagingLedger:
             current["updated_at"] = time.time()
             return True, True
 
-        return bool(self._mutate(callback))
+        return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
 
     def complete_d2p_host_load_rank(
         self,
@@ -1431,7 +1536,7 @@ class SharedHostStagingLedger:
             current["updated_at"] = time.time()
             return True, True
 
-        return bool(self._mutate(callback))
+        return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
 
     def complete_host_bind_rank(
         self,
@@ -1461,7 +1566,7 @@ class SharedHostStagingLedger:
             current["updated_at"] = time.time()
             return True, True
 
-        return bool(self._mutate(callback))
+        return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
 
     def request_d2p_retry(
         self, snapshot_id: str, owner: str, *, reason: str
@@ -1486,7 +1591,7 @@ class SharedHostStagingLedger:
             current["updated_at"] = time.time()
             return True, True
 
-        return bool(self._mutate(callback))
+        return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
 
     def complete_d2p_retry_rank(
         self,
@@ -1530,7 +1635,7 @@ class SharedHostStagingLedger:
             current["updated_at"] = time.time()
             return True, True
 
-        return bool(self._mutate(callback))
+        return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
 
     def begin_host_load_rank(
         self,
@@ -1570,7 +1675,7 @@ class SharedHostStagingLedger:
             current["updated_at"] = time.time()
             return True, True
 
-        return bool(self._mutate(callback))
+        return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
 
     def prepare_tp_host_load_rank(
         self,
@@ -1618,7 +1723,7 @@ class SharedHostStagingLedger:
                 current["updated_at"] = time.time()
             return True, changed
 
-        return bool(self._mutate(callback))
+        return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
 
     def complete_p2d_host_write_rank(
         self,
@@ -1655,7 +1760,7 @@ class SharedHostStagingLedger:
             current["updated_at"] = time.time()
             return True, True
 
-        return bool(self._mutate(callback))
+        return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
 
     def mark_writer_drained(self, snapshot_id: str, d_pid: int) -> bool:
         """ACK one rank has no DMA that can still target an aborting extent."""
@@ -1704,7 +1809,7 @@ class SharedHostStagingLedger:
             current["updated_at"] = time.time()
             return True, changed
 
-        return bool(self._mutate(callback))
+        return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
 
     def fail_host_write(
         self,
@@ -1752,7 +1857,7 @@ class SharedHostStagingLedger:
             current["updated_at"] = time.time()
             return True, True
 
-        return bool(self._mutate(callback))
+        return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
 
     def mark_sent(self, snapshot_id: str, seq: int) -> bool:
         def callback(entries):
@@ -1767,7 +1872,7 @@ class SharedHostStagingLedger:
             current["updated_at"] = time.time()
             return True, True
 
-        return bool(self._mutate(callback))
+        return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
 
     def ack_chunk(self, snapshot_id: str, owner: str, seq: int) -> bool:
         def callback(entries):
@@ -1784,7 +1889,7 @@ class SharedHostStagingLedger:
             current["updated_at"] = time.time()
             return True, True
 
-        return bool(self._mutate(callback))
+        return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
 
     def mark_host_ready(self, snapshot_id: str, owner: str, total_chunks: int) -> bool:
         """Commit visibility only when every expected chunk has a D2H ACK."""
@@ -1804,7 +1909,7 @@ class SharedHostStagingLedger:
             current["updated_at"] = time.time()
             return True, True
 
-        return bool(self._mutate(callback))
+        return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
 
     def transition(
         self,
@@ -1829,7 +1934,7 @@ class SharedHostStagingLedger:
                 current["reason"] = str(reason)[:256]
             return True, True
 
-        return bool(self._mutate(callback))
+        return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
 
     def prune(
         self,
@@ -1854,9 +1959,14 @@ class SharedHostStagingLedger:
             ]
             for key in doomed:
                 entries.pop(key, None)
-            return None, bool(doomed)
+            return tuple(doomed), bool(doomed)
 
-        self._mutate(callback)
+        doomed = self._mutate(callback)
+        for snapshot_id in doomed:
+            try:
+                os.unlink(self._event_path(snapshot_id))
+            except FileNotFoundError:
+                pass
 
 
 class LayerFirstD2HStaging:
@@ -2812,6 +2922,15 @@ class AgenticPHostStagingManager:
                 )
             ),
         )
+        self._control_idle_backstop = max(
+            self._control_interval,
+            float(
+                os.getenv(
+                    "SGLANG_AGENTIC_KV_P_ASYNC_CONTROL_IDLE_BACKSTOP_SECONDS",
+                    "5.0",
+                )
+            ),
+        )
         self._admission_batch = max(
             1,
             int(os.getenv("SGLANG_AGENTIC_KV_P_HOST_ADMISSION_BATCH", "16")),
@@ -2829,6 +2948,15 @@ class AgenticPHostStagingManager:
             ),
         )
         self._control_wakeup = threading.Event()
+        self._ledger_event_queue: queue.SimpleQueue = queue.SimpleQueue()
+        self._ledger_event_ready = threading.Event()
+        # Set only for startup, overflow, watcher failure, and the low-rate
+        # recovery backstop. Normal progress consumes per-snapshot deltas.
+        self._ledger_changed = threading.Event()
+        self._ledger_changed.set()
+        self._last_ledger_refresh = 0.0
+        self._ledger_watcher = None
+        self._ledger_watcher_thread = None
         # The arena is physically allocated and first-touched once at startup.
         # Snapshot admission therefore needs no per-generation prefault pool.
         self._prefault_worker_count = 0
@@ -2851,6 +2979,24 @@ class AgenticPHostStagingManager:
             self.arena.preallocation_seconds,
         )
         if self._async_control:
+            try:
+                self._ledger_watcher = AgenticDirectoryChangeWatcher(
+                    self.ledger.event_directory
+                )
+                self._ledger_watcher_thread = threading.Thread(
+                    target=self._ledger_watch_worker,
+                    name=f"agentic-p-ledger-watch-{os.getpid()}",
+                    daemon=True,
+                )
+                self._ledger_watcher_thread.start()
+            except Exception:
+                # Keep the previous bounded polling behavior on platforms
+                # without inotify. Linux node-local deployments take the
+                # event-driven path.
+                self._ledger_watcher = None
+                logger.exception(
+                    "Agentic P ledger inotify unavailable; using polling fallback"
+                )
             self._control_thread = threading.Thread(
                 target=self._control_worker,
                 name=f"agentic-p-control-{os.getpid()}",
@@ -2859,10 +3005,13 @@ class AgenticPHostStagingManager:
             self._control_thread.start()
             logger.info(
                 "Agentic P async control enabled interval_ms=%.3f "
+                "idle_backstop_s=%.3f snapshot_delta_events=%s "
                 "admission_batch=%d prefault_workers=%d "
                 "capacity_wait_timeout_s=%.3f "
                 "pageable_snapshot_mmap=true arena_preallocated=true",
                 self._control_interval * 1000.0,
+                self._control_idle_backstop,
+                self._ledger_watcher is not None,
                 self._admission_batch,
                 self._prefault_worker_count,
                 self._capacity_wait_timeout_seconds,
@@ -3456,7 +3605,74 @@ class AgenticPHostStagingManager:
         self._spill_threads[snapshot_id] = thread
         thread.start()
 
-    def _poll_once(self) -> None:
+    def _has_local_io_progress(self) -> bool:
+        """Return whether CUDA/thread completion still needs short polling."""
+
+        with self._get_state_lock():
+            pending_grant = any(
+                record.get("grant_publish_pending")
+                for record in self.active.values()
+            )
+            return bool(self.loads or self.spills or pending_grant)
+
+    def _ledger_watch_worker(self) -> None:
+        watcher = self._ledger_watcher
+        if watcher is None:
+            return
+        try:
+            while watcher.healthy:
+                paths, overflow = watcher.poll(timeout_seconds=None)
+                if overflow:
+                    self._ledger_changed.set()
+                for path in paths:
+                    try:
+                        event = self.ledger.read_entry_event(path)
+                    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+                        # A later event for the same snapshot may have replaced
+                        # this path between inotify delivery and open.  The
+                        # authoritative resync closes that rare race.
+                        self._ledger_changed.set()
+                        continue
+                    self._ledger_event_queue.put(event)
+                    self._ledger_event_ready.set()
+                if paths or overflow:
+                    self._control_wakeup.set()
+        except Exception:
+            logger.exception(
+                "Agentic P ledger watcher failed; switching to polling fallback"
+            )
+        finally:
+            # The control worker observes watcher health and resumes bounded
+            # polling. Never leave Host progress dependent on a dead daemon.
+            watcher.healthy = False
+            self._ledger_changed.set()
+            self._control_wakeup.set()
+
+    def _apply_ledger_events(self) -> bool:
+        """Merge changed request-generations into the in-memory ledger view."""
+
+        self._ledger_event_ready.clear()
+        changed = False
+        while True:
+            try:
+                event = self._ledger_event_queue.get_nowait()
+            except queue.Empty:
+                break
+            snapshot_id = str(event["snapshot_id"])
+            incoming_revision = int(event.get("revision", 0))
+            current = self._ledger_entries_cache.get(snapshot_id)
+            current_revision = int((current or {}).get("_event_revision", -1))
+            if incoming_revision <= current_revision:
+                continue
+            entry = event.get("entry")
+            if entry is None:
+                self._ledger_entries_cache.pop(snapshot_id, None)
+            else:
+                self._ledger_entries_cache[snapshot_id] = dict(entry)
+            changed = True
+        return changed
+
+    def _poll_once(self, *, force_ledger: bool = False) -> None:
         now = time.monotonic()
         if now < self._next_poll_at:
             return
@@ -3464,25 +3680,45 @@ class AgenticPHostStagingManager:
         # Publish populated extents before taking the shared ledger snapshot so
         # D can observe every new grant in this same control cycle.
         self._progress_arena_grants()
-        # One shared read per P scheduler tick replaces one complete JSON read
-        # per active snapshot (and another per aborting snapshot/request gate).
-        ledger_entries = self.ledger.snapshot_entries()
-        self._ledger_entries_cache = ledger_entries
         self._progress_h2d_loads()
         self._progress_spills()
-        self._poll_active(ledger_entries)
-        self._poll_aborting(ledger_entries)
         self._maybe_spill()
-        self._admit_batch(ledger_entries)
+        watcher_healthy = bool(
+            self._ledger_watcher is not None and self._ledger_watcher.healthy
+        )
+        full_resync = force_ledger or not watcher_healthy
+        if not full_resync:
+            full_resync = self._ledger_changed.is_set()
+        if now - self._last_ledger_refresh >= self._control_idle_backstop:
+            full_resync = True
+        ledger_dirty = False
+        if full_resync:
+            # Clear before reading. A concurrent overflow/failure will set the
+            # edge again and therefore cannot be lost behind this snapshot.
+            self._ledger_changed.clear()
+            ledger_entries = self.ledger.snapshot_entries(force_refresh=True)
+            self._ledger_entries_cache = ledger_entries
+            self._last_ledger_refresh = time.monotonic()
+            ledger_dirty = True
+        # Apply events after a resync. Revision checks discard edges already
+        # represented by that snapshot while retaining a concurrent newer one.
+        ledger_dirty = self._apply_ledger_events() or ledger_dirty
+        if ledger_dirty:
+            self._poll_active(self._ledger_entries_cache)
+            self._poll_aborting(self._ledger_entries_cache)
+            self._admit_batch(self._ledger_entries_cache)
         if time.monotonic() - self._last_prune > 5.0:
             self.ledger.prune()
             self._last_prune = time.monotonic()
 
     def _control_worker(self) -> None:
         while True:
+            # Clear before doing work so a wakeup produced during this cycle
+            # remains set and makes the following wait return immediately.
+            self._control_wakeup.clear()
             started = time.monotonic()
             try:
-                self._poll_once()
+                self._poll_once(force_ledger=False)
             except Exception:
                 self._control_errors += 1
                 logger.exception("Agentic P async control progress failed")
@@ -3519,8 +3755,24 @@ class AgenticPHostStagingManager:
                 self._control_total_seconds = 0.0
                 self._control_max_seconds = 0.0
                 self._control_last_stats = now
-            self._control_wakeup.wait(self._control_interval)
-            self._control_wakeup.clear()
+            watcher_healthy = bool(
+                self._ledger_watcher is not None and self._ledger_watcher.healthy
+            )
+            timeout = (
+                self._control_interval
+                if (
+                    self._has_local_io_progress()
+                    or self._ledger_event_ready.is_set()
+                    or self._ledger_changed.is_set()
+                    or not watcher_healthy
+                )
+                else max(
+                    self._control_interval,
+                    self._control_idle_backstop
+                    - (time.monotonic() - self._last_ledger_refresh),
+                )
+            )
+            self._control_wakeup.wait(timeout)
 
     def poll(self) -> None:
         """Retain synchronous behavior only when async control is disabled.

@@ -178,6 +178,218 @@ class AgenticArrivalWatcher:
         self.close()
 
 
+class AgenticFileChangeWatcher:
+    """Block on changes to one node-local control-plane file.
+
+    The file itself may be rewritten in place or atomically replaced. Watching
+    its parent directory covers both forms without periodically scanning that
+    directory.  Callers retain a low-rate timeout as an overflow/recovery
+    backstop; normal progress is edge-triggered by inotify.
+    """
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path).resolve()
+        self.fd = _inotify_init()
+        try:
+            self.watch_descriptor = _inotify_add_watch(
+                self.fd,
+                self.path.parent,
+                _IN_CLOSE_WRITE
+                | _IN_MOVED_TO
+                | _IN_CREATE
+                | _IN_DELETE_SELF
+                | _IN_MOVE_SELF,
+            )
+        except Exception:
+            os.close(self.fd)
+            raise
+        self.poller = select.poll()
+        self.poller.register(self.fd, select.POLLIN | select.POLLERR)
+        self._closed = False
+        self.healthy = True
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self.healthy = False
+        try:
+            self.poller.unregister(self.fd)
+        except (KeyError, OSError):
+            pass
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+    def poll(self, timeout_seconds: float | None = None) -> bool:
+        """Return whether the watched file changed or events overflowed."""
+
+        if self._closed:
+            return False
+        timeout_ms = (
+            -1
+            if timeout_seconds is None
+            else max(0, int(float(timeout_seconds) * 1000.0))
+        )
+        try:
+            ready = self.poller.poll(timeout_ms)
+        except OSError:
+            self.healthy = False
+            return True
+        if not ready:
+            return False
+
+        changed = False
+        while True:
+            try:
+                data = os.read(self.fd, 256 * 1024)
+            except BlockingIOError:
+                break
+            except OSError:
+                self.healthy = False
+                return True
+            if not data:
+                break
+            offset = 0
+            while offset + _INOTIFY_EVENT.size <= len(data):
+                _, mask, _, name_length = _INOTIFY_EVENT.unpack_from(data, offset)
+                offset += _INOTIFY_EVENT.size
+                raw_name = data[offset : offset + name_length]
+                offset += name_length
+                if mask & _IN_Q_OVERFLOW:
+                    changed = True
+                    continue
+                if mask & (_IN_IGNORED | _IN_DELETE_SELF | _IN_MOVE_SELF):
+                    self.healthy = False
+                    changed = True
+                    continue
+                name = raw_name.split(b"\0", 1)[0].decode(
+                    errors="surrogateescape"
+                )
+                if name == self.path.name and mask & (
+                    _IN_CLOSE_WRITE | _IN_MOVED_TO | _IN_CREATE
+                ):
+                    changed = True
+        return changed
+
+    def __enter__(self) -> "AgenticFileChangeWatcher":
+        return self
+
+    def __exit__(self, *_args) -> None:
+        self.close()
+
+
+class AgenticDirectoryChangeWatcher:
+    """Return the exact JSON paths changed in one node-local directory.
+
+    Unlike :class:`AgenticFileChangeWatcher`, this watcher preserves the file
+    name carried by inotify.  Request-generation control planes can therefore
+    consume only the changed manifest instead of rescanning a monolithic
+    ledger after every edge.  ``overflow`` tells the caller to perform its
+    infrequent authoritative resync.
+    """
+
+    def __init__(self, directory: str | Path):
+        self.directory = Path(directory).resolve()
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.fd = _inotify_init()
+        try:
+            self.watch_descriptor = _inotify_add_watch(
+                self.fd,
+                self.directory,
+                _IN_CLOSE_WRITE
+                | _IN_MOVED_TO
+                | _IN_CREATE
+                | _IN_DELETE_SELF
+                | _IN_MOVE_SELF,
+            )
+        except Exception:
+            os.close(self.fd)
+            raise
+        self.poller = select.poll()
+        self.poller.register(self.fd, select.POLLIN | select.POLLERR)
+        self._closed = False
+        self.healthy = True
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self.healthy = False
+        try:
+            self.poller.unregister(self.fd)
+        except (KeyError, OSError):
+            pass
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+    def poll(
+        self, timeout_seconds: float | None = None
+    ) -> tuple[tuple[Path, ...], bool]:
+        """Return changed JSON paths and whether a full resync is required."""
+
+        if self._closed:
+            return (), False
+        timeout_ms = (
+            -1
+            if timeout_seconds is None
+            else max(0, int(float(timeout_seconds) * 1000.0))
+        )
+        try:
+            ready = self.poller.poll(timeout_ms)
+        except OSError:
+            self.healthy = False
+            return (), True
+        if not ready:
+            return (), False
+
+        paths: set[Path] = set()
+        overflow = False
+        while True:
+            try:
+                data = os.read(self.fd, 256 * 1024)
+            except BlockingIOError:
+                break
+            except OSError:
+                self.healthy = False
+                return (), True
+            if not data:
+                break
+            offset = 0
+            while offset + _INOTIFY_EVENT.size <= len(data):
+                _, mask, _, name_length = _INOTIFY_EVENT.unpack_from(data, offset)
+                offset += _INOTIFY_EVENT.size
+                raw_name = data[offset : offset + name_length]
+                offset += name_length
+                if mask & _IN_Q_OVERFLOW:
+                    overflow = True
+                    continue
+                if mask & (_IN_IGNORED | _IN_DELETE_SELF | _IN_MOVE_SELF):
+                    self.healthy = False
+                    overflow = True
+                    continue
+                name = raw_name.split(b"\0", 1)[0].decode(
+                    errors="surrogateescape"
+                )
+                if (
+                    name
+                    and not name.startswith(".")
+                    and name.endswith(".json")
+                    and mask & (_IN_CLOSE_WRITE | _IN_MOVED_TO | _IN_CREATE)
+                ):
+                    paths.add(self.directory / name)
+        return tuple(sorted(paths)), overflow
+
+    def __enter__(self) -> "AgenticDirectoryChangeWatcher":
+        return self
+
+    def __exit__(self, *_args) -> None:
+        self.close()
+
+
 class AgenticEarlyClaimStore:
     def __init__(self, directory: str):
         if not directory:
