@@ -46,6 +46,7 @@ from sglang.srt.mem_cache.hicache_storage import HiCacheStorageExtraInfo
 
 logger = logging.getLogger(__name__)
 _LEDGER_ENTRY_UNSET = object()
+_LEDGER_OWNERSHIP_CHANGED = object()
 _HOST_LIBC = ctypes.CDLL(None, use_errno=True)
 _HOST_MEMMOVE = _HOST_LIBC.memmove
 _HOST_MEMMOVE.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t)
@@ -510,6 +511,12 @@ class SharedHostStagingLedger:
         self.path = os.path.abspath(path)
         self.event_directory = f"{self.path}.events"
         os.makedirs(self.event_directory, exist_ok=True)
+        self.lock_directory = os.path.join(self.event_directory, ".locks")
+        os.makedirs(self.lock_directory, exist_ok=True)
+        self.relay_marker_directory = os.path.join(
+            self.event_directory, ".relay"
+        )
+        os.makedirs(self.relay_marker_directory, exist_ok=True)
         # The ledger contains page hashes for every live request-generation.
         # Re-decoding the complete JSON document on every P/D scheduler step
         # makes Decode CPU-bound after a few hundred long-lived snapshots.
@@ -546,6 +553,35 @@ class SharedHostStagingLedger:
                 data = json.loads(raw)
                 if data.get("version") != self.VERSION:
                     raise ValueError("unsupported host staging ledger version")
+                # One-time compatibility migration from the original
+                # monolithic entries document. Normal operation thereafter
+                # keeps only the small relay registry in this file; every
+                # request-generation is authoritative in its own manifest.
+                legacy_entries = data.get("entries", {})
+                if legacy_entries:
+                    retained_relay_entries = {}
+                    for snapshot_id, entry in legacy_entries.items():
+                        value = dict(entry)
+                        try:
+                            manifest = self.read_entry_event(
+                                self._event_path(snapshot_id)
+                            )
+                            manifest_revision = int(manifest.get("revision", 0))
+                        except FileNotFoundError:
+                            manifest_revision = 0
+                        # The old global document was authoritative. Always
+                        # republish it and advance beyond either observed
+                        # revision; a stale mirror must never win migration.
+                        value["_event_revision"] = max(
+                            manifest_revision,
+                            int(value.get("_event_revision", 0)),
+                        ) + 1
+                        self._publish_entry_event_locked(snapshot_id, value)
+                        if value.get("relay_id"):
+                            self._publish_relay_marker(snapshot_id)
+                            retained_relay_entries[snapshot_id] = value
+                    data["entries"] = retained_relay_entries
+                    self._write_locked(file_obj, data)
             fcntl.flock(file_obj.fileno(), fcntl.LOCK_UN)
 
     @staticmethod
@@ -559,6 +595,48 @@ class SharedHostStagingLedger:
     def _event_path(self, snapshot_id: str) -> str:
         digest = hashlib.sha256(str(snapshot_id).encode("utf-8")).hexdigest()
         return os.path.join(self.event_directory, f"{digest}.json")
+
+    def _entry_lock_path(self, snapshot_id: str) -> str:
+        digest = hashlib.sha256(str(snapshot_id).encode("utf-8")).hexdigest()
+        # Stable striped locks avoid one permanent inode per generation while
+        # never unlinking a flock inode that another process may already have
+        # opened. Hash collisions only serialize unrelated snapshots.
+        stripe = int(digest[:8], 16) % 4096
+        return os.path.join(self.lock_directory, f"{stripe:04x}.lock")
+
+    def _relay_marker_path(self, snapshot_id: str) -> str:
+        digest = hashlib.sha256(str(snapshot_id).encode("utf-8")).hexdigest()
+        return os.path.join(self.relay_marker_directory, digest)
+
+    def _publish_relay_marker(self, snapshot_id: str) -> None:
+        path = self._relay_marker_path(snapshot_id)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+        os.close(fd)
+
+    def _is_relay_snapshot(self, snapshot_id: str) -> bool:
+        return os.path.exists(self._relay_marker_path(snapshot_id))
+
+    @contextmanager
+    def _entry_locked(self, snapshot_id: str):
+        lock_path = self._entry_lock_path(snapshot_id)
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    @contextmanager
+    def _entry_read_locked(self, snapshot_id: str):
+        lock_path = self._entry_lock_path(snapshot_id)
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH)
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
 
     def _publish_entry_event_locked(
         self, snapshot_id: str, entry: Optional[dict[str, Any]]
@@ -603,27 +681,85 @@ class SharedHostStagingLedger:
         return event
 
     def _mutate(self, callback, *, event_snapshot_id: Optional[str] = None):
+        if event_snapshot_id is None:
+            raise ValueError("request-generation mutation requires snapshot id")
+        snapshot_id = str(event_snapshot_id)
+        while True:
+            if self._is_relay_snapshot(snapshot_id):
+                result = self._mutate_relay_entry(snapshot_id, callback)
+                if result is _LEDGER_OWNERSHIP_CHANGED:
+                    continue
+                return result
+            with self._entry_locked(snapshot_id):
+                # assign_transfer_path publishes the relay marker while it
+                # holds this stripe. A writer that observed normal ownership
+                # before waiting for the stripe must not update only the event
+                # mirror after ownership has moved to the global relay
+                # transaction.
+                if self._is_relay_snapshot(snapshot_id):
+                    continue
+                try:
+                    previous_event = self.read_entry_event(
+                        self._event_path(snapshot_id)
+                    )
+                except FileNotFoundError:
+                    previous_event = {"revision": 0, "entry": None}
+                previous = previous_event.get("entry")
+                entries = {} if previous is None else {snapshot_id: dict(previous)}
+                result, changed = callback(entries)
+                if changed:
+                    current = entries.get(snapshot_id)
+                    if current is not None:
+                        current["_event_revision"] = max(
+                            int(previous_event.get("revision", 0)),
+                            int(current.get("_event_revision", 0)),
+                        ) + 1
+                    self._publish_entry_event_locked(snapshot_id, current)
+                    with self._snapshot_cache_lock:
+                        self._snapshot_cache_at = 0.0
+                        self._snapshot_cache = {}
+                return result
+
+    def _mutate_relay_entry(self, snapshot_id: str, callback):
+        """Mutate a relay-owned entry in the single atomic relay document."""
+
         with open(self.path, "r+", encoding="utf-8") as file_obj:
             fcntl.flock(file_obj.fileno(), fcntl.LOCK_EX)
             try:
+                # Relay prune removes the marker and authoritative entry in
+                # this same global transaction. A caller that observed the
+                # old marker before waiting for the lock must retry through
+                # the normal per-snapshot path instead of resurrecting a
+                # deleted relay entry.
+                if not self._is_relay_snapshot(snapshot_id):
+                    return _LEDGER_OWNERSHIP_CHANGED
                 file_obj.seek(0)
                 data = json.loads(file_obj.read() or "{}")
                 if data.get("version") != self.VERSION:
-                    raise ValueError("corrupt host staging ledger")
-                result, changed = callback(data.setdefault("entries", {}))
-                if changed:
-                    if event_snapshot_id is not None:
-                        current = data["entries"].get(str(event_snapshot_id))
-                        if current is not None:
-                            current["_event_revision"] = (
-                                int(current.get("_event_revision", 0)) + 1
-                            )
-                    self._write_locked(file_obj, data)
-                    if event_snapshot_id is not None:
-                        self._publish_entry_event_locked(
-                            str(event_snapshot_id),
-                            data["entries"].get(str(event_snapshot_id)),
+                    raise ValueError("corrupt host staging relay registry")
+                entries = data.setdefault("entries", {})
+                previous = entries.get(snapshot_id)
+                if previous is None:
+                    try:
+                        previous_event = self.read_entry_event(
+                            self._event_path(snapshot_id)
                         )
+                    except FileNotFoundError:
+                        previous_event = {"revision": 0, "entry": None}
+                    previous = previous_event.get("entry")
+                    if previous is not None:
+                        entries[snapshot_id] = dict(previous)
+                result, changed = callback(entries)
+                if changed:
+                    current = entries.get(snapshot_id)
+                    if current is not None:
+                        current["_event_revision"] = (
+                            int(current.get("_event_revision", 0)) + 1
+                        )
+                    self._write_locked(file_obj, data)
+                    # Global JSON is authoritative for relay entries. The
+                    # per-snapshot file remains its event/read-through mirror.
+                    self._publish_entry_event_locked(snapshot_id, current)
                     with self._snapshot_cache_lock:
                         self._snapshot_cache_at = 0.0
                         self._snapshot_cache = {}
@@ -636,6 +772,9 @@ class SharedHostStagingLedger:
     ):
         """Mutate entries plus the node-local relay registry atomically."""
 
+        if callable(event_snapshot_id):
+            raise ValueError("dynamic relay claims require claim_relay_job")
+
         with open(self.path, "r+", encoding="utf-8") as file_obj:
             fcntl.flock(file_obj.fileno(), fcntl.LOCK_EX)
             try:
@@ -643,31 +782,59 @@ class SharedHostStagingLedger:
                 data = json.loads(file_obj.read() or "{}")
                 if data.get("version") != self.VERSION:
                     raise ValueError("corrupt host staging ledger")
-                data.setdefault("entries", {})
                 data.setdefault("relays", {})
-                result, changed = callback(data)
-                if changed:
-                    resolved_event_id = (
-                        event_snapshot_id(result)
-                        if callable(event_snapshot_id)
-                        else event_snapshot_id
-                    )
-                    if resolved_event_id is not None:
-                        current = data["entries"].get(str(resolved_event_id))
-                        if current is not None:
-                            current["_event_revision"] = (
-                                int(current.get("_event_revision", 0)) + 1
-                            )
-                    self._write_locked(file_obj, data)
-                    if resolved_event_id is not None:
-                        self._publish_entry_event_locked(
-                            str(resolved_event_id),
-                            data["entries"].get(str(resolved_event_id)),
+                if event_snapshot_id is None:
+                    data.setdefault("entries", {})
+                    result, changed = callback(data)
+                    if changed:
+                        self._write_locked(file_obj, data)
+                    return result
+                snapshot_id = str(event_snapshot_id)
+                with self._entry_locked(snapshot_id):
+                    try:
+                        previous_event = self.read_entry_event(
+                            self._event_path(snapshot_id)
                         )
-                    with self._snapshot_cache_lock:
-                        self._snapshot_cache_at = 0.0
-                        self._snapshot_cache = {}
-                return result
+                    except FileNotFoundError:
+                        previous_event = {"revision": 0, "entry": None}
+                    global_entries = data.setdefault("entries", {})
+                    previous = global_entries.get(snapshot_id)
+                    if previous is None:
+                        previous = previous_event.get("entry")
+                    working_entries = (
+                        {} if previous is None else {snapshot_id: dict(previous)}
+                    )
+                    data["entries"] = working_entries
+                    result, changed = callback(data)
+                    if changed:
+                        current = working_entries.get(snapshot_id)
+                        if current is not None:
+                            current["_event_revision"] = max(
+                                int(previous_event.get("revision", 0)),
+                                int(current.get("_event_revision", 0)),
+                            ) + 1
+                        relay_owned = bool(
+                            current is not None and current.get("relay_id")
+                        )
+                        if relay_owned:
+                            global_entries[snapshot_id] = current
+                        else:
+                            global_entries.pop(snapshot_id, None)
+                        data["entries"] = global_entries
+                        self._write_locked(file_obj, data)
+                        if relay_owned:
+                            # Publish only after the authoritative global
+                            # transaction commits, while the entry stripe is
+                            # still held. A racing normal mutation therefore
+                            # cannot miss the ownership-mode switch.
+                            self._publish_relay_marker(snapshot_id)
+                        self._publish_entry_event_locked(snapshot_id, current)
+                        with self._snapshot_cache_lock:
+                            self._snapshot_cache_at = 0.0
+                            self._snapshot_cache = {}
+                    else:
+                        data["entries"] = global_entries
+                    return result
             finally:
                 fcntl.flock(file_obj.fileno(), fcntl.LOCK_UN)
 
@@ -771,11 +938,34 @@ class SharedHostStagingLedger:
         return self._mutate(callback, event_snapshot_id=snapshot_id)
 
     def get(self, snapshot_id: str) -> Optional[dict[str, Any]]:
-        def callback(entries):
-            value = entries.get(snapshot_id)
-            return (None if value is None else dict(value)), False
-
-        return self._mutate(callback)
+        snapshot_id = str(snapshot_id)
+        while True:
+            if self._is_relay_snapshot(snapshot_id):
+                with open(self.path, "r", encoding="utf-8") as file_obj:
+                    fcntl.flock(file_obj.fileno(), fcntl.LOCK_SH)
+                    try:
+                        # prune may have removed relay ownership while this
+                        # reader waited for the global lock.
+                        if not self._is_relay_snapshot(snapshot_id):
+                            continue
+                        data = json.loads(file_obj.read() or "{}")
+                        value = data.get("entries", {}).get(snapshot_id)
+                        return None if value is None else dict(value)
+                    finally:
+                        fcntl.flock(file_obj.fileno(), fcntl.LOCK_UN)
+            # A normal read participates in the snapshot stripe protocol.
+            # If assign_transfer_path switched ownership while this reader
+            # waited, release the stripe and retry through the global relay
+            # document; never acquire global while holding the stripe.
+            with self._entry_read_locked(snapshot_id):
+                if self._is_relay_snapshot(snapshot_id):
+                    continue
+                try:
+                    event = self.read_entry_event(self._event_path(snapshot_id))
+                except FileNotFoundError:
+                    return None
+                value = event.get("entry")
+                return None if value is None else dict(value)
 
     def snapshot_entries(
         self, *, force_refresh: bool = False
@@ -798,16 +988,45 @@ class SharedHostStagingLedger:
                 return {
                     key: dict(value) for key, value in self._snapshot_cache.items()
                 }
+        entries = {}
+        try:
+            paths = tuple(
+                item.path
+                for item in os.scandir(self.event_directory)
+                if item.is_file() and item.name.endswith(".json")
+            )
+        except FileNotFoundError:
+            paths = ()
+        for path in paths:
+            try:
+                event = self.read_entry_event(path)
+            except FileNotFoundError:
+                continue
+            value = event.get("entry")
+            if value is not None:
+                entries[str(event["snapshot_id"])] = dict(value)
+        # Relay entries remain atomically coupled to the relay registry in the
+        # small global document. Overlay them so a crash between global commit
+        # and mirror publication cannot expose stale state during resync.
         with open(self.path, "r", encoding="utf-8") as file_obj:
             fcntl.flock(file_obj.fileno(), fcntl.LOCK_SH)
             try:
                 data = json.loads(file_obj.read() or "{}")
-                if data.get("version") != self.VERSION:
-                    raise ValueError("corrupt host staging ledger")
-                entries = {
+                relay_entries = {
                     str(key): dict(value)
                     for key, value in data.get("entries", {}).items()
                 }
+                # Keep relay ownership stable until every event mirror has
+                # either been overlaid from its authoritative global entry or
+                # removed as a pruned relay. An assign/prune transaction can
+                # only publish/remove its marker while holding global EX.
+                for snapshot_id in tuple(entries):
+                    if self._is_relay_snapshot(snapshot_id):
+                        if snapshot_id in relay_entries:
+                            entries[snapshot_id] = relay_entries.pop(snapshot_id)
+                        else:
+                            entries.pop(snapshot_id, None)
+                entries.update(relay_entries)
             finally:
                 fcntl.flock(file_obj.fileno(), fcntl.LOCK_UN)
         with self._snapshot_cache_lock:
@@ -953,37 +1172,57 @@ class SharedHostStagingLedger:
         return self._mutate_document(callback, event_snapshot_id=snapshot_id)
 
     def claim_relay_job(self, relay_id: str, pid: int) -> Optional[dict[str, Any]]:
-        def callback(data):
-            relay = data["relays"].get(str(relay_id))
-            if relay is None or int(relay.get("pid", -1)) != int(pid):
-                return None, False
-            active = relay.get("active_snapshot")
-            if active:
-                current = data["entries"].get(active)
-                return (None if current is None else dict(current)), False
-            queued = [
-                value
-                for value in data["entries"].values()
-                if value.get("relay_id") == str(relay_id)
-                and value.get("relay_job_state") == "queued"
-                and value.get("state") == HostStageState.HOST_WRITING.value
-            ]
-            if not queued:
-                return None, False
-            queued.sort(key=lambda item: (item.get("created_at", 0.0), item["snapshot_id"]))
-            current = queued[0]
-            current["relay_job_state"] = "claimed"
-            current["updated_at"] = time.time()
-            relay["active_snapshot"] = current["snapshot_id"]
-            relay["updated_at"] = time.time()
-            return dict(current), True
-
-        return self._mutate_document(
-            callback,
-            event_snapshot_id=lambda result: (
-                None if result is None else result.get("snapshot_id")
-            ),
-        )
+        # Relay mode is exceptional and may search all request-generations.
+        # Keep its small global registry lock outside the selected snapshot
+        # lock so every relay operation uses the same lock order.
+        with open(self.path, "r+", encoding="utf-8") as file_obj:
+            fcntl.flock(file_obj.fileno(), fcntl.LOCK_EX)
+            try:
+                file_obj.seek(0)
+                data = json.loads(file_obj.read() or "{}")
+                if data.get("version") != self.VERSION:
+                    raise ValueError("corrupt host staging relay registry")
+                relay = data.setdefault("relays", {}).get(str(relay_id))
+                if relay is None or int(relay.get("pid", -1)) != int(pid):
+                    return None
+                active = relay.get("active_snapshot")
+                if active:
+                    current = data.setdefault("entries", {}).get(str(active))
+                    return None if current is None else dict(current)
+                queued = [
+                    value
+                    for value in data.setdefault("entries", {}).values()
+                    if value.get("relay_id") == str(relay_id)
+                    and value.get("relay_job_state") == "queued"
+                    and value.get("state") == HostStageState.HOST_WRITING.value
+                ]
+                queued.sort(
+                    key=lambda item: (
+                        item.get("created_at", 0.0),
+                        item["snapshot_id"],
+                    )
+                )
+                for candidate in queued:
+                    snapshot_id = str(candidate["snapshot_id"])
+                    current = data["entries"].get(snapshot_id)
+                    if current is None:
+                        continue
+                    current["relay_job_state"] = "claimed"
+                    current["updated_at"] = time.time()
+                    current["_event_revision"] = (
+                        int(current.get("_event_revision", 0)) + 1
+                    )
+                    relay["active_snapshot"] = snapshot_id
+                    relay["updated_at"] = time.time()
+                    self._write_locked(file_obj, data)
+                    self._publish_entry_event_locked(snapshot_id, current)
+                    with self._snapshot_cache_lock:
+                        self._snapshot_cache_at = 0.0
+                        self._snapshot_cache = {}
+                    return dict(current)
+                return None
+            finally:
+                fcntl.flock(file_obj.fileno(), fcntl.LOCK_UN)
 
     def relay_prepare_chunk(
         self,
@@ -1113,13 +1352,15 @@ class SharedHostStagingLedger:
 
     def list_state(self, *states: HostStageState) -> list[dict[str, Any]]:
         wanted = {state.value for state in states}
-
-        def callback(entries):
-            values = [dict(v) for v in entries.values() if v.get("state") in wanted]
-            values.sort(key=lambda item: (item.get("created_at", 0.0), item["snapshot_id"]))
-            return values, False
-
-        return self._mutate(callback)
+        values = [
+            dict(value)
+            for value in self.snapshot_entries(force_refresh=True).values()
+            if value.get("state") in wanted
+        ]
+        values.sort(
+            key=lambda item: (item.get("created_at", 0.0), item["snapshot_id"])
+        )
+        return values
 
     def claim(self, snapshot_id: str, owner: str) -> Optional[dict[str, Any]]:
         def callback(entries):
@@ -1944,29 +2185,76 @@ class SharedHostStagingLedger:
         cutoff = time.time() - max(0.0, older_than_seconds)
         consumed_cutoff = time.time() - max(0.0, consumed_older_than_seconds)
 
-        def callback(entries):
-            doomed = [
-                key
-                for key, value in entries.items()
-                if (
-                    value.get("state") == HostStageState.CONSUMED.value
-                    and float(value.get("updated_at", 0.0)) < consumed_cutoff
+        candidates = self.snapshot_entries(force_refresh=True)
+        for snapshot_id, value in candidates.items():
+            doomed = (
+                value.get("state") == HostStageState.CONSUMED.value
+                and float(value.get("updated_at", 0.0)) < consumed_cutoff
+            ) or (
+                value.get("state") in _TERMINAL_STATES
+                and float(value.get("updated_at", 0.0)) < cutoff
+            )
+            if not doomed:
+                continue
+            if self._is_relay_snapshot(snapshot_id):
+                with open(self.path, "r+", encoding="utf-8") as file_obj:
+                    fcntl.flock(file_obj.fileno(), fcntl.LOCK_EX)
+                    try:
+                        # Relay ownership is switched under global->stripe,
+                        # the same order used by assign_transfer_path.  Delete
+                        # the authoritative entry and its mirror while both
+                        # locks are held so no writer can resurrect stale
+                        # relay state through the read-through fallback.
+                        with self._entry_locked(snapshot_id):
+                            file_obj.seek(0)
+                            data = json.loads(file_obj.read() or "{}")
+                            current = data.setdefault("entries", {}).get(snapshot_id)
+                            if current is None:
+                                continue
+                            still_doomed = (
+                                current.get("state")
+                                == HostStageState.CONSUMED.value
+                                and float(current.get("updated_at", 0.0))
+                                < consumed_cutoff
+                            ) or (
+                                current.get("state") in _TERMINAL_STATES
+                                and float(current.get("updated_at", 0.0)) < cutoff
+                            )
+                            if not still_doomed:
+                                continue
+                            data["entries"].pop(snapshot_id, None)
+                            self._write_locked(file_obj, data)
+                            try:
+                                os.unlink(self._event_path(snapshot_id))
+                            except FileNotFoundError:
+                                pass
+                            try:
+                                os.unlink(self._relay_marker_path(snapshot_id))
+                            except FileNotFoundError:
+                                pass
+                    finally:
+                        fcntl.flock(file_obj.fileno(), fcntl.LOCK_UN)
+                continue
+            with self._entry_locked(snapshot_id):
+                try:
+                    event = self.read_entry_event(self._event_path(snapshot_id))
+                except FileNotFoundError:
+                    continue
+                current = event.get("entry")
+                if current is None:
+                    continue
+                still_doomed = (
+                    current.get("state") == HostStageState.CONSUMED.value
+                    and float(current.get("updated_at", 0.0)) < consumed_cutoff
+                ) or (
+                    current.get("state") in _TERMINAL_STATES
+                    and float(current.get("updated_at", 0.0)) < cutoff
                 )
-                or (
-                    value.get("state") in _TERMINAL_STATES
-                    and float(value.get("updated_at", 0.0)) < cutoff
-                )
-            ]
-            for key in doomed:
-                entries.pop(key, None)
-            return tuple(doomed), bool(doomed)
-
-        doomed = self._mutate(callback)
-        for snapshot_id in doomed:
-            try:
-                os.unlink(self._event_path(snapshot_id))
-            except FileNotFoundError:
-                pass
+                if still_doomed:
+                    try:
+                        os.unlink(self._event_path(snapshot_id))
+                    except FileNotFoundError:
+                        pass
 
 
 class LayerFirstD2HStaging:
@@ -2848,6 +3136,7 @@ class AgenticPHostStagingManager:
         # snapshot ids whose allocator/Radix boundary may now advance.
         self._scheduler_events: queue.SimpleQueue = queue.SimpleQueue()
         self._ledger_entries_cache: dict[str, dict[str, Any]] = {}
+        self._pending_host_offers: dict[str, dict[str, Any]] = {}
         self.max_h2d_inflight = max(
             1, int(os.getenv("SGLANG_AGENTIC_KV_P_H2D_MAX_INFLIGHT", "4"))
         )
@@ -3267,7 +3556,9 @@ class AgenticPHostStagingManager:
         self._publish_arena_grant(claimed["snapshot_id"], record)
         return True
 
-    def _admit_batch(self, ledger_entries=None) -> int:
+    def _admit_batch(
+        self, ledger_entries=None, *, replace_pending: bool = False
+    ) -> int:
         """Admit several complete snapshots per control cycle.
 
         The old one-offer-per-scheduler-tick rule was visible as tens of D
@@ -3281,15 +3572,17 @@ class AgenticPHostStagingManager:
                 HostStageState.OFFERED, HostStageState.HOST_RESERVED
             )
         else:
-            offers = [
-                dict(value)
-                for value in ledger_entries.values()
-                if value.get("state")
-                in {
+            if replace_pending:
+                self._pending_host_offers.clear()
+            for snapshot_id, value in ledger_entries.items():
+                if value.get("state") in {
                     HostStageState.OFFERED.value,
                     HostStageState.HOST_RESERVED.value,
-                }
-            ]
+                } and self._offer_targets_this_arena(value):
+                    self._pending_host_offers[snapshot_id] = dict(value)
+                else:
+                    self._pending_host_offers.pop(snapshot_id, None)
+            offers = list(self._pending_host_offers.values())
             offers.sort(
                 key=lambda item: (item.get("created_at", 0.0), item["snapshot_id"])
             )
@@ -3300,6 +3593,7 @@ class AgenticPHostStagingManager:
         for offer in offers[: self._admission_batch]:
             if self._admit_one({offer["snapshot_id"]: offer}):
                 admitted += 1
+                self._pending_host_offers.pop(offer["snapshot_id"], None)
         return admitted
 
     def _release_record(self, record: dict[str, Any]) -> None:
@@ -3321,9 +3615,17 @@ class AgenticPHostStagingManager:
                 snapshot_id, HostStageState.ABORTING, owner=self.owner, reason=reason
             )
 
-    def _poll_aborting(self, ledger_entries=None) -> None:
+    def _poll_aborting(self, ledger_entries=None, *, snapshot_ids=None) -> None:
         with self._get_state_lock():
-            aborting = list(self.aborting.items())
+            aborting = (
+                list(self.aborting.items())
+                if snapshot_ids is None
+                else [
+                    (snapshot_id, self.aborting[snapshot_id])
+                    for snapshot_id in snapshot_ids
+                    if snapshot_id in self.aborting
+                ]
+            )
         for snapshot_id, entry in aborting:
             ledger_entry = (
                 self.ledger.get(snapshot_id)
@@ -3343,9 +3645,17 @@ class AgenticPHostStagingManager:
             with self._get_state_lock():
                 self.aborting.pop(snapshot_id, None)
 
-    def _poll_active(self, ledger_entries=None) -> None:
+    def _poll_active(self, ledger_entries=None, *, snapshot_ids=None) -> None:
         with self._get_state_lock():
-            active = list(self.active.items())
+            active = (
+                list(self.active.items())
+                if snapshot_ids is None
+                else [
+                    (snapshot_id, self.active[snapshot_id])
+                    for snapshot_id in snapshot_ids
+                    if snapshot_id in self.active
+                ]
+            )
         for snapshot_id, entry in active:
             ledger_entry = (
                 self.ledger.get(snapshot_id)
@@ -3648,11 +3958,11 @@ class AgenticPHostStagingManager:
             self._ledger_changed.set()
             self._control_wakeup.set()
 
-    def _apply_ledger_events(self) -> bool:
+    def _apply_ledger_events(self) -> set[str]:
         """Merge changed request-generations into the in-memory ledger view."""
 
         self._ledger_event_ready.clear()
-        changed = False
+        changed: set[str] = set()
         while True:
             try:
                 event = self._ledger_event_queue.get_nowait()
@@ -3669,7 +3979,7 @@ class AgenticPHostStagingManager:
                 self._ledger_entries_cache.pop(snapshot_id, None)
             else:
                 self._ledger_entries_cache[snapshot_id] = dict(entry)
-            changed = True
+            changed.add(snapshot_id)
         return changed
 
     def _poll_once(self, *, force_ledger: bool = False) -> None:
@@ -3691,7 +4001,7 @@ class AgenticPHostStagingManager:
             full_resync = self._ledger_changed.is_set()
         if now - self._last_ledger_refresh >= self._control_idle_backstop:
             full_resync = True
-        ledger_dirty = False
+        full_snapshot = None
         if full_resync:
             # Clear before reading. A concurrent overflow/failure will set the
             # edge again and therefore cannot be lost behind this snapshot.
@@ -3699,14 +4009,31 @@ class AgenticPHostStagingManager:
             ledger_entries = self.ledger.snapshot_entries(force_refresh=True)
             self._ledger_entries_cache = ledger_entries
             self._last_ledger_refresh = time.monotonic()
-            ledger_dirty = True
+            full_snapshot = ledger_entries
         # Apply events after a resync. Revision checks discard edges already
         # represented by that snapshot while retaining a concurrent newer one.
-        ledger_dirty = self._apply_ledger_events() or ledger_dirty
-        if ledger_dirty:
+        changed_snapshot_ids = self._apply_ledger_events()
+        if full_snapshot is not None:
             self._poll_active(self._ledger_entries_cache)
             self._poll_aborting(self._ledger_entries_cache)
-            self._admit_batch(self._ledger_entries_cache)
+            self._admit_batch(
+                self._ledger_entries_cache, replace_pending=True
+            )
+        elif changed_snapshot_ids:
+            changed_entries = {
+                snapshot_id: self._ledger_entries_cache[snapshot_id]
+                for snapshot_id in changed_snapshot_ids
+                if snapshot_id in self._ledger_entries_cache
+            }
+            self._poll_active(
+                self._ledger_entries_cache,
+                snapshot_ids=changed_snapshot_ids,
+            )
+            self._poll_aborting(
+                self._ledger_entries_cache,
+                snapshot_ids=changed_snapshot_ids,
+            )
+            self._admit_batch(changed_entries)
         if time.monotonic() - self._last_prune > 5.0:
             self.ledger.prune()
             self._last_prune = time.monotonic()

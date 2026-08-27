@@ -3,6 +3,7 @@ import os
 import json
 import mmap
 import queue
+import shutil
 import tempfile
 import threading
 import time
@@ -142,14 +143,114 @@ def test_host_ledger_publishes_versioned_snapshot_delta():
             event = ledger.read_entry_event(paths[0])
             assert event["revision"] == 3
             assert event["entry"]["state"] == HostStageState.HOST_RESERVED.value
+            assert ledger.get(offered["snapshot_id"])["p_owner"] == "p:test"
+            assert offered["snapshot_id"] in ledger.snapshot_entries(
+                force_refresh=True
+            )
+            with open(path, encoding="utf-8") as handle:
+                # The global file is now relay metadata only. Ordinary Host
+                # control never rewrites a map containing all snapshots.
+                assert json.load(handle)["entries"] == {}
     finally:
-        try:
-            for name in os.listdir(ledger.event_directory):
-                os.unlink(os.path.join(ledger.event_directory, name))
-            os.rmdir(ledger.event_directory)
-        except FileNotFoundError:
-            pass
+        shutil.rmtree(ledger.event_directory, ignore_errors=True)
         os.unlink(path)
+
+
+def test_host_ledger_migration_keeps_legacy_global_entry_authoritative():
+    with tempfile.TemporaryDirectory(
+        prefix="sglang-agentic-ledger-migration-", dir="/dev/shm"
+    ) as directory:
+        path = os.path.join(directory, "ledger.json")
+        ledger = SharedHostStagingLedger(path)
+        offered = ledger.offer(_rank_offer(0))
+        stale_revision = ledger.read_entry_event(
+            ledger._event_path(offered["snapshot_id"])
+        )["revision"]
+        legacy = dict(offered)
+        legacy.update(
+            state=HostStageState.REJECTED.value,
+            reason="authoritative legacy state",
+            _event_revision=stale_revision + 10,
+        )
+        with open(path, "r+", encoding="utf-8") as handle:
+            data = json.load(handle)
+            data["entries"] = {offered["snapshot_id"]: legacy}
+            handle.seek(0)
+            json.dump(data, handle)
+            handle.truncate()
+
+        migrated = SharedHostStagingLedger(path)
+        current = migrated.get(offered["snapshot_id"])
+        assert current["state"] == HostStageState.REJECTED.value
+        assert current["reason"] == "authoritative legacy state"
+        assert current["_event_revision"] > legacy["_event_revision"]
+        with open(path, encoding="utf-8") as handle:
+            assert json.load(handle)["entries"] == {}
+
+
+def test_relay_claim_and_prune_preserve_unrelated_relay_snapshot():
+    with tempfile.TemporaryDirectory(
+        prefix="sglang-agentic-ledger-relay-", dir="/dev/shm"
+    ) as directory:
+        path = os.path.join(directory, "ledger.json")
+        ledger = SharedHostStagingLedger(path)
+        ledger.register_relay(
+            relay_id="relay:1",
+            pid=222,
+            numa_node=1,
+            slot_token_count=64,
+            slot_count=2,
+            d2h_gib_per_second=100.0,
+        )
+
+        snapshot_ids = []
+        for generation in (3, 4):
+            offer = dict(_rank_offer(0))
+            offer.update(
+                snapshot_id=f"request:{generation}",
+                generation=generation,
+                tp_size=1,
+                source_numa_node=0,
+                arena_numa_node=1,
+            )
+            offered = ledger.offer(offer)
+            snapshot_id = offered["snapshot_id"]
+            snapshot_ids.append(snapshot_id)
+            assert ledger.claim(snapshot_id, "p:test") is not None
+            assert ledger.publish_grants(
+                snapshot_id,
+                "p:test",
+                [{"kind": "shared_host_extent"}],
+            )
+            assigned = ledger.assign_transfer_path(
+                snapshot_id,
+                source_pid=offer["d_pid"],
+                source_numa_node=0,
+                arena_numa_node=1,
+                direct_cross_numa_gib_per_second=0.01,
+                nvlink_gib_per_second=100.0,
+                relay_stale_seconds=60.0,
+            )
+            assert assigned["write_mode"] == "relay"
+
+        claimed = ledger.claim_relay_job("relay:1", 222)
+        assert claimed["snapshot_id"] == snapshot_ids[0]
+        assert ledger.get(snapshot_ids[1])["relay_job_state"] == "queued"
+        with open(path, encoding="utf-8") as handle:
+            assert set(json.load(handle)["entries"]) == set(snapshot_ids)
+
+        def make_terminal(entries):
+            current = entries[snapshot_ids[0]]
+            current["state"] = HostStageState.FAILED.value
+            current["updated_at"] = 0.0
+            return True, True
+
+        assert ledger._mutate_relay_entry(snapshot_ids[0], make_terminal)
+        ledger.prune(older_than_seconds=0.0, consumed_older_than_seconds=0.0)
+        assert ledger.get(snapshot_ids[0]) is None
+        assert ledger.get(snapshot_ids[1]) is not None
+        with open(path, encoding="utf-8") as handle:
+            assert set(json.load(handle)["entries"]) == {snapshot_ids[1]}
 
 
 def test_host_control_applies_only_new_snapshot_delta():
@@ -183,7 +284,7 @@ def test_host_control_applies_only_new_snapshot_delta():
     )
     manager._ledger_event_ready.set()
 
-    assert manager._apply_ledger_events() is True
+    assert manager._apply_ledger_events() == {"request:4"}
     assert manager._ledger_entries_cache["request:3"]["_event_revision"] == 2
     assert (
         manager._ledger_entries_cache["request:4"]["state"]
