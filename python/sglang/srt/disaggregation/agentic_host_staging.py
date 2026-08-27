@@ -2320,6 +2320,7 @@ class LazySharedMHAHostSnapshot:
         byte_size: int,
         allocation_bytes: Optional[int] = None,
         create: bool = True,
+        file_offset: int = 0,
     ):
         if not path.startswith("/dev/shm/"):
             raise ValueError("shared Host snapshot must reside in /dev/shm")
@@ -2331,6 +2332,9 @@ class LazySharedMHAHostSnapshot:
             self.byte_size,
             self.byte_size if allocation_bytes is None else int(allocation_bytes),
         )
+        self.file_offset = int(file_offset)
+        if self.file_offset < 0 or self.file_offset % mmap.ALLOCATIONGRANULARITY:
+            raise ValueError("shared Host extent offset must be mmap-aligned")
         self.requires_prefault = bool(create)
         self._materialized = None
         self._closed = False
@@ -2339,8 +2343,10 @@ class LazySharedMHAHostSnapshot:
         fd = os.open(path, flags, 0o600)
         try:
             if create:
+                if self.file_offset:
+                    raise ValueError("new standalone Host snapshots require offset zero")
                 os.ftruncate(fd, self.allocation_bytes)
-            elif os.fstat(fd).st_size < self.byte_size:
+            elif os.fstat(fd).st_size < self.file_offset + self.byte_size:
                 raise ValueError("recycled Host extent is smaller than the snapshot")
         finally:
             os.close(fd)
@@ -2411,6 +2417,7 @@ class LazySharedMHAHostSnapshot:
                     device_pool=self.device_pool,
                     byte_size=self.byte_size,
                     create=False,
+                    file_offset=self.file_offset,
                 )
             return self
 
@@ -2445,150 +2452,204 @@ class LazySharedMHAHostSnapshot:
 
 
 class SharedHostSnapshotArena:
-    """P-owned capacity and lifecycle for snapshot-scoped shared extents.
+    """One process-lifetime tmpfs arena with request-generation suballocation.
 
-    Consumed extents are recycled instead of unlinked.  Creating a sparse
-    tmpfs file for every generation makes the first KV write pay one page
-    fault per 4-KiB page; on long-running agent workloads that cost dominates
-    PCIe DMA.  A recycled extent contains no live snapshot state and is not
-    visible in the ledger, but its already-backed pages can serve the next
-    complete request-generation without changing request-level ownership.
+    The complete file is physically allocated and first-touched once at P
+    startup, under the P process' NUMA memory policy. A snapshot subsequently
+    owns only one aligned ``(offset, length)`` extent in that file. D and P map
+    the same subrange, so request-level ownership is preserved without
+    per-snapshot ``ftruncate``, ``fallocate`` or prefault workers.
+
+    The arena intentionally remains pageable. Transfers use the existing
+    bounded pinned bounce buffers; this avoids registering hundreds of GiB
+    with every CUDA context while still removing sparse-tmpfs page faults from
+    the serving hot path.
     """
+
+    _ALIGNMENT = mmap.ALLOCATIONGRANULARITY
 
     def __init__(self, directory: str, capacity_bytes: int):
         if not directory.startswith("/dev/shm/"):
             raise ValueError("shared Host arena must reside in /dev/shm")
         self.directory = directory.rstrip("/")
-        self.capacity_bytes = int(capacity_bytes)
+        self.capacity_bytes = self._align_down(int(capacity_bytes))
         if self.capacity_bytes <= 0:
             raise ValueError("shared Host arena capacity must be positive")
         os.makedirs(self.directory, mode=0o700, exist_ok=True)
+        self.path = os.path.join(
+            self.directory, f"preallocated-arena-{os.getpid()}.kv"
+        )
+        fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        mapping = None
+        try:
+            os.ftruncate(fd, self.capacity_bytes)
+            # Reserve tmpfs backing before publishing the arena. Capacity
+            # failure is therefore a startup error, never a SIGBUS after D
+            # has relinquished request ownership.
+            os.posix_fallocate(fd, 0, self.capacity_bytes)
+            mapping = mmap.mmap(
+                fd, self.capacity_bytes, access=mmap.ACCESS_WRITE
+            )
+        except BaseException:
+            if mapping is not None:
+                mapping.close()
+            os.close(fd)
+            try:
+                os.unlink(self.path)
+            except FileNotFoundError:
+                pass
+            raise
+        else:
+            os.close(fd)
+
+        # First-touch while this P process is NUMA-bound. tmpfs retains the
+        # backing pages after this temporary mapping is closed.
+        anchor = ctypes.c_char.from_buffer(mapping)
+        address = ctypes.addressof(anchor)
+        started_at = time.monotonic()
+        try:
+            ctypes.set_errno(0)
+            if _HOST_MADVISE(address, self.capacity_bytes, _MADV_POPULATE_WRITE) != 0:
+                error_number = ctypes.get_errno()
+                unsupported = {
+                    errno.EINVAL,
+                    errno.ENOSYS,
+                    getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+                }
+                if error_number not in unsupported:
+                    raise OSError(error_number, os.strerror(error_number), self.path)
+                _HOST_MEMSET(address, 0, self.capacity_bytes)
+        except BaseException:
+            del anchor
+            mapping.close()
+            try:
+                os.unlink(self.path)
+            except FileNotFoundError:
+                pass
+            raise
+        else:
+            del anchor
+            mapping.close()
+        self.preallocation_seconds = time.monotonic() - started_at
         self.used_bytes = 0
-        self.committed_bytes = 0
+        self.committed_bytes = self.capacity_bytes
         self._lock = threading.Lock()
-        self._free_extents: list[tuple[int, str]] = []
+        self._free_extents: list[tuple[int, int]] = [(0, self.capacity_bytes)]
         self._active_extents: dict[
-            str, tuple[LazySharedMHAHostSnapshot, int, int]
+            int, tuple[SharedMHAHostSnapshot, int, int]
         ] = {}
-        self._extent_sequence = 0
+        self._closed = False
+
+    @classmethod
+    def _align_up(cls, value: int) -> int:
+        return (int(value) + cls._ALIGNMENT - 1) // cls._ALIGNMENT * cls._ALIGNMENT
+
+    @classmethod
+    def _align_down(cls, value: int) -> int:
+        return int(value) // cls._ALIGNMENT * cls._ALIGNMENT
 
     def path_for(self, snapshot_id: str) -> str:
-        digest = hashlib.sha256(snapshot_id.encode("utf-8")).hexdigest()
-        return os.path.join(self.directory, f"{digest}.kv")
+        del snapshot_id
+        return self.path
 
     def can_reserve(self, byte_size: int, hard_watermark: float) -> bool:
+        requested = self._align_up(byte_size)
         with self._lock:
-            return (
-                self.used_bytes + int(byte_size)
-                <= int(self.capacity_bytes * float(hard_watermark))
-            )
+            if self.used_bytes + requested > int(
+                self.capacity_bytes * float(hard_watermark)
+            ):
+                return False
+            return any(length >= requested for _, length in self._free_extents)
 
     def create(self, snapshot_id: str, token_count: int, device_pool, byte_size: int):
+        del snapshot_id
+        requested = self._align_up(byte_size)
         with self._lock:
-            requested = int(byte_size)
-            reusable = [
-                (capacity, path, index)
-                for index, (capacity, path) in enumerate(self._free_extents)
-                if capacity >= requested
+            candidates = [
+                (length, offset, index)
+                for index, (offset, length) in enumerate(self._free_extents)
+                if length >= requested
             ]
-            if reusable:
-                capacity, path, index = min(reusable, key=lambda item: item[0])
-                self._free_extents.pop(index)
-                create = False
-            else:
-                # Free extents that are too small are not useful for this
-                # request.  Reclaim enough of them before growing the physical
-                # tmpfs footprint, while keeping active snapshot accounting
-                # independent from the reusable backing pool.
-                while (
-                    self.committed_bytes + requested > self.capacity_bytes
-                    and self._free_extents
-                ):
-                    capacity, stale_path = self._free_extents.pop()
-                    try:
-                        os.unlink(stale_path)
-                    except FileNotFoundError:
-                        pass
-                    self.committed_bytes = max(
-                        0, self.committed_bytes - int(capacity)
-                    )
-                if self.committed_bytes + requested > self.capacity_bytes:
-                    raise RuntimeError("shared Host arena has no physical extent capacity")
-                self._extent_sequence += 1
-                path = os.path.join(
-                    self.directory,
-                    f"extent-{os.getpid()}-{self._extent_sequence}-"
-                    f"{hashlib.sha256(snapshot_id.encode('utf-8')).hexdigest()}.kv",
+            if not candidates:
+                raise RuntimeError("shared Host arena has no contiguous capacity")
+            _, offset, index = min(candidates)
+            free_offset, free_length = self._free_extents.pop(index)
+            if free_length > requested:
+                self._free_extents.append(
+                    (free_offset + requested, free_length - requested)
                 )
-                capacity = requested
-                create = True
-                self.committed_bytes += capacity
+                self._free_extents.sort()
             try:
-                if not create and capacity > requested:
-                    # Reuse the already-backed prefix, but return the unused
-                    # tail to tmpfs.  Otherwise logical watermark admission
-                    # can succeed after hidden internal fragmentation has
-                    # exhausted the arena's physical capacity.
-                    os.truncate(path, requested)
-                    self.committed_bytes -= capacity - requested
-                    capacity = requested
                 snapshot = LazySharedMHAHostSnapshot(
-                    path=path,
+                    path=self.path,
                     token_count=token_count,
                     device_pool=device_pool,
-                    byte_size=requested,
-                    allocation_bytes=capacity,
-                    create=create,
+                    byte_size=int(byte_size),
+                    allocation_bytes=requested,
+                    create=False,
+                    file_offset=offset,
                 )
-            except Exception:
-                # A failed reopen means the recycled extent can no longer be
-                # trusted.  Destroy it instead of poisoning the free pool.
-                self.committed_bytes = max(
-                    0, self.committed_bytes - int(capacity)
-                )
-                try:
-                    os.unlink(path)
-                except FileNotFoundError:
-                    pass
+                snapshot.offset = offset
+            except BaseException:
+                self._insert_free_locked(offset, requested)
                 raise
-            self.used_bytes += snapshot.byte_size
-            self._active_extents[path] = (
-                snapshot,
-                capacity,
-                snapshot.byte_size,
-            )
+            self.used_bytes += requested
+            self._active_extents[id(snapshot)] = (snapshot, offset, requested)
         return snapshot
 
+    def _insert_free_locked(self, offset: int, allocation_bytes: int) -> None:
+        self._free_extents.append((int(offset), int(allocation_bytes)))
+        self._free_extents.sort()
+        merged: list[tuple[int, int]] = []
+        for current_offset, current_length in self._free_extents:
+            if merged and merged[-1][0] + merged[-1][1] == current_offset:
+                previous_offset, previous_length = merged[-1]
+                merged[-1] = (
+                    previous_offset,
+                    previous_length + current_length,
+                )
+            else:
+                merged.append((current_offset, current_length))
+        self._free_extents = merged
+
     def release(self, snapshot: SharedMHAHostSnapshot) -> None:
-        path = snapshot.path
         with self._lock:
-            active = self._active_extents.get(path)
+            active = self._active_extents.pop(id(snapshot), None)
             # Identity is the extent lease.  A stale release from the prior
-            # request must not pop a newer request that recycled the path.
+            # request must not release a newer request that recycled the range.
             if active is None or active[0] is not snapshot:
                 return
-            self._active_extents.pop(path)
-            _, allocation_bytes, byte_size = active
-            reusable = not bool(getattr(snapshot, "requires_prefault", False))
-            self.used_bytes = max(0, self.used_bytes - int(byte_size))
+            _, offset, allocation_bytes = active
             try:
-                snapshot.close(unlink=not reusable)
+                snapshot.close(unlink=False)
             except Exception:
-                # The mapping may still own physical pages.  Lose this extent
-                # from the usable pool but retain committed accounting so a
-                # close failure cannot make the arena overcommit tmpfs.
-                logger.exception("Failed to close shared Host extent %s", path)
-                return
-            if not reusable:
-                self.committed_bytes = max(
-                    0, self.committed_bytes - int(allocation_bytes)
+                logger.exception(
+                    "Failed to close shared Host arena extent offset=%d bytes=%d",
+                    offset,
+                    allocation_bytes,
                 )
                 return
-            self._free_extents.append((int(allocation_bytes), path))
+            self.used_bytes = max(0, self.used_bytes - int(allocation_bytes))
+            self._insert_free_locked(offset, allocation_bytes)
 
     def usage(self) -> float:
         with self._lock:
             return self.used_bytes / max(1, self.capacity_bytes)
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            for snapshot, _, _ in self._active_extents.values():
+                snapshot.close(unlink=False)
+            self._active_extents.clear()
+            self._free_extents = []
+            self.used_bytes = 0
+            try:
+                os.unlink(self.path)
+            except FileNotFoundError:
+                pass
+            self._closed = True
 
 
 class AgenticPHostStagingManager:
@@ -2672,6 +2733,10 @@ class AgenticPHostStagingManager:
         self.host_ready: dict[str, dict[str, Any]] = {}
         self.loads: dict[str, dict[str, Any]] = {}
         self.spills: dict[str, dict[str, Any]] = {}
+        # Edge-triggered notifications consumed by the P scheduler. The
+        # control worker owns ledger/I/O progress; the scheduler receives only
+        # snapshot ids whose allocator/Radix boundary may now advance.
+        self._scheduler_events: queue.SimpleQueue = queue.SimpleQueue()
         self._ledger_entries_cache: dict[str, dict[str, Any]] = {}
         self.max_h2d_inflight = max(
             1, int(os.getenv("SGLANG_AGENTIC_KV_P_H2D_MAX_INFLIGHT", "4"))
@@ -2764,25 +2829,9 @@ class AgenticPHostStagingManager:
             ),
         )
         self._control_wakeup = threading.Event()
-        # Extent population is CPU/DRAM work only.  A small daemon pool keeps
-        # sparse-tmpfs page faults off both the P scheduler and every D copy
-        # progress thread.  The grant is published only after one worker has
-        # populated the complete request-generation extent.
-        self._prefault_queue: queue.Queue = queue.Queue()
-        self._prefault_results: queue.SimpleQueue = queue.SimpleQueue()
-        self._prefault_worker_count = max(
-            1,
-            int(os.getenv("SGLANG_AGENTIC_KV_HOST_PREFAULT_WORKERS", "4")),
-        )
-        self._prefault_threads = []
-        for worker_index in range(self._prefault_worker_count):
-            thread = threading.Thread(
-                target=self._prefault_worker,
-                name=f"agentic-host-prefault-{os.getpid()}-{worker_index}",
-                daemon=True,
-            )
-            self._prefault_threads.append(thread)
-            thread.start()
+        # The arena is physically allocated and first-touched once at startup.
+        # Snapshot admission therefore needs no per-generation prefault pool.
+        self._prefault_worker_count = 0
         self._control_cycles = 0
         self._control_errors = 0
         self._control_total_seconds = 0.0
@@ -2792,12 +2841,14 @@ class AgenticPHostStagingManager:
         logger.info(
             "Agentic shared Host arena enabled directory=%s capacity_gib=%.1f "
             "reserved_hbm_mib=0 h2d_priority=%d h2d_max_inflight=%d "
-            "h2d_chunk_tokens=%d host_bounce=preallocated_pinned",
+            "h2d_chunk_tokens=%d host_bounce=preallocated_pinned "
+            "arena_preallocated=true preallocation_s=%.3f",
             self.arena.directory,
             self.arena.capacity_bytes / (1024**3),
             h2d_priority,
             self.max_h2d_inflight,
             self.h2d_chunk_tokens,
+            self.arena.preallocation_seconds,
         )
         if self._async_control:
             self._control_thread = threading.Thread(
@@ -2810,7 +2861,7 @@ class AgenticPHostStagingManager:
                 "Agentic P async control enabled interval_ms=%.3f "
                 "admission_batch=%d prefault_workers=%d "
                 "capacity_wait_timeout_s=%.3f "
-                "pageable_snapshot_mmap=true",
+                "pageable_snapshot_mmap=true arena_preallocated=true",
                 self._control_interval * 1000.0,
                 self._admission_batch,
                 self._prefault_worker_count,
@@ -2853,71 +2904,20 @@ class AgenticPHostStagingManager:
             and offer_domain != configured_domain
         )
 
-    def _prefault_worker(self) -> None:
-        """Prepare sparse tmpfs extents without touching P/D CUDA state."""
-
-        while True:
-            snapshot_id, record = self._prefault_queue.get()
-            error = None
-            try:
-                record["snapshot"].prefault_for_write()
-            except Exception as exc:
-                error = exc
-            self._prefault_results.put((snapshot_id, record, error))
-            self._control_wakeup.set()
-
-    def _publish_prefaulted_grant(
-        self, snapshot_id: str, record: dict[str, Any], error
+    def _publish_arena_grant(
+        self, snapshot_id: str, record: dict[str, Any]
     ) -> None:
         with self._get_state_lock():
             if self.active.get(snapshot_id) is not record:
                 return
         claimed = record["offer"]
         snapshot = record["snapshot"]
-        if error is not None:
-            try:
-                current = self.ledger.get(snapshot_id)
-            except Exception:
-                current = None
-                logger.exception(
-                    "Could not classify failed Shared Host prefault for %s; "
-                    "retaining extent and retrying prefault",
-                    snapshot_id,
-                )
-                record["prefault_retry_pending"] = True
-                return
-            if (
-                current is not None
-                and current.get("state") == HostStageState.ABORTING.value
-            ):
-                record.update(
-                    prefault_pending=False,
-                    failure_reason="shared_host_extent_prefault_aborted",
-                    free_host_on_abort=True,
-                )
-                with self._get_state_lock():
-                    self.active.pop(snapshot_id, None)
-                    self.aborting[snapshot_id] = record
-                return
-            with self._get_state_lock():
-                self.active.pop(snapshot_id, None)
-            self.arena.release(snapshot)
-            # Prefault is an allocation-side transient failure.  D still owns
-            # the complete GPU snapshot, so leave the request-generation in
-            # HOST_RESERVED and retry with a fresh extent.  REJECTED is
-            # reserved for permanent incompatibility/explicit eviction.
-            logger.warning(
-                "Failed to populate shared Host extent for %s; retrying: %s",
-                snapshot_id,
-                error,
-            )
-            return
-
         grant = {
             "kind": "shared_host_extent",
             "seq": 0,
             "tp_rank": self.tp_rank,
             "arena_path": snapshot.path,
+            "arena_offset": int(getattr(snapshot, "file_offset", 0)),
             "byte_size": snapshot.byte_size,
             "token_count": snapshot.token_count,
             "arena_numa_node": self.arena_numa_node,
@@ -2985,7 +2985,6 @@ class AgenticPHostStagingManager:
                 ):
                     record.update(
                         grant_publish_pending=False,
-                        prefault_pending=False,
                         failure_reason="shared_host_grant_publish_aborted",
                         free_host_on_abort=True,
                     )
@@ -3007,38 +3006,24 @@ class AgenticPHostStagingManager:
                 return
         if published:
             record.pop("grant_publish_pending", None)
-            record["prefault_pending"] = False
         else:
             return
         logger.info(
             "AgenticKV shared_host_extent_ready snapshot=%s bytes=%d "
-            "prefaulted=true",
+            "arena_preallocated=true",
             snapshot_id,
             snapshot.byte_size,
         )
 
-    def _progress_prefaults(self) -> None:
+    def _progress_arena_grants(self) -> None:
         with self._get_state_lock():
-            pending_prefaults = [
-                (snapshot_id, record)
-                for snapshot_id, record in self.active.items()
-                if record.pop("prefault_retry_pending", False)
-            ]
             pending_grants = [
                 (snapshot_id, record)
                 for snapshot_id, record in self.active.items()
                 if record.get("grant_publish_pending")
             ]
-        for item in pending_prefaults:
-            self._prefault_queue.put(item)
         for snapshot_id, record in pending_grants:
-            self._publish_prefaulted_grant(snapshot_id, record, None)
-        while True:
-            try:
-                result = self._prefault_results.get_nowait()
-            except queue.Empty:
-                return
-            self._publish_prefaulted_grant(*result)
+            self._publish_arena_grant(snapshot_id, record)
 
     def _admit_one(self, ledger_entries=None) -> bool:
         if ledger_entries is None:
@@ -3126,10 +3111,11 @@ class AgenticPHostStagingManager:
                 "offer": claimed,
                 "snapshot": snapshot,
                 "loading": False,
-                "prefault_pending": True,
             }
             self.active[claimed["snapshot_id"]] = record
-        self._prefault_queue.put((claimed["snapshot_id"], record))
+        # The process-lifetime arena was populated at startup, so the grant is
+        # immediately safe for D to map and write.
+        self._publish_arena_grant(claimed["snapshot_id"], record)
         return True
 
     def _admit_batch(self, ledger_entries=None) -> int:
@@ -3235,6 +3221,9 @@ class AgenticPHostStagingManager:
                     # but it treats HOST_READY as deferred and retries.
                     self.host_ready[snapshot_id] = entry
                     self.active.pop(snapshot_id, None)
+                AgenticPHostStagingManager._notify_scheduler(
+                    self, "host_ready", snapshot_id
+                )
                 logger.info(
                     "AgenticKV shared_host_ready snapshot=%s tokens=%d bytes=%d "
                     "materialize=deferred_until_selected",
@@ -3474,7 +3463,7 @@ class AgenticPHostStagingManager:
         self._next_poll_at = now + self._poll_interval
         # Publish populated extents before taking the shared ledger snapshot so
         # D can observe every new grant in this same control cycle.
-        self._progress_prefaults()
+        self._progress_arena_grants()
         # One shared read per P scheduler tick replaces one complete JSON read
         # per active snapshot (and another per aborting snapshot/request gate).
         ledger_entries = self.ledger.snapshot_entries()
@@ -3551,6 +3540,23 @@ class AgenticPHostStagingManager:
 
         with self._get_state_lock():
             return request_generation.snapshot_id in self.host_ready
+
+    def drain_scheduler_events(self) -> tuple[tuple[str, str], ...]:
+        """Drain completed control edges without reading the file ledger."""
+
+        events = []
+        while True:
+            try:
+                events.append(self._scheduler_events.get_nowait())
+            except queue.Empty:
+                return tuple(events)
+
+    def _notify_scheduler(self, kind: str, snapshot_id: str) -> None:
+        events = getattr(self, "_scheduler_events", None)
+        if events is None:
+            events = queue.SimpleQueue()
+            self._scheduler_events = events
+        events.put((str(kind), str(snapshot_id)))
 
     def _reserve_h2d_lane(self, snapshot_id: str) -> Optional[int]:
         """Reserve one physical Slow-I/O lane without reserving P KV pages."""
@@ -3808,6 +3814,11 @@ class AgenticPHostStagingManager:
                 load["host_released"] = True
             elif not load.get("drop_host_on_abort"):
                 self.host_ready[load["request_generation"].snapshot_id] = record
+                AgenticPHostStagingManager._notify_scheduler(
+                    self,
+                    "host_ready",
+                    load["request_generation"].snapshot_id,
+                )
         AgenticPHostStagingManager._release_h2d_lane(
             self, load["request_generation"].snapshot_id
         )
@@ -3850,6 +3861,9 @@ class AgenticPHostStagingManager:
         if not acknowledged:
             return False
         load["io_complete"] = True
+        AgenticPHostStagingManager._notify_scheduler(
+            self, "hbm_ready", snapshot_id
+        )
         record = load["record"]
         h2d_elapsed_ms = float(load["gpu_elapsed_ms"])
         logger.info(
@@ -4413,7 +4427,21 @@ class AgenticPHostStagingManager:
                 # Materialization now only mmaps the pageable tmpfs extent;
                 # the process-lifetime bounce was pinned during manager init.
                 started_at = time.monotonic()
-                record["snapshot"].materialize()
+                try:
+                    record["snapshot"].materialize()
+                except (OSError, MemoryError):
+                    # mmap/open can fail transiently under virtual-memory or
+                    # fd pressure. Host remains authoritative, so relinquish
+                    # only the lane and retry this exact snapshot later; a
+                    # scheduler-thread exception must not terminate P.
+                    AgenticPHostStagingManager._release_h2d_lane(
+                        self, snapshot_id
+                    )
+                    logger.exception(
+                        "AgenticKV shared_host_materialize_retry snapshot=%s",
+                        snapshot_id,
+                    )
+                    return True
                 logger.info(
                     "AgenticKV shared_host_materialize_complete snapshot=%s "
                     "tokens=%d bytes=%d reason=selected_slow_recovery",
@@ -4753,6 +4781,7 @@ class AgenticDRelayWorker:
                 device_pool=self.device_pool,
                 byte_size=int(grant["byte_size"]),
                 create=False,
+                file_offset=int(grant.get("arena_offset", 0)),
             )
         except Exception:
             logger.exception("Relay could not map Host extent for %s", entry["snapshot_id"])
@@ -5234,6 +5263,7 @@ class AgenticDHostStagingClient:
             device_pool=self.device_pool,
             byte_size=int(grant["byte_size"]),
             create=False,
+            file_offset=int(grant.get("arena_offset", 0)),
         )
         candidate["arena_write"] = {
             "snapshot": snapshot,

@@ -228,6 +228,97 @@ def test_tp1_p2d_submission_keeps_short_nixl_control_lock():
     assert result == int(KVPoll.Transferring)
 
 
+def _tp1_terminal_scheduler(req, poll, p2d_host):
+    key = (str(req.rid), int(req.bootstrap_room))
+    return SimpleNamespace(
+        disagg_prefill_inflight_queue=[req],
+        tp_size=1,
+        tp_rank=0,
+        pp_rank=0,
+        _prefill_transfer_async_enabled=True,
+        _prefill_transfer_prepare_queue=deque(),
+        _prefill_transfer_prepare_keys=set(),
+        _prefill_transfer_terminal_queue=deque([key]),
+        _prefill_transfer_poll_lock=threading.Lock(),
+        _prefill_transfer_key=lambda request: (
+            str(request.rid),
+            int(request.bootstrap_room),
+        ),
+        _prefill_transfer_cached_polls=lambda _requests: [poll],
+        _prepare_deferred_prefill_transfer=lambda _request: True,
+        _enqueue_deferred_prefill_transfer=lambda _request: True,
+        _release_prefill_transfer_poll_claims=lambda _requests: None,
+        agentic_p2d_host_staging_manager=p2d_host,
+        token_to_kv_pool_allocator=SimpleNamespace(page_size=1),
+        disagg_prefill_bootstrap_queue=SimpleNamespace(
+            kv_manager=SimpleNamespace(kv_args=SimpleNamespace(kv_item_lens=[]))
+        ),
+        stream_output=lambda *_args, **_kwargs: None,
+        enable_metrics=False,
+    )
+
+
+def test_tp1_p2d_terminal_edge_requeues_when_host_release_is_not_ready():
+    release_attempts = []
+    p2d_host = SimpleNamespace(
+        poll=lambda _req: None,
+        prepare_scheduler_release=lambda req: release_attempts.append(req.rid)
+        or False,
+    )
+    req = SimpleNamespace(
+        rid="terminal-host-wins",
+        bootstrap_room=7,
+        disagg_p_ready_deferred=False,
+        _async_prefill_transfer_poll=int(KVPoll.Success),
+        return_logprob=False,
+    )
+    scheduler = _tp1_terminal_scheduler(req, int(KVPoll.Success), p2d_host)
+
+    first = SchedulerDisaggregationPrefillMixin.process_disagg_prefill_inflight_queue(
+        scheduler
+    )
+    second = SchedulerDisaggregationPrefillMixin.process_disagg_prefill_inflight_queue(
+        scheduler
+    )
+
+    assert first == second == []
+    assert release_attempts == [req.rid, req.rid]
+    assert list(scheduler._prefill_transfer_terminal_queue) == [
+        (req.rid, req.bootstrap_room)
+    ]
+
+
+def test_tp1_p2d_failed_cleanup_requeues_the_same_terminal_edge():
+    cleanup_attempts = []
+    sender = SimpleNamespace(
+        failure_exception=lambda: RuntimeError("transfer failed")
+    )
+    req = SimpleNamespace(
+        rid="terminal-failed",
+        bootstrap_room=9,
+        disagg_p_ready_deferred=False,
+        _async_prefill_transfer_poll=int(KVPoll.Failed),
+        disagg_kv_sender=sender,
+        time_stats=SimpleNamespace(
+            trace_ctx=SimpleNamespace(abort=lambda **_kwargs: None)
+        ),
+        return_logprob=False,
+    )
+    scheduler = _tp1_terminal_scheduler(req, int(KVPoll.Failed), None)
+    scheduler._cleanup_failed_prefill_transfer = (
+        lambda request, *_args: cleanup_attempts.append(request.rid) or False
+    )
+
+    SchedulerDisaggregationPrefillMixin.process_disagg_prefill_inflight_queue(
+        scheduler
+    )
+
+    assert cleanup_attempts == [req.rid]
+    assert list(scheduler._prefill_transfer_terminal_queue) == [
+        (req.rid, req.bootstrap_room)
+    ]
+
+
 def test_node_local_metadata_store_is_cross_instance_and_create_only():
     with tempfile.TemporaryDirectory(
         prefix="sglang-agentic-metadata-", dir="/dev/shm"
@@ -2307,7 +2398,7 @@ def test_lazy_shared_host_extent_enospc_never_touches_sparse_pages(monkeypatch):
         os.rmdir(directory)
 
 
-def test_shared_host_arena_recycles_backed_extent_without_prefault():
+def test_shared_host_arena_suballocates_preallocated_extent_without_prefault():
     directory = tempfile.mkdtemp(dir="/dev/shm")
     arena = SharedHostSnapshotArena(directory, 16 * 1024 * 1024)
     pool = SimpleNamespace()
@@ -2323,15 +2414,16 @@ def test_shared_host_arena_recycles_backed_extent_without_prefault():
         assert second.allocation_bytes == 2 * 1024 * 1024
         assert not second.requires_prefault
         assert arena.used_bytes == 2 * 1024 * 1024
-        assert arena.committed_bytes == 2 * 1024 * 1024
-        assert os.stat(second.path).st_size == 2 * 1024 * 1024
+        assert arena.committed_bytes == 16 * 1024 * 1024
+        assert os.stat(second.path).st_size == 16 * 1024 * 1024
+        assert second.file_offset == 0
     finally:
         arena.release(second)
-        os.unlink(first_path)
+        arena.close()
         os.rmdir(directory)
 
 
-def test_shared_host_arena_discards_partial_extent_and_release_is_idempotent():
+def test_shared_host_arena_release_is_idempotent_and_keeps_backing_pool():
     directory = tempfile.mkdtemp(dir="/dev/shm")
     arena = SharedHostSnapshotArena(directory, 16 * 1024 * 1024)
     snapshot = arena.create("partial", 1, SimpleNamespace(), 4 * 1024 * 1024)
@@ -2340,10 +2432,12 @@ def test_shared_host_arena_discards_partial_extent_and_release_is_idempotent():
     arena.release(snapshot)
     arena.release(snapshot)
 
-    assert not os.path.exists(path)
+    assert os.path.exists(path)
     assert arena.used_bytes == 0
-    assert arena.committed_bytes == 0
-    assert arena._free_extents == []
+    assert arena.committed_bytes == 16 * 1024 * 1024
+    assert arena._free_extents == [(0, 16 * 1024 * 1024)]
+    arena.close()
+    assert not os.path.exists(path)
     os.rmdir(directory)
 
 
@@ -2359,10 +2453,10 @@ def test_shared_host_arena_stale_release_cannot_free_recycled_owner():
     arena.release(first)
 
     assert arena.used_bytes == 2 * 1024 * 1024
-    assert arena._active_extents[path][0] is second
-    assert arena._free_extents == []
+    assert arena._active_extents[id(second)][0] is second
+    assert arena._free_extents == [(2 * 1024 * 1024, 14 * 1024 * 1024)]
     arena.release(second)
-    os.unlink(path)
+    arena.close()
     os.rmdir(directory)
 
 
@@ -2583,17 +2677,17 @@ def test_p2d_manager_close_retains_arena_when_dma_has_no_fence():
     assert manager._stop.is_set()
 
 
-def test_p_host_grant_is_published_only_after_prefault_completion():
+def test_p_host_grant_publishes_preallocated_arena_extent():
     published = []
     snapshot = SimpleNamespace(
         path="/dev/shm/prefaulted.kv",
+        file_offset=8192,
         byte_size=4096,
         token_count=64,
     )
     record = {
         "offer": {"snapshot_id": "slow:prefaulted"},
         "snapshot": snapshot,
-        "prefault_pending": True,
     }
     manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
     manager._state_lock = threading.RLock()
@@ -2610,51 +2704,26 @@ def test_p_host_grant_is_published_only_after_prefault_completion():
     )
 
     assert published == []
-    manager._publish_prefaulted_grant("slow:prefaulted", record, None)
+    manager._publish_arena_grant("slow:prefaulted", record)
     assert len(published) == 1
     assert published[0][2][0]["arena_path"] == snapshot.path
-    assert record["prefault_pending"] is False
+    assert published[0][2][0]["arena_offset"] == snapshot.file_offset
 
 
-def test_p_host_prefault_failure_releases_extent_and_retries_snapshot():
-    released = []
-    rejected = []
-    published = []
-    snapshot = SimpleNamespace(
-        path="/dev/shm/prefault-failed.kv",
-        byte_size=4096,
-        token_count=64,
-    )
-    offer = {"snapshot_id": "slow:prefault-failed"}
-    record = {
-        "offer": offer,
-        "snapshot": snapshot,
-        "prefault_pending": True,
-    }
-    manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
-    manager._state_lock = threading.RLock()
-    manager.active = {offer["snapshot_id"]: record}
-    manager.owner = "p:test"
-    manager.tp_rank = 0
-    manager.tp_size = 1
-    manager.arena_numa_node = 0
-    manager.arena = SimpleNamespace(release=released.append)
-    manager._reject = lambda claimed, reason: rejected.append((claimed, reason))
-    manager.ledger = SimpleNamespace(
-        publish_grants=lambda *args, **kwargs: published.append(args) or True,
-        get=lambda _snapshot_id: {
-            "state": HostStageState.HOST_RESERVED.value,
-            "p_owner": "p:test",
-        },
-    )
+def test_shared_host_arena_preallocation_failure_is_atomic(monkeypatch):
+    directory = tempfile.mkdtemp(dir="/dev/shm")
 
-    failure = OSError(errno.ENOSPC, "tmpfs full")
-    manager._publish_prefaulted_grant(offer["snapshot_id"], record, failure)
+    def fail_fallocate(fd, offset, length):
+        raise OSError(errno.ENOSPC, "tmpfs full")
 
-    assert offer["snapshot_id"] not in manager.active
-    assert released == [snapshot]
-    assert rejected == []
-    assert published == []
+    monkeypatch.setattr(os, "posix_fallocate", fail_fallocate)
+    try:
+        with pytest.raises(OSError) as error:
+            SharedHostSnapshotArena(directory, 4 * 1024 * 1024)
+        assert error.value.errno == errno.ENOSPC
+        assert os.listdir(directory) == []
+    finally:
+        os.rmdir(directory)
 
 
 def test_p_host_grant_publish_transient_retains_complete_extent_for_retry():
@@ -2665,7 +2734,6 @@ def test_p_host_grant_publish_transient_retains_complete_extent_for_retry():
     record = {
         "offer": {"snapshot_id": snapshot_id},
         "snapshot": snapshot,
-        "prefault_pending": True,
     }
     manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
     manager._state_lock = threading.RLock()
@@ -2685,11 +2753,10 @@ def test_p_host_grant_publish_transient_retains_complete_extent_for_retry():
         },
     )
 
-    manager._publish_prefaulted_grant(snapshot_id, record, None)
+    manager._publish_arena_grant(snapshot_id, record)
 
     assert manager.active[snapshot_id] is record
     assert record["grant_publish_pending"] is True
-    assert record["prefault_pending"] is True
 
 
 def test_p_host_grant_publish_authoritative_abort_retires_extent_safely():
@@ -2700,7 +2767,6 @@ def test_p_host_grant_publish_authoritative_abort_retires_extent_safely():
     record = {
         "offer": {"snapshot_id": snapshot_id},
         "snapshot": snapshot,
-        "prefault_pending": True,
     }
     manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
     manager._state_lock = threading.RLock()
@@ -2720,7 +2786,7 @@ def test_p_host_grant_publish_authoritative_abort_retires_extent_safely():
         },
     )
 
-    manager._publish_prefaulted_grant(snapshot_id, record, None)
+    manager._publish_arena_grant(snapshot_id, record)
 
     assert snapshot_id not in manager.active
     assert manager.aborting[snapshot_id] is record
@@ -3682,6 +3748,104 @@ def test_tp_direct_and_slow_group_commands_progress_together():
     Scheduler._agentic_bind_completed_waiters(scheduler)
 
     assert list(scheduler.agentic_early_direct_completion_queue) == [snapshot_id]
+
+
+def _tp1_edge_scheduler(req, load):
+    scheduler = object.__new__(Scheduler)
+    scheduler.tp_size = 1
+    scheduler.agentic_kv_waiting_by_rid = {req.rid: (req, time.monotonic())}
+    scheduler.agentic_kv_waiting_by_parent = {}
+    scheduler.agentic_kv_progress_queues = {
+        "fast": deque(),
+        "slow": deque([req.rid]),
+        "new": deque(),
+    }
+    scheduler.agentic_kv_progress_enqueued = {req.rid}
+    scheduler.agentic_kv_retry_heap = []
+    scheduler.agentic_kv_retry_deadlines = {}
+    scheduler.agentic_kv_retry_sequence = 0
+    scheduler.agentic_kv_waiting_queue = [(req, time.monotonic())]
+    scheduler.agentic_kv_waiting_tombstones = 0
+    scheduler.agentic_early_direct_completion_queue = deque()
+    scheduler.agentic_early_direct_poll_lock = nullcontext()
+    scheduler.agentic_host_staging_manager = SimpleNamespace(
+        loads={req.rid: load}, drain_scheduler_events=lambda: ()
+    )
+    scheduler.agentic_p_workset_broker = SimpleNamespace(
+        drain_grant_events=lambda: ()
+    )
+    scheduler._agentic_should_defer = lambda *_args, **_kwargs: True
+    return scheduler
+
+
+@pytest.mark.parametrize(
+    ("load", "expects_retry"),
+    [
+        ({"io_complete": False, "ledger_prepare_pending": False}, False),
+        ({"io_complete": False, "ledger_prepare_pending": True}, True),
+        ({"io_complete": True, "ledger_prepare_pending": False}, True),
+    ],
+)
+def test_tp1_slow_edge_retries_only_scheduler_owned_boundaries(
+    monkeypatch, load, expects_retry
+):
+    """One H2D edge remains live through transient bind/ledger boundaries."""
+
+    monkeypatch.setenv("SGLANG_AGENTIC_KV_ADMISSION_BATCH", "1")
+    monkeypatch.setenv("SGLANG_AGENTIC_KV_SLOW_AGING_SECONDS", "0")
+    req = SimpleNamespace(rid="slow-child", _agentic_kv_queue_class="slow")
+    scheduler = _tp1_edge_scheduler(req, load)
+
+    Scheduler._drain_agentic_kv_waiting_queue_tp1(scheduler)
+
+    assert (req.rid in scheduler.agentic_kv_retry_deadlines) is expects_retry
+
+
+def test_tp1_edge_queue_ages_slow_recovery_ahead_of_continuous_direct(
+    monkeypatch,
+):
+    monkeypatch.setenv("SGLANG_AGENTIC_KV_ADMISSION_BATCH", "2")
+    monkeypatch.setenv("SGLANG_AGENTIC_KV_SLOW_AGING_SECONDS", "0")
+    monkeypatch.setenv("SGLANG_AGENTIC_KV_NEW_AGING_SECONDS", "1000")
+    fast = [
+        SimpleNamespace(rid=f"fast-{index}", _agentic_kv_queue_class="fast")
+        for index in range(3)
+    ]
+    slow = SimpleNamespace(rid="slow", _agentic_kv_queue_class="slow")
+    requests = fast + [slow]
+    scheduler = object.__new__(Scheduler)
+    scheduler.tp_size = 1
+    scheduler.agentic_kv_waiting_by_rid = {
+        req.rid: (req, time.monotonic() - 10) for req in requests
+    }
+    scheduler.agentic_kv_waiting_by_parent = {}
+    scheduler.agentic_kv_progress_queues = {
+        "fast": deque(req.rid for req in fast),
+        "slow": deque([slow.rid]),
+        "new": deque(),
+    }
+    scheduler.agentic_kv_progress_enqueued = {req.rid for req in requests}
+    scheduler.agentic_kv_retry_heap = []
+    scheduler.agentic_kv_retry_deadlines = {}
+    scheduler.agentic_kv_retry_sequence = 0
+    scheduler.agentic_kv_waiting_queue = [
+        scheduler.agentic_kv_waiting_by_rid[req.rid] for req in requests
+    ]
+    scheduler.agentic_kv_waiting_tombstones = 0
+    scheduler.agentic_early_direct_completion_queue = deque()
+    scheduler.agentic_early_direct_poll_lock = nullcontext()
+    scheduler.agentic_host_staging_manager = None
+    scheduler.agentic_p_workset_broker = SimpleNamespace(
+        drain_grant_events=lambda: ()
+    )
+    visited = []
+    scheduler._agentic_should_defer = (
+        lambda req, *_args, **_kwargs: visited.append(req.rid) or True
+    )
+
+    Scheduler._drain_agentic_kv_waiting_queue_tp1(scheduler)
+
+    assert visited == [slow.rid, fast[0].rid]
 
 
 def test_prefill_priority_puts_owned_worksets_before_unrunnable_fast_fallbacks():

@@ -445,6 +445,9 @@ class SchedulerDisaggregationPrefillMixin:
         if enabled not in {"1", "true", "yes", "on"}:
             return
         self._prefill_transfer_poll_lock = threading.Lock()
+        self._prefill_transfer_terminal_queue = deque()
+        self._prefill_transfer_prepare_queue = deque()
+        self._prefill_transfer_prepare_keys = set()
         self._prefill_transfer_stop = threading.Event()
         self._prefill_transfer_interval = max(
             0.0005,
@@ -1047,6 +1050,8 @@ class SchedulerDisaggregationPrefillMixin:
                 with self._prefill_transfer_poll_lock:
                     req._async_prefill_transfer_consumer_active = False
                     req._async_prefill_transfer_poll = poll
+                    if self.tp_size == 1:
+                        self._prefill_transfer_terminal_queue.append(key)
             elif not self._prefill_transfer_stop.is_set():
                 # Keep the transfer active but relinquish this worker after
                 # one step, so later P results cannot be starved by waiters.
@@ -1665,13 +1670,19 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                     logprob_pt += num_input_logprobs
                 if getattr(req, "disagg_p_ready_deferred", False):
-                    if not getattr(self, "_prefill_transfer_async_enabled", False) or (
-                        self._prepare_deferred_prefill_transfer(req)
-                    ):
+                    async_progress = getattr(
+                        self, "_prefill_transfer_async_enabled", False
+                    )
+                    if not async_progress or self._prepare_deferred_prefill_transfer(req):
                         if getattr(self, "_prefill_transfer_async_enabled", False):
                             self._enqueue_deferred_prefill_transfer(req)
                         else:
                             self._publish_deferred_prefill_ready(req)
+                    elif self.tp_size == 1:
+                        key = self._prefill_transfer_key(req)
+                        if key not in self._prefill_transfer_prepare_keys:
+                            self._prefill_transfer_prepare_keys.add(key)
+                            self._prefill_transfer_prepare_queue.append(req)
                 else:
                     self.send_kv_chunk(req, last_chunk=True)
                     req.disagg_p_ready_transfer_started = True
@@ -1745,6 +1756,42 @@ class SchedulerDisaggregationPrefillMixin:
 
         full_inflight_queue = self.disagg_prefill_inflight_queue
         inflight_queue = full_inflight_queue
+        unselected_reqs = []
+        if (
+            self.tp_size == 1
+            and getattr(self, "_prefill_transfer_async_enabled", False)
+        ):
+            # Retry only requests that explicitly failed immutable payload
+            # preparation; do not rescan every P-ready request each tick.
+            prepare_budget = min(8, len(self._prefill_transfer_prepare_queue))
+            if prepare_budget:
+                live_ids = {id(req) for req in full_inflight_queue}
+                for _ in range(prepare_budget):
+                    req = self._prefill_transfer_prepare_queue.popleft()
+                    key = self._prefill_transfer_key(req)
+                    self._prefill_transfer_prepare_keys.discard(key)
+                    if id(req) not in live_ids:
+                        continue
+                    if self._prepare_deferred_prefill_transfer(req):
+                        self._enqueue_deferred_prefill_transfer(req)
+                    elif key not in self._prefill_transfer_prepare_keys:
+                        self._prefill_transfer_prepare_keys.add(key)
+                        self._prefill_transfer_prepare_queue.append(req)
+
+            with self._prefill_transfer_poll_lock:
+                terminal_keys = set(self._prefill_transfer_terminal_queue)
+                self._prefill_transfer_terminal_queue.clear()
+            if not terminal_keys:
+                return []
+            selected = []
+            for req in full_inflight_queue:
+                if self._prefill_transfer_key(req) in terminal_keys:
+                    selected.append(req)
+                else:
+                    unselected_reqs.append(req)
+            inflight_queue = selected
+            if not inflight_queue:
+                return []
         if self.tp_size > 1:
             selected_keys = getattr(self, "_agentic_tp_prefill_transfer_keys", ())
             if not selected_keys:
@@ -1826,7 +1873,7 @@ class SchedulerDisaggregationPrefillMixin:
                 for host_poll in [p2d_host.poll(req)]
             ]
 
-        undone_reqs: List[Req] = []
+        undone_reqs: List[Req] = list(unselected_reqs)
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(inflight_queue, polls):
 
@@ -2044,6 +2091,16 @@ class SchedulerDisaggregationPrefillMixin:
         if self.tp_size == 1 and getattr(
             self, "_prefill_transfer_async_enabled", False
         ):
+            selected_ids = {id(req) for req in inflight_queue}
+            with self._prefill_transfer_poll_lock:
+                for req in undone_reqs:
+                    if id(req) not in selected_ids:
+                        continue
+                    poll = getattr(req, "_async_prefill_transfer_poll", None)
+                    if poll in (int(KVPoll.Success), int(KVPoll.Failed)):
+                        self._prefill_transfer_terminal_queue.append(
+                            self._prefill_transfer_key(req)
+                        )
             self._release_prefill_transfer_poll_claims(undone_reqs)
         if self.tp_size > 1:
             done_ids = {id(req) for req in done_reqs}

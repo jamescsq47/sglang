@@ -15,6 +15,7 @@
 
 import copy
 import faulthandler
+import heapq
 import json
 import logging
 import os
@@ -329,6 +330,7 @@ class AgenticPWorksetLeaseBroker:
         self._intents: Dict[str, Tuple[str, int, int]] = {}
         self._leases: Dict[str, AgenticPWorksetLease] = {}
         self._release_requested: Dict[str, int] = {}
+        self._grant_events: Deque[str] = deque()
         self._next_lease_id = 1
         self._grants = 0
         self._allocation_failures = 0
@@ -524,6 +526,15 @@ class AgenticPWorksetLeaseBroker:
                 self._next_lease_id += 1
                 self._grants += 1
                 self._intents.pop(snapshot_id, None)
+                self._grant_events.append(snapshot_id)
+
+    def drain_grant_events(self) -> tuple[str, ...]:
+        """Return newly allocated worksets without scanning broker state."""
+
+        with self._lock:
+            events = tuple(self._grant_events)
+            self._grant_events.clear()
+            return events
 
     def handoff_to_req(
         self, snapshot_id: str, req, lease: AgenticPWorksetLease
@@ -1488,6 +1499,22 @@ class Scheduler(
         # Requests whose parent D snapshot is not committed yet.  They carry
         # metadata only and consume neither P host cache nor P GPU KV memory.
         self.agentic_kv_waiting_queue: List[Tuple[Req, float]] = []
+        # TP=1 uses an edge-triggered ready pipeline. Background Direct/Slow
+        # state machines publish snapshot completions; the scheduler indexes
+        # metadata waiters and consumes only exact ready events instead of
+        # rescanning and reclassifying the whole queue every model iteration.
+        self.agentic_kv_waiting_by_rid: Dict[str, Tuple[Req, float]] = {}
+        self.agentic_kv_waiting_by_parent: Dict[str, Dict[str, Req]] = {}
+        self.agentic_kv_progress_queues: Dict[str, Deque[str]] = {
+            "fast": deque(),
+            "slow": deque(),
+            "new": deque(),
+        }
+        self.agentic_kv_progress_enqueued: set[str] = set()
+        self.agentic_kv_retry_heap: List[Tuple[float, int, str]] = []
+        self.agentic_kv_retry_deadlines: Dict[str, float] = {}
+        self.agentic_kv_retry_sequence = 0
+        self.agentic_kv_waiting_tombstones = 0
         # Reverse D->P Direct transfers are discovered from the router's
         # lightweight arrival marker, before a tokenized Req exists.  Entries
         # remain allocator-owned until that Req arrives and binds the KV into
@@ -5701,6 +5728,129 @@ class Scheduler(
         value = getattr(req, "_agentic_kv_queue_class", "fast")
         return value if value in {"fast", "slow", "new"} else "fast"
 
+    def _agentic_track_waiter(self, req: Req, started_at: float) -> None:
+        """Index one metadata-only P request for edge-triggered progress."""
+
+        self.agentic_kv_waiting_by_rid[req.rid] = (req, float(started_at))
+        metadata = AgenticRequestMetadata.from_req(req)
+        parent = metadata.parent if metadata is not None else None
+        if parent is not None:
+            self.agentic_kv_waiting_by_parent.setdefault(
+                parent.snapshot_id, {}
+            )[req.rid] = req
+        self._agentic_enqueue_progress(req)
+
+    def _agentic_forget_waiter(self, req: Req) -> None:
+        """Remove indexes immediately; compact the compatibility list lazily."""
+
+        if self.agentic_kv_waiting_by_rid.pop(req.rid, None) is None:
+            return
+        metadata = AgenticRequestMetadata.from_req(req)
+        parent = metadata.parent if metadata is not None else None
+        if parent is not None:
+            waiters = self.agentic_kv_waiting_by_parent.get(parent.snapshot_id)
+            if waiters is not None:
+                waiters.pop(req.rid, None)
+                if not waiters:
+                    self.agentic_kv_waiting_by_parent.pop(parent.snapshot_id, None)
+        self.agentic_kv_progress_enqueued.discard(req.rid)
+        self.agentic_kv_retry_deadlines.pop(req.rid, None)
+        self.agentic_kv_waiting_tombstones += 1
+
+    def _agentic_enqueue_progress(self, req: Req) -> None:
+        """Publish one idempotent runnable/control edge to the scheduler."""
+
+        if (
+            req.rid not in self.agentic_kv_waiting_by_rid
+            or req.rid in self.agentic_kv_progress_enqueued
+        ):
+            return
+        queue_class = self._agentic_queue_class(req)
+        self.agentic_kv_progress_queues[queue_class].append(req.rid)
+        self.agentic_kv_progress_enqueued.add(req.rid)
+
+    def _agentic_enqueue_snapshot_waiters(self, snapshot_id: str) -> None:
+        for req in tuple(
+            self.agentic_kv_waiting_by_parent.get(str(snapshot_id), {}).values()
+        ):
+            self._agentic_enqueue_progress(req)
+
+    def _agentic_schedule_retry(self, req: Req, delay_seconds: float = 0.05) -> None:
+        """Backstop lost filesystem edges without repeatedly scanning waiters."""
+
+        if req.rid not in self.agentic_kv_waiting_by_rid:
+            return
+        deadline = time.monotonic() + max(0.001, float(delay_seconds))
+        previous = self.agentic_kv_retry_deadlines.get(req.rid)
+        if previous is not None and previous <= deadline:
+            return
+        self.agentic_kv_retry_sequence += 1
+        self.agentic_kv_retry_deadlines[req.rid] = deadline
+        heapq.heappush(
+            self.agentic_kv_retry_heap,
+            (deadline, self.agentic_kv_retry_sequence, req.rid),
+        )
+
+    def _agentic_ingest_progress_events(self) -> None:
+        """Convert background completion edges into exact waiter wakeups."""
+
+        completions = getattr(self, "agentic_early_direct_completion_queue", None)
+        if completions is not None:
+            with getattr(self, "agentic_early_direct_poll_lock", nullcontext()):
+                direct = tuple(completions)
+                completions.clear()
+            for snapshot_id in direct:
+                self._agentic_enqueue_snapshot_waiters(snapshot_id)
+
+        host_staging = getattr(self, "agentic_host_staging_manager", None)
+        if host_staging is not None:
+            drain_events = getattr(host_staging, "drain_scheduler_events", None)
+            if drain_events is not None:
+                for _, snapshot_id in drain_events():
+                    self._agentic_enqueue_snapshot_waiters(snapshot_id)
+
+        broker = getattr(self, "agentic_p_workset_broker", None)
+        if broker is not None:
+            drain_grants = getattr(broker, "drain_grant_events", None)
+            if drain_grants is not None:
+                for snapshot_id in drain_grants():
+                    self._agentic_enqueue_snapshot_waiters(snapshot_id)
+
+        now = time.monotonic()
+        while self.agentic_kv_retry_heap:
+            deadline, _, rid = self.agentic_kv_retry_heap[0]
+            if deadline > now:
+                break
+            heapq.heappop(self.agentic_kv_retry_heap)
+            if self.agentic_kv_retry_deadlines.get(rid) != deadline:
+                continue
+            self.agentic_kv_retry_deadlines.pop(rid, None)
+            waiter = self.agentic_kv_waiting_by_rid.get(rid)
+            if waiter is not None:
+                self._agentic_enqueue_progress(waiter[0])
+
+    def _agentic_compact_waiting_queue(self, *, force: bool = False) -> None:
+        """Keep legacy diagnostics/TP iteration accurate off the hot path."""
+
+        tombstones = self.agentic_kv_waiting_tombstones
+        if not force and tombstones < 64 and tombstones * 2 < len(
+            self.agentic_kv_waiting_queue
+        ):
+            return
+        if not tombstones:
+            return
+        live = self.agentic_kv_waiting_by_rid
+        self.agentic_kv_waiting_queue = [
+            entry
+            for entry in self.agentic_kv_waiting_queue
+            if (
+                entry[0].rid in live
+                and live[entry[0].rid][0] is entry[0]
+                and live[entry[0].rid][1] == entry[1]
+            )
+        ]
+        self.agentic_kv_waiting_tombstones = 0
+
     @staticmethod
     def _agentic_slow_aging_seconds() -> float:
         try:
@@ -6722,6 +6872,121 @@ class Scheduler(
         )
         return bool(started)
 
+    def _drain_agentic_kv_waiting_queue_tp1(self) -> None:
+        """Consume edge-triggered Direct/Slow readiness without queue scans."""
+
+        self._agentic_ingest_progress_events()
+        try:
+            admission_batch = max(
+                1, int(os.environ.get("SGLANG_AGENTIC_KV_ADMISSION_BATCH", "8"))
+            )
+        except ValueError:
+            logger.exception("Invalid agentic KV admission setting")
+            raise
+
+        def pop_waiter(queue_class: str):
+            """Pop one live edge, repairing a stale priority classification."""
+
+            progress = self.agentic_kv_progress_queues[queue_class]
+            while progress:
+                rid = progress.popleft()
+                self.agentic_kv_progress_enqueued.discard(rid)
+                waiter = self.agentic_kv_waiting_by_rid.get(rid)
+                if waiter is None:
+                    continue
+                if self._agentic_queue_class(waiter[0]) != queue_class:
+                    self._agentic_enqueue_progress(waiter[0])
+                    continue
+                return waiter
+            return None
+
+        def oldest_wait_age(queue_class: str) -> Optional[float]:
+            """Read only the queue head; never rescan all metadata waiters."""
+
+            progress = self.agentic_kv_progress_queues[queue_class]
+            while progress:
+                rid = progress[0]
+                waiter = self.agentic_kv_waiting_by_rid.get(rid)
+                if waiter is None:
+                    progress.popleft()
+                    self.agentic_kv_progress_enqueued.discard(rid)
+                    continue
+                if self._agentic_queue_class(waiter[0]) != queue_class:
+                    progress.popleft()
+                    self.agentic_kv_progress_enqueued.discard(rid)
+                    self._agentic_enqueue_progress(waiter[0])
+                    continue
+                return max(0.0, time.monotonic() - waiter[1])
+            return None
+
+        # Direct remains the normal first choice. Once Slow recovery or fresh
+        # work crosses its existing aging bound, reserve one slot before the
+        # usual priority pass. This keeps the path O(1) and prevents a steady
+        # Direct stream from starving Shared-Arena recovery indefinitely.
+        promoted = []
+        slow_age = oldest_wait_age("slow")
+        if slow_age is not None and slow_age >= self._agentic_slow_aging_seconds():
+            promoted.append("slow")
+        new_age = oldest_wait_age("new")
+        if new_age is not None and new_age >= self._agentic_new_aging_seconds():
+            promoted.append("new")
+
+        processed = 0
+
+        def consume_one(queue_class: str) -> bool:
+            nonlocal processed
+            waiter = pop_waiter(queue_class)
+            if waiter is None:
+                return False
+            req, started_at = waiter
+            processed += 1
+            try:
+                deferred = self._agentic_should_defer(
+                    req, started_at, allow_start_io=True
+                )
+            except (SnapshotNotReadyError, SnapshotLifecycleError):
+                deferred = True
+            if deferred:
+                host_staging = getattr(self, "agentic_host_staging_manager", None)
+                # Slow DMA and early Direct publish completion edges. A
+                # legacy request-owned receiver still needs polling, while
+                # missing/transitioning manifests get a low-rate timer
+                # backstop in case an external file event is lost.
+                if getattr(req, "_agentic_direct_receiver", None) is not None:
+                    self._agentic_schedule_retry(req, 0.005)
+                elif host_staging is not None and req.rid in host_staging.loads:
+                    load = host_staging.loads[req.rid]
+                    if (
+                        load.get("ledger_prepare_pending")
+                        or load.get("io_complete")
+                        or load.get("io_error") is not None
+                    ):
+                        # Pure DMA wait is background-owned and emits an edge.
+                        # Ledger prepare/retry, Radix bind, handoff and failure
+                        # cleanup are scheduler-owned idempotent boundaries;
+                        # keep retrying those without expecting another DMA
+                        # completion notification.
+                        self._agentic_schedule_retry(req, 0.005)
+                else:
+                    self._agentic_schedule_retry(req, 0.05)
+                return True
+
+            req._agentic_kv_wait_enqueued = False
+            self._agentic_forget_waiter(req)
+            self._agentic_publish_p_scheduled(req)
+            self._add_request_to_queue(req)
+            return True
+
+        for queue_class in promoted:
+            if processed >= admission_batch:
+                break
+            consume_one(queue_class)
+
+        for queue_class in ("fast", "slow", "new"):
+            while processed < admission_batch and consume_one(queue_class):
+                pass
+        self._agentic_compact_waiting_queue()
+
     def _drain_agentic_kv_waiting_queue(self) -> None:
         """Progress active KV I/O and admit pending work in arrival order.
 
@@ -6731,6 +6996,10 @@ class Scheduler(
         I/O engines and credits remain independent. A small admission batch
         amortizes scheduler ticks that contain long Prefill kernels.
         """
+        if getattr(self, "tp_size", 1) == 1:
+            self._drain_agentic_kv_waiting_queue_tp1()
+            return
+
         # This sweep is intentionally outside admission_batch.  Admission
         # limits Prefill compute; it must not retain a completed workset lease.
         if getattr(self, "tp_size", 1) == 1:
@@ -7287,6 +7556,8 @@ class Scheduler(
                     enqueued_at = time.monotonic()
                     req._agentic_kv_wait_started_at = enqueued_at
                     self.agentic_kv_waiting_queue.append((req, enqueued_at))
+                    if getattr(self, "tp_size", 1) == 1:
+                        self._agentic_track_waiter(req, enqueued_at)
                     return
                 # Direct is already resident; bypass the metadata-only
                 # lifecycle queue and enter native Prefill admission.
@@ -8437,7 +8708,12 @@ class Scheduler(
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
         idle &= len(self.waiting_queue) == 0
-        idle &= len(self.agentic_kv_waiting_queue) == 0
+        indexed_waiters = getattr(self, "agentic_kv_waiting_by_rid", None)
+        idle &= len(
+            self.agentic_kv_waiting_queue
+            if indexed_waiters is None or getattr(self, "tp_size", 1) > 1
+            else indexed_waiters
+        ) == 0
         idle &= len(self.agentic_early_direct_receives) == 0
 
         if not for_health_check:
@@ -8683,6 +8959,8 @@ class Scheduler(
         remaining_agentic_waiters = []
         for req, started_at in self.agentic_kv_waiting_queue:
             if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                if getattr(self, "tp_size", 1) == 1:
+                    self._agentic_forget_waiter(req)
                 self._agentic_abort_cleanup(req)
                 self.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
             else:
