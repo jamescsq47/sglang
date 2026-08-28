@@ -799,6 +799,13 @@ class SchedulerDisaggregationPrefillMixin:
         receiver_mailbox = self.agentic_tp_p2d_receiver_mailbox
         p2d_host = getattr(self, "agentic_p2d_host_staging_manager", None)
 
+        # The scheduler consumes only a native TP-broadcast group terminal.
+        # Once that boundary has been crossed on this rank, no rank-local
+        # sender/receipt state may resurrect the request after mailbox cleanup.
+        group_terminal = getattr(req, "_agentic_p2d_group_terminal", None)
+        if group_terminal in (int(KVPoll.Success), int(KVPoll.Failed)):
+            return int(group_terminal)
+
         if getattr(req, "_agentic_p2d_host_terminal", False):
             local_poll = int(KVPoll.Success)
         elif p2d_host is not None:
@@ -1929,6 +1936,14 @@ class SchedulerDisaggregationPrefillMixin:
             ]:
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
+                if self.tp_size > 1:
+                    # The native TP broadcast has made this terminal result
+                    # scheduler-visible on every rank.  Cache it on the Req
+                    # before group mailbox cleanup, so a background worker
+                    # that is between its receipt read and active-map cleanup
+                    # observes the same level-triggered terminal instead of
+                    # re-entering Transferring after the receipt disappears.
+                    req._agentic_p2d_group_terminal = int(KVPoll.Success)
                 # Resolve native-vs-Host ownership before freeing any GPU
                 # page.  A Host claim arriving after the last native poll
                 # keeps the request inflight until its D2H completes.
@@ -2038,6 +2053,13 @@ class SchedulerDisaggregationPrefillMixin:
                 ):
                     undone_reqs.append(req)
                     continue
+                if self.tp_size > 1:
+                    # Failed becomes a level-triggered group terminal only
+                    # after cleanup has proved that Host staging did not win
+                    # the ownership race.  If Host already claimed the
+                    # generation, cleanup returns False and progress must keep
+                    # polling that path until its durable terminal is visible.
+                    req._agentic_p2d_group_terminal = int(KVPoll.Failed)
                 prepare_abort(
                     req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
                 )

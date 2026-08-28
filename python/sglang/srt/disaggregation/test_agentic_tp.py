@@ -540,6 +540,69 @@ def test_tp1_p2d_failed_cleanup_requeues_the_same_terminal_edge():
     ]
 
 
+def test_tp_p2d_failed_cleanup_defers_terminal_to_host_owner():
+    """Native failure must not mask a Host claim that won during cleanup."""
+
+    sender = SimpleNamespace(
+        failure_exception=lambda: RuntimeError("native transfer failed"),
+        poll=lambda: (_ for _ in ()).throw(
+            AssertionError("Host-owned progress must not poll native sender")
+        ),
+    )
+    req = SimpleNamespace(
+        rid="native-failed-host-won",
+        bootstrap_room=10,
+        disagg_p_ready_deferred=False,
+        _async_prefill_transfer_poll=int(KVPoll.Failed),
+        disagg_kv_sender=sender,
+        time_stats=SimpleNamespace(
+            trace_ctx=SimpleNamespace(abort=lambda **_kwargs: None)
+        ),
+        return_logprob=False,
+    )
+    scheduler = _tp1_terminal_scheduler(req, int(KVPoll.Failed), None)
+    scheduler.tp_size = 2
+    scheduler._cleanup_failed_prefill_transfer = lambda *_args: False
+
+    SchedulerDisaggregationPrefillMixin.process_disagg_prefill_inflight_queue(
+        scheduler
+    )
+
+    assert not hasattr(req, "_agentic_p2d_group_terminal")
+    assert list(scheduler._prefill_transfer_terminal_queue) == [
+        (req.rid, req.bootstrap_room)
+    ]
+
+    with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+        namespace = f"p2d-host-won-{time.time_ns()}"
+        sender_mailbox = TPGroupMailbox(
+            f"{namespace}-sender", tp_rank=0, tp_size=2, directory=directory
+        )
+        sender_peer = TPGroupMailbox(
+            f"{namespace}-sender", tp_rank=1, tp_size=2, directory=directory
+        )
+        receiver_mailbox = TPGroupMailbox(
+            f"{namespace}-receiver", tp_rank=0, tp_size=2, directory=directory
+        )
+        key = scheduler._prefill_transfer_key(req)
+        sender_peer.publish_local(key, int(KVPoll.Success))
+        host_polls = []
+        scheduler.tp_rank = 0
+        scheduler.agentic_tp_p2d_sender_mailbox = sender_mailbox
+        scheduler.agentic_tp_p2d_receiver_mailbox = receiver_mailbox
+        scheduler.agentic_p2d_host_staging_manager = SimpleNamespace(
+            poll=lambda request: host_polls.append(request.rid)
+            or int(KVPoll.Success)
+        )
+
+        poll = SchedulerDisaggregationPrefillMixin._prefill_transfer_progress_tp_req_once(
+            scheduler, req
+        )
+
+    assert poll == int(KVPoll.Success)
+    assert host_polls == [req.rid]
+
+
 def test_node_local_metadata_store_is_cross_instance_and_create_only():
     with tempfile.TemporaryDirectory(
         prefix="sglang-agentic-metadata-", dir="/dev/shm"
@@ -689,6 +752,145 @@ def test_workset_lease_rounds_parent_and_suffix_independently():
     assert lease.allocated_tokens == 16
 
 
+def test_host_ready_tombstone_rejects_a_late_direct_intent_but_not_slow():
+    snapshot_id = "slow-won-before-marker:0"
+    broker = AgenticPWorksetLeaseBroker(page_size=4)
+    direct_owner = broker.direct_owner(snapshot_id)
+    slow_owner = broker.slow_owner(snapshot_id, "next-request")
+
+    assert not broker.supersede_unstarted(snapshot_id, owner=direct_owner)
+    assert broker.owner_is_superseded(snapshot_id, owner=direct_owner)
+    assert not broker.request(
+        snapshot_id, parent_tokens=4, prompt_tokens=8, owner=direct_owner
+    )
+    assert broker.request(
+        snapshot_id, parent_tokens=4, prompt_tokens=8, owner=slow_owner
+    )
+
+    # Consuming the marker is not enough to clear the tombstone: an older TP
+    # epoch may still install its already-frozen Direct plan afterwards.
+    assert broker.owner_is_superseded(snapshot_id, owner=direct_owner)
+
+
+def test_tp0_retires_a_superseded_direct_from_an_already_frozen_plan():
+    class Allocator:
+        def alloc(self, count):
+            return torch.arange(count, dtype=torch.int64)
+
+        def free(self, _indices):
+            pass
+
+    snapshot_id = "host-ready-after-freeze:0"
+    broker = AgenticPWorksetLeaseBroker(page_size=4)
+    owner = broker.direct_owner(snapshot_id)
+
+    # HOST_READY is observed while TP0's older epoch is already in flight and
+    # before this rank has installed any local intent/lease.
+    assert not broker.supersede_unstarted(snapshot_id, owner=owner)
+    broker.install_tp_plan(1, [(snapshot_id, owner, 4, 8)])
+    broker.service(Allocator())
+    # The already-broadcast epoch remains a group decision.  This rank still
+    # allocates Direct, then TP0 retires it authoritatively next epoch.
+    assert broker.get(snapshot_id, owner=owner) is not None
+
+    _plan, retirements, _handoffs = broker.prepare_tp_control(2)
+    assert retirements == (snapshot_id,)
+    assert snapshot_id in broker.tp_retire_candidates
+
+
+def test_old_direct_plan_cannot_retire_the_new_slow_owner():
+    class Allocator:
+        def alloc(self, count):
+            return torch.arange(count, dtype=torch.int64)
+
+        def free(self, _indices):
+            pass
+
+    snapshot_id = "direct-to-slow-owner-transition:0"
+    broker = AgenticPWorksetLeaseBroker(page_size=4)
+    direct_owner = broker.direct_owner(snapshot_id)
+    slow_owner = broker.slow_owner(snapshot_id, "next-request")
+    allocator = Allocator()
+
+    # An old TP epoch installs Direct after HOST_READY had already superseded
+    # it.  The following epoch performs the required group retirement.
+    assert not broker.supersede_unstarted(snapshot_id, owner=direct_owner)
+    broker.install_tp_plan(1, [(snapshot_id, direct_owner, 4, 8)])
+    broker.service(allocator)
+    _plan, retirements, _handoffs = broker.prepare_tp_control(2)
+    assert retirements == (snapshot_id,)
+    assert broker.commit_tp_retire(snapshot_id)
+    broker.service(allocator)
+    assert broker.get(snapshot_id) is None
+
+    # Slow now owns the same request-generation.  Epoch 2 still names the old
+    # Direct owner, but that stale plan may no longer create a snapshot-wide
+    # retirement that would kill Slow.
+    assert broker.request(snapshot_id, 4, 8, owner=slow_owner)
+    plan, retirements, _handoffs = broker.prepare_tp_control(3)
+    assert plan == ((snapshot_id, slow_owner, 4, 8),)
+    assert retirements == ()
+    broker.service(allocator)
+    slow_lease = broker.get(snapshot_id, owner=slow_owner)
+    assert slow_lease is not None
+    assert broker.begin_io_attempt(snapshot_id, slow_lease, "slow-attempt")
+
+
+def test_frozen_direct_plan_stays_rank_consistent_during_slow_transition():
+    class Allocator:
+        def __init__(self):
+            self.allocations = []
+            self.cursor = 0
+
+        def alloc(self, count):
+            self.allocations.append(count)
+            result = torch.arange(
+                self.cursor, self.cursor + count, dtype=torch.int64
+            )
+            self.cursor += count
+            return result
+
+        def free(self, _indices):
+            pass
+
+    snapshot_id = "host-ready-between-plan-and-service:0"
+    next_snapshot_id = "following-direct:0"
+    brokers = [AgenticPWorksetLeaseBroker(page_size=4) for _ in range(2)]
+    direct_owner = brokers[0].direct_owner(snapshot_id)
+    next_owner = brokers[0].direct_owner(next_snapshot_id)
+    slow_owner = brokers[0].slow_owner(snapshot_id, "next-request")
+    allocators = [Allocator(), Allocator()]
+
+    # TP0 froze Direct, but HOST_READY and the successor Slow request became
+    # authoritative on rank0 before either rank services that epoch.  Rank1
+    # has not observed HOST_READY yet.  Rank-local observation order must not
+    # change any physical allocation in the already-broadcast plan.
+    plan = [
+        (snapshot_id, direct_owner, 4, 8),
+        (next_snapshot_id, next_owner, 4, 8),
+    ]
+    for broker in brokers:
+        broker.install_tp_plan(1, plan)
+    assert not brokers[0].supersede_unstarted(
+        snapshot_id, owner=direct_owner
+    )
+    assert brokers[0].request(snapshot_id, 4, 8, owner=slow_owner)
+
+    for broker, allocator in zip(brokers, allocators):
+        broker.service(allocator)
+
+    assert allocators[0].allocations == allocators[1].allocations == [8, 8]
+    for broker in brokers:
+        assert torch.equal(
+            broker.get(snapshot_id, owner=direct_owner).device_indices,
+            torch.arange(0, 8),
+        )
+        assert torch.equal(
+            broker.get(next_snapshot_id, owner=next_owner).device_indices,
+            torch.arange(8, 16),
+        )
+
+
 def test_workset_lease_does_not_steal_native_chunk_continuation_capacity():
     class Allocator:
         def __init__(self):
@@ -720,6 +922,679 @@ def test_workset_lease_does_not_steal_native_chunk_continuation_capacity():
     broker.service(allocator)
     assert broker.get("direct:1") is not None
     assert allocator.available == 8
+
+
+def test_tp_workset_allocation_plan_prevents_cross_rank_ownership_inversion():
+    class Allocator:
+        def __init__(self):
+            self.available = 16
+            self.allocations = []
+
+        def available_size(self):
+            return self.available
+
+        def alloc(self, count):
+            if count > self.available:
+                return None
+            start = 16 - self.available
+            self.available -= count
+            self.allocations.append(count)
+            return torch.arange(start, start + count, dtype=torch.int64)
+
+        def free(self, indices):
+            self.available += int(indices.numel())
+
+    rank0 = AgenticPWorksetLeaseBroker(page_size=4)
+    rank1 = AgenticPWorksetLeaseBroker(page_size=4)
+    owner_a = rank0.direct_owner("a:0")
+    owner_b = rank0.direct_owner("b:0")
+    assert rank0.request("a:0", 4, 8, owner=owner_a)
+    assert rank0.request("b:0", 4, 8, owner=owner_b)
+    # Filesystem/HTTP readiness is deliberately observed in the opposite
+    # order on the follower.
+    assert rank1.request("b:0", 4, 8, owner=owner_b)
+
+    plan = rank0.prepare_tp_plan(1)
+    allocator0 = Allocator()
+    allocator1 = Allocator()
+    rank1.install_tp_plan(1, plan)
+    rank0.service(allocator0)
+    rank1.service(allocator1)
+
+    assert rank0.get("a:0", owner=owner_a) is not None
+    assert rank0.get("b:0", owner=owner_b) is not None
+    # TP0's immutable command is sufficient to install a follower intent; a
+    # rank-local filesystem marker is not an allocation authority.
+    assert rank1.get("a:0", owner=owner_a) is not None
+    assert rank1.get("b:0", owner=owner_b) is not None
+    assert allocator0.allocations == allocator1.allocations == [8, 8]
+
+
+def test_tp_workset_epoch_defers_rank0_cancel_until_group_removal():
+    class Allocator:
+        def __init__(self):
+            self.available = 24
+
+        def available_size(self):
+            return self.available
+
+        def alloc(self, count):
+            if count > self.available:
+                return None
+            self.available -= count
+            return torch.arange(count, dtype=torch.int64)
+
+        def free(self, indices):
+            self.available += int(indices.numel())
+
+    rank0 = AgenticPWorksetLeaseBroker(page_size=4)
+    rank1 = AgenticPWorksetLeaseBroker(page_size=4)
+    owner_a = rank0.direct_owner("cancel-a:0")
+    owner_b = rank0.direct_owner("cancel-b:0")
+    rank0.request("cancel-a:0", 4, 8, owner=owner_a)
+    rank0.request("cancel-b:0", 4, 8, owner=owner_b)
+    plan1 = rank0.prepare_tp_plan(1)
+    rank1.install_tp_plan(1, plan1)
+
+    # This is the exact former race: cancellation lands after TP0 snapshots
+    # the plan but before the scheduler services physical allocation.
+    assert rank0.cancel_unstarted("cancel-a:0", owner=owner_a)
+    allocator0, allocator1 = Allocator(), Allocator()
+    rank0.service(allocator0)
+    rank1.service(allocator1)
+    assert rank0.get("cancel-a:0", owner=owner_a) is not None
+    assert rank1.get("cancel-a:0", owner=owner_a) is not None
+
+    plan2 = rank0.prepare_tp_plan(2)
+    assert [entry[0] for entry in plan2] == ["cancel-a:0", "cancel-b:0"]
+    rank1.install_tp_plan(2, plan2)
+    assert rank0.prepare_tp_retire("cancel-a:0")
+    assert rank1.prepare_tp_retire("cancel-a:0")
+    assert rank0.commit_tp_retire("cancel-a:0")
+    assert rank1.commit_tp_retire("cancel-a:0")
+    rank0.service(allocator0)
+    rank1.service(allocator1)
+    assert rank0.get("cancel-a:0", owner=owner_a) is None
+    assert rank1.get("cancel-a:0", owner=owner_a) is None
+    assert allocator0.available == allocator1.available == 16
+
+
+def test_tp_workset_epoch_ignores_follower_only_cancel():
+    class Allocator:
+        def __init__(self):
+            self.available = 16
+
+        def available_size(self):
+            return self.available
+
+        def alloc(self, count):
+            self.available -= count
+            return torch.arange(count, dtype=torch.int64)
+
+        def free(self, indices):
+            self.available += int(indices.numel())
+
+    rank0 = AgenticPWorksetLeaseBroker(page_size=4)
+    rank1 = AgenticPWorksetLeaseBroker(page_size=4)
+    owner = rank0.direct_owner("follower-cancel:0")
+    rank0.request("follower-cancel:0", 4, 8, owner=owner)
+    rank1.request("follower-cancel:0", 4, 8, owner=owner)
+    plan1 = rank0.prepare_tp_plan(1)
+    rank1.install_tp_plan(1, plan1)
+    assert rank1.cancel_unstarted("follower-cancel:0", owner=owner)
+    allocator0, allocator1 = Allocator(), Allocator()
+    rank0.service(allocator0)
+    rank1.service(allocator1)
+
+    # TP0 still owns the generation in epoch 2, overriding the follower's
+    # rank-local timeout without freeing either shard.
+    plan2 = rank0.prepare_tp_plan(2)
+    rank1.install_tp_plan(2, plan2)
+    rank0.service(allocator0)
+    rank1.service(allocator1)
+    assert rank0.get("follower-cancel:0", owner=owner) is not None
+    assert rank1.get("follower-cancel:0", owner=owner) is not None
+    assert allocator0.available == allocator1.available == 8
+    lease0 = rank0.get("follower-cancel:0", owner=owner)
+    lease1 = rank1.get("follower-cancel:0", owner=owner)
+    assert rank0.begin_io_attempt("follower-cancel:0", lease0, "next")
+    assert rank1.begin_io_attempt("follower-cancel:0", lease1, "next")
+
+
+def test_tp_workset_epoch_defers_release_without_reallocating_old_plan():
+    class Allocator:
+        def __init__(self):
+            self.available = 8
+
+        def available_size(self):
+            return self.available
+
+        def alloc(self, count):
+            if count > self.available:
+                return None
+            self.available -= count
+            return torch.arange(count, dtype=torch.int64)
+
+        def free(self, indices):
+            self.available += int(indices.numel())
+
+    rank0 = AgenticPWorksetLeaseBroker(page_size=4)
+    rank1 = AgenticPWorksetLeaseBroker(page_size=4)
+    owner = rank0.direct_owner("release-after-plan:0")
+    rank0.request("release-after-plan:0", 4, 8, owner=owner)
+    plan1 = rank0.prepare_tp_plan(1)
+    rank1.install_tp_plan(1, plan1)
+    allocator0, allocator1 = Allocator(), Allocator()
+    rank0.service(allocator0)
+    rank1.service(allocator1)
+    old_lease = rank0.get("release-after-plan:0", owner=owner)
+    assert old_lease is not None
+
+    # TP0 has frozen epoch 2, then an async transport callback asks to release.
+    # Service must retain the exact old lease for this epoch, not free and
+    # immediately recreate it from the frozen entry.
+    plan2 = rank0.prepare_tp_plan(2)
+    rank1.install_tp_plan(2, plan2)
+    assert rank0.request_release(
+        "release-after-plan:0", old_lease, owner=owner
+    )
+    assert not rank0.begin_io_attempt(
+        "release-after-plan:0", old_lease, "late-io"
+    )
+    assert not rank0.begin_bind("release-after-plan:0", old_lease)
+    rank0.service(allocator0)
+    rank1.service(allocator1)
+    assert rank0.get("release-after-plan:0", owner=owner) is old_lease
+    assert rank1.get("release-after-plan:0", owner=owner) is not None
+
+    assert rank0.prepare_tp_retire("release-after-plan:0")
+    assert rank1.prepare_tp_retire("release-after-plan:0")
+    assert rank0.commit_tp_retire("release-after-plan:0")
+    assert rank1.commit_tp_retire("release-after-plan:0")
+    rank0.service(allocator0)
+    rank1.service(allocator1)
+    assert rank0.get("release-after-plan:0") is None
+    assert rank1.get("release-after-plan:0") is None
+    assert allocator0.available == allocator1.available == 8
+    plan3 = rank0.prepare_tp_plan(3)
+    assert plan3 == ()
+    rank1.install_tp_plan(3, plan3)
+
+
+def test_tp_workset_epoch_does_not_resurrect_io_terminal_release():
+    class Allocator:
+        def __init__(self):
+            self.available = 8
+
+        def available_size(self):
+            return self.available
+
+        def alloc(self, count):
+            if count > self.available:
+                return None
+            self.available -= count
+            return torch.arange(count, dtype=torch.int64)
+
+        def free(self, indices):
+            self.available += int(indices.numel())
+
+    broker = AgenticPWorksetLeaseBroker(page_size=4)
+    allocator = Allocator()
+    owner = broker.direct_owner("io-terminal:0")
+    broker.request("io-terminal:0", 4, 8, owner=owner)
+    broker.prepare_tp_plan(1)
+    broker.service(allocator)
+    lease = broker.get("io-terminal:0", owner=owner)
+    assert broker.begin_io_attempt("io-terminal:0", lease, "attempt-1")
+    broker.mark_io_inflight("io-terminal:0", lease, "attempt-1")
+
+    # Epoch 2 is frozen while DMA is still live.  Its terminal callback may
+    # release the old exact lease, but the same epoch must never recreate A.
+    assert broker.prepare_tp_plan(2)[0][0] == "io-terminal:0"
+    assert not broker.request_release(
+        "io-terminal:0", lease, owner=owner, io_attempt="attempt-1"
+    )
+    assert broker.mark_io_quiesced(
+        "io-terminal:0", lease, "attempt-1"
+    )
+    assert broker.prepare_tp_retire("io-terminal:0")
+    assert broker.commit_tp_retire("io-terminal:0")
+    broker.service(allocator)
+    assert broker.get("io-terminal:0", owner=owner) is None
+    assert allocator.available == 8
+    assert broker.prepare_tp_plan(3) == ()
+
+
+def test_tp_workset_group_retire_waits_for_staggered_rank_fences():
+    class Allocator:
+        def __init__(self):
+            self.available = 8
+
+        def available_size(self):
+            return self.available
+
+        def alloc(self, count):
+            if count > self.available:
+                return None
+            self.available -= count
+            return torch.arange(count, dtype=torch.int64)
+
+        def free(self, indices):
+            self.available += int(indices.numel())
+
+    ranks = [AgenticPWorksetLeaseBroker(page_size=4) for _ in range(2)]
+    owner = ranks[0].direct_owner("stagger:0")
+    ranks[0].request("stagger:0", 4, 8, owner=owner)
+    plan1 = ranks[0].prepare_tp_plan(1)
+    ranks[1].install_tp_plan(1, plan1)
+    allocators = [Allocator(), Allocator()]
+    for broker, allocator in zip(ranks, allocators):
+        broker.service(allocator)
+        lease = broker.get("stagger:0", owner=owner)
+        assert broker.begin_io_attempt("stagger:0", lease, "attempt")
+        broker.mark_io_inflight("stagger:0", lease, "attempt")
+
+    plan2 = ranks[0].prepare_tp_plan(2)
+    ranks[1].install_tp_plan(2, plan2)
+    leases = [broker.get("stagger:0", owner=owner) for broker in ranks]
+    for broker, lease in zip(ranks, leases):
+        assert not broker.request_release(
+            "stagger:0", lease, owner=owner, io_attempt="attempt"
+        )
+        assert not broker.prepare_tp_retire("stagger:0")
+
+    # Rank 0 finishes first.  Its pages remain quarantined and the group may
+    # not commit while rank 1 still has a live DMA fence.
+    assert ranks[0].mark_io_quiesced("stagger:0", leases[0], "attempt")
+    assert ranks[0].tp_retire_ready("stagger:0")
+    assert not ranks[1].tp_retire_ready("stagger:0")
+    assert not ranks[1].commit_tp_retire("stagger:0")
+    for broker, allocator in zip(ranks, allocators):
+        broker.service(allocator)
+        assert broker.get("stagger:0", owner=owner) is not None
+
+    assert ranks[1].mark_io_quiesced("stagger:0", leases[1], "attempt")
+    assert all(broker.tp_retire_ready("stagger:0") for broker in ranks)
+    assert all(broker.commit_tp_retire("stagger:0") for broker in ranks)
+    for broker, allocator in zip(ranks, allocators):
+        broker.service(allocator)
+        assert broker.get("stagger:0") is None
+        assert allocator.available == 8
+    assert ranks[0].prepare_tp_plan(3) == ()
+
+
+def test_tp_workset_epoch_rejects_stale_and_shape_mismatch():
+    broker = AgenticPWorksetLeaseBroker(page_size=4)
+    owner = broker.direct_owner("shape:0")
+    broker.request("shape:0", 4, 8, owner=owner)
+    broker.install_tp_plan(3, (("shape:0", owner, 4, 8),))
+    # Replaying the exact native broadcast is idempotent; an older epoch or a
+    # same-epoch content change is rejected.
+    broker.install_tp_plan(3, (("shape:0", owner, 4, 8),))
+    with pytest.raises(RuntimeError, match="stale TP workset epoch"):
+        broker.install_tp_plan(2, (("shape:0", owner, 4, 8),))
+    with pytest.raises(RuntimeError, match="disagrees with local intent"):
+        broker.install_tp_plan(4, (("shape:0", owner, 4, 12),))
+
+
+def test_tp_workset_epoch_replay_includes_authoritative_retirements():
+    broker = AgenticPWorksetLeaseBroker(page_size=4)
+    owner = broker.direct_owner("retire-replay:0")
+    broker.request("retire-replay:0", 4, 8, owner=owner)
+    assert broker.prepare_tp_retire("retire-replay:0")
+
+    plan = broker.prepare_tp_plan(
+        3,
+        retiring_ids=("retire-replay:0",),
+    )
+    broker.install_tp_plan(
+        3,
+        plan,
+        retiring_ids=("retire-replay:0",),
+    )
+
+    with pytest.raises(RuntimeError, match="replayed with new content"):
+        broker.install_tp_plan(3, plan, retiring_ids=())
+
+
+def test_tp_workset_install_materializes_retire_tombstone_before_return():
+    class Allocator:
+        def available_size(self):
+            return 8
+
+        def alloc(self, count):
+            return torch.arange(count)
+
+        def free(self, _indices):
+            pass
+
+    broker = AgenticPWorksetLeaseBroker(page_size=4)
+    owner = broker.direct_owner("follower-retire:0")
+    broker.request("follower-retire:0", 4, 8, owner=owner)
+    plan = broker.prepare_tp_plan(1)
+    broker.service(Allocator())
+    lease = broker.get("follower-retire:0", owner=owner)
+    assert lease is not None
+
+    broker.install_tp_plan(
+        2,
+        plan,
+        retiring_ids=("follower-retire:0",),
+    )
+    assert broker.tp_retire_candidates == ("follower-retire:0",)
+    assert not broker.begin_io_attempt(
+        "follower-retire:0", lease, "must-not-start"
+    )
+    assert not broker.begin_bind("follower-retire:0", lease)
+
+
+def test_tp_workset_control_freezes_async_retire_with_plan():
+    class Allocator:
+        def __init__(self):
+            self.available = 8
+
+        def available_size(self):
+            return self.available
+
+        def alloc(self, count):
+            self.available -= count
+            return torch.arange(count)
+
+        def free(self, indices):
+            self.available += int(indices.numel())
+
+    broker = AgenticPWorksetLeaseBroker(page_size=4)
+    owner = broker.direct_owner("async-retire:0")
+    broker.request("async-retire:0", 4, 8, owner=owner)
+    broker.prepare_tp_plan(1)
+    broker.service(Allocator())
+    lease = broker.get("async-retire:0", owner=owner)
+    assert lease is not None
+
+    # Model the old scheduler race: it sampled no candidates, then an async
+    # completion requested release before the plan was frozen.  The atomic
+    # control transaction must include that new terminal decision.
+    sampled_before_release = broker.tp_retire_candidates
+    assert sampled_before_release == ()
+    assert broker.request_release("async-retire:0", lease, owner=owner)
+    plan, retiring, handoffs = broker.prepare_tp_control(
+        2,
+        retiring_ids=sampled_before_release,
+    )
+    assert plan == (("async-retire:0", owner, 4, 8),)
+    assert retiring == ("async-retire:0",)
+    assert handoffs == ()
+    assert not broker.begin_io_attempt(
+        "async-retire:0", lease, "must-not-restart"
+    )
+
+
+def test_tp_workset_final_suffix_broadcasts_group_handoff_without_free():
+    class Allocator:
+        def __init__(self):
+            self.available = 8
+
+        def available_size(self):
+            return self.available
+
+        def alloc(self, count):
+            self.available -= count
+            return torch.arange(count)
+
+        def free(self, indices):
+            self.available += int(indices.numel())
+
+    ranks = [AgenticPWorksetLeaseBroker(page_size=4) for _ in range(2)]
+    allocators = [Allocator(), Allocator()]
+    owner = ranks[0].direct_owner("handed-stagger:0")
+    ranks[0].request("handed-stagger:0", 4, 8, owner=owner)
+    plan1 = ranks[0].prepare_tp_plan(1)
+    ranks[1].install_tp_plan(1, plan1)
+    for broker, allocator in zip(ranks, allocators):
+        broker.service(allocator)
+        lease = broker.get("handed-stagger:0", owner=owner)
+        assert lease is not None
+        lease.parent_bound = True
+        req = SimpleNamespace(origin_input_ids=[0] * 8)
+        assert broker.begin_bind("handed-stagger:0", lease)
+        broker.handoff_to_req("handed-stagger:0", req, lease)
+
+    # Native TP scheduling consumes the same logical model row on every rank.
+    # Only after every shard has transferred ownership to its native Req may
+    # TP0 publish the idempotent group handoff acknowledgement.
+    for broker in ranks:
+        lease = broker.get("handed-stagger:0", owner=owner)
+        assert lease is not None
+        broker.consume_suffix(lease, 4, final_prompt_chunk=True)
+    plan2, retiring, handoffs = ranks[0].prepare_tp_control(2)
+    assert plan2 == ()
+    assert retiring == ()
+    assert handoffs == ("handed-stagger:0",)
+    for broker in ranks:
+        broker.install_tp_plan(2, plan2)
+        assert broker.commit_tp_handoff("handed-stagger:0")
+        assert broker.commit_tp_handoff("handed-stagger:0")
+    assert all(broker.get("handed-stagger:0") is None for broker in ranks)
+    assert allocators[0].available == allocators[1].available == 0
+
+
+def test_tp_workset_handed_cancel_still_requires_group_retire():
+    class Allocator:
+        def __init__(self):
+            self.available = 8
+
+        def available_size(self):
+            return self.available
+
+        def alloc(self, count):
+            self.available -= count
+            return torch.arange(count)
+
+        def free(self, indices):
+            self.available += int(indices.numel())
+
+    broker = AgenticPWorksetLeaseBroker(page_size=4)
+    allocator = Allocator()
+    owner = broker.direct_owner("handed-cancel:0")
+    broker.request("handed-cancel:0", 4, 8, owner=owner)
+    broker.prepare_tp_plan(1)
+    broker.service(allocator)
+    lease = broker.get("handed-cancel:0", owner=owner)
+    assert lease is not None
+    lease.parent_bound = True
+    req = SimpleNamespace(origin_input_ids=[0] * 8)
+    assert broker.begin_bind("handed-cancel:0", lease)
+    broker.handoff_to_req("handed-cancel:0", req, lease)
+    assert broker.prepare_tp_plan(2) == (
+        ("handed-cancel:0", owner, 4, 8),
+    )
+
+    assert broker.release_handed("handed-cancel:0", lease, req=req)
+    assert broker.tp_retire_candidates == ("handed-cancel:0",)
+    broker.service(allocator)
+    assert broker.get("handed-cancel:0", owner=owner) is lease
+    assert allocator.available == 0
+
+    assert broker.prepare_tp_retire("handed-cancel:0")
+    assert broker.commit_tp_retire("handed-cancel:0")
+    broker.service(allocator)
+    assert broker.get("handed-cancel:0") is None
+    # Parent pages are Radix-owned; only the unconsumed suffix returns here.
+    assert allocator.available == 4
+
+
+def test_tp_workset_binding_retry_may_finish_one_rank_later():
+    class Allocator:
+        def __init__(self):
+            self.available = 8
+
+        def available_size(self):
+            return self.available
+
+        def alloc(self, count):
+            self.available -= count
+            return torch.arange(count)
+
+        def free(self, indices):
+            self.available += int(indices.numel())
+
+    ranks = [AgenticPWorksetLeaseBroker(page_size=4) for _ in range(2)]
+    allocators = [Allocator(), Allocator()]
+    owner = ranks[0].direct_owner("binding-stagger:0")
+    ranks[0].request("binding-stagger:0", 4, 8, owner=owner)
+    plan1 = ranks[0].prepare_tp_plan(1)
+    ranks[1].install_tp_plan(1, plan1)
+    reqs = [SimpleNamespace(origin_input_ids=[0] * 8) for _ in ranks]
+    leases = []
+    for broker, allocator in zip(ranks, allocators):
+        broker.service(allocator)
+        lease = broker.get("binding-stagger:0", owner=owner)
+        assert lease is not None
+        lease.parent_bound = True
+        assert broker.begin_bind("binding-stagger:0", lease)
+        leases.append(lease)
+
+    ranks[0].handoff_to_req("binding-stagger:0", reqs[0], leases[0])
+    plan2 = ranks[0].prepare_tp_plan(2)
+    assert plan2 == (("binding-stagger:0", owner, 4, 8),)
+    ranks[1].install_tp_plan(2, plan2)
+    ranks[1].service(allocators[1])
+    assert ranks[1].get("binding-stagger:0", owner=owner).state == "binding"
+    assert allocators[0].available == allocators[1].available == 0
+
+    ranks[1].handoff_to_req("binding-stagger:0", reqs[1], leases[1])
+    for broker, lease in zip(ranks, leases):
+        broker.consume_suffix(lease, 4, final_prompt_chunk=True)
+    assert all(broker.get("binding-stagger:0") is None for broker in ranks)
+    assert allocators[0].available == allocators[1].available == 0
+
+
+def test_tp_workset_handoff_commit_rejects_a_follower_rank_split():
+    class Allocator:
+        def __init__(self):
+            self.available = 8
+
+        def available_size(self):
+            return self.available
+
+        def alloc(self, count):
+            self.available -= count
+            return torch.arange(count)
+
+        def free(self, indices):
+            self.available += int(indices.numel())
+
+    ranks = [AgenticPWorksetLeaseBroker(page_size=4) for _ in range(2)]
+    allocators = [Allocator(), Allocator()]
+    snapshot_id = "binding-handoff-stagger:0"
+    owner = ranks[0].direct_owner(snapshot_id)
+    ranks[0].request(snapshot_id, 4, 8, owner=owner)
+    plan1 = ranks[0].prepare_tp_plan(1)
+    ranks[1].install_tp_plan(1, plan1)
+    reqs = [SimpleNamespace(origin_input_ids=[0] * 8) for _ in ranks]
+    leases = []
+    for broker, allocator in zip(ranks, allocators):
+        broker.service(allocator)
+        lease = broker.get(snapshot_id, owner=owner)
+        assert lease is not None
+        lease.parent_bound = True
+        assert broker.begin_bind(snapshot_id, lease)
+        leases.append(lease)
+
+    ranks[0].handoff_to_req(snapshot_id, reqs[0], leases[0])
+    ranks[0].consume_suffix(leases[0], 4, final_prompt_chunk=True)
+    plan2, retiring, handoffs = ranks[0].prepare_tp_control(2)
+    assert plan2 == ()
+    assert retiring == ()
+    assert handoffs == (snapshot_id,)
+
+    ranks[0].install_tp_plan(2, plan2)
+    ranks[1].install_tp_plan(2, plan2)
+    assert ranks[0].commit_tp_handoff(snapshot_id)
+    # A follower that has not consumed the same model row is not allowed to
+    # catch up after TP0.  Continuing would assign collective rows to different
+    # requests, so the group must fail closed at this boundary.
+    assert not ranks[1].commit_tp_handoff(snapshot_id)
+    assert ranks[1].get(snapshot_id, owner=owner).state == "binding"
+
+
+def test_tp1_workset_binding_abort_preserves_original_release_behavior():
+    class Allocator:
+        def __init__(self):
+            self.available = 8
+
+        def available_size(self):
+            return self.available
+
+        def alloc(self, count):
+            self.available -= count
+            return torch.arange(count)
+
+        def free(self, indices):
+            self.available += int(indices.numel())
+
+    broker = AgenticPWorksetLeaseBroker(page_size=4)
+    allocator = Allocator()
+    snapshot_id = "tp1-bind-abort:0"
+    owner = broker.direct_owner(snapshot_id)
+    broker.request(snapshot_id, 4, 8, owner=owner)
+    broker.service(allocator)
+    lease = broker.get(snapshot_id, owner=owner)
+    assert lease is not None
+    assert broker.begin_bind(snapshot_id, lease)
+    assert broker.abort_bind(snapshot_id, lease, parent_bound=False)
+    broker.service(allocator)
+    assert broker.get(snapshot_id) is None
+    assert allocator.available == 8
+
+
+def test_tp_workset_epoch_releases_then_allocates_in_group_order():
+    class Allocator:
+        def __init__(self):
+            self.available = 8
+            self.next_index = 0
+
+        def available_size(self):
+            return self.available
+
+        def alloc(self, count):
+            if count > self.available:
+                return None
+            self.available -= count
+            result = torch.arange(self.next_index, self.next_index + count)
+            self.next_index += count
+            return result
+
+        def free(self, indices):
+            self.available += int(indices.numel())
+
+    rank0 = AgenticPWorksetLeaseBroker(page_size=4)
+    rank1 = AgenticPWorksetLeaseBroker(page_size=4)
+    owner_a = rank0.direct_owner("replace-a:0")
+    owner_b = rank0.direct_owner("replace-b:0")
+    rank0.request("replace-a:0", 4, 8, owner=owner_a)
+    plan1 = rank0.prepare_tp_plan(1)
+    rank1.install_tp_plan(1, plan1)
+    allocator0, allocator1 = Allocator(), Allocator()
+    rank0.service(allocator0)
+    rank1.service(allocator1)
+    lease_a = rank0.get("replace-a:0", owner=owner_a)
+    assert rank0.request_release("replace-a:0", lease_a, owner=owner_a)
+    rank0.request("replace-b:0", 4, 8, owner=owner_b)
+
+    plan2 = rank0.prepare_tp_plan(2)
+    assert [entry[0] for entry in plan2] == ["replace-a:0", "replace-b:0"]
+    rank1.install_tp_plan(2, plan2)
+    assert rank0.prepare_tp_retire("replace-a:0")
+    assert rank1.prepare_tp_retire("replace-a:0")
+    assert rank0.commit_tp_retire("replace-a:0")
+    assert rank1.commit_tp_retire("replace-a:0")
+    rank0.service(allocator0)
+    rank1.service(allocator1)
+    assert rank0.get("replace-a:0") is rank1.get("replace-a:0") is None
+    assert rank0.get("replace-b:0", owner=owner_b) is not None
+    assert rank1.get("replace-b:0", owner=owner_b) is not None
+    assert allocator0.available == allocator1.available == 0
 
 
 def test_workset_reserve_never_delays_a_release():
@@ -3178,6 +4053,45 @@ def test_tp_p2d_host_write_ready_is_a_monotonic_boundary():
     )
 
 
+def test_host_ready_retires_only_the_racing_unstarted_direct_workset():
+    """A complete Slow copy supersedes a Direct grant that never started I/O."""
+
+    snapshot_id = "slow-won:0"
+    cancelled = []
+
+    class Broker:
+        @staticmethod
+        def direct_owner(observed_snapshot_id):
+            return f"direct:{observed_snapshot_id}"
+
+        @staticmethod
+        def supersede_unstarted(observed_snapshot_id, *, owner=None):
+            cancelled.append((observed_snapshot_id, owner))
+            return True
+
+    record = {
+        "offer": {"token_count": 128, "byte_size": 4096},
+    }
+    manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
+    manager._state_lock = threading.RLock()
+    manager.active = {snapshot_id: record}
+    manager.host_ready = {}
+    manager.workset_broker = Broker()
+    manager.ledger = SimpleNamespace(
+        get=lambda observed_snapshot_id: (
+            {"state": HostStageState.HOST_READY.value}
+            if observed_snapshot_id == snapshot_id
+            else None
+        )
+    )
+
+    manager._poll_active()
+
+    assert cancelled == [(snapshot_id, f"direct:{snapshot_id}")]
+    assert manager.active == {}
+    assert manager.host_ready == {snapshot_id: record}
+
+
 def test_tp_p2d_host_wait_fails_closed_instead_of_hanging():
     with pytest.raises(RuntimeError, match="terminated in failed"):
         _raise_if_p2d_host_failed(
@@ -3823,6 +4737,67 @@ def test_tp_host_h2d_progresses_on_independent_worker_after_group_prepare():
     assert record["loading"] == "h2d"
 
 
+def test_completed_host_dma_waits_for_scheduler_owned_handoff_before_release():
+    """The I/O worker cannot release Host at an all-rank ledger ACK.
+
+    The final TP binder changes the shared ledger to CONSUMED before the
+    scheduler's native COMMIT broadcast reaches both ranks.  Host ownership
+    must therefore remain local until gate_request() hands the workset to the
+    exact live Req on this rank.
+    """
+
+    request = RequestGeneration("host-commit-race", 1)
+    load = {
+        "request_generation": request,
+        "io_error": None,
+        "io_complete": True,
+    }
+    released = []
+    manager = SimpleNamespace(
+        tp_size=2,
+        tp_rank=0,
+        loads={"child": load},
+        ledger=SimpleNamespace(
+            get=lambda _snapshot_id: {"state": HostStageState.CONSUMED.value}
+        ),
+        _h2d_poisoned=False,
+        _get_state_lock=nullcontext,
+        _release_completed_h2d_host=lambda selected: released.append(selected),
+    )
+
+    AgenticPHostStagingManager._progress_h2d_loads(manager)
+
+    assert manager.loads == {"child": load}
+    assert released == []
+
+
+def test_tp1_completed_host_dma_releases_lane_without_group_commit_wait():
+    """TP=1 must not retain a completed load in the finite H2D lane pool."""
+
+    request = RequestGeneration("host-complete-tp1", 1)
+    load = {
+        "request_generation": request,
+        "io_error": None,
+        "io_complete": True,
+    }
+    released = []
+    manager = SimpleNamespace(
+        tp_size=1,
+        tp_rank=0,
+        loads={"child": load},
+        ledger=SimpleNamespace(
+            get=lambda _snapshot_id: {"state": HostStageState.CONSUMED.value}
+        ),
+        _h2d_poisoned=False,
+        _get_state_lock=nullcontext,
+        _release_completed_h2d_host=lambda selected: released.append(selected),
+    )
+
+    AgenticPHostStagingManager._progress_h2d_loads(manager)
+
+    assert released == [load]
+
+
 def test_tp_host_h2d_failure_rearms_complete_host_snapshot_without_recompute():
     request = RequestGeneration("host-failure", 2)
     state = {"value": HostStageState.H2D_LOADING.value}
@@ -4247,6 +5222,57 @@ def test_prefill_priority_puts_owned_worksets_before_unrunnable_fast_fallbacks()
     ]
 
 
+def test_tp_prefill_priority_is_independent_of_local_io_completion_order():
+    def req(rid, sequence, priority, queue_class, *, workset_backed=False):
+        return SimpleNamespace(
+            rid=rid,
+            _agentic_tp_prefill_sequence=sequence,
+            _agentic_tp_prefill_priority=priority,
+            _agentic_kv_queue_class=queue_class,
+            _agentic_workset_backed=workset_backed,
+            _agentic_workset_suffix_indices=(
+                torch.arange(8) if workset_backed else None
+            ),
+        )
+
+    # The older parent has not acquired a workset; the newer two have.  Both
+    # ranks must prioritize the group-committed worksets despite observing
+    # their local I/O completion in opposite wall-clock order.
+    parent0 = req("parent-0", 0, 0, "slow")
+    new1 = req("new-1", 1, 1, "new")
+    parent2 = req("parent-2", 2, 0, "fast", workset_backed=True)
+    new3 = req("new-3", 3, 1, "new", workset_backed=True)
+    rank0 = SimpleNamespace(
+        tp_size=2,
+        waiting_queue=[parent0, new1, parent2, new3],
+    )
+    # Model the other shard completing Direct/Slow I/O in the opposite order.
+    rank1 = SimpleNamespace(
+        tp_size=2,
+        waiting_queue=[new3, parent2, new1, parent0],
+    )
+
+    Scheduler._prioritize_agentic_prefill_ready(rank0)
+    Scheduler._prioritize_agentic_prefill_ready(rank1)
+
+    expected = ["parent-2", "new-3", "parent-0", "new-1"]
+    assert [item.rid for item in rank0.waiting_queue] == expected
+    assert [item.rid for item in rank1.waiting_queue] == expected
+
+
+def test_tp_prefill_priority_has_deterministic_fallback_for_legacy_requests():
+    first = SimpleNamespace(rid="a", _agentic_tp_prefill_priority=1)
+    second = SimpleNamespace(rid="b", _agentic_tp_prefill_priority=1)
+    rank0 = SimpleNamespace(tp_size=2, waiting_queue=[second, first])
+    rank1 = SimpleNamespace(tp_size=2, waiting_queue=[first, second])
+
+    Scheduler._prioritize_agentic_prefill_ready(rank0)
+    Scheduler._prioritize_agentic_prefill_ready(rank1)
+
+    assert [item.rid for item in rank0.waiting_queue] == ["a", "b"]
+    assert [item.rid for item in rank1.waiting_queue] == ["a", "b"]
+
+
 def test_tp_direct_worker_defers_failed_page_release_to_owner_scheduler():
     """A TP ingress worker must not free GPU pages outside the model loop."""
 
@@ -4311,6 +5337,151 @@ def test_tp_direct_stale_offer_aborts_instead_of_blocking_group():
         scheduler, request, arrived_at=time.time(), prefill_domain=0
     )
     assert scheduler.agentic_tp_direct_local_failed == {request.snapshot_id}
+
+
+def test_stale_direct_arrival_retires_a_granted_unstarted_workset(monkeypatch):
+    """D fallback cannot leave its earlier Direct reservation in P HBM."""
+
+    monkeypatch.setenv("SGLANG_PD_LATE_BIND_DYNAMIC_PREFILL_DOMAINS", "0")
+    request = RequestGeneration("stale-direct-grant", 1)
+    arrived_at = time.time()
+    manifest = SimpleNamespace(
+        request=request,
+        state=SnapshotState.SLOW_FALLBACK,
+        created_at=arrived_at,
+        token_count=1024,
+    )
+    cancelled = []
+    broker = SimpleNamespace(
+        owner_is_superseded=lambda *_args, **_kwargs: False,
+        cancel_unstarted=lambda snapshot_id, *, owner=None: cancelled.append(
+            (snapshot_id, owner)
+        )
+    )
+    scheduler = SimpleNamespace(
+        tp_size=2,
+        tp_rank=0,
+        agentic_early_claim_store=object(),
+        agentic_tp_direct_admission_active={},
+        agentic_early_direct_admission_queue=deque(
+            [
+                (
+                    request,
+                    {"arrived_at": arrived_at, "prompt_token_count": 2048},
+                    manifest,
+                )
+            ]
+        ),
+        agentic_early_direct_admission_ids={request.snapshot_id},
+        agentic_early_direct_receives={},
+        agentic_early_direct_terminal={},
+        agentic_p_workset_broker=broker,
+        server_args=SimpleNamespace(page_size=64),
+    )
+
+    Scheduler._agentic_admit_queued_direct_receives(
+        scheduler,
+        SimpleNamespace(load=lambda *_args, **_kwargs: manifest),
+        2.0,
+        nullcontext(),
+    )
+
+    assert cancelled == [
+        (
+            request.snapshot_id,
+            AgenticPWorksetLeaseBroker.direct_owner(request.snapshot_id),
+        )
+    ]
+    assert not scheduler.agentic_early_direct_admission_queue
+
+
+def test_direct_grant_refreshes_cached_manifest_before_start(monkeypatch):
+    """A queued DIRECT_READY object cannot hide D's later Slow fallback."""
+
+    monkeypatch.setenv("SGLANG_PD_LATE_BIND_DYNAMIC_PREFILL_DOMAINS", "0")
+    request = RequestGeneration("cached-direct-grant", 1)
+    arrived_at = time.time()
+    direct = SimpleNamespace(
+        request=request,
+        state=SnapshotState.DIRECT_READY,
+        created_at=arrived_at,
+        token_count=1024,
+    )
+    slow = SimpleNamespace(
+        request=request,
+        state=SnapshotState.SLOW_FALLBACK,
+        created_at=arrived_at,
+        token_count=1024,
+    )
+    authoritative = {"manifest": direct}
+    get_calls = []
+    lease = object()
+    cancelled = []
+
+    def get_lease(*_args, **_kwargs):
+        get_calls.append(True)
+        return None if len(get_calls) == 1 else lease
+
+    broker = SimpleNamespace(
+        owner_is_superseded=lambda *_args, **_kwargs: False,
+        request=lambda *_args, **_kwargs: True,
+        get=get_lease,
+        cancel_unstarted=lambda snapshot_id, *, owner=None: cancelled.append(
+            (snapshot_id, owner)
+        ),
+    )
+    scheduler = SimpleNamespace(
+        tp_size=2,
+        tp_rank=0,
+        agentic_early_claim_store=object(),
+        agentic_tp_direct_admission_active={},
+        agentic_early_direct_admission_queue=deque(
+            [
+                (
+                    request,
+                    {"arrived_at": arrived_at, "prompt_token_count": 2048},
+                    direct,
+                )
+            ]
+        ),
+        agentic_early_direct_admission_ids={request.snapshot_id},
+        agentic_early_direct_receives={},
+        agentic_early_direct_terminal={},
+        agentic_p_workset_broker=broker,
+        agentic_tp_direct_mailbox=SimpleNamespace(
+            publish_receipt=lambda *_args: (_ for _ in ()).throw(
+                AssertionError("stale grant must not be published")
+            )
+        ),
+        server_args=SimpleNamespace(page_size=64),
+    )
+    store = SimpleNamespace(
+        load=lambda *_args, **_kwargs: authoritative["manifest"]
+    )
+
+    # First pass publishes the intent but receives no physical lease, so the
+    # queue retains its cached DIRECT_READY object.
+    Scheduler._agentic_admit_queued_direct_receives(
+        scheduler, store, 2.0, nullcontext()
+    )
+    assert len(scheduler.agentic_early_direct_admission_queue) == 1
+    assert scheduler.agentic_early_direct_admission_queue[0][2] is direct
+
+    # D falls back before the scheduler grants the intent.  The second pass
+    # obtains that grant but must refresh the store and retire it immediately.
+    authoritative["manifest"] = slow
+    Scheduler._agentic_admit_queued_direct_receives(
+        scheduler, store, 2.0, nullcontext()
+    )
+
+    assert cancelled == [
+        (
+            request.snapshot_id,
+            AgenticPWorksetLeaseBroker.direct_owner(request.snapshot_id),
+        )
+    ]
+    assert not scheduler.agentic_early_direct_admission_queue
+    assert not scheduler.agentic_tp_direct_admission_active
 
 
 def test_tp_host_timeout_is_diagnostic_and_retains_parent():
@@ -4548,6 +5719,8 @@ def test_tp_prefill_worker_activation_preserves_producer_sequence():
 def test_tp_prefill_batch_control_preserves_identical_order_on_all_ranks():
     control = {
         Scheduler._AGENTIC_TP_CONTROL_KEY: True,
+        "workset_plan_epoch": 1,
+        "workset_allocation_plan": [],
         "direct_commands": [],
         "prefill_transfer_keys": [("first", 10), ("second", 20)],
         "prefill_transfer_statuses": [
@@ -4579,6 +5752,9 @@ def test_tp_prefill_batch_control_preserves_identical_order_on_all_ranks():
             agentic_tp_host_command_visible=False,
             agentic_tp_host_group_status=0,
             agentic_host_staging_manager=None,
+            agentic_p_workset_broker=SimpleNamespace(
+                    install_tp_plan=lambda *_args, **_kwargs: None
+            ),
         )
 
     schedulers = [rank(0), rank(1)]
@@ -4603,6 +5779,8 @@ def test_tp_direct_control_round_trip_preserves_local_workset_lease():
     snapshot_id = request.snapshot_id
     control = {
         Scheduler._AGENTIC_TP_CONTROL_KEY: True,
+        "workset_plan_epoch": 1,
+        "workset_allocation_plan": [],
         "direct_commands": [
             {
                 "snapshot": snapshot_id,
@@ -4646,7 +5824,8 @@ def test_tp_direct_control_round_trip_preserves_local_workset_lease():
         agentic_early_direct_receives={},
         agentic_early_direct_poll_lock=direct_lock,
         agentic_p_workset_broker=SimpleNamespace(
-            get=lambda *_args, **_kwargs: None
+            get=lambda *_args, **_kwargs: None,
+                install_tp_plan=lambda *_args, **_kwargs: None,
         ),
         agentic_tp_host_local_admitted=set(),
         agentic_tp_host_active=None,
@@ -4822,6 +6001,49 @@ def test_tp_prefill_background_progress_submits_without_scheduler_control():
         assert progress(schedulers[0], requests[0]) == int(KVPoll.Transferring)
         assert progress(schedulers[1], requests[1]) == int(KVPoll.Transferring)
         assert submissions == [1, 1]
+
+
+def test_tp_prefill_background_keeps_scheduler_terminal_after_mailbox_cleanup():
+    """A late worker must not resurrect a scheduler-retired transfer."""
+
+    with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+        namespace = f"p2d-retired-terminal-{time.time_ns()}"
+        sender = TPGroupMailbox(
+            f"{namespace}-sender", tp_rank=1, tp_size=2, directory=directory
+        )
+        receiver = TPGroupMailbox(
+            f"{namespace}-receiver", tp_rank=1, tp_size=2, directory=directory
+        )
+
+        class ClearedSender:
+            def poll(self):
+                raise AssertionError("retired transport must not be polled")
+
+        request = SimpleNamespace(
+            rid="retired-transfer",
+            bootstrap_room=321,
+            disagg_kv_sender=ClearedSender(),
+            disagg_p_ready_transfer_started=True,
+            _agentic_p2d_group_terminal=int(KVPoll.Success),
+        )
+        scheduler = SimpleNamespace(
+            tp_size=2,
+            tp_rank=1,
+            agentic_tp_p2d_sender_mailbox=sender,
+            agentic_tp_p2d_receiver_mailbox=receiver,
+            agentic_p2d_host_staging_manager=None,
+        )
+        scheduler._prefill_transfer_key = (
+            SchedulerDisaggregationPrefillMixin._prefill_transfer_key
+        )
+
+        poll = (
+            SchedulerDisaggregationPrefillMixin._prefill_transfer_progress_tp_req_once(
+                scheduler, request
+            )
+        )
+
+        assert poll == int(KVPoll.Success)
 
 
 def test_tp_prefill_cleanup_waits_for_every_scheduler_rank():
@@ -5329,6 +6551,54 @@ def test_slow_fallback_offer_retry_retains_d_kv_until_host_staging(tp_world_size
     assert not releases and not popped
 
 
+def test_tp_slow_offer_uses_rank0_manifest_token_identity():
+    """Follower sampling metadata must not redefine a logical TP snapshot."""
+
+    request = RequestGeneration("tp-slow-authoritative", 1)
+    authoritative_tokens = [11, 12, 13]
+    manifest = SnapshotManifest(
+        request=request,
+        page_keys=(),
+        token_count=len(authoritative_tokens),
+        byte_size=0,
+        state=SnapshotState.SLOW_FALLBACK,
+        token_digest=token_ids_digest(authoritative_tokens),
+        tp_size=2,
+    )
+    captured = []
+    client = SimpleNamespace(
+        retain_logical_hashes=False,
+        arena_domain=0,
+        arena_numa_node=1,
+        offer=lambda **kwargs: captured.append(kwargs),
+    )
+    manager = SimpleNamespace(
+        tp_world_size=2,
+        tp_rank=1,
+        agentic_host_staging_client=client,
+        agentic_direct_runtime=SimpleNamespace(
+            manager=SimpleNamespace(kv_args=SimpleNamespace(kv_item_lens=[64]))
+        ),
+        _assign_slow_prefill_target=lambda _candidate: None,
+    )
+    candidate = {
+        "metadata": SimpleNamespace(current=request),
+        # A follower may not own the authoritative sampled token-id view, even
+        # though its KV shard covers exactly the same logical positions.
+        "tokens": [91, 92, 93],
+        "source_token_indices": torch.tensor([3, 4, 5], dtype=torch.int64),
+        "source_page_indices": [3],
+        "selected_arena_numa_nodes": [0, 1],
+    }
+
+    assert DecodeKVCacheOffloadManager._start_agentic_host_staging(
+        manager, candidate, manifest
+    )
+    assert candidate["staging"] is True
+    assert captured[0]["token_count"] == len(authoritative_tokens)
+    assert captured[0]["token_digest"] == manifest.token_digest
+
+
 def test_nixl_sender_records_each_posted_handle_once_and_completes():
     room = 44
     kv_handle = object()
@@ -5539,6 +6809,7 @@ def test_tp_direct_rank0_background_grant_starts_all_followers(monkeypatch):
                 agentic_early_direct_receives={},
                 agentic_early_direct_terminal={},
                     agentic_p_workset_broker=SimpleNamespace(
+                        owner_is_superseded=lambda *_args, **_kwargs: False,
                         request=lambda *_args, **_kwargs: None,
                         get=lambda _snapshot_id, **_kwargs: object(),
                         request_release=lambda *_args: None,
@@ -6180,7 +7451,8 @@ def test_tp_direct_peer_abort_waits_for_ordered_scheduler_rollback():
             agentic_tp_direct_local_failed=set(),
             agentic_tp_direct_local_admitted=set(),
                 agentic_p_workset_broker=SimpleNamespace(
-                    request_release=lambda *_args, **_kwargs: None
+                    request_release=lambda *_args, **_kwargs: None,
+                        install_tp_plan=lambda *_args, **_kwargs: None,
                 ),
             agentic_tp_host_local_admitted=set(),
             agentic_tp_host_active=None,
@@ -6211,6 +7483,8 @@ def test_tp_direct_peer_abort_waits_for_ordered_scheduler_rollback():
 
         control = {
             Scheduler._AGENTIC_TP_CONTROL_KEY: True,
+            "workset_plan_epoch": 1,
+            "workset_allocation_plan": [],
             "direct_commands": [
                 {
                     "snapshot": request.snapshot_id,
@@ -6261,8 +7535,9 @@ def test_tp1_direct_arrival_starts_without_scheduler_reservation_queue(monkeypat
         agentic_early_direct_admission_ids={request.snapshot_id},
         agentic_early_direct_receives={},
         agentic_early_direct_terminal={},
-        agentic_p_workset_broker=SimpleNamespace(
-            request=lambda *_args, **_kwargs: None,
+            agentic_p_workset_broker=SimpleNamespace(
+                owner_is_superseded=lambda *_args, **_kwargs: False,
+                request=lambda *_args, **_kwargs: None,
             get=lambda _snapshot_id, **_kwargs: object(),
             request_release=lambda *_args: None,
         ),
@@ -6307,8 +7582,9 @@ def test_direct_arrival_waits_until_complete_workset_is_granted(monkeypatch):
         agentic_early_direct_admission_ids={request.snapshot_id},
         agentic_early_direct_receives={},
         agentic_early_direct_terminal={},
-        agentic_p_workset_broker=SimpleNamespace(
-            request=lambda *_args, **_kwargs: None,
+            agentic_p_workset_broker=SimpleNamespace(
+                owner_is_superseded=lambda *_args, **_kwargs: False,
+                request=lambda *_args, **_kwargs: None,
             get=lambda _snapshot_id, **_kwargs: None,
             request_release=lambda *_args: None,
         ),

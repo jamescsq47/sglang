@@ -1842,9 +1842,23 @@ class DecodeKVCacheOffloadManager:
         # Shared-Arena operation that may raise, so a retry remains idempotent
         # instead of trying to reacquire its own persistent claim.
         candidate["manifest"] = fallback
-        token_count = len(candidate["tokens"])
+        # TP followers do not own sampling metadata.  Their local ``Req`` may
+        # carry a token-id view that is sufficient to address the same KV
+        # positions but is not authoritative for the logical token digest.
+        # Rank 0 broadcasts the immutable SnapshotManifest when it selects
+        # Slow, so every shard must publish that manifest's count/digest.
+        # Recomputing either value from each rank's local ``tokens`` can make
+        # an otherwise valid TP snapshot fail the all-rank Host offer.
+        token_count = int(fallback.token_count)
+        token_digest = fallback.token_digest
         token_indices = candidate["source_token_indices"]
         source_pages = candidate["source_page_indices"]
+        if int(token_indices.numel()) != token_count:
+            raise RuntimeError(
+                "TP Host staging source length disagrees with the "
+                f"authoritative manifest for {fallback.snapshot_id}: "
+                f"source={int(token_indices.numel())} manifest={token_count}"
+            )
         logical_hashes = (
             self._compute_prefix_hash(candidate["tokens"])
             if self.agentic_host_staging_client.retain_logical_hashes
@@ -1858,7 +1872,7 @@ class DecodeKVCacheOffloadManager:
             manifest=fallback,
             metadata=metadata,
             token_count=token_count,
-            token_digest=token_ids_digest(candidate["tokens"]),
+            token_digest=token_digest,
             logical_hashes=logical_hashes,
             byte_size=bytes_per_page * len(source_pages),
             arena_domain=int(

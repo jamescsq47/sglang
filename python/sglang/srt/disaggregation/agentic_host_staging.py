@@ -3714,6 +3714,21 @@ class AgenticPHostStagingManager:
                 continue
             state = ledger_entry.get("state")
             if state == HostStageState.HOST_READY.value:
+                # The complete Shared-Host snapshot is now the authoritative
+                # parent copy.  A Direct marker may have raced the D timeout:
+                # its workset can already be allocated even though no Direct
+                # DMA ever started.  Retire only that unstarted Direct owner
+                # before Slow recovery asks for the same request-generation
+                # workset.  In TP mode the broker turns this into the normal
+                # group-synchronous retirement; an in-flight Direct attempt is
+                # deliberately untouched and must finish through its own
+                # transport terminal path.
+                workset_broker = getattr(self, "workset_broker", None)
+                if workset_broker is not None:
+                    workset_broker.supersede_unstarted(
+                        snapshot_id,
+                        owner=workset_broker.direct_owner(snapshot_id),
+                    )
                 # HOST_READY means D has finished writing the complete tmpfs
                 # extent; it does *not* mean P needs the snapshot now.  Eagerly
                 # cudaHostRegister-ing every completed extent caused bursts of
@@ -4542,7 +4557,23 @@ class AgenticPHostStagingManager:
                 self._discard_failed_h2d_load(rid, load)
                 continue
             if load.get("io_complete"):
-                self._release_completed_h2d_host(load)
+                if self.tp_size == 1:
+                    # TP=1 has no peer scheduler that still needs to observe a
+                    # group COMMIT.  Release the completed Host load now so the
+                    # physical H2D lane can accept the next Slow snapshot.  In
+                    # TP mode the source must stay pinned until every rank has
+                    # consumed the scheduler-owned handoff below.
+                    self._release_completed_h2d_host(load)
+                    continue
+                # DMA completion (and even the ledger's all-rank bind ACK) is
+                # not the ownership handoff boundary.  In TP mode the native
+                # scheduler broadcast must first make COMMIT visible to every
+                # rank, then each rank hands the same workset to its live Req.
+                # Releasing Host here races that broadcast: the rank that
+                # publishes the final binder ACK can remove its local record
+                # before consuming COMMIT, while a peer completes normally.
+                # Keep the complete Host source and load context until
+                # gate_request() performs the scheduler-owned handoff.
                 continue
             if load.get("h2d_copy_complete"):
                 self._publish_d2p_hbm_ready(load)
