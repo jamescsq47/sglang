@@ -71,3 +71,41 @@ outcome, and the code issue exposed by the run.
 - Follow-up: audit all remaining transient-failure-to-recompute branches,
   then run the canonical 300+1200 s validation. Fix process ownership in the
   launcher separately from the serving state machine.
+
+## 2026-08-28 TP1 decoupled P-ready Host staging formal validation
+
+- UTC time: 2026-08-28.
+- Commit tested: `6f4aa6c19a`.
+- Status: `completed`.
+- Model/workload/topology/concurrency: Qwen3-8B, fixed source-order n680 pure
+  BrowseComp, TP=1, 4P:4D, closed-loop c512.
+- Warmup/measurement: 301.1 s / 1200.0 s.
+- Configuration: native SGLang HiCache/Mooncake disabled; request-generation
+  D-to-P Direct and Shared Host paths enabled; decoupled P-ready Host
+  preparation and FIFO D-admission stages; 32 GiB P-to-D Shared Host Arena per
+  P; 128 GiB D-to-P Shared Host Arena per P.
+- Slime artifact path:
+  `slime/examples/pd/runs-host/new-method/formal-qwen3-8b-tp1-browsecomp-4p4d-p2d-decoupled-w300-m1200-20260828-r1`.
+  Durable result summary is in Slime commit `18b0fc5` on
+  `agent/agentic-pd-experiments`.
+- Result: 2,653 agents completed with zero failures (2.211 agents/s). Decode
+  throughput was 4,557.62 token/s total (1,139.41 token/s/D); average D Forward
+  was 98.66% per GPU. Prefill compute throughput was 30,221.24 token/s and
+  average P Forward was 78.81% per GPU. All 6,389 completed later turns reused
+  100.00% of their page-aligned parent KV, with zero extra Prefill tokens from
+  parent-KV loss. P-to-D Host staging and P-HBM release counters matched on
+  every P except for one copy still live at the abrupt measurement cutoff.
+- Data-path behavior: 6,239 settled D-to-P Direct transfers and 2,281 settled
+  fallbacks, for 73.2% Direct success. Of 2,244 Host-ready fallback snapshots,
+  2,055 had completed Host-to-P recovery by cutoff; 189 remained pending among
+  the 512 still-active closed-loop requests. No Mooncake path, eviction, or
+  recompute fallback was used.
+- Problem found: no lifecycle or parent-KV correctness failure. The formal
+  Decode result is about 2.2% below the earlier approximately 4,660 token/s
+  reference and varies by source-order trajectory phase; D-to-P Direct success
+  remains the main optimization opportunity. Router graceful shutdown can take
+  longer than 120 s while c512 HTTP requests are active, although supervised
+  cleanup left no orphan worker or GPU allocation.
+- Follow-up: treat this as the stage checkpoint for the decoupled P-ready Host
+  pipeline. Optimize Direct admission and shutdown latency without weakening
+  request-generation ownership, FIFO P-to-D commit, or strict parent-KV reuse.
