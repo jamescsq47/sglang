@@ -2066,6 +2066,7 @@ def test_p2d_claim_and_grant_are_one_ownership_transaction(tp_size):
                 "tp_size": tp_size,
             }
         )
+        grants = []
         for rank in range(tp_size):
             grant = {
                 "kind": "shared_host_extent",
@@ -2074,6 +2075,15 @@ def test_p2d_claim_and_grant_are_one_ownership_transaction(tp_size):
                 "byte_size": 1024,
                 "token_count": 128,
             }
+            grants.append(grant)
+            assert ledger.prepare_p2d_write_rank(
+                snapshot_id,
+                owner,
+                grant,
+                tp_rank=rank,
+                tp_size=tp_size,
+            )
+        for rank, grant in enumerate(grants):
             claimed = ledger.claim_p2d_write_rank(
                 snapshot_id,
                 owner,
@@ -2129,6 +2139,7 @@ def test_duplicate_control_offer_never_regresses_owned_p2d_state(tp_size):
     }
     try:
         ledger.offer(control)
+        grants = []
         for rank in range(tp_size):
             grant = {
                 "kind": "shared_host_extent",
@@ -2137,6 +2148,15 @@ def test_duplicate_control_offer_never_regresses_owned_p2d_state(tp_size):
                 "byte_size": 1024,
                 "token_count": 128,
             }
+            grants.append(grant)
+            assert ledger.prepare_p2d_write_rank(
+                snapshot_id,
+                owner,
+                grant,
+                tp_rank=rank,
+                tp_size=tp_size,
+            )
+        for rank, grant in enumerate(grants):
             assert ledger.claim_p2d_write_rank(
                 snapshot_id,
                 owner,
@@ -2210,6 +2230,7 @@ def test_tp_p2d_managers_join_atomic_host_transaction_in_any_order(rank_order):
         value.hard_watermark = 1.0
         value.arena = Arena(rank)
         value._lock = threading.RLock()
+        value._prepared = {}
         value._active = {}
         value._results = {}
         value._records = {}
@@ -2239,17 +2260,127 @@ def test_tp_p2d_managers_join_atomic_host_transaction_in_any_order(rank_order):
                 "tp_size": 2,
             }
         )
-        for position, rank in enumerate(rank_order):
-            assert managers[rank].has_offer(reqs[rank])
-            assert managers[rank].try_submit(reqs[rank], torch.tensor([0, 1]))
-            current = ledger.get(snapshot_id)
-            assert current["state"] == (
-                HostStageState.HOST_WRITING.value
-                if position == 1
-                else HostStageState.HOST_RESERVED.value
+        first, second = rank_order
+        assert managers[first].has_offer(reqs[first])
+        # A single prepared shard owns only a tentative Host extent.  It must
+        # not take P-KV ownership before every TP peer has capacity.
+        assert not managers[first].try_submit(
+            reqs[first], torch.tensor([0, 1])
+        )
+        current = ledger.get(snapshot_id)
+        assert current["state"] == HostStageState.OFFERED.value
+        assert current["prepared_ranks"] == [first]
+        assert not current.get("claimed_ranks")
+
+        assert managers[second].has_offer(reqs[second])
+        assert managers[second].try_submit(reqs[second], torch.tensor([0, 1]))
+        current = ledger.get(snapshot_id)
+        assert current["state"] == HostStageState.HOST_RESERVED.value
+        assert current["claimed_ranks"] == [second]
+
+        # The first rank's offer worker retries after its peer publishes the
+        # final extent and joins the group-owned transaction.
+        assert managers[first].try_submit(reqs[first], torch.tensor([0, 1]))
+        current = ledger.get(snapshot_id)
+        assert current["state"] == HostStageState.HOST_WRITING.value
+        assert current["claimed_ranks"] == [0, 1]
+        assert len(current["rank_grants"]) == 2
+    finally:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
+def test_tp_p2d_capacity_failure_rejects_before_any_rank_owns_p_kv():
+    ledger, path = _ledger()
+    snapshot_id = "p2d:4243"
+    owner = "p2d-p-group:prefill-test"
+    released = []
+
+    class Arena:
+        capacity_bytes = 1 << 20
+        used_bytes = 0
+
+        def __init__(self, rank, has_capacity):
+            self.rank = rank
+            self.has_capacity = has_capacity
+
+        def can_reserve(self, *_args):
+            return self.has_capacity
+
+        def create(self, *_args):
+            return SimpleNamespace(
+                path=f"/dev/shm/p2d-capacity-rank-{self.rank}",
+                offset=self.rank * 4096,
             )
-            assert current["claimed_ranks"] == sorted(rank_order[: position + 1])
-            assert len(current["rank_grants"]) == position + 1
+
+        def release(self, snapshot):
+            released.append((self.rank, snapshot.path))
+
+    def manager(rank, has_capacity):
+        value = AgenticPToDHostStagingManager.__new__(
+            AgenticPToDHostStagingManager
+        )
+        value.ledger = ledger
+        value.device_pool = SimpleNamespace(
+            layer_num=1,
+            head_num=1,
+            head_dim=1,
+            store_dtype=torch.uint8,
+        )
+        value.prefill_domain = 0
+        value.numa_node = rank
+        value.tp_rank = rank
+        value.tp_size = 2
+        value.owner = owner
+        value.hard_watermark = 1.0
+        value.arena = Arena(rank, has_capacity)
+        value._lock = threading.RLock()
+        value._prepared = {}
+        value._active = {}
+        value._results = {}
+        value._records = {}
+        value._candidates = {}
+        value._work = queue.SimpleQueue()
+        return value
+
+    reqs = [
+        SimpleNamespace(
+            bootstrap_room=4243,
+            origin_input_ids=[1, 2],
+            output_ids=[3],
+            return_logprob=False,
+            cached_tokens=0,
+        )
+        for _ in range(2)
+    ]
+    managers = [manager(0, True), manager(1, False)]
+    try:
+        ledger.offer(
+            {
+                "snapshot_id": snapshot_id,
+                "bootstrap_room": 4243,
+                "token_count": 2,
+                "prefill_domain": 0,
+                "request_direction": "p2d",
+                "control_offer": True,
+                "tp_size": 2,
+            }
+        )
+        assert not managers[0].try_submit(reqs[0], torch.tensor([0, 1]))
+        assert not managers[1].try_submit(reqs[1], torch.tensor([0, 1]))
+        current = ledger.get(snapshot_id)
+        assert current["state"] == HostStageState.REJECTED.value
+        assert current.get("p_owner") is None
+        assert not current.get("claimed_ranks")
+
+        # The peer that tentatively reserved an extent can now return it and
+        # release its untouched P pages through the ordinary native path.
+        assert managers[0].cancel_watch(reqs[0])
+        assert released == [(0, "/dev/shm/p2d-capacity-rank-0")]
+        assert managers[0]._prepared == {}
+        assert managers[0]._active == {}
     finally:
         try:
             os.unlink(path)
@@ -2831,9 +2962,17 @@ def test_p2d_host_extent_is_reserved_before_ledger_claim_and_released_on_loss():
                 "prefill_domain": 0,
             }
 
+        def prepare_p2d_write_rank(self, *_args, **_kwargs):
+            events.append("prepare")
+            return {"state": HostStageState.OFFERED.value}
+
         def claim_p2d_write_rank(self, *_args, **_kwargs):
             events.append("claim")
             return None
+
+        def reject_unclaimed_offer(self, *_args, **_kwargs):
+            events.append("reject")
+            return True
 
         def transition(self, *_args, **_kwargs):
             raise AssertionError("an unclaimed offer must not be failed")
@@ -2854,6 +2993,7 @@ def test_p2d_host_extent_is_reserved_before_ledger_claim_and_released_on_loss():
     manager.hard_watermark = 1.0
     manager.arena = Arena()
     manager._lock = threading.RLock()
+    manager._prepared = {}
     manager._active = {}
     manager._results = {}
     manager._records = {}
@@ -2866,7 +3006,14 @@ def test_p2d_host_extent_is_reserved_before_ledger_claim_and_released_on_loss():
     )
 
     assert not manager.try_submit(req, torch.tensor([0, 1]))
-    assert events == ["capacity", "reserve", "claim", "release"]
+    assert events == [
+        "capacity",
+        "reserve",
+        "prepare",
+        "claim",
+        "release",
+        "reject",
+    ]
     assert manager._active == {}
     assert manager._records == {}
 
@@ -3144,6 +3291,7 @@ def test_tp_p2d_peer_host_claim_blocks_native_page_release():
         manager.ledger = ledger
         manager.tp_size = 2
         manager._lock = threading.RLock()
+        manager._prepared = {}
         manager._active = {}
         manager._results = {}
         manager._candidates = {}
@@ -3293,6 +3441,7 @@ def test_tp_p2d_peer_terminal_releases_unsubmitted_local_shard(
         manager.ledger = ledger
         manager.tp_size = 2
         manager._lock = threading.RLock()
+        manager._prepared = {}
         manager._active = {}
         manager._results = {}
         manager._candidates = {snapshot_id: {}}

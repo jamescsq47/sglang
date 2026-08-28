@@ -483,6 +483,11 @@ class AgenticPToDHostStagingManager:
         ]
         self._work: queue.SimpleQueue = queue.SimpleQueue()
         self._lock = threading.RLock()
+        # Host extents are reserved before any TP rank takes ownership of P
+        # KV.  The ledger admits the group only after every rank has published
+        # one prepared extent, so capacity failure remains a safe native-path
+        # fallback instead of a partially claimed TP transaction.
+        self._prepared: dict[str, dict[str, Any]] = {}
         self._active: dict[str, dict[str, Any]] = {}
         self._results: dict[str, int] = {}
         self._records: dict[str, dict[str, Any]] = {}
@@ -589,6 +594,7 @@ class AgenticPToDHostStagingManager:
         with self._lock:
             if (
                 snapshot_id in self._active
+                or snapshot_id in self._prepared
                 or snapshot_id in self._results
                 or snapshot_id in self._candidates
                 or getattr(req, "_agentic_p2d_host_terminal", False)
@@ -624,6 +630,9 @@ class AgenticPToDHostStagingManager:
                     return False
             req._agentic_p2d_host_terminal = True
             self._candidates.pop(snapshot_id, None)
+            prepared = self._prepared.pop(snapshot_id, None)
+            if prepared is not None:
+                self.arena.release(prepared["snapshot"])
             if local_snapshot is not None:
                 self._results.pop(local_snapshot, None)
             return True
@@ -679,25 +688,58 @@ class AgenticPToDHostStagingManager:
                     return False
                 if snapshot_id in self._active or snapshot_id in self._results:
                     return True
-                if not self.arena.can_reserve(byte_size, self.hard_watermark):
-                    return False
-                # Reserve the physical extent before taking ledger ownership.
-                # A worker can no longer fail after claim merely because a
-                # burst consumed or fragmented the Shared Arena meanwhile.
-                snapshot = self.arena.create(
-                    snapshot_id, token_count, self.device_pool, byte_size
-                )
-                grant = {
-                    "kind": "shared_host_extent",
-                    "arena_path": snapshot.path,
-                    "arena_offset": snapshot.offset,
-                    "byte_size": int(byte_size),
-                    "token_count": int(token_count),
-                    "prefill_domain": self.prefill_domain,
-                    "arena_numa_node": self.numa_node,
-                    "prefill_metadata": prefill_metadata,
-                    "tp_rank": self.tp_rank,
-                }
+                record = self._prepared.get(snapshot_id)
+                if record is None:
+                    if not self.arena.can_reserve(byte_size, self.hard_watermark):
+                        self.ledger.reject_unclaimed_offer(
+                            snapshot_id, reason="p2d_host_capacity"
+                        )
+                        return False
+                    # Reserve the physical extent before publishing readiness.
+                    # This tentative reservation owns no P KV and can be
+                    # discarded if Router/native admission wins the offer.
+                    snapshot = self.arena.create(
+                        snapshot_id, token_count, self.device_pool, byte_size
+                    )
+                    grant = {
+                        "kind": "shared_host_extent",
+                        "arena_path": snapshot.path,
+                        "arena_offset": snapshot.offset,
+                        "byte_size": int(byte_size),
+                        "token_count": int(token_count),
+                        "prefill_domain": self.prefill_domain,
+                        "arena_numa_node": self.numa_node,
+                        "prefill_metadata": prefill_metadata,
+                        "tp_rank": self.tp_rank,
+                    }
+                    prepared = self.ledger.prepare_p2d_write_rank(
+                        snapshot_id,
+                        self.owner,
+                        grant,
+                        tp_rank=self.tp_rank,
+                        tp_size=self.tp_size,
+                    )
+                    if prepared is None:
+                        self.arena.release(snapshot)
+                        snapshot = None
+                        self.ledger.reject_unclaimed_offer(
+                            snapshot_id, reason="p2d_prepare_failed"
+                        )
+                        return False
+                    record = {
+                        "source_indices": source_indices,
+                        "source_ready_event": source_ready_event,
+                        "token_count": token_count,
+                        "byte_size": byte_size,
+                        "prefill_metadata": prefill_metadata,
+                        "started_at": time.monotonic(),
+                        "snapshot": snapshot,
+                        "grant": grant,
+                    }
+                    self._prepared[snapshot_id] = record
+                else:
+                    snapshot = record["snapshot"]
+                    grant = record["grant"]
                 claim = self.ledger.claim_p2d_write_rank(
                     snapshot_id,
                     self.owner,
@@ -706,19 +748,29 @@ class AgenticPToDHostStagingManager:
                     tp_size=self.tp_size,
                 )
                 if claim is None:
-                    self.arena.release(snapshot)
-                    snapshot = None
+                    current = self.ledger.get(snapshot_id)
+                    if (
+                        self.tp_size == 1
+                        or current is None
+                        or current.get("state")
+                        in {
+                            HostStageState.REJECTED.value,
+                            HostStageState.ABORTING.value,
+                            HostStageState.FAILED.value,
+                        }
+                    ):
+                        self._prepared.pop(snapshot_id, None)
+                        self.arena.release(snapshot)
+                        snapshot = None
+                        if current is not None and current.get("state") == (
+                            HostStageState.OFFERED.value
+                        ):
+                            self.ledger.reject_unclaimed_offer(
+                                snapshot_id, reason="p2d_claim_failed"
+                            )
                     return False
                 claimed = True
-                record = {
-                    "source_indices": source_indices,
-                    "source_ready_event": source_ready_event,
-                    "token_count": token_count,
-                    "byte_size": byte_size,
-                    "prefill_metadata": prefill_metadata,
-                    "started_at": time.monotonic(),
-                    "snapshot": snapshot,
-                }
+                self._prepared.pop(snapshot_id, None)
                 self._active[snapshot_id] = record
                 self._records[snapshot_id] = record
                 req._agentic_p2d_host_snapshot_id = snapshot_id
@@ -736,9 +788,16 @@ class AgenticPToDHostStagingManager:
         except Exception as exc:
             with self._lock:
                 record = self._active.pop(snapshot_id, None)
+                prepared = self._prepared.pop(snapshot_id, None)
                 self._records.pop(snapshot_id, None)
                 owned_snapshot = (
-                    record.get("snapshot") if record is not None else snapshot
+                    record.get("snapshot")
+                    if record is not None
+                    else (
+                        prepared.get("snapshot")
+                        if prepared is not None
+                        else snapshot
+                    )
                 )
                 if owned_snapshot is not None:
                     self.arena.release(owned_snapshot)
@@ -751,6 +810,13 @@ class AgenticPToDHostStagingManager:
                     HostStageState.FAILED,
                     owner=self.owner,
                     reason=f"p2d_submit_failed:{exc}",
+                )
+            else:
+                # Any failure before group ownership is a RETAIN_P outcome.
+                # Terminate the offer so Router does not hold a preparation
+                # lane waiting for HOST_READY that can no longer be produced.
+                self.ledger.reject_unclaimed_offer(
+                    snapshot_id, reason=f"p2d_prepare_failed:{exc}"
                 )
             logger.exception("Failed to submit P->D Host staging for %s", snapshot_id)
             return False
@@ -801,6 +867,14 @@ class AgenticPToDHostStagingManager:
                 self._results.pop(snapshot_id, None)
             elif candidate_id in self._active or candidate_id in self._results:
                 return False
+            elif candidate_id in self._prepared:
+                ownership = self.ledger.arbitrate_p2d_release(
+                    candidate_id, tp_size=self.tp_size
+                )
+                if ownership == P2D_RELEASE_HOST_OWNED:
+                    return False
+                prepared = self._prepared.pop(candidate_id)
+                self.arena.release(prepared["snapshot"])
             else:
                 ownership = self.ledger.arbitrate_p2d_release(
                     candidate_id, tp_size=self.tp_size
@@ -852,6 +926,11 @@ class AgenticPToDHostStagingManager:
                 "retaining registered arena"
             )
         else:
+            with self._lock:
+                prepared = list(self._prepared.values())
+                self._prepared.clear()
+            for record in prepared:
+                self.arena.release(record["snapshot"])
             self.arena.close()
 
     def _offer_worker(self) -> None:
@@ -862,7 +941,6 @@ class AgenticPToDHostStagingManager:
             self._candidate_wakeup.clear()
             with self._lock:
                 candidates = list(self._candidates.items())
-            entries = self.ledger.snapshot_entries() if candidates else {}
             for snapshot_id, candidate in candidates:
                 if self._stop.is_set():
                     return
@@ -871,16 +949,24 @@ class AgenticPToDHostStagingManager:
                     with self._lock:
                         self._candidates.pop(snapshot_id, None)
                     continue
-                entry = entries.get(snapshot_id)
+                # Candidates are the only P generations whose source pages
+                # are currently pinned.  Read their per-snapshot manifests
+                # directly instead of rescanning every historical ledger
+                # event on each 20 ms wakeup.
+                entry = self.ledger.get(snapshot_id)
                 if entry is None:
                     continue
                 if entry.get("state") in {
                     HostStageState.CONSUMED.value,
                     HostStageState.FAILED.value,
                     HostStageState.REJECTED.value,
+                    HostStageState.ABORTING.value,
                 }:
                     with self._lock:
                         self._candidates.pop(snapshot_id, None)
+                        prepared = self._prepared.pop(snapshot_id, None)
+                        if prepared is not None:
+                            self.arena.release(prepared["snapshot"])
                     continue
                 if entry.get("state") not in {
                     HostStageState.OFFERED.value,

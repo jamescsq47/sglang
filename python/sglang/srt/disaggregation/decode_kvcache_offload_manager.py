@@ -2154,7 +2154,6 @@ class DecodeKVCacheOffloadManager:
             self.agentic_fast_threshold,
             envs.SGLANG_AGENTIC_KV_DIRECT_HANDSHAKE_TIMEOUT.get(),
         )
-        staging_entries = None
         for snapshot_id, candidate in candidate_items:
             is_slow = bool(candidate.get("staging"))
             if progress_class == "direct" and is_slow:
@@ -2203,17 +2202,18 @@ class DecodeKVCacheOffloadManager:
                             candidate, candidate["source_token_indices"]
                         )
                 else:
-                    if staging_entries is None:
-                        # All D-side staging candidates share one /dev/shm ledger.
-                        # Decode must not reread and reparse that complete JSON
-                        # document once per candidate on every scheduler tick.
-                        staging_entries = staging_ledger.snapshot_entries()
+                    # Read only this live request-generation.  A whole-ledger
+                    # snapshot made slow-path progress O(total historical
+                    # generations) and caused multi-second gaps before some
+                    # D2H writes started, despite idle copy lanes.  The
+                    # per-snapshot manifest is the lifecycle authority, so an
+                    # exact keyed read is both cheaper and more current.
+                    cached_entry = staging_ledger.get(snapshot_id)
                     with candidate["io_lock"]:
                         if not self._agentic_candidate_is_live_locked(
                             snapshot_id, candidate
                         ):
                             continue
-                        cached_entry = staging_entries.get(snapshot_id)
                         outcome = self.agentic_host_staging_client.progress(
                             candidate,
                             candidate["source_token_indices"],

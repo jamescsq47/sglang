@@ -1413,6 +1413,50 @@ class SharedHostStagingLedger:
 
         return self._mutate(callback, event_snapshot_id=snapshot_id)
 
+    def prepare_p2d_write_rank(
+        self,
+        snapshot_id: str,
+        owner: str,
+        grant: dict[str, Any],
+        *,
+        tp_rank: int,
+        tp_size: int,
+    ) -> Optional[dict[str, Any]]:
+        """Publish one already-reserved Host extent without taking KV ownership.
+
+        Every TP producer first reserves its local NUMA arena extent and
+        publishes that immutable grant.  The offer remains rejectable by the
+        Router until all ranks are prepared; only then may
+        :meth:`claim_p2d_write_rank` atomically move the whole logical
+        request-generation under Host ownership.  This prevents one rank from
+        claiming P KV while a peer rank has no Host capacity.
+        """
+
+        def callback(entries):
+            current = entries.get(snapshot_id)
+            if (
+                current is None
+                or int(current.get("tp_size", 1)) != int(tp_size)
+                or current.get("state") != HostStageState.OFFERED.value
+                or current.get("p_owner") is not None
+                or current.get("claimed_ranks")
+            ):
+                return None, False
+            rank_key = str(int(tp_rank))
+            normalized = dict(grant, tp_rank=int(tp_rank))
+            prepared = current.setdefault("prepared_rank_grants", {})
+            previous = prepared.get(rank_key)
+            if previous is not None and previous != normalized:
+                return None, False
+            prepared[rank_key] = normalized
+            current["prepared_ranks"] = sorted(
+                int(rank) for rank in prepared
+            )
+            current["updated_at"] = time.time()
+            return dict(current), True
+
+        return self._mutate(callback, event_snapshot_id=snapshot_id)
+
     def claim_p2d_write_rank(
         self,
         snapshot_id: str,
@@ -1453,6 +1497,9 @@ class SharedHostStagingLedger:
 
             rank_key = str(int(tp_rank))
             normalized = dict(grant, tp_rank=int(tp_rank))
+            prepared = current.get("prepared_rank_grants", {})
+            if len(prepared) != int(tp_size) or prepared.get(rank_key) != normalized:
+                return None, False
             rank_grants = current.setdefault("rank_grants", {})
             previous = rank_grants.get(rank_key)
             if previous is not None and previous != normalized:
