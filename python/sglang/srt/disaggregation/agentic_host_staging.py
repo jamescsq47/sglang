@@ -468,11 +468,13 @@ _ALLOWED_STAGE_TRANSITIONS = {
     HostStageState.ABORTING.value: {HostStageState.FAILED.value},
     HostStageState.HOST_READY.value: {
         HostStageState.H2D_LOADING.value,
+        HostStageState.ABORTING.value,
         HostStageState.SPILLING.value,
         HostStageState.CONSUMED.value,
         HostStageState.FAILED.value,
     },
     HostStageState.H2D_LOADING.value: {
+        HostStageState.ABORTING.value,
         HostStageState.HOST_READY.value,
         HostStageState.HBM_READY.value,
         HostStageState.CONSUMED.value,
@@ -931,6 +933,7 @@ class SharedHostStagingLedger:
                 rank_grants={},
                 writer_acks=[],
                 loader_acks=[],
+                loader_drained_ranks=[],
             )
             entries[snapshot_id] = value
             return dict(value), True
@@ -1789,6 +1792,85 @@ class SharedHostStagingLedger:
                 current["state"] = HostStageState.CONSUMED.value
             current["updated_at"] = time.time()
             return True, True
+
+        return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
+
+    def request_host_load_failure(
+        self, snapshot_id: str, owner: str, *, reason: str
+    ) -> bool:
+        """Begin a TP-wide P2D Host-load abort without releasing Host data.
+
+        This only publishes failure intent.  The source Host extents remain
+        authoritative until every destination rank separately confirms that
+        no H2D DMA can still read them via :meth:`mark_host_load_rank_drained`.
+        """
+
+        def callback(entries):
+            current = entries.get(snapshot_id)
+            if current is None or current.get("p_owner") != owner:
+                return False, False
+            state = current.get("state")
+            if state == HostStageState.FAILED.value:
+                return True, False
+            if state == HostStageState.ABORTING.value:
+                return bool(current.get("h2d_abort_started", False)), False
+            if state not in {
+                HostStageState.HOST_READY.value,
+                HostStageState.H2D_LOADING.value,
+            }:
+                return False, False
+            current["state"] = HostStageState.ABORTING.value
+            current["h2d_abort_started"] = True
+            current["loader_failure_reason"] = str(reason)[:256]
+            current["updated_at"] = time.time()
+            return True, True
+
+        return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
+
+    def mark_host_load_rank_drained(
+        self,
+        snapshot_id: str,
+        owner: str,
+        *,
+        tp_rank: int,
+        tp_size: int,
+    ) -> bool:
+        """ACK one destination rank is physically quiescent after H2D abort.
+
+        FAILED is deliberately group-committed only after all TP ranks ACK.
+        A missing CUDA completion fence therefore leaks the snapshot closed
+        instead of allowing the source extent to be reused under live DMA.
+        """
+
+        def callback(entries):
+            current = entries.get(snapshot_id)
+            if (
+                current is None
+                or current.get("p_owner") != owner
+                or int(current.get("tp_size", 1)) != int(tp_size)
+                or current.get("state")
+                not in {
+                    HostStageState.ABORTING.value,
+                    HostStageState.FAILED.value,
+                }
+                or not current.get("h2d_abort_started", False)
+            ):
+                return False, False
+            if current.get("state") == HostStageState.FAILED.value:
+                return True, False
+            drained = set(
+                int(value) for value in current.get("loader_drained_ranks", [])
+            )
+            changed = int(tp_rank) not in drained
+            drained.add(int(tp_rank))
+            current["loader_drained_ranks"] = sorted(drained)
+            if len(drained) == int(tp_size):
+                current["state"] = HostStageState.FAILED.value
+                current["reason"] = current.get(
+                    "loader_failure_reason", "p2d_h2d_failed"
+                )
+            current["updated_at"] = time.time()
+            return True, changed
 
         return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
 

@@ -907,6 +907,7 @@ class AgenticPToDHostStagingManager:
         for thread in self._threads:
             thread.join(timeout=2.0)
         self._completion_thread.join(timeout=2.0)
+
         background_threads = [
             self._offer_thread,
             *self._threads,
@@ -1252,6 +1253,37 @@ class AgenticPToDHostLoadManager:
             thread.join(timeout=2.0)
         self._completion_thread.join(timeout=2.0)
 
+    def request_abort(
+        self,
+        receiver: "AgenticPToDHostReceiver",
+        *,
+        locally_quiesced: bool,
+    ) -> None:
+        """Publish cancellation without releasing a peer rank's Host extent."""
+
+        entry = self.ledger.get(receiver.snapshot_id)
+        if entry is None:
+            return
+        owner = entry.get("p_owner")
+        if owner is None:
+            return
+        self.ledger.request_host_load_failure(
+            receiver.snapshot_id,
+            owner,
+            reason="p2d_h2d_cancelled",
+        )
+        if not locally_quiesced:
+            with self._completion_lock:
+                locally_quiesced = receiver.snapshot_id in self._group_pending
+        if locally_quiesced:
+            self.ledger.mark_host_load_rank_drained(
+                receiver.snapshot_id,
+                owner,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+            )
+        self._group_wakeup.set()
+
     def submit(self, receiver: "AgenticPToDHostReceiver", device_indices) -> None:
         with receiver._state_lock:
             if receiver._submitted:
@@ -1261,6 +1293,23 @@ class AgenticPToDHostLoadManager:
                 receiver._poll = int(KVPoll.Failed)
                 return
             entry = self.ledger.get(receiver.snapshot_id)
+            if (
+                entry is not None
+                and entry.get("state") == HostStageState.ABORTING.value
+                and entry.get("h2d_abort_started", False)
+            ):
+                owner = entry.get("p_owner")
+                self.ledger.mark_host_load_rank_drained(
+                    receiver.snapshot_id,
+                    owner,
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
+                )
+                receiver._owner = owner
+                receiver._terminal = True
+                receiver._error = RuntimeError("P->D Host peer load aborted")
+                receiver._poll = int(KVPoll.Failed)
+                return
             if entry is None or entry.get("state") not in {
                 HostStageState.HOST_READY.value,
                 HostStageState.H2D_LOADING.value,
@@ -1279,11 +1328,9 @@ class AgenticPToDHostLoadManager:
                     f"{getattr(self, 'tp_rank', 0)} extent"
                 )
             grant = matching[0]
-            if int(grant.get("arena_numa_node", -1)) != self.numa_node:
-                raise RuntimeError(
-                    "P->D slow path crossed NUMA: "
-                    f"arena={grant.get('arena_numa_node')} D={self.numa_node}"
-                )
+            arena_numa_node = int(grant.get("arena_numa_node", -1))
+            if arena_numa_node < 0:
+                raise RuntimeError("P->D Host grant has no Arena NUMA node")
             if int(grant["token_count"]) != len(device_indices):
                 raise RuntimeError("P->D Host destination token count mismatch")
             owner = entry.get("p_owner")
@@ -1298,6 +1345,7 @@ class AgenticPToDHostLoadManager:
             receiver._poll = int(KVPoll.Transferring)
             receiver._grant = grant
             receiver._owner = owner
+            receiver._cross_numa = arena_numa_node != self.numa_node
             self._work.put((receiver, device_indices))
 
     def _worker(
@@ -1318,6 +1366,11 @@ class AgenticPToDHostLoadManager:
             try:
                 if receiver.abort_pending:
                     raise RuntimeError("P->D Host load aborted before H2D")
+                current = self.ledger.get(receiver.snapshot_id)
+                if current is not None and current.get("state") == (
+                    HostStageState.ABORTING.value
+                ):
+                    raise RuntimeError("P->D Host peer load aborted before H2D")
                 grant = receiver._grant
                 snapshot = SharedMHAHostSnapshot(
                     path=str(grant["arena_path"]),
@@ -1344,6 +1397,13 @@ class AgenticPToDHostLoadManager:
                     launch_fence = None
                     if receiver.abort_pending:
                         raise RuntimeError("P->D Host load aborted after H2D fence")
+                    current = self.ledger.get(receiver.snapshot_id)
+                    if current is not None and current.get("state") == (
+                        HostStageState.ABORTING.value
+                    ):
+                        raise RuntimeError(
+                            "P->D Host peer load aborted after H2D fence"
+                        )
                 if not self.ledger.complete_host_load_rank(
                     receiver.snapshot_id,
                     receiver._owner,
@@ -1370,6 +1430,14 @@ class AgenticPToDHostLoadManager:
                         self._group_pending[receiver.snapshot_id] = completion
                     self._group_wakeup.set()
             except Exception as exc:
+                try:
+                    self.ledger.request_host_load_failure(
+                        receiver.snapshot_id,
+                        receiver._owner,
+                        reason=f"p2d_h2d_failed:{exc}",
+                    )
+                except Exception:
+                    logger.exception("Failed to publish P->D H2D abort intent")
                 if launch_fence is not None and launch_fence.submitted:
                     physically_quiesced = False
                     if launch_fence.armed and not launch_fence.unavailable:
@@ -1397,15 +1465,27 @@ class AgenticPToDHostLoadManager:
                         # reused safely for any later request.
                         return
                 try:
-                    self.ledger.transition(
+                    self.ledger.mark_host_load_rank_drained(
                         receiver.snapshot_id,
-                        HostStageState.FAILED,
-                        owner=receiver._owner,
-                        reason=f"p2d_h2d_failed:{exc}",
+                        receiver._owner,
+                        tp_rank=self.tp_rank,
+                        tp_size=self.tp_size,
                     )
                 except Exception:
-                    logger.exception("Failed to publish P->D H2D failure")
-                receiver.mark_terminal(KVPoll.Failed, error=exc)
+                    logger.exception("Failed to publish P->D H2D drain ACK")
+                completion = {
+                    "receiver": receiver,
+                    "started_at": started_at,
+                    "token_count": len(device_indices),
+                    "byte_size": int(
+                        0 if receiver._grant is None else receiver._grant["byte_size"]
+                    ),
+                    "worker_id": worker_id,
+                    "failure": exc,
+                }
+                with self._completion_lock:
+                    self._group_pending[receiver.snapshot_id] = completion
+                self._group_wakeup.set()
                 logger.exception("P->D Host H2D failed for %s", receiver.snapshot_id)
             finally:
                 if snapshot is not None:
@@ -1419,13 +1499,20 @@ class AgenticPToDHostLoadManager:
         elapsed = time.monotonic() - float(completion["started_at"])
         logger.info(
             "AgenticKV p2d_host_h2d_complete snapshot=%s tokens=%d "
-            "elapsed_ms=%.3f gib_per_s=%.3f D_domain=%d numa=%d worker=%d",
+            "elapsed_ms=%.3f gib_per_s=%.3f D_domain=%d numa=%d "
+            "arena_numa=%d cross_numa=%s worker=%d",
             receiver.snapshot_id,
             int(completion["token_count"]),
             elapsed * 1000.0,
             int(completion["byte_size"]) / max(elapsed, 1e-9) / (1024**3),
             self.decode_domain,
             self.numa_node,
+            int(
+                (getattr(receiver, "_grant", None) or {}).get(
+                    "arena_numa_node", -1
+                )
+            ),
+            bool(getattr(receiver, "_cross_numa", False)),
             int(completion["worker_id"]),
         )
 
@@ -1435,6 +1522,17 @@ class AgenticPToDHostLoadManager:
         progressed = 0
         for snapshot_id, completion in pending:
             current = self.ledger.get(snapshot_id)
+            if (
+                current is not None
+                and current.get("state") == HostStageState.ABORTING.value
+            ):
+                self.ledger.mark_host_load_rank_drained(
+                    snapshot_id,
+                    completion["receiver"]._owner,
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
+                )
+                current = self.ledger.get(snapshot_id)
             if (
                 current is not None
                 and current.get("state") == HostStageState.CONSUMED.value
@@ -1447,7 +1545,10 @@ class AgenticPToDHostLoadManager:
             except Exception as exc:
                 with self._completion_lock:
                     self._group_pending.pop(snapshot_id, None)
-                completion["receiver"].mark_terminal(KVPoll.Failed, error=exc)
+                completion["receiver"].mark_terminal(
+                    KVPoll.Failed,
+                    error=completion.get("failure", exc),
+                )
                 logger.error("P->D Host TP load failed for %s: %s", snapshot_id, exc)
                 progressed += 1
         return progressed
@@ -1523,10 +1624,15 @@ class AgenticPToDHostReceiver:
     def abort(self) -> None:
         with self._state_lock:
             self._abort_pending = True
+            submitted = self._submitted
+            terminal = self._terminal
             if not self._submitted or self._terminal:
                 self._terminal = True
                 self._error = RuntimeError("P->D Host load was aborted")
                 self._poll = int(KVPoll.Failed)
+        request_abort = getattr(self.manager, "request_abort", None)
+        if request_abort is not None and not terminal:
+            request_abort(self, locally_quiesced=not submitted)
 
     def commit_req(self, req) -> None:
         if self._grant is None:
