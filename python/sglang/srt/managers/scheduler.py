@@ -34,6 +34,11 @@ suppress_noisy_warnings()
 import psutil  # isort: skip
 import setproctitle
 import torch
+
+from sglang.srt.disaggregation.agentic_workset import (
+    AgenticPWorksetLease,
+    AgenticPWorksetLeaseBroker,
+)
 import torch.distributed
 from torch.cuda import Stream as CudaStream
 from torch.distributed import barrier
