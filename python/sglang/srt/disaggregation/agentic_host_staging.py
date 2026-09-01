@@ -428,6 +428,12 @@ class HostStageState(str, Enum):
     # inserted and pinned it in Radix. Host remains authoritative here.
     HBM_READY = "hbm_ready"
     RETRY_PENDING = "retry_pending"
+    # Request-generation eviction is a two-phase group operation.  The Host
+    # snapshot remains authoritative in EVICTING until every TP rank has
+    # released its local shard.  Only RECOMPUTE_REQUIRED means no physical
+    # Host copy remains and the child may safely run a full Prefill.
+    EVICTING = "evicting"
+    RECOMPUTE_REQUIRED = "recompute_required"
     SPILLING = "spilling"
     MOONCAKE_READY = "mooncake_ready"
     CONSUMED = "consumed"
@@ -443,6 +449,7 @@ _TERMINAL_STATES = {
     HostStageState.CONSUMED.value,
     HostStageState.REJECTED.value,
     HostStageState.FAILED.value,
+    HostStageState.RECOMPUTE_REQUIRED.value,
 }
 
 P2D_RELEASE_NATIVE_WON = "native_won"
@@ -469,6 +476,7 @@ _ALLOWED_STAGE_TRANSITIONS = {
     HostStageState.HOST_READY.value: {
         HostStageState.H2D_LOADING.value,
         HostStageState.ABORTING.value,
+        HostStageState.EVICTING.value,
         HostStageState.SPILLING.value,
         HostStageState.CONSUMED.value,
         HostStageState.FAILED.value,
@@ -488,6 +496,10 @@ _ALLOWED_STAGE_TRANSITIONS = {
     },
     HostStageState.RETRY_PENDING.value: {
         HostStageState.HOST_READY.value,
+        HostStageState.FAILED.value,
+    },
+    HostStageState.EVICTING.value: {
+        HostStageState.RECOMPUTE_REQUIRED.value,
         HostStageState.FAILED.value,
     },
     HostStageState.SPILLING.value: {
@@ -2281,6 +2293,103 @@ class SharedHostStagingLedger:
 
         return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
 
+    def begin_host_eviction(
+        self,
+        snapshot_id: str,
+        owner: str,
+        *,
+        tp_size: int,
+        reason: str,
+    ) -> bool:
+        """Atomically claim one complete HOST_READY generation for eviction.
+
+        A load and an eviction compete through the same per-generation ledger
+        mutation.  Any prepared/loading rank makes the snapshot ineligible, so
+        a pressure worker can never remove pages underneath Host->P DMA or a
+        scheduler-owned Radix bind.
+        """
+
+        def callback(entries):
+            current = entries.get(snapshot_id)
+            if (
+                current is None
+                or current.get("p_owner") != owner
+                or int(current.get("tp_size", 1)) != int(tp_size)
+            ):
+                return False, False
+            state = current.get("state")
+            if state in {
+                HostStageState.EVICTING.value,
+                HostStageState.RECOMPUTE_REQUIRED.value,
+            }:
+                return True, False
+            if state != HostStageState.HOST_READY.value:
+                return False, False
+            if any(
+                current.get(field)
+                for field in (
+                    "loading_ranks",
+                    "h2d_prepared_ranks",
+                    "loader_acks",
+                    "binder_acks",
+                )
+            ):
+                return False, False
+            current["state"] = HostStageState.EVICTING.value
+            current["eviction_acks"] = []
+            current["eviction_reason"] = str(reason)[:256]
+            current["eviction_started_at"] = time.time()
+            current["updated_at"] = time.time()
+            return True, True
+
+        return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
+
+    def complete_host_eviction_rank(
+        self,
+        snapshot_id: str,
+        owner: str,
+        *,
+        tp_rank: int,
+        tp_size: int,
+    ) -> bool:
+        """ACK one released Host shard and publish group recomputation.
+
+        There is deliberately no timeout that converts a partially ACKed TP
+        eviction into recomputation.  If one TP rank dies, the model/NCCL
+        group is already fail-stop; advancing this state while a surviving
+        process may still own a shard would permit use-after-free.  Normal
+        process teardown removes the run-scoped ledger and arena together.
+        """
+
+        def callback(entries):
+            current = entries.get(snapshot_id)
+            if (
+                current is None
+                or current.get("p_owner") != owner
+                or int(current.get("tp_size", 1)) != int(tp_size)
+            ):
+                return False, False
+            if current.get("state") == HostStageState.RECOMPUTE_REQUIRED.value:
+                return True, False
+            if current.get("state") != HostStageState.EVICTING.value:
+                return False, False
+            acknowledgements = {
+                int(value) for value in current.get("eviction_acks", [])
+            }
+            changed = int(tp_rank) not in acknowledgements
+            acknowledgements.add(int(tp_rank))
+            current["eviction_acks"] = sorted(acknowledgements)
+            if len(acknowledgements) == int(tp_size):
+                current["state"] = HostStageState.RECOMPUTE_REQUIRED.value
+                current["evicted_at"] = time.time()
+                current["reason"] = current.get(
+                    "eviction_reason", "shared_host_pressure_eviction"
+                )
+            current["updated_at"] = time.time()
+            return True, changed
+
+        return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
+
     def transition(
         self,
         snapshot_id: str,
@@ -3139,13 +3248,13 @@ class SharedHostSnapshotArena:
                 merged.append((current_offset, current_length))
         self._free_extents = merged
 
-    def release(self, snapshot: SharedMHAHostSnapshot) -> None:
+    def release(self, snapshot: SharedMHAHostSnapshot) -> bool:
         with self._lock:
-            active = self._active_extents.pop(id(snapshot), None)
+            active = self._active_extents.get(id(snapshot))
             # Identity is the extent lease.  A stale release from the prior
             # request must not release a newer request that recycled the range.
             if active is None or active[0] is not snapshot:
-                return
+                return True
             _, offset, allocation_bytes = active
             try:
                 snapshot.close(unlink=False)
@@ -3155,9 +3264,13 @@ class SharedHostSnapshotArena:
                     offset,
                     allocation_bytes,
                 )
-                return
+                # Keep the extent lease and accounting intact.  The caller
+                # must retry and may not publish an ownership ACK.
+                return False
+            self._active_extents.pop(id(snapshot), None)
             self.used_bytes = max(0, self.used_bytes - int(allocation_bytes))
             self._insert_free_locked(offset, allocation_bytes)
+            return True
 
     def usage(self) -> float:
         with self._lock:
@@ -3204,9 +3317,9 @@ class AgenticPHostStagingManager:
         page_size: int,
         arena_directory: str,
         arena_capacity_bytes: int,
-        high_watermark: float = 0.80,
-        low_watermark: float = 0.70,
-        hard_watermark: float = 0.90,
+        high_watermark: float = 0.90,
+        low_watermark: float = 0.75,
+        hard_watermark: float = 0.95,
         arena_numa_node: int = -1,
         arena_domain: int = -1,
         tp_rank: int = 0,
@@ -3309,6 +3422,13 @@ class AgenticPHostStagingManager:
         self._h2d_lane_reservations: dict[str, int] = {}
         self._spill_threads: dict[str, threading.Thread] = {}
         self._spilling_pressure = False
+        self._host_eviction_pressure = False
+        self._host_eviction_required_bytes = 0
+        self._host_eviction_count = 0
+        self._host_eviction_tokens = 0
+        self._host_eviction_bytes = 0
+        self._host_eviction_local_released: set[str] = set()
+        self._last_host_eviction_blocked_log = 0.0
         self._last_prune = 0.0
         self._next_poll_at = 0.0
         self._poll_interval = max(
@@ -3632,7 +3752,41 @@ class AgenticPHostStagingManager:
         offered_byte_size = int(
             rank_offer.get("byte_size", offer.get("byte_size", 0))
         )
+        arena = getattr(self, "arena", None)
+        hard_capacity_bytes = (
+            None
+            if arena is None
+            else int(arena.capacity_bytes * self.hard_watermark)
+        )
+        if (
+            hard_capacity_bytes is not None
+            and offered_byte_size > hard_capacity_bytes
+        ):
+            self.ledger.reject_unclaimed_offer(
+                snapshot_id,
+                reason="shared_host_snapshot_exceeds_hard_capacity",
+            )
+            logger.warning(
+                "AgenticKV shared_host_oversize_recompute snapshot=%s "
+                "bytes=%d hard_capacity_bytes=%d",
+                snapshot_id,
+                offered_byte_size,
+                hard_capacity_bytes,
+            )
+            return True
         if offered_byte_size > 0 and not self._can_admit(offered_byte_size):
+            # Pressure can occur just below the high watermark when the next
+            # complete snapshot would cross the hard limit.  Treat that
+            # blocked admission as an eviction trigger instead of waiting for
+            # another writer to make the current usage numerically larger.
+            self._host_eviction_pressure = True
+            self._host_eviction_required_bytes = max(
+                int(getattr(self, "_host_eviction_required_bytes", 0)),
+                offered_byte_size,
+            )
+            wakeup = getattr(self, "_control_wakeup", None)
+            if wakeup is not None:
+                wakeup.set()
             return False
         if tp_size == 1:
             claimed = self.ledger.claim(offer["snapshot_id"], self.owner)
@@ -3662,6 +3816,14 @@ class AgenticPHostStagingManager:
             # Capacity can change between the pre-check and ownership claim.
             # Keep HOST_RESERVED and retry after older snapshots leave; D
             # retains the authoritative HBM copy throughout this wait.
+            self._host_eviction_pressure = True
+            self._host_eviction_required_bytes = max(
+                int(getattr(self, "_host_eviction_required_bytes", 0)),
+                byte_size,
+            )
+            wakeup = getattr(self, "_control_wakeup", None)
+            if wakeup is not None:
+                wakeup.set()
             return False
         try:
             snapshot = self.arena.create(
@@ -3725,10 +3887,14 @@ class AgenticPHostStagingManager:
                 self._pending_host_offers.pop(offer["snapshot_id"], None)
         return admitted
 
-    def _release_record(self, record: dict[str, Any]) -> None:
-        snapshot = record.pop("snapshot", None)
-        if snapshot is not None:
-            self.arena.release(snapshot)
+    def _release_record(self, record: dict[str, Any]) -> bool:
+        snapshot = record.get("snapshot")
+        if snapshot is None:
+            return True
+        if not self.arena.release(snapshot):
+            return False
+        record.pop("snapshot", None)
+        return True
 
     def _fail_active(self, snapshot_id: str, reason: str, *, free_host: bool = True) -> None:
         with self._get_state_lock():
@@ -4059,6 +4225,217 @@ class AgenticPHostStagingManager:
         self._spill_threads[snapshot_id] = thread
         thread.start()
 
+    @staticmethod
+    def _host_eviction_key(
+        snapshot_id: str, record: dict[str, Any]
+    ) -> tuple[int, float, str]:
+        """Prefer cheap recomputation, then the oldest equal-size wait."""
+
+        offer = record["offer"]
+        return (
+            int(offer.get("token_count", 0)),
+            float(record.get("ready_at", offer.get("created_at", 0.0))),
+            str(snapshot_id),
+        )
+
+    @staticmethod
+    def _host_record_allocation_bytes(record: dict[str, Any]) -> int:
+        snapshot = record.get("snapshot")
+        return int(
+            getattr(
+                snapshot,
+                "allocation_bytes",
+                record.get("offer", {}).get("byte_size", 0),
+            )
+        )
+
+    def _release_evicted_host_rank(
+        self, snapshot_id: str, entry: dict[str, Any]
+    ) -> bool:
+        """Release one local shard, then ACK the TP-wide eviction fence."""
+
+        with self._get_state_lock():
+            record = self.host_ready.get(snapshot_id)
+            container = self.host_ready
+            container_name = "host_ready"
+            if record is None:
+                record = self.active.get(snapshot_id)
+                container = self.active
+                container_name = "active"
+            if record is not None and record.get("loading"):
+                # A peer may have reserved a lane just before rank0 won the
+                # ledger CAS.  Its prepare call will observe EVICTING, cancel
+                # the unstarted lease, and make this record eligible next turn.
+                return False
+            if record is not None:
+                container.pop(snapshot_id, None)
+        if record is not None:
+            token_count = int(record.get("offer", {}).get("token_count", 0))
+            byte_size = self._host_record_allocation_bytes(record)
+            if not self._release_record(record):
+                with self._get_state_lock():
+                    destination = (
+                        self.host_ready
+                        if container_name == "host_ready"
+                        else self.active
+                    )
+                    destination.setdefault(snapshot_id, record)
+                logger.error(
+                    "AgenticKV shared_host_evict_release_retry snapshot=%s "
+                    "tp_rank=%d/%d",
+                    snapshot_id,
+                    self.tp_rank,
+                    self.tp_size,
+                )
+                return False
+            self._host_eviction_local_released.add(snapshot_id)
+            self._host_eviction_count += 1
+            self._host_eviction_tokens += token_count
+            self._host_eviction_bytes += byte_size
+            logger.warning(
+                "AgenticKV shared_host_evict_release snapshot=%s tokens=%d "
+                "bytes=%d tp_rank=%d/%d reason=%s",
+                snapshot_id,
+                token_count,
+                byte_size,
+                self.tp_rank,
+                self.tp_size,
+                entry.get("eviction_reason", "shared_host_pressure_eviction"),
+            )
+        if snapshot_id not in self._host_eviction_local_released:
+            return False
+        acknowledged = self.ledger.complete_host_eviction_rank(
+            snapshot_id,
+            self.owner,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+        )
+        if acknowledged:
+            self._notify_scheduler("recompute_required", snapshot_id)
+        return acknowledged
+
+    def _progress_host_evictions(
+        self, ledger_entries=None, *, snapshot_ids=None
+    ) -> None:
+        """Apply group eviction decisions to this rank's local Host arena."""
+
+        if ledger_entries is None:
+            entries = self.ledger.snapshot_entries(force_refresh=True)
+        else:
+            entries = ledger_entries
+        ids = entries.keys() if snapshot_ids is None else snapshot_ids
+        for snapshot_id in ids:
+            entry = entries.get(snapshot_id)
+            if entry is None or entry.get("p_owner") != self.owner:
+                continue
+            state = entry.get("state")
+            if state == HostStageState.EVICTING.value:
+                self._release_evicted_host_rank(snapshot_id, entry)
+            elif state == HostStageState.RECOMPUTE_REQUIRED.value:
+                # Idempotent cleanup after a final ACK/event race.  Normally
+                # the local record was already released in EVICTING.
+                with self._get_state_lock():
+                    record = self.host_ready.get(snapshot_id)
+                    container = self.host_ready
+                    if record is None:
+                        record = self.active.get(snapshot_id)
+                        container = self.active
+                    if record is not None and not record.get("loading"):
+                        container.pop(snapshot_id, None)
+                    else:
+                        record = None
+                if record is not None:
+                    if not self._release_record(record):
+                        with self._get_state_lock():
+                            container.setdefault(snapshot_id, record)
+                        logger.error(
+                            "AgenticKV terminal Host eviction cleanup failed "
+                            "snapshot=%s tp_rank=%d/%d",
+                            snapshot_id,
+                            self.tp_rank,
+                            self.tp_size,
+                        )
+                self._host_eviction_local_released.discard(snapshot_id)
+
+    def _maybe_evict_shared_host(self) -> None:
+        """Evict complete request-generations down to the configured low mark.
+
+        This is the Shared-Arena-only pressure policy.  Native storage spill
+        retains its existing controller and never enters this path.
+        """
+
+        if getattr(self, "storage_spill_enabled", False):
+            return
+        usage = self._host_usage()
+        required_bytes = int(
+            getattr(self, "_host_eviction_required_bytes", 0)
+        )
+        required_fits = required_bytes <= 0 or self.arena.can_reserve(
+            required_bytes, self.hard_watermark
+        )
+        if (
+            not self._host_eviction_pressure
+            and (usage >= self.high_watermark or not required_fits)
+        ):
+            self._host_eviction_pressure = True
+        if not self._host_eviction_pressure or self.tp_rank != 0:
+            return
+
+        target_bytes = int(self.arena.capacity_bytes * self.low_watermark)
+        with self._get_state_lock():
+            candidates = sorted(
+                (
+                    (snapshot_id, record)
+                    for snapshot_id, record in self.host_ready.items()
+                    if not record.get("loading")
+                ),
+                key=lambda item: self._host_eviction_key(item[0], item[1]),
+            )
+        initiated = 0
+        for snapshot_id, record in candidates:
+            required_fits = required_bytes <= 0 or self.arena.can_reserve(
+                required_bytes, self.hard_watermark
+            )
+            if self.arena.used_bytes <= target_bytes and required_fits:
+                break
+            if not self.ledger.begin_host_eviction(
+                snapshot_id,
+                self.owner,
+                tp_size=self.tp_size,
+                reason="shared_host_pressure_shortest_first",
+            ):
+                continue
+            entry = self.ledger.get(snapshot_id)
+            if entry is None:
+                continue
+            if self._release_evicted_host_rank(snapshot_id, entry):
+                initiated += 1
+
+        usage = self._host_usage()
+        required_fits = required_bytes <= 0 or self.arena.can_reserve(
+            required_bytes, self.hard_watermark
+        )
+        if usage <= self.low_watermark and required_fits:
+            self._host_eviction_pressure = False
+            self._host_eviction_required_bytes = 0
+        elif initiated == 0:
+            now = time.monotonic()
+            if now - self._last_host_eviction_blocked_log >= 5.0:
+                logger.warning(
+                    "AgenticKV shared_host_evict_blocked usage=%.4f "
+                    "high=%.4f low=%.4f required_bytes=%d required_fits=%s "
+                    "host_ready=%d active=%d loads=%d",
+                    usage,
+                    self.high_watermark,
+                    self.low_watermark,
+                    required_bytes,
+                    required_fits,
+                    len(self.host_ready),
+                    len(self.active),
+                    len(self.loads),
+                )
+                self._last_host_eviction_blocked_log = now
+
     def _has_local_io_progress(self) -> bool:
         """Return whether CUDA/thread completion still needs short polling."""
 
@@ -4067,7 +4444,11 @@ class AgenticPHostStagingManager:
                 record.get("grant_publish_pending")
                 for record in self.active.values()
             )
-            return bool(self.loads or self.spills or pending_grant)
+            return bool(
+                self.loads
+                or self.spills
+                or pending_grant
+            )
 
     def _ledger_watch_worker(self) -> None:
         watcher = self._ledger_watcher
@@ -4160,8 +4541,11 @@ class AgenticPHostStagingManager:
         if full_snapshot is not None:
             self._poll_active(self._ledger_entries_cache)
             self._poll_aborting(self._ledger_entries_cache)
+            self._progress_host_evictions(self._ledger_entries_cache)
+            self._maybe_evict_shared_host()
             self._admit_batch(
-                self._ledger_entries_cache, replace_pending=True
+                self._ledger_entries_cache,
+                replace_pending=True,
             )
         elif changed_snapshot_ids:
             changed_entries = {
@@ -4177,7 +4561,14 @@ class AgenticPHostStagingManager:
                 self._ledger_entries_cache,
                 snapshot_ids=changed_snapshot_ids,
             )
+            self._progress_host_evictions(
+                self._ledger_entries_cache,
+                snapshot_ids=changed_snapshot_ids,
+            )
+            self._maybe_evict_shared_host()
             self._admit_batch(changed_entries)
+        else:
+            self._maybe_evict_shared_host()
         if time.monotonic() - self._last_prune > 5.0:
             self.ledger.prune()
             self._last_prune = time.monotonic()
@@ -4208,7 +4599,9 @@ class AgenticPHostStagingManager:
                 logger.info(
                     "Agentic P async control stats cycles=%d avg_us=%.1f "
                     "max_ms=%.3f active=%d host_ready=%d spills=%d "
-                    "h2d_loads=%d h2d_lanes=%d/%d errors=%d",
+                    "h2d_loads=%d h2d_lanes=%d/%d errors=%d "
+                    "host_evictions=%d host_eviction_tokens=%d "
+                    "host_eviction_gib=%.3f",
                     self._control_cycles,
                     self._control_total_seconds
                     / max(self._control_cycles, 1)
@@ -4221,6 +4614,9 @@ class AgenticPHostStagingManager:
                     h2d_lanes_owned,
                     self.max_h2d_inflight,
                     self._control_errors,
+                    self._host_eviction_count,
+                    self._host_eviction_tokens,
+                    self._host_eviction_bytes / (1024**3),
                 )
                 self._control_cycles = 0
                 self._control_total_seconds = 0.0
@@ -5124,14 +5520,22 @@ class AgenticPHostStagingManager:
             if ledger_cache is None
             else ledger_cache.get(snapshot_id)
         )
-        if ledger_entry is not None and ledger_entry.get("state") == HostStageState.FAILED.value:
+        if ledger_entry is not None and ledger_entry.get("state") in {
+            HostStageState.FAILED.value,
+            HostStageState.RECOMPUTE_REQUIRED.value,
+        }:
             with self._get_state_lock():
                 failed_record = self.host_ready.pop(snapshot_id, None)
             if failed_record is not None:
                 self._release_record(failed_record)
             AgenticPHostStagingManager._release_h2d_lane(self, snapshot_id)
             req._agentic_kv_gate_complete = True
-            req._agentic_kv_fallback = "shared_host_h2d_failed"
+            req._agentic_kv_fallback = (
+                "shared_host_evicted"
+                if ledger_entry.get("state")
+                == HostStageState.RECOMPUTE_REQUIRED.value
+                else "shared_host_h2d_failed"
+            )
             return False
         if record is None:
             if ledger_entry is not None and ledger_entry.get("state") in {
@@ -5139,6 +5543,7 @@ class AgenticPHostStagingManager:
                 HostStageState.HOST_WRITING.value,
                 HostStageState.ABORTING.value,
                 HostStageState.HOST_READY.value,
+                HostStageState.EVICTING.value,
                 HostStageState.SPILLING.value,
                 HostStageState.H2D_LOADING.value,
                 HostStageState.HBM_READY.value,
@@ -6139,6 +6544,12 @@ class AgenticDHostStagingClient:
         durable_states = {
             HostStageState.HOST_READY.value,
             HostStageState.H2D_LOADING.value,
+            # Pressure eviction can race D's observation of the HOST_READY
+            # fence.  Both states prove that the complete Host copy was
+            # durable before intentional recomputation was chosen, so D may
+            # still release its obsolete source pages.
+            HostStageState.EVICTING.value,
+            HostStageState.RECOMPUTE_REQUIRED.value,
             HostStageState.SPILLING.value,
             HostStageState.MOONCAKE_READY.value,
             HostStageState.CONSUMED.value,
