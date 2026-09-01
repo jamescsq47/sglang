@@ -498,6 +498,12 @@ class SnapshotManifest:
     # existing experiment retain their exact behavior.
     tp_size: int = 1
     kv_layout_hash: Optional[str] = None
+    # A Qwen3.5 request-generation is complete only when both attention pages
+    # and the matching temporal/conv checkpoint are visible.  These compact
+    # fields describe that composite transaction without adding per-page state.
+    cache_components: tuple[str, ...] = ("attention",)
+    state_byte_size: int = 0
+    state_checkpoint_tokens: Optional[int] = None
     version: int = MANIFEST_VERSION
 
     def __post_init__(self) -> None:
@@ -511,6 +517,19 @@ class SnapshotManifest:
             raise ValueError("byte_size must be non-negative")
         if self.tp_size <= 0:
             raise ValueError("tp_size must be positive")
+        if not self.cache_components or any(not item for item in self.cache_components):
+            raise ValueError("cache_components must be non-empty")
+        if len(set(self.cache_components)) != len(self.cache_components):
+            raise ValueError("cache_components must be unique")
+        if self.state_byte_size < 0:
+            raise ValueError("state_byte_size must be non-negative")
+        if self.state_checkpoint_tokens is not None and self.state_checkpoint_tokens < 0:
+            raise ValueError("state_checkpoint_tokens must be non-negative")
+        if "mamba" in self.cache_components:
+            if self.state_byte_size <= 0:
+                raise ValueError("Mamba snapshots require a state payload")
+            if self.state_checkpoint_tokens is None:
+                raise ValueError("Mamba snapshots require a checkpoint position")
         if not self.page_keys and self.state not in {
             SnapshotState.FAILED,
             SnapshotState.FINAL,
@@ -604,6 +623,9 @@ class SnapshotManifest:
             "direct_room": self.direct_room,
             "tp_size": self.tp_size,
             "kv_layout_hash": self.kv_layout_hash,
+            "cache_components": self.cache_components,
+            "state_byte_size": self.state_byte_size,
+            "state_checkpoint_tokens": self.state_checkpoint_tokens,
         }
         raw = json.dumps(body, separators=(",", ":"), ensure_ascii=True).encode()
         return zlib.compress(raw, level=1)
@@ -634,6 +656,13 @@ class SnapshotManifest:
             direct_room=body.get("direct_room"),
             tp_size=int(body.get("tp_size", 1)),
             kv_layout_hash=body.get("kv_layout_hash"),
+            cache_components=tuple(body.get("cache_components", ("attention",))),
+            state_byte_size=int(body.get("state_byte_size", 0)),
+            state_checkpoint_tokens=(
+                None
+                if body.get("state_checkpoint_tokens") is None
+                else int(body["state_checkpoint_tokens"])
+            ),
             version=int(body["version"]),
         )
 

@@ -77,6 +77,8 @@ def debug_kv_digest(kv_pool, token_indices) -> str | None:
         "on",
     }:
         return None
+    if hasattr(kv_pool, "full_kv_pool"):
+        kv_pool = kv_pool.full_kv_pool
     indices = torch.as_tensor(
         token_indices, dtype=torch.long, device=kv_pool.k_buffer[0].device
     )
