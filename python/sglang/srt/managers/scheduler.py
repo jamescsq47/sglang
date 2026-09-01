@@ -474,6 +474,15 @@ class Scheduler(
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
 
+        state_allocators = ()
+        if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get() and hasattr(
+            self.req_to_token_pool, "mamba_allocator"
+        ):
+            state_allocators = (self.req_to_token_pool.mamba_allocator,)
+        self.agentic_p_workset_broker = AgenticPWorksetLeaseBroker(
+            self.page_size, state_allocators=state_allocators
+        )
+
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
 
@@ -484,9 +493,19 @@ class Scheduler(
 
         if (
             self.server_args.disaggregation_mode == "decode"
-            and self.server_args.disaggregation_decode_enable_offload_kvcache
+            and (
+                self.server_args.disaggregation_decode_enable_offload_kvcache
+                or envs.SGLANG_AGENTIC_KV_LIFECYCLE.get()
+            )
         ):
-            self.decode_offload_manager = DecodeKVCacheOffloadManager(
+            manager_class = DecodeKVCacheOffloadManager
+            if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get():
+                from sglang.srt.disaggregation.agentic_decode_manager import (
+                    DecodeKVCacheOffloadManager as AgenticDecodeKVCacheOffloadManager,
+                )
+
+                manager_class = AgenticDecodeKVCacheOffloadManager
+            self.decode_offload_manager = manager_class(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 tp_group=(
@@ -1221,6 +1240,37 @@ class Scheduler(
                 tp_group=self.tp_group,
                 scheduler=self,
             )
+
+    def _agentic_service_p_workset_leases(self) -> None:
+        """Service complete Attention+state worksets at an allocator boundary."""
+
+        broker = getattr(self, "agentic_p_workset_broker", None)
+        if broker is None:
+            return
+        reserve_tokens = 0
+        chunked_req = getattr(self, "chunked_req", None)
+        private_suffix = (
+            None
+            if chunked_req is None
+            or not getattr(chunked_req, "_agentic_workset_backed", False)
+            else getattr(chunked_req, "_agentic_workset_suffix_indices", None)
+        )
+        if chunked_req is not None and (
+            private_suffix is None or private_suffix.numel() == 0
+        ):
+            remaining = max(
+                0,
+                len(chunked_req.origin_input_ids)
+                + len(chunked_req.output_ids)
+                - len(chunked_req.fill_ids),
+            )
+            reserve_tokens = (
+                (remaining + self.page_size - 1) // self.page_size
+            ) * self.page_size
+        broker.service(
+            self.token_to_kv_pool_allocator,
+            reserve_tokens=reserve_tokens,
+        )
 
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)

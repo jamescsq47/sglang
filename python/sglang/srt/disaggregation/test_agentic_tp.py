@@ -57,7 +57,7 @@ from sglang.srt.disaggregation.agentic_tp import (
 )
 from sglang.srt.disaggregation.agentic_tp_control import TPGroupMailbox
 from sglang.srt.disaggregation.base import KVPoll
-from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
+from sglang.srt.disaggregation.agentic_decode_manager import (
     DecodeKVCacheOffloadManager,
 )
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeTransferQueue

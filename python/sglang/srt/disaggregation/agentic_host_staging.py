@@ -342,19 +342,6 @@ def create_agentic_storage_controller(
 ) -> AgenticStorageController:
     """Create the custom slow-path storage data plane without HiCache."""
 
-    from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
-    from sglang.srt.mem_cache.memory_pool import (
-        MHATokenToKVPool,
-        MLATokenToKVPool,
-        NSATokenToKVPool,
-    )
-    from sglang.srt.mem_cache.memory_pool_host import (
-        MHATokenToKVPoolHost,
-        MLATokenToKVPoolHost,
-        NSATokenToKVPoolHost,
-    )
-    from sglang.srt.mem_cache.storage import StorageBackendFactory
-
     backend_name = server_args.hicache_storage_backend
     if backend_name is None:
         backend = create_agentic_node_local_metadata_backend()
@@ -364,7 +351,23 @@ def create_agentic_storage_controller(
             backend._raw_store.directory,
         )
         return AgenticStorageController(None, backend)
+    from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
+    from sglang.srt.mem_cache.memory_pool import (
+        HybridLinearKVPool,
+        MHATokenToKVPool,
+        MLATokenToKVPool,
+    )
+    from sglang.srt.mem_cache.memory_pool_host import (
+        MHATokenToKVPoolHost,
+        MLATokenToKVPoolHost,
+    )
+    from sglang.srt.mem_cache.storage import StorageBackendFactory
+
     device_pool = token_allocator.get_kvcache()
+    if isinstance(device_pool, HybridLinearKVPool):
+        # The request-generation slow path owns the Mamba payload separately;
+        # the native storage controller here stores only attention pages.
+        device_pool = device_pool.full_kv_pool
     common = (
         device_pool,
         server_args.hicache_ratio,
@@ -374,10 +377,6 @@ def create_agentic_storage_controller(
     )
     if isinstance(device_pool, MHATokenToKVPool):
         host_pool = MHATokenToKVPoolHost(
-            *common, allocator_type=backend_name
-        )
-    elif isinstance(device_pool, NSATokenToKVPool):
-        host_pool = NSATokenToKVPoolHost(
             *common, allocator_type=backend_name
         )
     elif isinstance(device_pool, MLATokenToKVPool):

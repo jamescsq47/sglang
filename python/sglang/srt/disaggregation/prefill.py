@@ -445,6 +445,8 @@ class SchedulerDisaggregationPrefillMixin:
     def get_next_disagg_prefill_batch_to_run(
         self: Scheduler,
     ) -> Optional[ScheduleBatch]:
+        if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get():
+            self._agentic_service_p_workset_leases()
         self.process_pending_chunked_abort()
 
         # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
