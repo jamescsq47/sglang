@@ -309,6 +309,9 @@ class Envs:
     # Baseline launchers leave this disabled and retain stock SGLang behavior.
     SGLANG_AGENTIC_KV_CUSTOM_STORAGE_ONLY = EnvBool(False)
     SGLANG_AGENTIC_KV_FAST_TOOL_THRESHOLD = EnvFloat(0.2)
+    # Ablation only: keep the request-generation lifecycle and Shared Host
+    # recovery enabled while bypassing D->P Direct admission.
+    SGLANG_AGENTIC_KV_FORCE_SLOW_PATH = EnvBool(False)
     SGLANG_AGENTIC_KV_DIRECT_BOOTSTRAP_PORT = EnvInt(0)
     SGLANG_AGENTIC_KV_DIRECT_HANDSHAKE_TIMEOUT = EnvFloat(2.0)
     SGLANG_AGENTIC_KV_HOST_TRANSITION_GRACE = EnvFloat(8.0)
@@ -342,9 +345,9 @@ class Envs:
     # per Arena-local relay rather than one full request snapshot.
     SGLANG_AGENTIC_KV_STAGING_SLOT_MIB = EnvInt(64)
     SGLANG_AGENTIC_KV_STAGING_SLOTS = EnvInt(2)
-    SGLANG_AGENTIC_KV_P_HOST_HIGH_WATERMARK = EnvFloat(0.80)
-    SGLANG_AGENTIC_KV_P_HOST_LOW_WATERMARK = EnvFloat(0.70)
-    SGLANG_AGENTIC_KV_P_HOST_HARD_WATERMARK = EnvFloat(0.90)
+    SGLANG_AGENTIC_KV_P_HOST_HIGH_WATERMARK = EnvFloat(0.90)
+    SGLANG_AGENTIC_KV_P_HOST_LOW_WATERMARK = EnvFloat(0.75)
+    SGLANG_AGENTIC_KV_P_HOST_HARD_WATERMARK = EnvFloat(0.95)
     # Bound large Mooncake PUTs across all same-node decode workers so a burst
     # of D->Store snapshots cannot starve the P worker's Store->P GET path.
     # This is consulted only when SGLANG_AGENTIC_KV_LIFECYCLE is enabled.
