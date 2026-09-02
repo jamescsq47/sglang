@@ -1877,7 +1877,11 @@ class SharedHostStagingLedger:
             drained.add(int(tp_rank))
             current["loader_drained_ranks"] = sorted(drained)
             if len(drained) == int(tp_size):
+                if current.get("recovery_claims"):
+                    return False, False
                 current["state"] = HostStageState.FAILED.value
+                current["recovery_claim_id"] = None
+                current["recovery_claims"] = {}
                 current["reason"] = current.get(
                     "loader_failure_reason", "p2d_h2d_failed"
                 )
@@ -2006,6 +2010,8 @@ class SharedHostStagingLedger:
             current["retry_acks"] = sorted(retry_acks)
             if len(retry_acks) == int(tp_size):
                 current["state"] = HostStageState.HOST_READY.value
+                current["recovery_claim_id"] = None
+                current["recovery_claims"] = {}
                 for key in (
                     "loading_ranks",
                     "h2d_prepared_ranks",
@@ -2054,6 +2060,233 @@ class SharedHostStagingLedger:
             loading_ranks.add(int(tp_rank))
             current["loading_ranks"] = sorted(loading_ranks)
             current["state"] = HostStageState.H2D_LOADING.value
+            current["updated_at"] = time.time()
+            return True, True
+
+        return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
+
+    def claim_d2p_recovery_rank(
+        self,
+        snapshot_id: str,
+        owner: str,
+        *,
+        tp_rank: int,
+        tp_size: int,
+        claim_id: str,
+    ) -> bool:
+        """Pin a D->P Host snapshot before allocating any P workset pages.
+
+        This is the request-generation ownership boundary between pressure
+        eviction and Slow recovery.  Once any TP rank has published the same
+        logical claim, the generation is no longer ``HOST_READY`` and is
+        therefore invisible to eviction.  Workset allocation happens only
+        after this CAS succeeds.
+        """
+
+        claim_id = str(claim_id)
+
+        def callback(entries):
+            current = entries.get(snapshot_id)
+            if (
+                current is None
+                or current.get("p_owner") != owner
+                or int(current.get("tp_size", 1)) != int(tp_size)
+                or current.get("state")
+                not in {
+                    HostStageState.HOST_READY.value,
+                    HostStageState.H2D_LOADING.value,
+                }
+            ):
+                return False, False
+            recovery_claim_id = current.get("recovery_claim_id")
+            if recovery_claim_id not in {None, claim_id}:
+                return False, False
+            claims = dict(current.get("recovery_claims", {}))
+            rank_key = str(int(tp_rank))
+            previous = claims.get(rank_key)
+            if previous is not None and previous.get("claim_id") != claim_id:
+                return False, False
+            changed = previous is None
+            claims[rank_key] = {
+                "claim_id": claim_id,
+                "phase": "pinned",
+                "lease_id": None,
+            }
+            current["recovery_claim_id"] = claim_id
+            current["recovery_claims"] = claims
+            current["state"] = HostStageState.H2D_LOADING.value
+            if changed:
+                current["updated_at"] = time.time()
+            return True, changed
+
+        return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
+
+    def attach_d2p_recovery_lease_rank(
+        self,
+        snapshot_id: str,
+        owner: str,
+        *,
+        tp_rank: int,
+        tp_size: int,
+        claim_id: str,
+        lease_id: int,
+    ) -> bool:
+        """Attach the exact P workset lease to an already pinned snapshot."""
+
+        claim_id = str(claim_id)
+        lease_id = int(lease_id)
+
+        def callback(entries):
+            current = entries.get(snapshot_id)
+            claims = {} if current is None else dict(
+                current.get("recovery_claims", {})
+            )
+            rank_key = str(int(tp_rank))
+            claim = claims.get(rank_key)
+            if (
+                current is None
+                or current.get("p_owner") != owner
+                or int(current.get("tp_size", 1)) != int(tp_size)
+                or current.get("state") != HostStageState.H2D_LOADING.value
+                or current.get("recovery_claim_id") != claim_id
+                or claim is None
+                or claim.get("claim_id") != claim_id
+            ):
+                return False, False
+            previous_lease_id = claim.get("lease_id")
+            if previous_lease_id not in {None, lease_id}:
+                return False, False
+            changed = previous_lease_id is None or claim.get("phase") != "leased"
+            claim = dict(claim)
+            claim.update(lease_id=lease_id, phase="leased")
+            claims[rank_key] = claim
+            current["recovery_claims"] = claims
+            if changed:
+                current["updated_at"] = time.time()
+            return True, changed
+
+        return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
+
+    def mark_d2p_recovery_phase_rank(
+        self,
+        snapshot_id: str,
+        owner: str,
+        *,
+        tp_rank: int,
+        tp_size: int,
+        claim_id: str,
+        lease_id: int,
+        phase: str,
+    ) -> bool:
+        """Advance the ledger-owned recovery/lease lifecycle monotonically."""
+
+        phases = {"leased": 0, "io_inflight": 1, "handed": 2}
+        if phase not in phases:
+            raise ValueError(f"invalid D->P recovery phase {phase}")
+        claim_id = str(claim_id)
+        lease_id = int(lease_id)
+
+        def callback(entries):
+            current = entries.get(snapshot_id)
+            claims = {} if current is None else dict(
+                current.get("recovery_claims", {})
+            )
+            rank_key = str(int(tp_rank))
+            claim = claims.get(rank_key)
+            if (
+                current is None
+                or current.get("p_owner") != owner
+                or int(current.get("tp_size", 1)) != int(tp_size)
+                or current.get("state")
+                not in {
+                    HostStageState.H2D_LOADING.value,
+                    HostStageState.HBM_READY.value,
+                    HostStageState.CONSUMED.value,
+                }
+                or claim is None
+                or claim.get("claim_id") != claim_id
+                or int(claim.get("lease_id", -1)) != lease_id
+            ):
+                return False, False
+            old_phase = str(claim.get("phase", "leased"))
+            if old_phase not in phases or phases[old_phase] > phases[phase]:
+                return False, False
+            if old_phase == phase:
+                return True, False
+            claim = dict(claim)
+            claim["phase"] = phase
+            claims[rank_key] = claim
+            current["recovery_claims"] = claims
+            current["updated_at"] = time.time()
+            return True, True
+
+        return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
+
+    def cancel_d2p_recovery_rank(
+        self,
+        snapshot_id: str,
+        owner: str,
+        *,
+        tp_rank: int,
+        tp_size: int,
+        claim_id: str,
+        lease_id: Optional[int] = None,
+    ) -> bool:
+        """Roll back a pinned recovery after its exact workset was cancelled.
+
+        I/O-owned or handed leases cannot be cancelled through this method.
+        The caller must first prove transport quiescence and use the normal
+        terminal path.  Once every TP rank has rolled back, Host ownership is
+        returned to ``HOST_READY`` and pressure eviction may see it again.
+        """
+
+        claim_id = str(claim_id)
+
+        def callback(entries):
+            current = entries.get(snapshot_id)
+            claims = {} if current is None else dict(
+                current.get("recovery_claims", {})
+            )
+            rank_key = str(int(tp_rank))
+            claim = claims.get(rank_key)
+            if (
+                current is None
+                or current.get("p_owner") != owner
+                or int(current.get("tp_size", 1)) != int(tp_size)
+                or current.get("state")
+                not in {
+                    HostStageState.H2D_LOADING.value,
+                    HostStageState.ABORTING.value,
+                }
+                or current.get("recovery_claim_id") != claim_id
+                or claim is None
+                or claim.get("claim_id") != claim_id
+                or claim.get("phase") in {"io_inflight", "handed"}
+            ):
+                return False, False
+            attached_lease_id = claim.get("lease_id")
+            if lease_id is not None and attached_lease_id not in {
+                None,
+                int(lease_id),
+            }:
+                return False, False
+            claims.pop(rank_key, None)
+            current["recovery_claims"] = claims
+            if (
+                not claims
+                and current.get("state") == HostStageState.H2D_LOADING.value
+            ):
+                current["recovery_claim_id"] = None
+                current["state"] = HostStageState.HOST_READY.value
+                for key in (
+                    "loading_ranks",
+                    "h2d_prepared_ranks",
+                    "loader_acks",
+                    "binder_acks",
+                ):
+                    current[key] = []
+            elif not claims:
+                current["recovery_claim_id"] = None
             current["updated_at"] = time.time()
             return True, True
 
@@ -4398,6 +4631,20 @@ class AgenticPHostStagingManager:
             )
             if self.arena.used_bytes <= target_bytes and required_fits:
                 break
+            broker = getattr(self, "workset_broker", None)
+            eviction_blocker = (
+                None
+                if broker is None
+                else broker.eviction_blocker(snapshot_id)
+            )
+            if eviction_blocker is not None:
+                logger.error(
+                    "AgenticKV shared_host_evict_invariant_blocked "
+                    "snapshot=%s lease=%s",
+                    snapshot_id,
+                    eviction_blocker,
+                )
+                continue
             if not self.ledger.begin_host_eviction(
                 snapshot_id,
                 self.owner,
@@ -4405,6 +4652,18 @@ class AgenticPHostStagingManager:
                 reason="shared_host_pressure_shortest_first",
             ):
                 continue
+            # The HOST_READY->EVICTING CAS is the final ownership boundary.
+            # Recovery must pin the ledger before allocating a workset, so no
+            # lease may appear after this transition.  Check the invariant
+            # again after the CAS to turn any future ordering regression into
+            # an immediate fail-stop instead of an orphaned P-HBM reservation.
+            if broker is not None:
+                post_cas_blocker = broker.eviction_blocker(snapshot_id)
+                if post_cas_blocker is not None:
+                    raise RuntimeError(
+                        "evicted Host snapshot retains live P workset: "
+                        f"snapshot={snapshot_id} lease={post_cas_blocker}"
+                    )
             entry = self.ledger.get(snapshot_id)
             if entry is None:
                 continue
@@ -4447,6 +4706,7 @@ class AgenticPHostStagingManager:
             return bool(
                 self.loads
                 or self.spills
+                or getattr(self, "_prestart_recovery_aborts", {})
                 or pending_grant
             )
 
@@ -4515,6 +4775,7 @@ class AgenticPHostStagingManager:
         # Publish populated extents before taking the shared ledger snapshot so
         # D can observe every new grant in this same control cycle.
         self._progress_arena_grants()
+        self._progress_prestart_aborts()
         self._progress_h2d_loads()
         self._progress_spills()
         self._maybe_spill()
@@ -4747,14 +5008,32 @@ class AgenticPHostStagingManager:
 
         request_generation = load["request_generation"]
         snapshot_id = request_generation.snapshot_id
-        self.workset_broker.cancel_io_attempt(
+        lease = load["workset_lease"]
+        attempt = load["io_attempt"]
+        cancelled = self.workset_broker.cancel_io_attempt(
             snapshot_id, load["workset_lease"], load["io_attempt"]
         )
-        self.workset_broker.request_release(snapshot_id, load["workset_lease"])
+        if not cancelled:
+            raise RuntimeError(
+                f"cannot cancel started Slow recovery {snapshot_id}"
+            )
+        self.workset_broker.request_release(snapshot_id, lease)
+        if not self.ledger.cancel_d2p_recovery_rank(
+            snapshot_id,
+            self.owner,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            claim_id=load["recovery_claim_id"],
+            lease_id=lease.lease_id,
+        ):
+            raise RuntimeError(
+                f"cannot roll back Slow recovery ownership {snapshot_id}"
+            )
         with AgenticPHostStagingManager._get_state_lock(self):
             if self.loads.get(rid) is load:
                 self.loads.pop(rid, None)
             load["record"]["loading"] = False
+            load["record"].pop("recovery_claim_id", None)
         AgenticPHostStagingManager._release_h2d_lane(self, snapshot_id)
 
     def _complete_shared_host_manifest(self, request_generation) -> bool:
@@ -4796,6 +5075,23 @@ class AgenticPHostStagingManager:
                 load["workset_lease"],
                 load["io_attempt"],
             )
+            if not self.ledger.mark_d2p_recovery_phase_rank(
+                load["request_generation"].snapshot_id,
+                self.owner,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+                claim_id=load["recovery_claim_id"],
+                lease_id=load["workset_lease"].lease_id,
+                phase="io_inflight",
+            ):
+                self.workset_broker.mark_io_quiesced(
+                    load["request_generation"].snapshot_id,
+                    load["workset_lease"],
+                    load["io_attempt"],
+                )
+                raise RuntimeError(
+                    "Slow recovery lost Host ownership before H2D"
+                )
             load["io_inflight"] = True
         launch_fence = H2DLaunchFence(
             event=torch.cuda.Event(enable_timing=True)
@@ -5118,10 +5414,135 @@ class AgenticPHostStagingManager:
                     load["request_generation"].snapshot_id,
                 )
 
+    def _progress_prestart_aborts(self) -> None:
+        """Retire pinned Slow recoveries that never started physical H2D.
+
+        Abort, recovery claim, and workset allocation can race on three
+        independent threads.  The shared ledger is frozen in ABORTING first;
+        then the exact local workset owner is retired; only after both fences
+        are visible may this rank release its Host shard and ACK the group.
+        """
+
+        with self._get_state_lock():
+            pending = list(
+                getattr(self, "_prestart_recovery_aborts", {}).items()
+            )
+        for snapshot_id, context in pending:
+            try:
+                entry = self.ledger.get(snapshot_id)
+                state = None if entry is None else entry.get("state")
+                if state in {
+                    HostStageState.EVICTING.value,
+                    HostStageState.RECOMPUTE_REQUIRED.value,
+                }:
+                    # Eviction won the HOST_READY ownership CAS.  Restore the
+                    # local record's eligibility and let the eviction state
+                    # machine release/ACK this shard; abort must not steal it.
+                    with self._get_state_lock():
+                        record = self.host_ready.get(snapshot_id)
+                        if record is not None:
+                            record["loading"] = False
+                            record.pop("abort_requested", None)
+                        self._prestart_recovery_aborts.pop(snapshot_id, None)
+                    AgenticPHostStagingManager._release_h2d_lane(
+                        self, snapshot_id
+                    )
+                    continue
+                if state == HostStageState.FAILED.value:
+                    with self._get_state_lock():
+                        record = self.host_ready.pop(snapshot_id, None)
+                    if record is not None and not self._release_record(record):
+                        with self._get_state_lock():
+                            self.host_ready.setdefault(snapshot_id, record)
+                        continue
+                    with self._get_state_lock():
+                        self._prestart_recovery_aborts.pop(snapshot_id, None)
+                    AgenticPHostStagingManager._release_h2d_lane(
+                        self, snapshot_id
+                    )
+                    continue
+                if state != HostStageState.ABORTING.value:
+                    if not self.ledger.request_host_load_failure(
+                        snapshot_id,
+                        self.owner,
+                        reason="request_aborted_before_h2d",
+                    ):
+                        continue
+                    entry = self.ledger.get(snapshot_id)
+                    if (
+                        entry is None
+                        or entry.get("state")
+                        != HostStageState.ABORTING.value
+                    ):
+                        continue
+            except Exception:
+                logger.exception(
+                    "AgenticKV prestart abort ownership retry snapshot=%s",
+                    snapshot_id,
+                )
+                continue
+
+            rid = str(context["rid"])
+            claim_id = self.workset_broker.slow_owner(snapshot_id, rid)
+            lease = self.workset_broker.get(snapshot_id, owner=claim_id)
+            if lease is None:
+                self.workset_broker.cancel_unstarted(
+                    snapshot_id, owner=claim_id
+                )
+            else:
+                self.workset_broker.request_release(
+                    snapshot_id, lease, owner=claim_id
+                )
+                if self.workset_broker.eviction_blocker(snapshot_id) is not None:
+                    continue
+
+            entry = self.ledger.get(snapshot_id)
+            claims = {} if entry is None else entry.get("recovery_claims", {})
+            rank_claim = claims.get(str(int(self.tp_rank)))
+            if rank_claim is not None:
+                if not self.ledger.cancel_d2p_recovery_rank(
+                    snapshot_id,
+                    self.owner,
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
+                    claim_id=str(rank_claim.get("claim_id", claim_id)),
+                    lease_id=(
+                        None if lease is None else int(lease.lease_id)
+                    ),
+                ):
+                    continue
+
+            with self._get_state_lock():
+                current = getattr(self, "_prestart_recovery_aborts", {}).get(
+                    snapshot_id
+                )
+                if current is not context:
+                    continue
+                record = self.host_ready.pop(snapshot_id, None)
+            if record is not None and not self._release_record(record):
+                with self._get_state_lock():
+                    self.host_ready.setdefault(snapshot_id, record)
+                continue
+            if not self.ledger.mark_host_load_rank_drained(
+                snapshot_id,
+                self.owner,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+            ):
+                continue
+            with self._get_state_lock():
+                current = getattr(self, "_prestart_recovery_aborts", {}).get(
+                    snapshot_id
+                )
+                if current is context:
+                    self._prestart_recovery_aborts.pop(snapshot_id, None)
+            AgenticPHostStagingManager._release_h2d_lane(self, snapshot_id)
+
     def abort_request(self, rid: str, request_generation) -> None:
         """Cancel one Slow restore without racing an in-flight H2D."""
 
         snapshot_id = request_generation.snapshot_id
+        prestart_abort = False
         with self._get_state_lock():
             load = self.loads.get(rid)
             if load is not None:
@@ -5129,14 +5550,28 @@ class AgenticPHostStagingManager:
                 load.setdefault("io_error", RuntimeError("request aborted"))
                 load["drop_host_on_abort"] = True
             else:
-                record = self.host_ready.pop(snapshot_id, None)
+                record = self.host_ready.get(snapshot_id)
                 if record is not None:
-                    self._release_record(record)
-                self.workset_broker.cancel_unstarted(
-                    snapshot_id,
-                    owner=self.workset_broker.slow_owner(snapshot_id, rid),
-                )
-                AgenticPHostStagingManager._release_h2d_lane(self, snapshot_id)
+                    record["abort_requested"] = True
+                    record["loading"] = "abort_pending"
+                    pending = getattr(self, "_prestart_recovery_aborts", None)
+                    if pending is None:
+                        pending = self._prestart_recovery_aborts = {}
+                    pending[snapshot_id] = {
+                        "rid": str(rid),
+                        "request_generation": request_generation,
+                    }
+                    prestart_abort = True
+                else:
+                    self.workset_broker.cancel_unstarted(
+                        snapshot_id,
+                        owner=self.workset_broker.slow_owner(snapshot_id, rid),
+                    )
+                    AgenticPHostStagingManager._release_h2d_lane(
+                        self, snapshot_id
+                    )
+        if prestart_abort:
+            self._progress_prestart_aborts()
         self._control_wakeup.set()
 
     def rollback_bound_parent(self, req, request_generation) -> None:
@@ -5277,6 +5712,18 @@ class AgenticPHostStagingManager:
                 self.workset_broker.handoff_to_req(
                     snapshot_id, req, workset_lease
                 )
+                if not self.ledger.mark_d2p_recovery_phase_rank(
+                    snapshot_id,
+                    self.owner,
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
+                    claim_id=workset_lease.owner,
+                    lease_id=workset_lease.lease_id,
+                    phase="handed",
+                ):
+                    raise RuntimeError(
+                        f"Slow handoff lost lifecycle ownership for {snapshot_id}"
+                    )
             except Exception:
                 # Host remains authoritative and every cleanup marker remains
                 # intact.  Retry this idempotent ownership commit before
@@ -5489,6 +5936,18 @@ class AgenticPHostStagingManager:
                 self.workset_broker.handoff_to_req(
                     snapshot_id, req, load["workset_lease"]
                 )
+                if not self.ledger.mark_d2p_recovery_phase_rank(
+                    snapshot_id,
+                    self.owner,
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
+                    claim_id=load["recovery_claim_id"],
+                    lease_id=load["workset_lease"].lease_id,
+                    phase="handed",
+                ):
+                    raise RuntimeError(
+                        f"Slow handoff lost lifecycle ownership for {snapshot_id}"
+                    )
             except Exception:
                 # Do not destroy the only retryable recovery context before
                 # the live request has atomically accepted the workset.
@@ -5558,7 +6017,7 @@ class AgenticPHostStagingManager:
             if record is None:
                 return True
             loading = record.get("loading")
-            if loading:
+            if loading and loading != "h2d_reserving":
                 return True
             if not allow_prepare:
                 return True
@@ -5603,9 +6062,12 @@ class AgenticPHostStagingManager:
                 # deferring this harmless step to another scheduler visit
                 # creates multi-second gaps whenever the next Prefill batch is
                 # long, even though HBM is already available.
-            # Claim before touching the GPU allocator so spill selection and
-            # H2D admission can never own the same snapshot concurrently.
-            record["loading"] = "h2d_reserving"
+            # First prevent another local scheduler visit from selecting the
+            # same record.  The shared-ledger claim immediately below is the
+            # authoritative eviction fence; no P workset may be requested
+            # before that CAS succeeds.
+            if not loading:
+                record["loading"] = "h2d_claiming"
         # Each admitted snapshot owns one isolated H2D lane.  The lane is
         # reserved before this workset intent is created, so no more than
         # ``max_h2d_inflight`` Slow leases can consume P HBM.  Distinct streams,
@@ -5651,8 +6113,31 @@ class AgenticPHostStagingManager:
                 req.rid,
             )
             return False
-        prompt_tokens = len(req.origin_input_ids)
         workset_owner = self.workset_broker.slow_owner(snapshot_id, req.rid)
+        recovery_claim_id = workset_owner
+        try:
+            recovery_claimed = self.ledger.claim_d2p_recovery_rank(
+                snapshot_id,
+                self.owner,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+                claim_id=recovery_claim_id,
+            )
+        except Exception:
+            recovery_claimed = False
+            logger.exception(
+                "AgenticKV shared_host_recovery_claim_retry snapshot=%s",
+                snapshot_id,
+            )
+        if not recovery_claimed:
+            with self._get_state_lock():
+                if self.host_ready.get(snapshot_id) is record:
+                    record["loading"] = False
+            AgenticPHostStagingManager._release_h2d_lane(self, snapshot_id)
+            return True
+        record["recovery_claim_id"] = recovery_claim_id
+        record["loading"] = "h2d_reserving"
+        prompt_tokens = len(req.origin_input_ids)
         with self._get_state_lock():
             # Lane ownership and workset intent creation are one atomic
             # admission operation.  An abort may otherwise release/reassign a
@@ -5676,8 +6161,34 @@ class AgenticPHostStagingManager:
                 snapshot_id, owner=workset_owner
             )
             if workset_lease is None:
-                record["loading"] = False
+                # The Host claim remains pinned while the scheduler services
+                # this bounded lane's allocation intent.  It owns no P pages
+                # yet and cannot be pressure-evicted underneath the intent.
+                record["loading"] = "h2d_reserving"
                 return True
+            if not self.ledger.attach_d2p_recovery_lease_rank(
+                snapshot_id,
+                self.owner,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+                claim_id=recovery_claim_id,
+                lease_id=workset_lease.lease_id,
+            ):
+                self.workset_broker.request_release(snapshot_id, workset_lease)
+                self.ledger.cancel_d2p_recovery_rank(
+                    snapshot_id,
+                    self.owner,
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
+                    claim_id=recovery_claim_id,
+                    lease_id=workset_lease.lease_id,
+                )
+                record["loading"] = False
+                record.pop("recovery_claim_id", None)
+                AgenticPHostStagingManager._release_h2d_lane(self, snapshot_id)
+                raise RuntimeError(
+                    f"Slow workset lease lost Host claim for {snapshot_id}"
+                )
             io_attempt = (
                 f"slow-h2d:{self.owner}:{req.rid}:{workset_lease.lease_id}"
             )
@@ -5695,6 +6206,7 @@ class AgenticPHostStagingManager:
                 "request_generation": request_generation,
                 "device_indices": device_indices,
                 "workset_lease": workset_lease,
+                "recovery_claim_id": recovery_claim_id,
                 "io_attempt": io_attempt,
                 "io_inflight": False,
                 "io_quiesced": False,

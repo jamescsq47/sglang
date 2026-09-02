@@ -1328,6 +1328,25 @@ class AgenticPWorksetLeaseBroker:
             ]
             return ";".join(active) or "empty"
 
+    def eviction_blocker(self, snapshot_id: str) -> Optional[str]:
+        """Describe live ownership that makes Host eviction illegal.
+
+        A request-generation may be evicted only while Host is its sole
+        owner.  Pending intents own no physical pages and releasing leases are
+        already fenced for allocator cleanup; every other lease state means
+        the snapshot is claimed by recovery, I/O, Radix binding, or a live
+        Prefill request and must remain invisible to the evictor.
+        """
+
+        with self._lock:
+            lease = self._leases.get(snapshot_id)
+            if lease is None or lease.state in {"releasing", "consumed"}:
+                return None
+            return (
+                f"id={lease.lease_id} owner={lease.owner} "
+                f"state={lease.state} tokens={lease.allocated_tokens}"
+            )
+
     @property
     def unaccounted_tokens(self) -> int:
         """Lease pages not already represented by a bound Radix parent."""
@@ -1979,10 +1998,12 @@ class Scheduler(
             self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
             self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
 
+        # The request-generation lifecycle owns both D->P transports.  Host
+        # staging is only the Slow fallback and must be independently
+        # ablatable without also disabling the Direct manager.
         custom_agentic_decode = bool(
             envs.SGLANG_AGENTIC_KV_LIFECYCLE.get()
             and envs.SGLANG_AGENTIC_KV_CUSTOM_STORAGE_ONLY.get()
-            and envs.SGLANG_AGENTIC_KV_HOST_STAGING.get()
         )
         if server_args.disaggregation_mode == "decode" and (
             server_args.disaggregation_decode_enable_offload_kvcache
@@ -2424,7 +2445,10 @@ class Scheduler(
                     self.agentic_early_claim_store = AgenticEarlyClaimStore(
                         early_claim_dir
                     )
-                if self.agentic_early_claim_store is not None:
+                if (
+                    self.agentic_early_claim_store is not None
+                    and not envs.SGLANG_AGENTIC_KV_FORCE_SLOW_PATH.get()
+                ):
                     marker_max_age = max(
                         5.0,
                         envs.SGLANG_AGENTIC_KV_FAST_TOOL_THRESHOLD.get()
@@ -2445,6 +2469,22 @@ class Scheduler(
                         "Agentic P unified workset leases enabled total_tokens=%d",
                         self.max_total_num_tokens,
                     )
+                controller = None
+                if envs.SGLANG_AGENTIC_KV_CUSTOM_STORAGE_ONLY.get():
+                    # Direct and Slow share the same node-local lifecycle
+                    # metadata.  Create it independently of Host staging so
+                    # the Direct-only ablation still has an authoritative
+                    # request-generation manifest store.
+                    controller = create_agentic_storage_controller(
+                        token_allocator=self.token_to_kv_pool_allocator,
+                        server_args=self.server_args,
+                        tp_rank=self.tp_rank,
+                        tp_size=self.tp_size,
+                        pp_rank=self.pp_rank,
+                        pp_size=self.pp_size,
+                        model_name=self.server_args.served_model_name,
+                    )
+                    self.agentic_storage_controller = controller
                 if envs.SGLANG_AGENTIC_KV_HOST_STAGING.get():
                     ledger_base = envs.SGLANG_AGENTIC_KV_LEDGER_PATH.get()
                     staging_ledger_path = (
@@ -2459,18 +2499,7 @@ class Scheduler(
                             "P Host staging requires SGLANG_AGENTIC_KV_LEDGER_PATH "
                             "or SGLANG_AGENTIC_KV_STAGING_LEDGER_PATH"
                         )
-                    if envs.SGLANG_AGENTIC_KV_CUSTOM_STORAGE_ONLY.get():
-                        controller = create_agentic_storage_controller(
-                            token_allocator=self.token_to_kv_pool_allocator,
-                            server_args=self.server_args,
-                            tp_rank=self.tp_rank,
-                            tp_size=self.tp_size,
-                            pp_rank=self.pp_rank,
-                            pp_size=self.pp_size,
-                            model_name=self.server_args.served_model_name,
-                        )
-                        self.agentic_storage_controller = controller
-                    else:
+                    if controller is None:
                         controller = getattr(self.tree_cache, "cache_controller", None)
                         if controller is None:
                             raise ValueError(
@@ -6149,6 +6178,12 @@ class Scheduler(
             and manifest.state is SnapshotState.DIRECT_READY
             and not getattr(req, "_agentic_direct_disabled", False)
         ):
+            if envs.SGLANG_AGENTIC_KV_FORCE_SLOW_PATH.get():
+                # D owns the parent until its independent worker commits the
+                # complete snapshot to Shared Host.  Do not claim Direct in
+                # this ablation; the next scheduler pass observes HOST_READY.
+                req._agentic_kv_queue_class = "slow"
+                return True
             req._agentic_kv_queue_class = "fast"
             if getattr(self, "tp_size", 1) > 1:
                 # TP Direct admission is exclusively driven by rank 0's

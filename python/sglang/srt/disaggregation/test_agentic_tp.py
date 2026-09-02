@@ -639,6 +639,49 @@ def test_custom_storage_controller_needs_no_native_storage_backend(
     store = controller.storage_backend.agentic_snapshot_store()
     assert store.store.put("claim", b"owner") == 0
 
+    # Direct-only ablations still need the node-local lifecycle store even
+    # though no Shared Host Arena or native HiCache backend exists.
+    monkeypatch.setenv("SGLANG_AGENTIC_KV_LIFECYCLE", "true")
+    scheduler = SimpleNamespace(
+        agentic_storage_controller=controller,
+        tree_cache=SimpleNamespace(cache_controller=None),
+    )
+    assert Scheduler._agentic_snapshot_store(scheduler) is not None
+
+
+def test_publish_agentic_failure_releases_only_after_failed_cas():
+    request = RequestGeneration("failure-cas", 0)
+    metadata = SimpleNamespace(current=request, tool_type=None)
+    manifest = SimpleNamespace(claim_id="claim", state=SnapshotState.DIRECT_READY)
+    routes = []
+
+    class Store:
+        lose_cas = True
+
+        def mark_failed(self, *_args, **_kwargs):
+            if self.lose_cas:
+                raise RuntimeError("concurrent P claim won")
+            return SimpleNamespace(state=SnapshotState.FAILED)
+
+    store = Store()
+    manager = SimpleNamespace(
+        agentic_snapshot_store=store,
+        _publish_agentic_route=lambda request, **kwargs: (
+            routes.append((request, kwargs)) or True
+        ),
+    )
+
+    assert not DecodeKVCacheOffloadManager._publish_agentic_failure(
+        manager, metadata, "no_host", manifest
+    )
+    assert routes == []
+
+    store.lose_cas = False
+    assert DecodeKVCacheOffloadManager._publish_agentic_failure(
+        manager, metadata, "no_host", manifest
+    )
+    assert routes == [(request, {"route": "recompute"})]
+
 
 def test_agentic_nixl_ignores_heartbeat_failure_until_data_is_complete():
     room = 17
@@ -4372,7 +4415,10 @@ def test_tp_host_commit_admits_after_manifest_cleanup():
     """The native commit outlives request-level Host manifest cleanup."""
 
     request = RequestGeneration("host-commit", 4)
-    ledger = SimpleNamespace(get=lambda _snapshot_id: None)
+    ledger = SimpleNamespace(
+        get=lambda _snapshot_id: None,
+        mark_d2p_recovery_phase_rank=lambda *_args, **_kwargs: True,
+    )
     manager = SimpleNamespace(
         tp_size=2,
         tp_rank=1,
@@ -4386,7 +4432,9 @@ def test_tp_host_commit_admits_after_manifest_cleanup():
         rid="child",
         _agentic_host_rank_loaded=True,
         _agentic_host_rank_token_count=256,
-        _agentic_host_workset_lease=object(),
+        _agentic_host_workset_lease=SimpleNamespace(
+            lease_id=1, owner=f"slow:{request.snapshot_id}:child"
+        ),
     )
 
     assert AgenticPHostStagingManager.gate_request(manager, req, request) is False
@@ -4428,7 +4476,8 @@ def test_slow_h2d_lanes_cap_workset_intents_before_hbm_allocation():
     manager.owner = "p:test"
     manager.workset_broker = Broker()
     manager.ledger = SimpleNamespace(
-        get=lambda snapshot_id: manager._ledger_entries_cache.get(snapshot_id)
+        get=lambda snapshot_id: manager._ledger_entries_cache.get(snapshot_id),
+        claim_d2p_recovery_rank=lambda *_args, **_kwargs: True,
     )
 
     requests = []
@@ -4464,12 +4513,536 @@ def test_slow_h2d_lanes_cap_workset_intents_before_hbm_allocation():
     assert manager._h2d_lane_reservations[requests[4].snapshot_id] == 1
 
 
+def test_d2p_recovery_claim_fences_eviction_before_workset_allocation():
+    """Host pinning wins the lifecycle CAS before any P-HBM lease exists."""
+
+    ledger, path = _ledger()
+    snapshot_id = "recovery-fence:1"
+    owner = "p:test"
+    try:
+        ledger.offer(
+            {
+                "snapshot_id": snapshot_id,
+                "token_count": 128,
+                "byte_size": 4096,
+                "tp_size": 1,
+            }
+        )
+
+        def publish_ready(entries):
+            current = entries[snapshot_id]
+            current.update(
+                p_owner=owner,
+                state=HostStageState.HOST_READY.value,
+                updated_at=time.time(),
+            )
+            return True, True
+
+        ledger._mutate(publish_ready, event_snapshot_id=snapshot_id)
+        claim_id = f"slow:{snapshot_id}:child"
+        assert ledger.claim_d2p_recovery_rank(
+            snapshot_id,
+            owner,
+            tp_rank=0,
+            tp_size=1,
+            claim_id=claim_id,
+        )
+        assert ledger.get(snapshot_id)["state"] == HostStageState.H2D_LOADING.value
+        assert not ledger.begin_host_eviction(
+            snapshot_id,
+            owner,
+            tp_size=1,
+            reason="pressure",
+        )
+        assert ledger.attach_d2p_recovery_lease_rank(
+            snapshot_id,
+            owner,
+            tp_rank=0,
+            tp_size=1,
+            claim_id=claim_id,
+            lease_id=17,
+        )
+        assert ledger.cancel_d2p_recovery_rank(
+            snapshot_id,
+            owner,
+            tp_rank=0,
+            tp_size=1,
+            claim_id=claim_id,
+            lease_id=17,
+        )
+        assert ledger.get(snapshot_id)["state"] == HostStageState.HOST_READY.value
+        assert ledger.begin_host_eviction(
+            snapshot_id,
+            owner,
+            tp_size=1,
+            reason="pressure",
+        )
+    finally:
+        os.unlink(path)
+
+
+def test_d2p_recovery_inflight_cannot_be_cancelled_or_evicted():
+    ledger, path = _ledger()
+    snapshot_id = "recovery-inflight:1"
+    owner = "p:test"
+    claim_id = f"slow:{snapshot_id}:child"
+    try:
+        ledger.offer(
+            {
+                "snapshot_id": snapshot_id,
+                "token_count": 128,
+                "byte_size": 4096,
+                "tp_size": 1,
+            }
+        )
+
+        def publish_ready(entries):
+            entries[snapshot_id].update(
+                p_owner=owner,
+                state=HostStageState.HOST_READY.value,
+                updated_at=time.time(),
+            )
+            return True, True
+
+        ledger._mutate(publish_ready, event_snapshot_id=snapshot_id)
+        assert ledger.claim_d2p_recovery_rank(
+            snapshot_id, owner, tp_rank=0, tp_size=1, claim_id=claim_id
+        )
+        assert ledger.attach_d2p_recovery_lease_rank(
+            snapshot_id,
+            owner,
+            tp_rank=0,
+            tp_size=1,
+            claim_id=claim_id,
+            lease_id=23,
+        )
+        assert ledger.mark_d2p_recovery_phase_rank(
+            snapshot_id,
+            owner,
+            tp_rank=0,
+            tp_size=1,
+            claim_id=claim_id,
+            lease_id=23,
+            phase="io_inflight",
+        )
+        assert not ledger.cancel_d2p_recovery_rank(
+            snapshot_id,
+            owner,
+            tp_rank=0,
+            tp_size=1,
+            claim_id=claim_id,
+            lease_id=23,
+        )
+        assert not ledger.begin_host_eviction(
+            snapshot_id, owner, tp_size=1, reason="pressure"
+        )
+    finally:
+        os.unlink(path)
+
+
+def test_abort_cancels_pinned_recovery_before_workset_grant():
+    ledger, path = _ledger()
+    request = RequestGeneration("abort-pinned", 1)
+    snapshot_id = request.snapshot_id
+    owner = "p:test"
+    rid = "child-pinned"
+    broker = AgenticPWorksetLeaseBroker(page_size=4)
+    released = []
+    try:
+        ledger.offer(
+            {
+                "snapshot_id": snapshot_id,
+                "token_count": 8,
+                "byte_size": 4096,
+                "tp_size": 1,
+            }
+        )
+
+        def publish_ready(entries):
+            entries[snapshot_id].update(
+                p_owner=owner,
+                state=HostStageState.HOST_READY.value,
+                updated_at=time.time(),
+            )
+            return True, True
+
+        ledger._mutate(publish_ready, event_snapshot_id=snapshot_id)
+        claim_id = broker.slow_owner(snapshot_id, rid)
+        assert ledger.claim_d2p_recovery_rank(
+            snapshot_id, owner, tp_rank=0, tp_size=1, claim_id=claim_id
+        )
+
+        manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
+        manager._state_lock = threading.RLock()
+        manager.owner = owner
+        manager.tp_rank = 0
+        manager.tp_size = 1
+        manager.ledger = ledger
+        manager.workset_broker = broker
+        manager.loads = {}
+        manager.host_ready = {
+            snapshot_id: {
+                "loading": "h2d_reserving",
+                "snapshot": object(),
+                "offer": {"token_count": 8, "byte_size": 4096},
+            }
+        }
+        manager._h2d_lane_reservations = {snapshot_id: 0}
+        manager._control_wakeup = SimpleNamespace(set=lambda: None)
+        manager._release_record = lambda record: released.append(record) or True
+
+        manager.abort_request(rid, request)
+
+        assert ledger.get(snapshot_id)["state"] == HostStageState.FAILED.value
+        assert snapshot_id not in manager.host_ready
+        assert snapshot_id not in manager._prestart_recovery_aborts
+        assert broker.eviction_blocker(snapshot_id) is None
+        assert len(released) == 1
+    finally:
+        os.unlink(path)
+
+
+def test_abort_releases_exact_granted_workset_before_host_snapshot():
+    class Allocator:
+        def __init__(self):
+            self.freed = []
+
+        @staticmethod
+        def alloc(count):
+            return torch.arange(count, dtype=torch.int64)
+
+        def free(self, indices):
+            self.freed.append(indices.clone())
+
+    ledger, path = _ledger()
+    request = RequestGeneration("abort-leased", 1)
+    snapshot_id = request.snapshot_id
+    owner = "p:test"
+    rid = "child-leased"
+    broker = AgenticPWorksetLeaseBroker(page_size=4)
+    allocator = Allocator()
+    released = []
+    try:
+        ledger.offer(
+            {
+                "snapshot_id": snapshot_id,
+                "token_count": 8,
+                "byte_size": 4096,
+                "tp_size": 1,
+            }
+        )
+
+        def publish_ready(entries):
+            entries[snapshot_id].update(
+                p_owner=owner,
+                state=HostStageState.HOST_READY.value,
+                updated_at=time.time(),
+            )
+            return True, True
+
+        ledger._mutate(publish_ready, event_snapshot_id=snapshot_id)
+        claim_id = broker.slow_owner(snapshot_id, rid)
+        assert ledger.claim_d2p_recovery_rank(
+            snapshot_id, owner, tp_rank=0, tp_size=1, claim_id=claim_id
+        )
+        assert broker.request(snapshot_id, 8, 12, owner=claim_id)
+        broker.service(allocator)
+        lease = broker.get(snapshot_id, owner=claim_id)
+        assert lease is not None
+        assert ledger.attach_d2p_recovery_lease_rank(
+            snapshot_id,
+            owner,
+            tp_rank=0,
+            tp_size=1,
+            claim_id=claim_id,
+            lease_id=lease.lease_id,
+        )
+
+        manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
+        manager._state_lock = threading.RLock()
+        manager.owner = owner
+        manager.tp_rank = 0
+        manager.tp_size = 1
+        manager.ledger = ledger
+        manager.workset_broker = broker
+        manager.loads = {}
+        manager.host_ready = {
+            snapshot_id: {
+                "loading": "h2d_reserving",
+                "snapshot": object(),
+                "offer": {"token_count": 8, "byte_size": 4096},
+            }
+        }
+        manager._h2d_lane_reservations = {snapshot_id: 0}
+        manager._control_wakeup = SimpleNamespace(set=lambda: None)
+        manager._release_record = lambda record: released.append(record) or True
+
+        manager.abort_request(rid, request)
+        broker.service(allocator)
+
+        assert ledger.get(snapshot_id)["state"] == HostStageState.FAILED.value
+        assert broker.get(snapshot_id, owner=claim_id) is None
+        assert len(allocator.freed) == 1
+        assert len(released) == 1
+    finally:
+        os.unlink(path)
+
+
+@pytest.mark.parametrize("with_lease", [False, True])
+def test_tp2_prestart_abort_is_group_atomic(with_lease):
+    class Allocator:
+        @staticmethod
+        def alloc(count):
+            return torch.arange(count, dtype=torch.int64)
+
+        @staticmethod
+        def free(_indices):
+            return None
+
+    ledger, path = _ledger()
+    request = RequestGeneration(f"tp2-abort-{with_lease}", 1)
+    snapshot_id = request.snapshot_id
+    owner = "p-group:test"
+    rid = "child-tp2"
+    managers = []
+    try:
+        ledger.offer(
+            {
+                "snapshot_id": snapshot_id,
+                "token_count": 8,
+                "byte_size": 4096,
+                "tp_size": 2,
+            }
+        )
+
+        def publish_ready(entries):
+            entries[snapshot_id].update(
+                p_owner=owner,
+                state=HostStageState.HOST_READY.value,
+                updated_at=time.time(),
+            )
+            return True, True
+
+        ledger._mutate(publish_ready, event_snapshot_id=snapshot_id)
+        claim_id = AgenticPWorksetLeaseBroker.slow_owner(snapshot_id, rid)
+        for rank in range(2):
+            assert ledger.claim_d2p_recovery_rank(
+                snapshot_id,
+                owner,
+                tp_rank=rank,
+                tp_size=2,
+                claim_id=claim_id,
+            )
+            broker = AgenticPWorksetLeaseBroker(page_size=4)
+            if with_lease:
+                assert broker.request(snapshot_id, 8, 12, owner=claim_id)
+                broker.service(Allocator())
+                lease = broker.get(snapshot_id, owner=claim_id)
+                assert lease is not None
+                assert ledger.attach_d2p_recovery_lease_rank(
+                    snapshot_id,
+                    owner,
+                    tp_rank=rank,
+                    tp_size=2,
+                    claim_id=claim_id,
+                    lease_id=lease.lease_id,
+                )
+            manager = AgenticPHostStagingManager.__new__(
+                AgenticPHostStagingManager
+            )
+            manager._state_lock = threading.RLock()
+            manager.owner = owner
+            manager.tp_rank = rank
+            manager.tp_size = 2
+            manager.ledger = ledger
+            manager.workset_broker = broker
+            manager.loads = {}
+            manager.host_ready = {
+                snapshot_id: {
+                    "loading": "h2d_reserving",
+                    "snapshot": object(),
+                    "offer": {"token_count": 8, "byte_size": 4096},
+                }
+            }
+            manager._h2d_lane_reservations = {snapshot_id: 0}
+            manager._control_wakeup = SimpleNamespace(set=lambda: None)
+            manager._release_record = lambda _record: True
+            managers.append(manager)
+
+        managers[0].abort_request(rid, request)
+        first = ledger.get(snapshot_id)
+        assert first["state"] == HostStageState.ABORTING.value
+        assert first["loader_drained_ranks"] == [0]
+        assert set(first["recovery_claims"]) == {"1"}
+
+        managers[1].abort_request(rid, request)
+        final = ledger.get(snapshot_id)
+        assert final["state"] == HostStageState.FAILED.value
+        assert final["loader_drained_ranks"] == [0, 1]
+        assert final["recovery_claims"] == {}
+        for manager in managers:
+            assert snapshot_id not in manager.host_ready
+            assert snapshot_id not in manager._prestart_recovery_aborts
+            assert manager.workset_broker.eviction_blocker(snapshot_id) is None
+    finally:
+        os.unlink(path)
+
+
+def test_tp2_prestart_abort_loser_yields_to_eviction_owner():
+    ledger, path = _ledger()
+    request = RequestGeneration("abort-vs-eviction", 1)
+    snapshot_id = request.snapshot_id
+    owner = "p-group:test"
+    released = []
+    try:
+        ledger.offer(
+            {
+                "snapshot_id": snapshot_id,
+                "token_count": 8,
+                "byte_size": 4096,
+                "tp_size": 2,
+            }
+        )
+
+        def publish_ready(entries):
+            entries[snapshot_id].update(
+                p_owner=owner,
+                state=HostStageState.HOST_READY.value,
+                updated_at=time.time(),
+            )
+            return True, True
+
+        ledger._mutate(publish_ready, event_snapshot_id=snapshot_id)
+        assert ledger.begin_host_eviction(
+            snapshot_id, owner, tp_size=2, reason="pressure"
+        )
+
+        manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
+        manager._state_lock = threading.RLock()
+        manager.owner = owner
+        manager.tp_rank = 1
+        manager.tp_size = 2
+        manager.ledger = ledger
+        manager.workset_broker = AgenticPWorksetLeaseBroker(page_size=4)
+        manager.host_ready = {
+            snapshot_id: {
+                "loading": "abort_pending",
+                "abort_requested": True,
+                "snapshot": object(),
+                "offer": {"token_count": 8, "byte_size": 4096},
+            }
+        }
+        manager._prestart_recovery_aborts = {
+            snapshot_id: {"rid": "child", "request_generation": request}
+        }
+        manager._h2d_lane_reservations = {snapshot_id: 0}
+        manager._release_record = lambda record: released.append(record) or True
+
+        manager._progress_prestart_aborts()
+
+        assert ledger.get(snapshot_id)["state"] == HostStageState.EVICTING.value
+        assert released == []
+        assert manager.host_ready[snapshot_id]["loading"] is False
+        assert "abort_requested" not in manager.host_ready[snapshot_id]
+        assert snapshot_id not in manager._prestart_recovery_aborts
+    finally:
+        os.unlink(path)
+
+
+def test_prestart_abort_retries_first_ledger_mutation_error():
+    ledger, path = _ledger()
+    request = RequestGeneration("abort-ledger-retry", 1)
+    snapshot_id = request.snapshot_id
+    owner = "p:test"
+    rid = "child-retry"
+    released = []
+    try:
+        ledger.offer(
+            {
+                "snapshot_id": snapshot_id,
+                "token_count": 8,
+                "byte_size": 4096,
+                "tp_size": 1,
+            }
+        )
+
+        def publish_ready(entries):
+            entries[snapshot_id].update(
+                p_owner=owner,
+                state=HostStageState.HOST_READY.value,
+                updated_at=time.time(),
+            )
+            return True, True
+
+        ledger._mutate(publish_ready, event_snapshot_id=snapshot_id)
+        original = ledger.request_host_load_failure
+        calls = 0
+
+        def fail_once(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError("transient ledger failure")
+            return original(*args, **kwargs)
+
+        ledger.request_host_load_failure = fail_once
+        manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
+        manager._state_lock = threading.RLock()
+        manager.owner = owner
+        manager.tp_rank = 0
+        manager.tp_size = 1
+        manager.ledger = ledger
+        manager.workset_broker = AgenticPWorksetLeaseBroker(page_size=4)
+        manager.loads = {}
+        manager.host_ready = {
+            snapshot_id: {
+                "loading": False,
+                "snapshot": object(),
+                "offer": {"token_count": 8, "byte_size": 4096},
+            }
+        }
+        manager._h2d_lane_reservations = {snapshot_id: 0}
+        manager._control_wakeup = SimpleNamespace(set=lambda: None)
+        manager._release_record = lambda record: released.append(record) or True
+
+        manager.abort_request(rid, request)
+        assert ledger.get(snapshot_id)["state"] == HostStageState.HOST_READY.value
+        assert snapshot_id in manager._prestart_recovery_aborts
+        assert released == []
+
+        manager._progress_prestart_aborts()
+        assert ledger.get(snapshot_id)["state"] == HostStageState.FAILED.value
+        assert snapshot_id not in manager._prestart_recovery_aborts
+        assert len(released) == 1
+    finally:
+        os.unlink(path)
+
+
+def test_workset_broker_reports_every_eviction_unsafe_owner():
+    broker = AgenticPWorksetLeaseBroker(page_size=4)
+    lease = SimpleNamespace(
+        snapshot_id="eviction-owner:1",
+        lease_id=9,
+        owner="slow:eviction-owner:1:child",
+        allocated_tokens=32,
+        state="active",
+    )
+    broker._leases[lease.snapshot_id] = lease
+    assert "state=active" in broker.eviction_blocker(lease.snapshot_id)
+    lease.state = "io_inflight"
+    assert "state=io_inflight" in broker.eviction_blocker(lease.snapshot_id)
+    lease.state = "handed"
+    assert "state=handed" in broker.eviction_blocker(lease.snapshot_id)
+    lease.state = "releasing"
+    assert broker.eviction_blocker(lease.snapshot_id) is None
+
+
 def test_tp_slow_lane_retries_transient_prepare_without_start_or_leak():
     """A TP ledger hiccup keeps one exact lease and retries before H2D."""
 
     request = RequestGeneration("slow-prepare-retry", 3)
     req = SimpleNamespace(rid="child-retry", origin_input_ids=[11, 22])
-    lease = SimpleNamespace(lease_id="lease-retry", parent_indices=[7])
+    lease = SimpleNamespace(lease_id=1, parent_indices=[7])
     prepare_calls = []
 
     class Broker:
@@ -4493,6 +5066,14 @@ def test_tp_slow_lane_retries_transient_prepare_without_start_or_leak():
         @staticmethod
         def get(_snapshot_id):
             return {"state": HostStageState.HOST_READY.value}
+
+        @staticmethod
+        def claim_d2p_recovery_rank(*_args, **_kwargs):
+            return True
+
+        @staticmethod
+        def attach_d2p_recovery_lease_rank(*_args, **_kwargs):
+            return True
 
         @staticmethod
         def prepare_tp_host_load_rank(*_args, **_kwargs):
@@ -4550,7 +5131,9 @@ def test_tp1_slow_handoff_failure_retains_host_load_and_lane_for_retry():
     req = SimpleNamespace(rid="child-tp1", origin_input_ids=[11, 22], extra_key=None)
     handoff_calls = []
     released_host = []
-    lease = object()
+    lease = SimpleNamespace(
+        lease_id=1, owner=f"slow:{request.snapshot_id}:{req.rid}"
+    )
     record = {
         "snapshot": object(),
         "offer": {"token_count": 1, "byte_size": 128},
@@ -4561,6 +5144,7 @@ def test_tp1_slow_handoff_failure_retains_host_load_and_lane_for_retry():
         "request_generation": request,
         "device_indices": [7],
         "workset_lease": lease,
+        "recovery_claim_id": lease.owner,
         "io_error": None,
         "io_complete": True,
         "radix_bound": True,
@@ -4586,6 +5170,7 @@ def test_tp1_slow_handoff_failure_retains_host_load_and_lane_for_retry():
     manager.ledger = SimpleNamespace(
         get=lambda _snapshot_id: {"state": HostStageState.CONSUMED.value},
         complete_host_bind_rank=lambda *_args, **_kwargs: True,
+        mark_d2p_recovery_phase_rank=lambda *_args, **_kwargs: True,
     )
     manager._complete_shared_host_manifest = lambda _request: True
     manager._release_record = lambda selected: released_host.append(selected)
@@ -4611,7 +5196,9 @@ def test_tp2_slow_handoff_failure_retains_commit_context_for_retry():
         origin_input_ids=[11, 22],
         _agentic_host_rank_loaded=True,
         _agentic_host_rank_token_count=1,
-        _agentic_host_workset_lease=object(),
+        _agentic_host_workset_lease=SimpleNamespace(
+            lease_id=1, owner=f"slow:{request.snapshot_id}:child-tp2"
+        ),
     )
     handoff_calls = []
     released_host = []
@@ -4635,7 +5222,8 @@ def test_tp2_slow_handoff_failure_retains_commit_context_for_retry():
     manager._h2d_lane_reservations = {request.snapshot_id: 2}
     manager.workset_broker = Broker()
     manager.ledger = SimpleNamespace(
-        get=lambda _snapshot_id: {"state": HostStageState.CONSUMED.value}
+        get=lambda _snapshot_id: {"state": HostStageState.CONSUMED.value},
+        mark_d2p_recovery_phase_rank=lambda *_args, **_kwargs: True,
     )
     manager._release_record = lambda selected: released_host.append(selected)
 
@@ -4674,7 +5262,8 @@ def test_tp_host_h2d_progresses_on_independent_worker_after_group_prepare():
         "record": record,
         "request_generation": request,
         "device_indices": list(range(128)),
-        "workset_lease": object(),
+        "workset_lease": SimpleNamespace(lease_id=1),
+        "recovery_claim_id": f"slow:{request.snapshot_id}:child",
         "io_attempt": "slow-h2d:test",
         "io_inflight": False,
         "io_quiesced": False,
@@ -4692,7 +5281,8 @@ def test_tp_host_h2d_progresses_on_independent_worker_after_group_prepare():
         owner="p-group:prefill-0",
         loads={"child": load},
         ledger=SimpleNamespace(
-            get=lambda _snapshot_id: {"state": HostStageState.H2D_LOADING.value}
+            get=lambda _snapshot_id: {"state": HostStageState.H2D_LOADING.value},
+            mark_d2p_recovery_phase_rank=lambda *_args, **_kwargs: True,
         ),
         h2d_chunk_tokens=64,
         _h2d_stream=object(),
@@ -6551,6 +7141,59 @@ def test_slow_fallback_offer_retry_retains_d_kv_until_host_staging(tp_world_size
     assert not releases and not popped
 
 
+def test_force_slow_ablation_stages_immediately_without_direct_wait():
+    snapshot_id = "request:force-slow"
+    manifest = SimpleNamespace(
+        snapshot_id=snapshot_id,
+        state=SnapshotState.DIRECT_READY,
+        token_count=1024,
+    )
+    candidate = {
+        "req": object(),
+        "metadata": SimpleNamespace(current=SimpleNamespace()),
+        "manifest": manifest,
+        "sender": SimpleNamespace(poll=lambda: KVPoll.WaitingForInput),
+        "sent": False,
+        "staging": False,
+        "claimed_at": None,
+        "created_at": time.monotonic(),
+        "fallback_retry_at": 0.0,
+        "io_lock": threading.RLock(),
+    }
+    staged = []
+    manager = SimpleNamespace(
+        tp_world_size=1,
+        tp_rank=0,
+        agentic_force_slow_path=True,
+        agentic_fast_threshold=2.0,
+        agentic_early_claim_post_timeout=2.0,
+        agentic_relay_worker=None,
+        agentic_early_claim_store=object(),
+        agentic_host_staging_client=object(),
+        _agentic_candidate_items=lambda: ((snapshot_id, candidate),),
+        _agentic_try_final_confirmation=lambda _candidate: False,
+        _agentic_candidate_is_live_locked=lambda sid, value: (
+            sid == snapshot_id and value is candidate
+        ),
+        _agentic_try_early_claim=lambda _candidate, _now: "absent",
+        _agentic_direct_manifest=lambda *_args, **_kwargs: manifest,
+        _agentic_try_tool_confirmation=lambda _candidate: False,
+        _agentic_release_early_claim=lambda *_args: None,
+        _agentic_direct_kv_usage=lambda: 0.5,
+        _start_agentic_host_staging=lambda value, current: (
+            staged.append((value, current)) or value.update(staging=True) or True
+        ),
+        _publish_agentic_route=lambda *_args, **_kwargs: True,
+    )
+
+    DecodeKVCacheOffloadManager._check_agentic_direct_progress(
+        manager, progress_relay=False
+    )
+
+    assert staged == [(candidate, manifest)]
+    assert candidate["staging"] is True
+
+
 def test_tp_slow_offer_uses_rank0_manifest_token_identity():
     """Follower sampling metadata must not redefine a logical TP snapshot."""
 
@@ -6597,6 +7240,27 @@ def test_tp_slow_offer_uses_rank0_manifest_token_identity():
     assert candidate["staging"] is True
     assert captured[0]["token_count"] == len(authoritative_tokens)
     assert captured[0]["token_digest"] == manifest.token_digest
+
+
+def test_random_routing_ablation_selects_one_deterministic_slow_p(monkeypatch):
+    monkeypatch.setenv("SGLANG_PD_ABLATION_RANDOM_ROUTING", "1")
+    monkeypatch.setenv("SGLANG_PD_ABLATION_RANDOM_SEED", "2026")
+    monkeypatch.setenv("SGLANG_AGENTIC_KV_PREFILL_DOMAIN_COUNT", "2")
+    candidate = {
+        "manifest": SimpleNamespace(snapshot_id="request-generation-7")
+    }
+    manager = SimpleNamespace(
+        _prefill_domain_numa_nodes=lambda domain: [domain],
+    )
+
+    DecodeKVCacheOffloadManager._assign_slow_prefill_target(manager, candidate)
+    first = candidate["selected_prefill_domain"]
+    assert first in {0, 1}
+    assert candidate["selected_arena_numa_nodes"] == [first]
+
+    # Repeated calls are idempotent and cannot split one snapshot across P's.
+    DecodeKVCacheOffloadManager._assign_slow_prefill_target(manager, candidate)
+    assert candidate["selected_prefill_domain"] == first
 
 
 def test_nixl_sender_records_each_posted_handle_once_and_completes():
