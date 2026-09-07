@@ -22,7 +22,7 @@ class SharedPrefillPressureReservations:
 
     VERSION = 1
 
-    def __init__(self, path: str, *, ttl_seconds: float = 5.0):
+    def __init__(self, path: str, *, ttl_seconds: float = 300.0):
         if not path:
             raise ValueError("Prefill reservation path is required")
         directory = os.path.dirname(path) or "."
@@ -104,15 +104,17 @@ class SharedPrefillPressureReservations:
                     + max(0, int(item.get("p2d_host_tokens", 0)))
                     + reserved_tokens.get(domain, 0)
                 ) / hbm_capacity
-                hbm_pressure = max(
-                    0, int(item.get("hbm_used_tokens", 0))
-                ) / hbm_capacity
-                host_pressure = 2.0 * max(
-                    0, int(item.get("arena_used_bytes", 0))
-                ) / arena_capacity
-                delivery_pressure = 2.0 * max(
-                    0, int(item.get("p2d_host_bytes", 0))
-                ) / p2d_arena_capacity
+                hbm_pressure = (
+                    max(0, int(item.get("hbm_used_tokens", 0))) / hbm_capacity
+                )
+                host_pressure = (
+                    2.0 * max(0, int(item.get("arena_used_bytes", 0))) / arena_capacity
+                )
+                delivery_pressure = (
+                    2.0
+                    * max(0, int(item.get("p2d_host_bytes", 0)))
+                    / p2d_arena_capacity
+                )
                 request_pressure = 0.01 * (
                     max(0, int(item.get("pending_requests", 0)))
                     + max(0, int(item.get("scheduler_waiting", 0)))
@@ -165,3 +167,142 @@ class SharedPrefillPressureReservations:
                 )
             fcntl.flock(file_obj.fileno(), fcntl.LOCK_UN)
             return totals
+
+
+class SharedHostPlacementReservations:
+    """Atomically place D->P snapshots using Host capacity only.
+
+    Host placement and Prefill placement are intentionally different
+    decisions.  This ledger bridges the short interval between a D choosing
+    an arena and that arena's physical allocation becoming visible in the
+    periodic capacity sample.  It deliberately ignores P queues, P HBM and
+    P->D delivery pressure: none of those values changes whether a complete
+    snapshot fits in tmpfs.
+    """
+
+    VERSION = 1
+
+    def __init__(self, path: str, *, ttl_seconds: float = 5.0):
+        if not path:
+            raise ValueError("Host placement reservation path is required")
+        directory = os.path.dirname(path) or "."
+        if directory != "/dev/shm" and not directory.startswith("/dev/shm/"):
+            raise ValueError("Host placement reservations must reside in /dev/shm")
+        os.makedirs(directory, exist_ok=True)
+        self.path = os.path.abspath(path)
+        self.ttl_seconds = max(0.5, float(ttl_seconds))
+
+    @staticmethod
+    def _read(file_obj) -> dict[str, Any]:
+        file_obj.seek(0)
+        raw = file_obj.read()
+        if not raw:
+            return {"version": 1, "reservations": {}}
+        payload = json.loads(raw)
+        if payload.get("version") != 1:
+            raise ValueError("unsupported Host placement reservation version")
+        payload.setdefault("reservations", {})
+        return payload
+
+    @staticmethod
+    def _write(file_obj, payload: dict[str, Any]) -> None:
+        file_obj.seek(0)
+        json.dump(payload, file_obj, separators=(",", ":"), sort_keys=True)
+        file_obj.truncate()
+        file_obj.flush()
+
+    @staticmethod
+    def _prune(payload: dict[str, Any], now: float) -> None:
+        reservations = payload.setdefault("reservations", {})
+        for snapshot_id, value in tuple(reservations.items()):
+            if float(value.get("expires_at", 0.0)) <= now:
+                reservations.pop(snapshot_id, None)
+
+    def select_and_reserve(
+        self,
+        snapshot_id: str,
+        byte_size: int,
+        domains: Iterable[dict[str, Any]],
+        *,
+        local_domains: Iterable[int] = (),
+        locality_slack_bytes: int = 0,
+    ) -> int:
+        """Choose maximum effective Host free space in one flock transaction.
+
+        A local-NUMA arena wins only when it is within ``locality_slack_bytes``
+        of the global maximum.  Physical arena allocation remains the final
+        capacity authority, so a stale sample can delay an offer but cannot
+        create overlapping Host ownership.
+        """
+
+        snapshot_id = str(snapshot_id)
+        byte_size = max(1, int(byte_size))
+        local_domains = {int(value) for value in local_domains}
+        locality_slack_bytes = max(0, int(locality_slack_bytes))
+        now = time.time()
+        fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+        with os.fdopen(fd, "r+", encoding="utf-8") as file_obj:
+            fcntl.flock(file_obj.fileno(), fcntl.LOCK_EX)
+            payload = self._read(file_obj)
+            self._prune(payload, now)
+            reservations = payload["reservations"]
+            existing = reservations.get(snapshot_id)
+            if existing is not None:
+                domain = int(existing["domain"])
+                fcntl.flock(file_obj.fileno(), fcntl.LOCK_UN)
+                return domain
+
+            reserved_bytes: dict[int, int] = {}
+            for value in reservations.values():
+                domain = int(value["domain"])
+                reserved_bytes[domain] = reserved_bytes.get(domain, 0) + int(
+                    value.get("byte_size", 0)
+                )
+
+            free_by_domain: dict[int, int] = {}
+            for item in domains:
+                domain = int(item["domain"])
+                capacity = max(0, int(item.get("arena_capacity_bytes", 0)))
+                used = max(0, int(item.get("arena_used_bytes", 0)))
+                free_by_domain[domain] = capacity - used - reserved_bytes.get(domain, 0)
+            if not free_by_domain:
+                raise ValueError("empty Host capacity snapshot")
+
+            feasible = {
+                domain: free
+                for domain, free in free_by_domain.items()
+                if free >= byte_size
+            }
+            if not feasible:
+                raise ValueError("no Host arena can fit complete snapshot")
+            max_free = max(feasible.values())
+            local = [
+                domain
+                for domain in local_domains
+                if domain in feasible
+                and feasible[domain] >= max_free - locality_slack_bytes
+            ]
+            candidates = local or list(feasible)
+            selected = max(candidates, key=lambda domain: (feasible[domain], -domain))
+            reservations[snapshot_id] = {
+                "domain": int(selected),
+                "byte_size": byte_size,
+                "created_at": now,
+                "expires_at": now + self.ttl_seconds,
+            }
+            self._write(file_obj, payload)
+            fcntl.flock(file_obj.fileno(), fcntl.LOCK_UN)
+            return int(selected)
+
+    def release(self, snapshot_id: str) -> bool:
+        """Explicitly settle placement once a physical extent owns capacity."""
+
+        fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+        with os.fdopen(fd, "r+", encoding="utf-8") as file_obj:
+            fcntl.flock(file_obj.fileno(), fcntl.LOCK_EX)
+            payload = self._read(file_obj)
+            removed = payload.setdefault("reservations", {}).pop(str(snapshot_id), None)
+            if removed is not None:
+                self._write(file_obj, payload)
+            fcntl.flock(file_obj.fileno(), fcntl.LOCK_UN)
+            return removed is not None

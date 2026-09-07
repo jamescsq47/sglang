@@ -32,6 +32,7 @@ import torch
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.p2d_host_staging import p2d_snapshot_id
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -752,6 +753,12 @@ class SchedulerDisaggregationPrefillMixin:
         taking the control lock so a Host-owned request never waits behind a
         reverse Direct control call.
         """
+
+        # The scheduler may have consumed an edge-triggered Host completion
+        # before a stale copy of this request leaves the generic worker FIFO.
+        # In that case no sender/metadata state may be touched again.
+        if getattr(req, "_agentic_p2d_host_terminal", False):
+            return int(KVPoll.Success)
 
         p2d_host = getattr(self, "agentic_p2d_host_staging_manager", None)
         if p2d_host is not None:
@@ -1788,11 +1795,29 @@ class SchedulerDisaggregationPrefillMixin:
             with self._prefill_transfer_poll_lock:
                 terminal_keys = set(self._prefill_transfer_terminal_queue)
                 self._prefill_transfer_terminal_queue.clear()
-            if not terminal_keys:
+            p2d_host = getattr(self, "agentic_p2d_host_staging_manager", None)
+            drain_host_completions = (
+                None
+                if p2d_host is None
+                else getattr(p2d_host, "drain_scheduler_completions", None)
+            )
+            host_terminal_snapshots = (
+                set()
+                if drain_host_completions is None
+                else set(drain_host_completions())
+            )
+            if not terminal_keys and not host_terminal_snapshots:
                 return []
             selected = []
             for req in full_inflight_queue:
-                if self._prefill_transfer_key(req) in terminal_keys:
+                room = getattr(req, "bootstrap_room", None)
+                host_snapshot = (
+                    None if room is None else p2d_snapshot_id(room)
+                )
+                if (
+                    self._prefill_transfer_key(req) in terminal_keys
+                    or host_snapshot in host_terminal_snapshots
+                ):
                     selected.append(req)
                 else:
                     unselected_reqs.append(req)

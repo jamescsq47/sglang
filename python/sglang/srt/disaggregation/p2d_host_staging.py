@@ -22,6 +22,9 @@ from typing import Any, Optional
 
 import torch
 
+from sglang.srt.disaggregation.agentic_early_claim import (
+    AgenticDirectoryChangeWatcher,
+)
 from sglang.srt.disaggregation.agentic_host_staging import (
     H2DLaunchFence,
     HostStageState,
@@ -490,6 +493,11 @@ class AgenticPToDHostStagingManager:
         self._prepared: dict[str, dict[str, Any]] = {}
         self._active: dict[str, dict[str, Any]] = {}
         self._results: dict[str, int] = {}
+        # Physical Host completion is an edge, not a condition that the
+        # generic P->D sender pool should have to rediscover by round-robin
+        # polling.  The P scheduler drains this queue at its next allocator-
+        # safe boundary and releases the source request-generation there.
+        self._scheduler_completions: queue.SimpleQueue = queue.SimpleQueue()
         self._records: dict[str, dict[str, Any]] = {}
         self._group_pending: dict[str, dict[str, Any]] = {}
         self._group_wakeup = threading.Event()
@@ -501,8 +509,26 @@ class AgenticPToDHostStagingManager:
         # that offer, so a long subsequent Prefill cannot pin completed KV in
         # P HBM merely because control progress is delayed.
         self._candidates: dict[str, dict[str, Any]] = {}
+        self._offer_events: queue.SimpleQueue = queue.SimpleQueue()
+        self._offer_resync = threading.Event()
         self._candidate_wakeup = threading.Event()
         self._stop = threading.Event()
+        self._ledger_watcher = None
+        self._ledger_watcher_thread = None
+        try:
+            self._ledger_watcher = AgenticDirectoryChangeWatcher(
+                self.ledger.event_directory
+            )
+            self._ledger_watcher_thread = threading.Thread(
+                target=self._ledger_watch_worker,
+                name=f"agentic-p2d-ledger-watch-{os.getpid()}",
+                daemon=True,
+            )
+        except Exception:
+            # Non-Linux compatibility keeps the bounded polling backstop.
+            logger.exception(
+                "P->D Host ledger inotify unavailable; using polling fallback"
+            )
         self._offer_thread = threading.Thread(
             target=self._offer_worker,
             name=f"agentic-p2d-offer-{os.getpid()}",
@@ -522,6 +548,8 @@ class AgenticPToDHostStagingManager:
             name=f"agentic-p2d-spill-completion-{os.getpid()}",
             daemon=True,
         )
+        if self._ledger_watcher_thread is not None:
+            self._ledger_watcher_thread.start()
         self._offer_thread.start()
         for thread in self._threads:
             thread.start()
@@ -529,7 +557,7 @@ class AgenticPToDHostStagingManager:
         logger.info(
             "Agentic P->D Host staging enabled directory=%s capacity_gib=%.1f "
             "P=%d numa=%d chunk_tokens=%d workers=%d registered_arena=true "
-            "registration_s=%.3f",
+            "registration_s=%.3f offer_events=%s",
             self.arena.directory,
             self.arena.capacity_bytes / (1024**3),
             self.prefill_domain,
@@ -537,6 +565,7 @@ class AgenticPToDHostStagingManager:
             self.chunk_tokens,
             self.worker_count,
             self.arena.registration_seconds,
+            self._ledger_watcher is not None,
         )
 
     def _byte_size(self, token_count: int) -> int:
@@ -611,6 +640,7 @@ class AgenticPToDHostStagingManager:
                 "source_indices": source_indices,
                 "source_ready_event": source_ready_event,
             }
+        self._offer_events.put(snapshot_id)
         self._candidate_wakeup.set()
         return True
 
@@ -848,6 +878,19 @@ class AgenticPToDHostStagingManager:
             return result
         return int(KVPoll.Transferring) if active else None
 
+    def drain_scheduler_completions(self) -> tuple[str, ...]:
+        """Return newly durable Host snapshots without scanning manager state."""
+
+        completions = getattr(self, "_scheduler_completions", None)
+        if completions is None:
+            return ()
+        completed = []
+        while True:
+            try:
+                completed.append(completions.get_nowait())
+            except queue.Empty:
+                return tuple(completed)
+
     def prepare_scheduler_release(self, req) -> bool:
         """Atomically return final page ownership to the scheduler.
 
@@ -901,9 +944,15 @@ class AgenticPToDHostStagingManager:
         self._stop.set()
         self._candidate_wakeup.set()
         self._group_wakeup.set()
+        ledger_watcher = getattr(self, "_ledger_watcher", None)
+        if ledger_watcher is not None:
+            ledger_watcher.close()
         for _ in self._threads:
             self._work.put(None)
         self._offer_thread.join(timeout=2.0)
+        ledger_watcher_thread = getattr(self, "_ledger_watcher_thread", None)
+        if ledger_watcher_thread is not None:
+            ledger_watcher_thread.join(timeout=2.0)
         for thread in self._threads:
             thread.join(timeout=2.0)
         self._completion_thread.join(timeout=2.0)
@@ -913,6 +962,8 @@ class AgenticPToDHostStagingManager:
             *self._threads,
             self._completion_thread,
         ]
+        if ledger_watcher_thread is not None:
+            background_threads.append(ledger_watcher_thread)
         if self._dma_quarantine:
             # A submitted CUDA copy without a usable completion fence has no
             # safe reuse or teardown boundary.  Keep the registered mapping,
@@ -934,14 +985,53 @@ class AgenticPToDHostStagingManager:
                 self.arena.release(record["snapshot"])
             self.arena.close()
 
+    def _ledger_watch_worker(self) -> None:
+        """Wake offer admission on ledger changes without periodic scans."""
+
+        watcher = self._ledger_watcher
+        while not self._stop.is_set() and watcher is not None:
+            paths, overflow = watcher.poll(timeout_seconds=0.1)
+            if overflow:
+                self._offer_resync.set()
+            for path in paths:
+                try:
+                    event = self.ledger.read_entry_event(path)
+                    snapshot_id = str(event.get("snapshot_id", ""))
+                except Exception:
+                    self._offer_resync.set()
+                    continue
+                if snapshot_id:
+                    self._offer_events.put(snapshot_id)
+            if paths or overflow:
+                self._candidate_wakeup.set()
+
     def _offer_worker(self) -> None:
         """Claim new D Host offers without waiting for the P scheduler."""
 
         while not self._stop.is_set():
-            self._candidate_wakeup.wait(timeout=0.02)
+            # inotify is the normal wakeup; the timeout is only a lost-event
+            # recovery backstop and therefore need not generate high-rate
+            # per-candidate ledger reads.
+            signaled = self._candidate_wakeup.wait(timeout=0.5)
             self._candidate_wakeup.clear()
+            if self._stop.is_set():
+                return
+            snapshot_ids = set()
+            while True:
+                try:
+                    snapshot_ids.add(self._offer_events.get_nowait())
+                except queue.Empty:
+                    break
             with self._lock:
-                candidates = list(self._candidates.items())
+                if not signaled or self._offer_resync.is_set():
+                    candidates = list(self._candidates.items())
+                    self._offer_resync.clear()
+                else:
+                    candidates = [
+                        (snapshot_id, self._candidates[snapshot_id])
+                        for snapshot_id in snapshot_ids
+                        if snapshot_id in self._candidates
+                    ]
             for snapshot_id, candidate in candidates:
                 if self._stop.is_set():
                     return
@@ -1103,6 +1193,19 @@ class AgenticPToDHostStagingManager:
             self._group_pending.pop(snapshot_id, None)
             self._active.pop(snapshot_id, None)
             self._results[snapshot_id] = int(KVPoll.Success)
+        # Publish only after the durable result is level-triggered in
+        # ``_results``.  Queue delivery may race a scheduler visit, but the
+        # scheduler can always validate the result through poll()/release.
+        # TP ranks already publish one group terminal through their existing
+        # mailbox/control epoch.  This rank-local shortcut is TP1-only;
+        # enqueueing it on followers would leak and cannot authorize a group
+        # release decision.
+        if int(getattr(self, "tp_size", 1)) == 1:
+            completions = getattr(self, "_scheduler_completions", None)
+            if completions is None:
+                completions = queue.SimpleQueue()
+                self._scheduler_completions = completions
+            completions.put(snapshot_id)
         logger.info(
             "AgenticKV p2d_host_d2h_complete snapshot=%s tokens=%d "
             "elapsed_ms=%.3f gib_per_s=%.3f worker=%d",

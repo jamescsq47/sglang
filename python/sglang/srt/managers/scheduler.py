@@ -331,6 +331,14 @@ class AgenticPWorksetLeaseBroker:
         self._leases: Dict[str, AgenticPWorksetLease] = {}
         self._release_requested: Dict[str, int] = {}
         self._grant_events: Deque[str] = deque()
+        # Workset allocation is edge-triggered.  An unchanged shortage must
+        # not make every scheduler tick retry every Slow/Direct intent.  New
+        # intent, completed release, increased allocator capacity, or reduced
+        # native suffix reservation arms one new allocation pass.
+        self._allocation_event = threading.Event()
+        self._allocation_event.set()
+        self._last_allocator_available: Optional[int] = None
+        self._last_reserve_tokens = 0
         self._next_lease_id = 1
         self._grants = 0
         self._allocation_failures = 0
@@ -396,6 +404,7 @@ class AgenticPWorksetLeaseBroker:
             if snapshot_id in self._release_requested:
                 return False
             self._intents[snapshot_id] = (owner, parent_tokens, prompt_tokens)
+            self._allocation_event.set()
             return True
 
     def get(
@@ -464,6 +473,7 @@ class AgenticPWorksetLeaseBroker:
                 return False
             current.state = "releasing"
             self._release_requested[snapshot_id] = current.lease_id
+            self._allocation_event.set()
             return True
 
     def release_handed(
@@ -503,6 +513,7 @@ class AgenticPWorksetLeaseBroker:
                 return True
             current.state = "releasing"
             self._release_requested[snapshot_id] = current.lease_id
+            self._allocation_event.set()
             return True
 
     def service(
@@ -540,6 +551,31 @@ class AgenticPWorksetLeaseBroker:
                     )
                     if self._tp_plan_epoch >= 0:
                         self._tp_retired_in_epoch.add(snapshot_id)
+
+            available_size = getattr(allocator, "available_size", None)
+            allocator_available = (
+                None if available_size is None else int(available_size())
+            )
+            capacity_increased = (
+                allocator_available is None
+                or self._last_allocator_available is None
+                or allocator_available > self._last_allocator_available
+            )
+            reserve_decreased = reserve_tokens < self._last_reserve_tokens
+            allocation_needed = bool(
+                releases
+                or capacity_increased
+                or reserve_decreased
+                or self._allocation_event.is_set()
+            )
+            if self._tp_plan_epoch >= 0:
+                # TP plans are installed as one frozen group-control epoch.
+                # Preserve the original group-wide retry cadence: a rank-local
+                # free/capacity edge must never decide that only one shard runs
+                # the allocation pass.
+                allocation_needed = True
+            self._allocation_event.clear()
+            self._last_reserve_tokens = reserve_tokens
 
             allocation_plan = self._tp_plan if self._tp_plan_epoch >= 0 else None
             if allocation_plan is None:
@@ -586,6 +622,13 @@ class AgenticPWorksetLeaseBroker:
                         allocation_plan
                     )
                 )
+
+            # Releases are always serviced above.  With no allocation edge,
+            # identical pending intents remain metadata-only instead of
+            # hammering allocator.alloc() on every model-scheduler iteration.
+            if not allocation_needed:
+                self._last_allocator_available = allocator_available
+                return
 
             for snapshot_id, owner, parent_tokens, prompt_tokens in candidates:
                 if snapshot_id in self._tp_retired_in_epoch:
@@ -685,6 +728,9 @@ class AgenticPWorksetLeaseBroker:
                 self._grants += 1
                 self._intents.pop(snapshot_id, None)
                 self._grant_events.append(snapshot_id)
+            self._last_allocator_available = (
+                None if available_size is None else int(available_size())
+            )
 
     def install_tp_plan(
         self,
@@ -764,9 +810,16 @@ class AgenticPWorksetLeaseBroker:
                     if current is None or current.state == "active":
                         self._tp_release_pending.pop(snapshot_id, None)
                         self._tp_retire_requested.discard(snapshot_id)
+            plan_changed = (
+                normalized != self._tp_plan
+                or authoritative_retirements
+                != self._tp_authoritative_retirements
+            )
             self._tp_plan_epoch = epoch
             self._tp_plan = normalized
             self._tp_authoritative_retirements = authoritative_retirements
+            if plan_changed:
+                self._allocation_event.set()
             self._tp_retired_in_epoch.clear()
             for snapshot_id in authoritative_retirements:
                 self._prepare_tp_retire_locked(snapshot_id)
@@ -1126,6 +1179,7 @@ class AgenticPWorksetLeaseBroker:
                 else:
                     current.state = "releasing"
                     self._release_requested[snapshot_id] = current.lease_id
+                    self._allocation_event.set()
                 return True
             return False
 
@@ -1169,6 +1223,7 @@ class AgenticPWorksetLeaseBroker:
             current.parent_bound = bool(parent_bound)
             current.state = "releasing"
             self._release_requested[snapshot_id] = current.lease_id
+            self._allocation_event.set()
             return True
 
     def cancel_unstarted(
@@ -1213,6 +1268,7 @@ class AgenticPWorksetLeaseBroker:
             ):
                 lease.state = "releasing"
                 self._release_requested[snapshot_id] = lease.lease_id
+                self._allocation_event.set()
                 cancelled = True
             return cancelled
 
@@ -1281,6 +1337,7 @@ class AgenticPWorksetLeaseBroker:
                     lease.state = "releasing"
                     lease.io_attempt = None
                     self._release_requested[snapshot_id] = lease.lease_id
+                    self._allocation_event.set()
             self._intents.pop(snapshot_id, None)
             self._tp_cancel_pending.pop(snapshot_id, None)
             self._tp_release_pending.pop(snapshot_id, None)
@@ -2050,6 +2107,12 @@ class Scheduler(
             "new": deque(),
         }
         self.agentic_kv_progress_enqueued: set[str] = set()
+        # Slow H2D completion already owns a full workset.  Keep these exact
+        # snapshots out of the ordinary fast/slow/new admission competition;
+        # the scheduler performs only their safe Radix handoff on its next
+        # iteration.  The set is bounded by the physical H2D lane count.
+        self.agentic_h2d_completion_queue: Deque[str] = deque()
+        self.agentic_h2d_completion_enqueued: set[str] = set()
         self.agentic_kv_retry_heap: List[Tuple[float, int, str]] = []
         self.agentic_kv_retry_deadlines: Dict[str, float] = {}
         self.agentic_kv_retry_sequence = 0
@@ -6428,8 +6491,27 @@ class Scheduler(
         if host_staging is not None:
             drain_events = getattr(host_staging, "drain_scheduler_events", None)
             if drain_events is not None:
-                for _, snapshot_id in drain_events():
-                    self._agentic_enqueue_snapshot_waiters(snapshot_id)
+                for kind, snapshot_id in drain_events():
+                    if (
+                        kind == "hbm_ready"
+                        and getattr(self, "tp_size", 1) == 1
+                    ):
+                        completion_queue = getattr(
+                            self, "agentic_h2d_completion_queue", None
+                        )
+                        completion_ids = getattr(
+                            self, "agentic_h2d_completion_enqueued", None
+                        )
+                        if completion_queue is None or completion_ids is None:
+                            completion_queue = deque()
+                            completion_ids = set()
+                            self.agentic_h2d_completion_queue = completion_queue
+                            self.agentic_h2d_completion_enqueued = completion_ids
+                        if snapshot_id not in completion_ids:
+                            completion_ids.add(snapshot_id)
+                            completion_queue.append(snapshot_id)
+                    else:
+                        self._agentic_enqueue_snapshot_waiters(snapshot_id)
 
         broker = getattr(self, "agentic_p_workset_broker", None)
         if broker is not None:
@@ -7632,6 +7714,8 @@ class Scheduler(
             progress = self.agentic_kv_progress_queues[queue_class]
             while progress:
                 rid = progress.popleft()
+                if rid not in self.agentic_kv_progress_enqueued:
+                    continue
                 self.agentic_kv_progress_enqueued.discard(rid)
                 waiter = self.agentic_kv_waiting_by_rid.get(rid)
                 if waiter is None:
@@ -7648,6 +7732,9 @@ class Scheduler(
             progress = self.agentic_kv_progress_queues[queue_class]
             while progress:
                 rid = progress[0]
+                if rid not in self.agentic_kv_progress_enqueued:
+                    progress.popleft()
+                    continue
                 waiter = self.agentic_kv_waiting_by_rid.get(rid)
                 if waiter is None:
                     progress.popleft()
@@ -7675,13 +7762,7 @@ class Scheduler(
 
         processed = 0
 
-        def consume_one(queue_class: str) -> bool:
-            nonlocal processed
-            waiter = pop_waiter(queue_class)
-            if waiter is None:
-                return False
-            req, started_at = waiter
-            processed += 1
+        def consume_waiter(req: Req, started_at: float) -> bool:
             try:
                 deferred = self._agentic_should_defer(
                     req, started_at, allow_start_io=True
@@ -7718,6 +7799,56 @@ class Scheduler(
             self._agentic_publish_p_scheduled(req)
             self._add_request_to_queue(req)
             return True
+
+        def consume_one(queue_class: str) -> bool:
+            nonlocal processed
+            waiter = pop_waiter(queue_class)
+            if waiter is None:
+                return False
+            processed += 1
+            consume_waiter(*waiter)
+            return True
+
+        # A completed H2D already owns parent+suffix pages, so it no longer
+        # competes for allocation or I/O admission.  Commit at most one
+        # physical-lane worth of exact handoffs before ordinary priorities.
+        # This preserves the scheduler-owned Radix boundary while removing
+        # the former completion->slow-queue->admission delay.
+        host_staging = getattr(self, "agentic_host_staging_manager", None)
+        completion_budget = max(
+            1,
+            int(getattr(host_staging, "max_h2d_inflight", 1)),
+        )
+        completion_queue = getattr(
+            self, "agentic_h2d_completion_queue", deque()
+        )
+        completion_ids = getattr(
+            self, "agentic_h2d_completion_enqueued", set()
+        )
+        completion_visits = min(completion_budget, len(completion_queue))
+        for _ in range(completion_visits):
+            snapshot_id = completion_queue.popleft()
+            completion_ids.discard(snapshot_id)
+            waiters = tuple(
+                self.agentic_kv_waiting_by_parent.get(snapshot_id, {}).values()
+            )
+            if not waiters:
+                # This edge is only an acceleration hint.  ``io_complete`` is
+                # level-triggered, so later waiter registration observes it
+                # through the ordinary progress queue.  Never hot-requeue an
+                # orphan edge in front of newer valid completions.
+                continue
+            # A request-generation has one next-turn consumer.  Keep a
+            # defensive loop for duplicate HTTP metadata, whose lifecycle
+            # checks will admit at most the authoritative owner.
+            for req in waiters:
+                waiter = self.agentic_kv_waiting_by_rid.get(req.rid)
+                if waiter is None:
+                    continue
+                # Invalidate the older generic queue edge.  pop_waiter()
+                # drops that stale id in O(1) when it reaches the head.
+                self.agentic_kv_progress_enqueued.discard(req.rid)
+                consume_waiter(*waiter)
 
         for queue_class in promoted:
             if processed >= admission_batch:
