@@ -84,6 +84,7 @@ from sglang.srt.managers.scheduler import (
     AgenticPWorksetLeaseBroker,
     Scheduler,
 )
+from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
 
 
 def _ledger():
@@ -91,6 +92,27 @@ def _ledger():
     os.close(fd)
     os.unlink(path)
     return SharedHostStagingLedger(path), path
+
+
+def test_grouped_paged_free_owns_request_slot_indices():
+    """A deferred free must survive reuse of its req_to_token source row."""
+
+    allocator = PagedTokenToKVPoolAllocator.__new__(PagedTokenToKVPoolAllocator)
+    allocator.page_size = 64
+    allocator.need_sort = False
+    allocator.debug_mode = False
+    allocator.free_pages = torch.empty(0, dtype=torch.int64)
+    allocator.release_pages = torch.empty(0, dtype=torch.int64)
+    allocator.is_not_in_free_group = True
+    allocator.free_group = []
+
+    request_slot_view = torch.arange(64, 128, dtype=torch.int64)
+    allocator.free_group_begin()
+    allocator.free(request_slot_view)
+    request_slot_view.add_(64)  # Simulate immediate request-slot reuse.
+    allocator.free_group_end()
+
+    assert allocator.free_pages.tolist() == [1]
 
 
 def test_agentic_file_change_watcher_is_edge_triggered(tmp_path):
@@ -6098,14 +6120,13 @@ def test_prestart_abort_retries_first_ledger_mutation_error():
         manager._release_record = lambda record: released.append(record) or True
 
         manager.abort_request(rid, request)
-        # The exact selected rank is pinned before the fenced abort begins;
-        # a transient failure publishing ABORTING must retain that claim and
-        # the complete Host snapshot for retry.
-        assert ledger.get(snapshot_id)["state"] == HostStageState.H2D_LOADING.value
-        assert snapshot_id in manager._prestart_recovery_aborts
+        # A transient CAS failure is fail-closed: no local abort tombstone may
+        # precede authoritative ledger ownership.
+        assert ledger.get(snapshot_id)["state"] == HostStageState.HOST_READY.value
+        assert not getattr(manager, "_prestart_recovery_aborts", {})
         assert released == []
 
-        manager._progress_prestart_aborts()
+        manager._progress_host_abort_requests()
         assert ledger.get(snapshot_id)["state"] == HostStageState.FAILED.value
         assert snapshot_id not in manager._prestart_recovery_aborts
         assert len(released) == 1
@@ -8039,6 +8060,10 @@ def test_tp1_direct_release_waits_for_physical_nixl_completion(
         ),
         _agentic_candidate_pop=lambda sid: popped.append(sid),
         _enqueue_agentic_release=lambda req, offset: released.append((req, offset)),
+        _retire_candidate_for_release=lambda sid, req, offset: (
+            popped.append(sid),
+            released.append((req, offset)),
+        ),
     )
 
     DecodeKVCacheOffloadManager._check_agentic_direct_progress(
@@ -10592,11 +10617,12 @@ def test_tp_pending_release_accounts_only_uncached_tail():
         page_size=64,
         _decode_pending_release_tokens=64,
         _agentic_tp_pending_releases={"request:3": (req, 0)},
+        _agentic_release_ownership={"request:3": (req, 0)},
     )
     reserved = DecodeKVCacheOffloadManager.agentic_pending_release_token_count.fget(
         manager
     )
-    assert reserved == 64 + 4160 - 2048
+    assert reserved == 4160 - 2048
     assert (
         DecodeKVCacheOffloadManager.agentic_pending_release_req_count.fget(manager)
         == 1

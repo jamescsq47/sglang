@@ -305,28 +305,30 @@ def _registered_indexed_batch_copy(
     run_lengths = run_ends - run_starts
     run_device_starts = indices[run_starts]
 
-    host_pointer_rows = []
-    device_pointer_rows = []
     item_size = int(snapshot.item_size)
-    for kv_index, device_layers in enumerate(
-        (snapshot.device_pool.k_buffer, snapshot.device_pool.v_buffer)
-    ):
-        for layer_index in range(int(snapshot.layer_num)):
-            host_layer = snapshot.kv_buffer[
-                kv_index,
-                layer_index,
-                int(host_start) : int(host_start) + int(indices.size),
-            ]
-            host_pointer_rows.append(
-                np.uint64(host_layer.data_ptr())
-                + run_starts.astype(np.uint64) * np.uint64(item_size)
-            )
-            device_pointer_rows.append(
-                np.uint64(device_layers[layer_index].data_ptr())
-                + run_device_starts.astype(np.uint64) * np.uint64(item_size)
-            )
-    host_pointers = np.concatenate(host_pointer_rows)
-    device_pointers = np.concatenate(device_pointer_rows)
+    # Derive layer addresses from strides instead of constructing a Torch view
+    # per layer on every chunk.  Broadcasting builds the same K/V-major batch
+    # without 2*layer_num tensor slices and small NumPy allocations under GIL.
+    host = snapshot.kv_buffer
+    element_size = int(host.element_size())
+    layer_offsets = (
+        np.arange(2, dtype=np.uint64)[:, None] * np.uint64(host.stride(0))
+        + np.arange(int(snapshot.layer_num), dtype=np.uint64)[None, :]
+        * np.uint64(host.stride(1))
+        + np.uint64(int(host_start) * host.stride(2))
+    ).reshape(-1) * np.uint64(element_size)
+    host_bases = np.uint64(host.data_ptr()) + layer_offsets
+    device_bases = np.asarray(
+        [layer.data_ptr() for layer in device_layers], dtype=np.uint64
+    )
+    host_pointers = (
+        host_bases[:, None]
+        + run_starts.astype(np.uint64)[None, :] * np.uint64(item_size)
+    ).reshape(-1)
+    device_pointers = (
+        device_bases[:, None]
+        + run_device_starts.astype(np.uint64)[None, :] * np.uint64(item_size)
+    ).reshape(-1)
     remaining_sizes = np.tile(
         run_lengths.astype(np.uint64) * np.uint64(item_size),
         int(snapshot.layer_num) * 2,
@@ -2232,7 +2234,12 @@ class SharedHostStagingLedger:
         return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
 
     def request_host_load_failure(
-        self, snapshot_id: str, owner: str, *, reason: str
+        self,
+        snapshot_id: str,
+        owner: str,
+        *,
+        reason: str,
+        recovery_domain: Optional[int] = None,
     ) -> bool:
         """Begin a TP-wide P2D Host-load abort without releasing Host data.
 
@@ -2243,23 +2250,34 @@ class SharedHostStagingLedger:
 
         def callback(entries):
             current = entries.get(snapshot_id)
-            if current is None or owner not in {
-                current.get("p_owner"),
-                current.get("recovery_owner"),
-            }:
+            if current is None or not self._host_load_abort_requester_matches(
+                current, owner, recovery_domain=recovery_domain
+            ):
                 return False, False
             state = current.get("state")
             if state == HostStageState.FAILED.value:
                 return True, False
             if state == HostStageState.ABORTING.value:
-                return bool(current.get("h2d_abort_started", False)), False
+                return (
+                    bool(current.get("h2d_abort_started", False))
+                    and current.get("h2d_abort_owner") in {None, owner}
+                ), False
             if state not in {
                 HostStageState.HOST_READY.value,
                 HostStageState.H2D_LOADING.value,
+                HostStageState.HBM_READY.value,
             }:
+                return False, False
+            if state == HostStageState.HBM_READY.value and any(
+                claim.get("phase") == "handed"
+                for claim in current.get("recovery_claims", {}).values()
+            ):
                 return False, False
             current["state"] = HostStageState.ABORTING.value
             current["h2d_abort_started"] = True
+            current["h2d_abort_owner"] = owner
+            if recovery_domain is not None:
+                current["h2d_abort_recovery_domain"] = int(recovery_domain)
             current["loader_failure_reason"] = str(reason)[:256]
             current["updated_at"] = time.time()
             return True, True
@@ -2285,8 +2303,7 @@ class SharedHostStagingLedger:
             current = entries.get(snapshot_id)
             if (
                 current is None
-                or owner
-                not in {current.get("p_owner"), current.get("recovery_owner")}
+                or not self._host_load_abort_owner_matches(current, owner)
                 or int(current.get("tp_size", 1)) != int(tp_size)
                 or current.get("state")
                 not in {
@@ -2310,6 +2327,7 @@ class SharedHostStagingLedger:
                 current["state"] = HostStageState.FAILED.value
                 current["recovery_claim_id"] = None
                 current["recovery_claims"] = {}
+                current["recovery_owner"] = None
                 current["reason"] = current.get(
                     "loader_failure_reason", "p2d_h2d_failed"
                 )
@@ -2330,9 +2348,9 @@ class SharedHostStagingLedger:
 
         def callback(entries):
             current = entries.get(snapshot_id)
-            if current is None or current.get(
-                "recovery_owner", current.get("p_owner")
-            ) != owner:
+            if current is None or not self._d2p_recovery_owner_matches(
+                current, owner
+            ):
                 return False, False
             if current.get("state") in {
                 HostStageState.HBM_READY.value,
@@ -2366,9 +2384,9 @@ class SharedHostStagingLedger:
 
         def callback(entries):
             current = entries.get(snapshot_id)
-            if current is None or current.get(
-                "recovery_owner", current.get("p_owner")
-            ) != owner:
+            if current is None or not self._d2p_recovery_owner_matches(
+                current, owner
+            ):
                 return False, False
             if current.get("state") == HostStageState.CONSUMED.value:
                 return True, False
@@ -2393,9 +2411,9 @@ class SharedHostStagingLedger:
 
         def callback(entries):
             current = entries.get(snapshot_id)
-            if current is None or current.get(
-                "recovery_owner", current.get("p_owner")
-            ) != owner:
+            if current is None or not self._d2p_recovery_owner_matches(
+                current, owner
+            ):
                 return False, False
             if current.get("state") == HostStageState.RETRY_PENDING.value:
                 return True, False
@@ -2427,7 +2445,7 @@ class SharedHostStagingLedger:
             current = entries.get(snapshot_id)
             if (
                 current is None
-                or current.get("recovery_owner", current.get("p_owner")) != owner
+                or not self._d2p_recovery_owner_matches(current, owner)
                 or current.get("state")
                 not in {
                     HostStageState.RETRY_PENDING.value,
@@ -2478,14 +2496,13 @@ class SharedHostStagingLedger:
 
         def callback(entries):
             current = entries.get(snapshot_id)
-            expected_owner = (
-                current.get("recovery_owner", current.get("p_owner"))
-                if current is not None and recovery
-                else None if current is None else current.get("p_owner")
-            )
             if (
                 current is None
-                or expected_owner != owner
+                or (
+                    not self._d2p_recovery_owner_matches(current, owner)
+                    if recovery
+                    else current.get("p_owner") != owner
+                )
                 or int(current.get("tp_size", 1)) != int(tp_size)
                 or current.get("state")
                 not in {
@@ -2505,8 +2522,10 @@ class SharedHostStagingLedger:
 
         return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
 
-    def assign_d2p_recovery_domain(self, snapshot_id: str, domain: int) -> bool:
-        """Pin the Host-ready generation to one independently selected P."""
+    def assign_d2p_recovery_domain(
+        self, snapshot_id: str, domain: int, *, lease_seconds: float = 120.0
+    ) -> bool:
+        """Lease a Host-ready generation to one independently selected P."""
 
         domain = int(domain)
 
@@ -2520,13 +2539,59 @@ class SharedHostStagingLedger:
             previous = current.get("recovery_domain")
             if previous is not None and int(previous) != domain:
                 return False, False
-            changed = previous is None
+            expires_at = time.time() + max(1.0, float(lease_seconds))
+            changed = previous is None or float(
+                current.get("recovery_assignment_expires_at", 0.0)
+            ) < expires_at
             current["recovery_domain"] = domain
+            current["recovery_assignment_expires_at"] = expires_at
             if changed:
                 current["updated_at"] = time.time()
             return True, changed
 
         return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
+
+    @staticmethod
+    def _d2p_recovery_owner_matches(
+        current: dict[str, Any], owner: str
+    ) -> bool:
+        recovery_owner = current.get("recovery_owner")
+        if recovery_owner is not None:
+            return recovery_owner == owner
+        # A Router-assigned generation belongs to that logical P domain even
+        # before its per-process recovery claim is published.  The physical
+        # Shared-Arena owner is only the legacy/unassigned fallback owner.
+        return current.get("recovery_domain") is None and current.get(
+            "p_owner"
+        ) == owner
+
+    @staticmethod
+    def _host_load_abort_requester_matches(
+        current: dict[str, Any],
+        owner: str,
+        *,
+        recovery_domain: Optional[int] = None,
+    ) -> bool:
+        recovery_owner = current.get("recovery_owner")
+        if recovery_owner is not None:
+            return recovery_owner == owner
+        assigned_domain = current.get("recovery_domain")
+        if assigned_domain is not None:
+            return recovery_domain is not None and int(assigned_domain) == int(
+                recovery_domain
+            )
+        return current.get("p_owner") == owner
+
+    @staticmethod
+    def _host_load_abort_owner_matches(
+        current: dict[str, Any], owner: str
+    ) -> bool:
+        abort_owner = current.get("h2d_abort_owner")
+        if abort_owner is not None:
+            return abort_owner == owner
+        return SharedHostStagingLedger._d2p_recovery_owner_matches(
+            current, owner
+        )
 
     def claim_d2p_recovery_rank(
         self,
@@ -2618,7 +2683,7 @@ class SharedHostStagingLedger:
             claim = claims.get(rank_key)
             if (
                 current is None
-                or current.get("recovery_owner", current.get("p_owner")) != owner
+                or not self._d2p_recovery_owner_matches(current, owner)
                 or int(current.get("tp_size", 1)) != int(tp_size)
                 or current.get("state") != HostStageState.H2D_LOADING.value
                 or current.get("recovery_claim_id") != claim_id
@@ -2668,7 +2733,7 @@ class SharedHostStagingLedger:
             claim = claims.get(rank_key)
             if (
                 current is None
-                or current.get("recovery_owner", current.get("p_owner")) != owner
+                or not self._d2p_recovery_owner_matches(current, owner)
                 or int(current.get("tp_size", 1)) != int(tp_size)
                 or current.get("state")
                 not in {
@@ -2724,7 +2789,7 @@ class SharedHostStagingLedger:
             claim = claims.get(rank_key)
             if (
                 current is None
-                or current.get("recovery_owner", current.get("p_owner")) != owner
+                or not self._d2p_recovery_owner_matches(current, owner)
                 or int(current.get("tp_size", 1)) != int(tp_size)
                 or current.get("state")
                 not in {
@@ -2754,6 +2819,9 @@ class SharedHostStagingLedger:
                 and current.get("state") == HostStageState.H2D_LOADING.value
             ):
                 current["recovery_claim_id"] = None
+                current["recovery_owner"] = None
+                current.pop("recovery_domain", None)
+                current.pop("recovery_assignment_expires_at", None)
                 current["state"] = HostStageState.HOST_READY.value
                 for key in (
                     "loading_ranks",
@@ -2789,7 +2857,7 @@ class SharedHostStagingLedger:
             current = entries.get(snapshot_id)
             if (
                 current is None
-                or current.get("recovery_owner", current.get("p_owner")) != owner
+                or not self._d2p_recovery_owner_matches(current, owner)
                 or int(current.get("tp_size", 1)) != int(tp_size)
                 or current.get("state")
                 not in {
@@ -3035,9 +3103,14 @@ class SharedHostStagingLedger:
                 return True, False
             if state != HostStageState.HOST_READY.value:
                 return False, False
+            # Recovery assignment is the ownership fence before the selected
+            # P has published its process/rank claim.  Evicting in that gap
+            # can remove the only Host copy underneath the routed child.
             if any(
                 current.get(field)
                 for field in (
+                    "recovery_owner",
+                    "recovery_claims",
                     "loading_ranks",
                     "h2d_prepared_ranks",
                     "loader_acks",
@@ -3045,6 +3118,11 @@ class SharedHostStagingLedger:
                 )
             ):
                 return False, False
+            if current.get("recovery_domain") is not None:
+                if float(current.get("recovery_assignment_expires_at", 0.0)) > time.time():
+                    return False, False
+                current.pop("recovery_domain", None)
+                current.pop("recovery_assignment_expires_at", None)
             current["state"] = HostStageState.EVICTING.value
             current["eviction_acks"] = []
             current["eviction_reason"] = str(reason)[:256]
@@ -5869,6 +5947,7 @@ class AgenticPHostStagingManager:
             return bool(
                 self.loads
                 or self.spills
+                or getattr(self, "_pending_host_abort_requests", {})
                 or getattr(self, "_prestart_recovery_aborts", {})
                 or pending_grant
             )
@@ -5938,6 +6017,7 @@ class AgenticPHostStagingManager:
         # Publish populated extents before taking the shared ledger snapshot so
         # D can observe every new grant in this same control cycle.
         self._progress_arena_grants()
+        self._progress_host_abort_requests()
         self._progress_prestart_aborts()
         self._progress_h2d_loads()
         self._progress_spills()
@@ -6185,6 +6265,24 @@ class AgenticPHostStagingManager:
             reservations = getattr(self, "_h2d_lane_reservations", None)
             if reservations is not None:
                 reservations.pop(snapshot_id, None)
+
+    def _find_h2d_load(
+        self, snapshot_id: str, *, rid: Optional[str] = None
+    ) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+        """Resolve a Slow load by request-generation, not transient HTTP rid."""
+
+        if rid is not None:
+            load = self.loads.get(rid)
+            generation = None if load is None else load.get("request_generation")
+            if load is not None and (
+                generation is None or generation.snapshot_id == snapshot_id
+            ):
+                return str(rid), load
+        for load_rid, load in self.loads.items():
+            generation = load.get("request_generation")
+            if generation is not None and generation.snapshot_id == snapshot_id:
+                return str(load_rid), load
+        return None, None
 
     def _retire_stale_direct_before_slow(self, snapshot_id: str) -> bool:
         """Fence an obsolete Direct owner before Slow consumes an H2D lane.
@@ -6964,7 +7062,10 @@ class AgenticPHostStagingManager:
                 continue
 
             rid = str(context["rid"])
-            claim_id = self.workset_broker.slow_owner(snapshot_id, rid)
+            claim_id = str(
+                context.get("recovery_claim_id")
+                or self.workset_broker.slow_owner(snapshot_id, rid)
+            )
             lease = self.workset_broker.get(snapshot_id, owner=claim_id)
             if lease is None:
                 self.workset_broker.cancel_unstarted(
@@ -7037,122 +7138,127 @@ class AgenticPHostStagingManager:
                 )
             AgenticPHostStagingManager._release_h2d_lane(self, snapshot_id)
 
+    def _progress_host_abort_requests(self) -> None:
+        """Retry abort ownership CAS without publishing local tombstones."""
+
+        with self._get_state_lock():
+            pending = tuple(
+                getattr(self, "_pending_host_abort_requests", {}).values()
+            )
+        for context in pending:
+            self.abort_request(
+                str(context["rid"]), context["request_generation"]
+            )
+
     def abort_request(self, rid: str, request_generation) -> None:
         """Cancel one Slow restore without racing an in-flight H2D."""
 
         snapshot_id = request_generation.snapshot_id
         prestart_abort = False
         with self._get_state_lock():
-            load = self.loads.get(rid)
-            if load is not None:
-                load["abort_requested"] = True
-                load.setdefault("io_error", RuntimeError("request aborted"))
-                load["drop_host_on_abort"] = True
-            else:
-                record = self.host_ready.get(snapshot_id)
-                if record is not None:
-                    # A P that owns the physical Host arena also keeps a local
-                    # host_ready record when another P is the selected recovery
-                    # owner.  Aborting an obsolete Direct HTTP attempt on the
-                    # Host owner must not reinterpret that arena record as this
-                    # request's Slow claim and destroy the only durable copy.
-                    entry = self.ledger.get(snapshot_id)
-                    expected_claim_id = self.workset_broker.slow_owner(
-                        snapshot_id, rid
-                    )
-                    claims = {} if entry is None else entry.get(
-                        "recovery_claims", {}
-                    )
-                    rank_claim = claims.get(str(int(self.tp_rank)))
-                    record_claim_id = record.get("recovery_claim_id")
-                    loading = record.get("loading")
-                    targets_this_manager = bool(
-                        entry is not None
-                        and self._recovery_targets_this_manager(entry)
-                        and entry.get("recovery_owner") in {None, self.owner}
-                    )
-                    # The Router may cancel after assigning this P but before
-                    # gate_request() publishes its rank claim.  Pin the exact
-                    # request/rank first so the normal fenced abort can retire
-                    # the selected Host snapshot instead of leaking it in
-                    # HOST_READY until pressure eviction.
-                    can_join_selected_abort = bool(
-                        targets_this_manager
-                        and rank_claim is None
-                        and entry.get("state")
-                        in {
-                            HostStageState.HOST_READY.value,
-                            HostStageState.H2D_LOADING.value,
-                        }
-                        and entry.get("recovery_claim_id")
-                        in {None, expected_claim_id}
-                    )
-                    if (
-                        can_join_selected_abort
-                        and self.ledger.claim_d2p_recovery_rank(
-                            snapshot_id,
-                            self.owner,
-                            tp_rank=self.tp_rank,
-                            tp_size=self.tp_size,
-                            claim_id=expected_claim_id,
-                            recovery_domain=getattr(self, "arena_domain", None),
-                        )
-                    ):
+            pending = getattr(self, "_pending_host_abort_requests", None)
+            if pending is None:
+                pending = self._pending_host_abort_requests = {}
+            pending[snapshot_id] = {
+                "rid": str(rid),
+                "request_generation": request_generation,
+            }
+        # The ledger CAS is the ownership boundary.  A storage P must not
+        # mutate its local record before learning that a foreign recovery P
+        # has already claimed this request-generation.
+        try:
+            authorized = self.ledger.request_host_load_failure(
+                snapshot_id,
+                self.owner,
+                reason="request_aborted",
+                recovery_domain=getattr(self, "arena_domain", None),
+            )
+        except Exception:
+            logger.exception(
+                "AgenticKV Host abort CAS failed closed snapshot=%s", snapshot_id
+            )
+            self._control_wakeup.set()
+            return
+        if not authorized:
+            with self._get_state_lock():
+                getattr(self, "_pending_host_abort_requests", {}).pop(
+                    snapshot_id, None
+                )
+            logger.info(
+                "AgenticKV stale Host abort ignored snapshot=%s owner=%s",
+                snapshot_id,
+                self.owner,
+            )
+            return
+
+        no_local_state = False
+        try:
+            with self._get_state_lock():
+                _load_rid, load = self._find_h2d_load(snapshot_id, rid=rid)
+                if load is not None:
+                    load["abort_requested"] = True
+                    load.setdefault("io_error", RuntimeError("request aborted"))
+                    load["drop_host_on_abort"] = True
+                else:
+                    record = self.host_ready.get(snapshot_id)
+                    if record is not None:
                         entry = self.ledger.get(snapshot_id)
-                        claims = entry.get("recovery_claims", {})
-                        rank_claim = claims.get(str(int(self.tp_rank)))
-                    joins_group_abort = bool(
-                        targets_this_manager
-                        and entry.get("state") == HostStageState.ABORTING.value
-                        and entry.get("h2d_abort_started", False)
-                        and int(self.tp_rank)
-                        not in {
-                            int(value)
-                            for value in entry.get("loader_drained_ranks", [])
-                        }
-                    )
-                    owns_claim = targets_this_manager and (
-                        record_claim_id == expected_claim_id
-                        or (
-                            rank_claim is not None
-                            and rank_claim.get("claim_id") == expected_claim_id
+                        claims = {} if entry is None else entry.get(
+                            "recovery_claims", {}
                         )
-                        # Close the small window after the local record is
-                        # selected but before its ledger claim is visible.
-                        or loading == "h2d_claiming"
-                        # A peer TP rank may have already frozen the group in
-                        # ABORTING before this rank received the same cancel.
-                        # This rank owns no DMA and must still publish its
-                        # quiescent ACK so the group can reach FAILED.
-                        or joins_group_abort
-                    )
-                    if owns_claim:
+                        rank_claim = claims.get(str(int(self.tp_rank)))
+                        record_claim_id = record.get("recovery_claim_id")
+                        claim_id = (
+                            None
+                            if rank_claim is None
+                            else rank_claim.get("claim_id")
+                        ) or record_claim_id or self.workset_broker.slow_owner(
+                            snapshot_id, rid
+                        )
                         record["abort_requested"] = True
                         record["loading"] = "abort_pending"
-                        pending = getattr(
+                        prestart = getattr(
                             self, "_prestart_recovery_aborts", None
                         )
-                        if pending is None:
-                            pending = self._prestart_recovery_aborts = {}
-                        pending[snapshot_id] = {
+                        if prestart is None:
+                            prestart = self._prestart_recovery_aborts = {}
+                        prestart[snapshot_id] = {
                             "rid": str(rid),
                             "request_generation": request_generation,
+                            "recovery_claim_id": str(claim_id),
                         }
                         prestart_abort = True
                     else:
                         self.workset_broker.cancel_unstarted(
-                            snapshot_id, owner=expected_claim_id
+                            snapshot_id,
+                            owner=self.workset_broker.slow_owner(
+                                snapshot_id, rid
+                            ),
                         )
-                else:
-                    self.workset_broker.cancel_unstarted(
-                        snapshot_id,
-                        owner=self.workset_broker.slow_owner(snapshot_id, rid),
-                    )
-                    AgenticPHostStagingManager._release_h2d_lane(
-                        self, snapshot_id
-                    )
-        if prestart_abort:
-            self._progress_prestart_aborts()
+                        AgenticPHostStagingManager._release_h2d_lane(
+                            self, snapshot_id
+                        )
+                        no_local_state = True
+            if prestart_abort:
+                self._progress_prestart_aborts()
+            elif no_local_state and not self.ledger.mark_host_load_rank_drained(
+                snapshot_id,
+                self.owner,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+            ):
+                raise RuntimeError("Host abort drain ownership was not committed")
+        except Exception:
+            logger.exception(
+                "AgenticKV Host abort local completion retry snapshot=%s",
+                snapshot_id,
+            )
+            self._control_wakeup.set()
+            return
+        with self._get_state_lock():
+            getattr(self, "_pending_host_abort_requests", {}).pop(
+                snapshot_id, None
+            )
         self._control_wakeup.set()
 
     def rollback_bound_parent(self, req, request_generation) -> None:

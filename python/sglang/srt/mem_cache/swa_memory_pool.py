@@ -450,7 +450,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.full_attn_allocator.free(free_index)
             self.free_swa(free_index)
         else:
-            self.free_group.append(free_index)
+            self.free_group.append(free_index.clone())
         assert (
             self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
         )

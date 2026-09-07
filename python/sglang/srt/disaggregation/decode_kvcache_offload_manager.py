@@ -229,6 +229,11 @@ class DecodeKVCacheOffloadManager:
         # ``commit_tp_release`` on the scheduler thread.
         self._agentic_pending_release_lock = threading.RLock()
         self._agentic_tp_pending_releases = {}
+        # A request-generation remains physically owned while it moves from
+        # a transport candidate to the scheduler-owned release queue.  Keep a
+        # separate handoff table so capacity/idle accounting has no gap
+        # between those two containers.
+        self._agentic_release_ownership = {}
         # Ordered, de-duplicated local retry queue.  A follower observes each
         # rank-0 release broadcast only once, so a busy local I/O lane must not
         # let a later snapshot overwrite an earlier deferred release.
@@ -780,6 +785,51 @@ class DecodeKVCacheOffloadManager:
             pending = getattr(self, "_agentic_tp_pending_releases", None) or {}
             return pending.pop(snapshot_id, None)
 
+    def _agentic_release_ownership_items(self):
+        with getattr(self, "_agentic_pending_release_lock", nullcontext()):
+            pending = getattr(self, "_agentic_release_ownership", None) or {}
+            return tuple(pending.items())
+
+    def _agentic_detached_ownership_items(self):
+        """Read candidate and release-handoff ownership atomically."""
+
+        with getattr(self, "_agentic_candidates_lock", nullcontext()):
+            with getattr(self, "_agentic_pending_release_lock", nullcontext()):
+                candidates = getattr(self, "agentic_direct_candidates", {})
+                pending = getattr(self, "_agentic_release_ownership", None) or {}
+                return tuple(candidates.items()), tuple(pending.items())
+
+    def _agentic_release_ownership_pop(self, snapshot_id: str) -> None:
+        with getattr(self, "_agentic_pending_release_lock", nullcontext()):
+            pending = getattr(self, "_agentic_release_ownership", None) or {}
+            pending.pop(snapshot_id, None)
+
+    def _retire_candidate_for_release(
+        self, snapshot_id: str, req, start_offset: int
+    ):
+        """Atomically hand detached KV from transport to pending release."""
+
+        snapshot_id = str(snapshot_id)
+        with getattr(self, "_agentic_candidates_lock", nullcontext()):
+            with getattr(self, "_agentic_pending_release_lock", nullcontext()):
+                ownership = getattr(self, "_agentic_release_ownership", None)
+                if ownership is None:
+                    ownership = self._agentic_release_ownership = {}
+                ownership.setdefault(snapshot_id, (req, int(start_offset)))
+                candidate = getattr(self, "agentic_direct_candidates", {}).pop(
+                    snapshot_id, None
+                )
+                active = getattr(self, "_agentic_slow_active_ids", None)
+                if active is not None:
+                    active.pop(snapshot_id, None)
+        self._enqueue_agentic_release(
+            req,
+            start_offset,
+            snapshot_id=snapshot_id,
+            ownership_registered=True,
+        )
+        return candidate
+
     def _decode_progress_loop(self, name: str, step) -> None:
         """Run one non-scheduler progress domain without cross-domain HOL."""
 
@@ -825,14 +875,33 @@ class DecodeKVCacheOffloadManager:
             wakeup.wait(max(0.0, interval - elapsed))
             wakeup.clear()
 
-    def _enqueue_agentic_release(self, req, start_offset: int) -> None:
+    def _enqueue_agentic_release(
+        self,
+        req,
+        start_offset: int,
+        *,
+        snapshot_id: str | None = None,
+        ownership_registered: bool = False,
+    ) -> None:
         """Queue the only scheduler-owned mutation needed by D->P progress."""
+
+        metadata = AgenticRequestMetadata.from_req(req)
+        if snapshot_id is None:
+            if metadata is None:
+                raise RuntimeError("agentic release lost request-generation metadata")
+            snapshot_id = metadata.current.snapshot_id
+        snapshot_id = str(snapshot_id)
+        if not ownership_registered:
+            with getattr(self, "_agentic_pending_release_lock", nullcontext()):
+                ownership = getattr(self, "_agentic_release_ownership", None)
+                if ownership is None:
+                    ownership = self._agentic_release_ownership = {}
+                ownership.setdefault(snapshot_id, (req, int(start_offset)))
 
         if self.tp_world_size > 1:
             # TP source shards are one logical snapshot.  Background workers
             # may finish at different times, but only the native rank-0
             # scheduler command releases all shards together.
-            metadata = AgenticRequestMetadata.from_req(req)
             if metadata is None:
                 raise RuntimeError("TP agentic release lost request metadata")
             with getattr(self, "_agentic_pending_release_lock", nullcontext()):
@@ -845,6 +914,7 @@ class DecodeKVCacheOffloadManager:
             return
         if not getattr(self, "_decode_io_async_enabled", False):
             self._release_finished_req(req, start_offset)
+            self._agentic_release_ownership_pop(snapshot_id)
             return
         start_offset = int(start_offset)
         committed_len = int(getattr(req, "kv_committed_len", 0))
@@ -858,7 +928,7 @@ class DecodeKVCacheOffloadManager:
         ) + reserved_tokens
         was_empty = self._decode_io_events.empty()
         self._decode_io_events.put(
-            ("release_finished", req, start_offset, reserved_tokens)
+            ("release_finished", snapshot_id, req, start_offset, reserved_tokens)
         )
         if was_empty:
             self._decode_commit_ready_at = (
@@ -1135,6 +1205,9 @@ class DecodeKVCacheOffloadManager:
                 self._agentic_release_early_claim(candidate, "tp_release_commit")
             if req.req_pool_idx != -1:
                 self._release_finished_req(req, start_offset)
+            DecodeKVCacheOffloadManager._agentic_release_ownership_pop(
+                self, snapshot_id
+            )
         finally:
             if io_lock is not None:
                 io_lock.release()
@@ -1173,7 +1246,7 @@ class DecodeKVCacheOffloadManager:
         try:
             while committed < max_events:
                 try:
-                    kind, req, value, reserved_tokens = (
+                    kind, snapshot_id, req, value, reserved_tokens = (
                         self._decode_io_events.get_nowait()
                     )
                 except queue.Empty:
@@ -1186,6 +1259,9 @@ class DecodeKVCacheOffloadManager:
                 # event, while this guard also makes shutdown/fail-soft idempotent.
                 if req.req_pool_idx != -1:
                     self._release_finished_req(req, value)
+                DecodeKVCacheOffloadManager._agentic_release_ownership_pop(
+                    self, snapshot_id
+                )
                 self._decode_pending_release_tokens = max(
                     0,
                     int(getattr(self, "_decode_pending_release_tokens", 0))
@@ -1222,19 +1298,28 @@ class DecodeKVCacheOffloadManager:
 
     @property
     def agentic_pending_release_token_count(self) -> int:
-        """Completed-request KV waiting for a scheduler-owned free commit."""
+        """Detached Decode KV awaiting transport or scheduler free commit."""
 
-        reserved = int(getattr(self, "_decode_pending_release_tokens", 0))
+        reserved = 0
         # TP>1 uses the scheduler's existing native broadcast to commit a
         # release on every rank in lockstep.  Between local I/O completion and
         # that broadcast, the request's protected prefix is already accounted
         # by Radix, but its uncached/overallocated tail is owned by neither the
         # active batch nor Radix.  Include only that tail here so the idle
         # memory checker does not mistake the short hand-off window for a leak.
-        pending_items = DecodeKVCacheOffloadManager._agentic_pending_release_items(
-            self
+        candidate_items, pending_items = (
+            DecodeKVCacheOffloadManager._agentic_detached_ownership_items(self)
         )
-        for _snapshot_id, (req, _start_offset) in pending_items:
+        pending_snapshot_ids = {snapshot_id for snapshot_id, _ in pending_items}
+        detached_reqs = [item[0] for _snapshot_id, item in pending_items]
+        for snapshot_id, candidate in candidate_items:
+            if snapshot_id in pending_snapshot_ids or candidate.get("retired"):
+                continue
+            req = candidate.get("req")
+            if req is not None:
+                detached_reqs.append(req)
+
+        for req in detached_reqs:
             allocated_len = int(
                 getattr(req, "kv_allocated_len", getattr(req, "kv_committed_len", 0))
             )
@@ -1246,14 +1331,24 @@ class DecodeKVCacheOffloadManager:
 
     @property
     def agentic_pending_release_req_count(self) -> int:
-        """Request slots awaiting the same native TP release broadcast."""
+        """Detached request slots held by transport or pending free."""
 
-        pending_items = DecodeKVCacheOffloadManager._agentic_pending_release_items(
-            self
+        candidate_items, pending_items = (
+            DecodeKVCacheOffloadManager._agentic_detached_ownership_items(self)
         )
-        return sum(
-            1 for _snapshot_id, (req, _) in pending_items if req.req_pool_idx != -1
-        )
+        reqs = {
+            id(req): req
+            for _snapshot_id, (req, _) in pending_items
+            if req.req_pool_idx != -1
+        }
+        pending_snapshot_ids = {snapshot_id for snapshot_id, _ in pending_items}
+        for snapshot_id, candidate in candidate_items:
+            if snapshot_id in pending_snapshot_ids or candidate.get("retired"):
+                continue
+            req = candidate.get("req")
+            if req is not None and req.req_pool_idx != -1:
+                reqs[id(req)] = req
+        return len(reqs)
 
     def offload_kv_cache(self, req) -> bool:
         """Offload incremental KV cache for decode side."""
@@ -1985,8 +2080,9 @@ class DecodeKVCacheOffloadManager:
         self._cleanup_agentic_direct_sender(candidate)
         self._agentic_release_early_claim(candidate, "app_final")
         self._agentic_release_final_confirmation(candidate)
-        self._agentic_candidate_pop(manifest.snapshot_id)
-        self._enqueue_agentic_release(candidate["req"], 0)
+        self._retire_candidate_for_release(
+            manifest.snapshot_id, candidate["req"], 0
+        )
         logger.info(
             "AgenticKV app_final_release snapshot=%s elapsed_s=%.6f",
             manifest.snapshot_id,
@@ -2615,8 +2711,7 @@ class DecodeKVCacheOffloadManager:
                         continue
                     self._cleanup_agentic_direct_sender(candidate)
                     self._agentic_release_early_claim(candidate, "host_ready")
-                    self._agentic_candidate_pop(snapshot_id)
-                    self._enqueue_agentic_release(req, 0)
+                    self._retire_candidate_for_release(snapshot_id, req, 0)
                     logger.info("AgenticKV d_release_after_p_host snapshot=%s", snapshot_id)
                 elif outcome == "failed":
                     # D still owns the complete HBM copy here.  Hostless mode
@@ -2633,8 +2728,7 @@ class DecodeKVCacheOffloadManager:
                         self._agentic_release_early_claim(
                             candidate, "host_staging_failed"
                         )
-                        self._agentic_candidate_pop(snapshot_id)
-                        self._enqueue_agentic_release(req, 0)
+                        self._retire_candidate_for_release(snapshot_id, req, 0)
                         logger.warning(
                             "AgenticKV host_staging_fail_soft snapshot=%s; "
                             "next turn will recompute",
@@ -2668,8 +2762,7 @@ class DecodeKVCacheOffloadManager:
                         self._agentic_release_early_claim(
                             candidate, "emergency_recompute"
                         )
-                        self._agentic_candidate_pop(snapshot_id)
-                        self._enqueue_agentic_release(req, 0)
+                        self._retire_candidate_for_release(snapshot_id, req, 0)
                 continue
             # Slow-only ablation preserves the same manifest/CAS and durable
             # Host ownership transition, but starts it immediately instead of
@@ -3017,8 +3110,7 @@ class DecodeKVCacheOffloadManager:
                 # P marks CONSUMED only after Radix bind and pin succeed.
                 self._cleanup_agentic_direct_sender(candidate)
                 self._agentic_release_early_claim(candidate, "consumed")
-                self._agentic_candidate_pop(snapshot_id)
-                self._enqueue_agentic_release(req, 0)
+                self._retire_candidate_for_release(snapshot_id, req, 0)
 
             elif (
                 manifest.state is SnapshotState.SLOW_FALLBACK
@@ -3069,8 +3161,7 @@ class DecodeKVCacheOffloadManager:
                 self._agentic_release_early_claim(
                     candidate, f"manifest_{manifest.state.value}"
                 )
-                self._agentic_candidate_pop(snapshot_id)
-                self._enqueue_agentic_release(req, 0)
+                self._retire_candidate_for_release(snapshot_id, req, 0)
 
             if should_fallback:
                 if now < candidate["fallback_retry_at"]:
@@ -3137,8 +3228,7 @@ class DecodeKVCacheOffloadManager:
                             candidate["fallback_retry_at"] = now + 0.05
                             continue
                         self._cleanup_agentic_direct_sender(candidate)
-                        self._agentic_candidate_pop(snapshot_id)
-                        self._enqueue_agentic_release(req, 0)
+                        self._retire_candidate_for_release(snapshot_id, req, 0)
                         logger.warning(
                             "AgenticKV no Shared Arena for async fallback "
                             "snapshot=%s; next turn will recompute",
@@ -3179,9 +3269,10 @@ class DecodeKVCacheOffloadManager:
                     # zero.  It is cleaned after HOST_READY or direct fallback.
                     continue
                 self._cleanup_agentic_direct_sender(candidate)
-                self._agentic_candidate_pop(snapshot_id)
                 if not started and req.req_pool_idx != -1:
-                    self._enqueue_agentic_release(req, 0)
+                    self._retire_candidate_for_release(snapshot_id, req, 0)
+                else:
+                    self._agentic_candidate_pop(snapshot_id)
 
     def _check_agentic_tp_follower_progress(
         self,

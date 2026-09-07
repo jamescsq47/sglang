@@ -79,6 +79,12 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         if self.free_group:
             self.free(torch.cat(self.free_group))
 
+    @staticmethod
+    def _copy_for_free_group(free_index: torch.Tensor) -> torch.Tensor:
+        """Own deferred indices before their source request slot can be reused."""
+
+        return free_index.clone()
+
     def merge_and_sort_free(self):
         if len(self.release_pages) > 0:
             self.free_pages = torch.cat((self.free_pages, self.release_pages))
@@ -162,7 +168,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             else:
                 self.free_pages = torch.cat((self.free_pages, free_index))
         else:
-            self.free_group.append(free_index)
+            self.free_group.append(self._copy_for_free_group(free_index))
 
     def get_cpu_copy(self, indices):
         return self._kvcache.get_cpu_copy(indices)
@@ -527,7 +533,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             else:
                 self.free_pages = torch.cat((free_page_indices, self.free_pages))
         else:
-            self.free_group.append(free_index)
+            self.free_group.append(self._copy_for_free_group(free_index))
 
         if self.debug_mode:
             assert len(torch.unique(self.free_pages)) == len(self.free_pages)
