@@ -12,6 +12,7 @@ its node-local metadata store contains manifests and claims only.
 """
 
 import ctypes
+import ctypes.util
 import errno
 import fcntl
 import hashlib
@@ -23,11 +24,13 @@ import os
 import queue
 import threading
 import time
+from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Optional
 
+import numpy as np
 import torch
 
 from sglang.srt.disaggregation.agentic_early_claim import (
@@ -57,7 +60,384 @@ _HOST_MADVISE.restype = ctypes.c_int
 _HOST_MEMSET = _HOST_LIBC.memset
 _HOST_MEMSET.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t)
 _HOST_MEMSET.restype = ctypes.c_void_p
+_HOST_MEMFD_CREATE = getattr(_HOST_LIBC, "memfd_create", None)
+if _HOST_MEMFD_CREATE is not None:
+    _HOST_MEMFD_CREATE.argtypes = (ctypes.c_char_p, ctypes.c_uint)
+    _HOST_MEMFD_CREATE.restype = ctypes.c_int
 _MADV_POPULATE_WRITE = 23
+_MFD_CLOEXEC = 0x0001
+_CUDA_MEMCPY_HOST_TO_DEVICE = 1
+_CUDA_MEMCPY_DEVICE_TO_HOST = 2
+_CUDA_RUNTIME = None
+_CUDA_RUNTIME_LOCK = threading.Lock()
+_CUDA_DRIVER_BATCH = None
+_CUDA_DRIVER_BATCH_LOCK = threading.Lock()
+
+
+class _CUDAMemLocation(ctypes.Structure):
+    _fields_ = (("type", ctypes.c_int), ("id", ctypes.c_int))
+
+
+class _CUDAMemcpyAttributes(ctypes.Structure):
+    _fields_ = (
+        ("srcAccessOrder", ctypes.c_int),
+        ("srcLocHint", _CUDAMemLocation),
+        ("dstLocHint", _CUDAMemLocation),
+        ("flags", ctypes.c_uint),
+    )
+
+
+def _cuda_runtime():
+    """Return libcudart with the narrow async memcpy ABI configured.
+
+    ``torch.cuda.cudart()`` intentionally exposes only a subset of the CUDA
+    runtime in current PyTorch builds and does not include cudaMemcpyAsync.
+    Load the same process runtime directly so registered subranges do not go
+    through PyTorch's whole-storage pinned-memory classification.
+    """
+
+    global _CUDA_RUNTIME
+    if _CUDA_RUNTIME is not None:
+        return _CUDA_RUNTIME
+    with _CUDA_RUNTIME_LOCK:
+        if _CUDA_RUNTIME is not None:
+            return _CUDA_RUNTIME
+        candidates = []
+        try:
+            from importlib.resources import files
+
+            candidates.append(
+                str(files("nvidia.cuda_runtime.lib").joinpath("libcudart.so.12"))
+            )
+        except (ImportError, ModuleNotFoundError, TypeError):
+            pass
+        discovered = ctypes.util.find_library("cudart")
+        if discovered:
+            candidates.append(discovered)
+        candidates.extend(("libcudart.so.12", "libcudart.so"))
+        errors = []
+        for candidate in candidates:
+            try:
+                runtime = ctypes.CDLL(candidate)
+            except OSError as exc:
+                errors.append(f"{candidate}: {exc}")
+                continue
+            runtime.cudaMemcpyAsync.argtypes = (
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+                ctypes.c_int,
+                ctypes.c_void_p,
+            )
+            runtime.cudaMemcpyAsync.restype = ctypes.c_int
+            _CUDA_RUNTIME = runtime
+            return runtime
+        raise RuntimeError(
+            "unable to load libcudart for registered Host DMA: " + "; ".join(errors)
+        )
+
+
+def _cuda_memcpy_async(
+    destination: torch.Tensor,
+    source: torch.Tensor,
+    *,
+    byte_size: int,
+    kind: int,
+    stream,
+) -> None:
+    """Submit one non-crossing registered-memory DMA to ``stream``."""
+
+    result = _cuda_runtime().cudaMemcpyAsync(
+        destination.data_ptr(),
+        source.data_ptr(),
+        int(byte_size),
+        int(kind),
+        int(stream.cuda_stream),
+    )
+    if result != 0:
+        raise RuntimeError(f"cudaMemcpyAsync returned cudaError={result}")
+
+
+def _cuda_driver_batch_memcpy():
+    """Return CUDA 13's SM-free batched pointer-copy entry point if present."""
+
+    global _CUDA_DRIVER_BATCH
+    if _CUDA_DRIVER_BATCH is False:
+        return None
+    if _CUDA_DRIVER_BATCH is not None:
+        return _CUDA_DRIVER_BATCH
+    with _CUDA_DRIVER_BATCH_LOCK:
+        if _CUDA_DRIVER_BATCH is False:
+            return None
+        if _CUDA_DRIVER_BATCH is not None:
+            return _CUDA_DRIVER_BATCH
+        try:
+            driver = ctypes.CDLL("libcuda.so.1")
+            # Bind the explicitly versioned ABI.  The unversioned CUDA 13.1
+            # driver symbol already has a ninth ``failIdx`` argument while
+            # the public CUDA 13 API and ``_v2`` ABI have eight arguments.
+            function = driver.cuMemcpyBatchAsync_v2
+        except (OSError, AttributeError):
+            _CUDA_DRIVER_BATCH = False
+            return None
+        function.argtypes = (
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_size_t,
+            ctypes.POINTER(_CUDAMemcpyAttributes),
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+        )
+        function.restype = ctypes.c_int
+        # Keep the CDLL alive through the bound function object.
+        function._agentic_driver = driver
+        _CUDA_DRIVER_BATCH = function
+        return function
+
+
+def _cuda_batch_memcpy_async(
+    destinations,
+    sources,
+    sizes,
+    *,
+    stream,
+) -> tuple[Any, ...] | bool:
+    """Submit disjoint pointer copies as one copy-engine batch.
+
+    Returns ``False`` only when the running NVIDIA driver predates the batch
+    API, before any work is submitted.  A CUDA error after calling the API is
+    raised so the caller's launch fence drains/quarantines a possible partial
+    submission instead of unsafely replaying it through another path.
+    """
+
+    function = _cuda_driver_batch_memcpy()
+    if function is None:
+        return False
+    if len(destinations) == 0:
+        return True
+    if not (len(destinations) == len(sources) == len(sizes)):
+        raise ValueError("CUDA batch memcpy arrays have different lengths")
+    destination_array = np.ascontiguousarray(destinations, dtype=np.uint64)
+    source_array = np.ascontiguousarray(sources, dtype=np.uint64)
+    size_array = np.ascontiguousarray(sizes, dtype=np.uintp)
+    count = int(destination_array.size)
+    # STREAM is the conservative ordering contract for both GPU and registered
+    # Host sources.  The overlap flag is intentionally zero: the H100 driver
+    # already overlaps copy-engine traffic with compute, while the optional
+    # hint rejects large mixed Host/device batches on current CUDA 13.1.
+    attributes = _CUDAMemcpyAttributes(
+        1,
+        _CUDAMemLocation(0, 0),
+        _CUDAMemLocation(0, 0),
+        0,
+    )
+    attribute_indices = (ctypes.c_size_t * 1)(0)
+    result = function(
+        destination_array.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
+        source_array.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
+        size_array.ctypes.data_as(ctypes.POINTER(ctypes.c_size_t)),
+        count,
+        ctypes.byref(attributes),
+        attribute_indices,
+        1,
+        int(stream.cuda_stream),
+    )
+    if result != 0:
+        raise RuntimeError(f"cuMemcpyBatchAsync_v2 returned CUresult={result}")
+    # Retain descriptor storage through the CUDA completion event.  Current
+    # drivers consume it during the API call, but the stronger lifetime costs
+    # almost nothing and avoids depending on an undocumented implementation
+    # detail of this new API.
+    return (
+        destination_array,
+        source_array,
+        size_array,
+        attributes,
+        attribute_indices,
+    )
+
+
+def _registered_indexed_batch_copy(
+    snapshot,
+    *,
+    device_indices: list[int] | tuple[int, ...],
+    host_start: int,
+    stream,
+    host_to_device: bool,
+) -> tuple[Any, ...] | bool:
+    """Copy layer-first KV between Host and arbitrary device token indices.
+
+    Adjacent device indices are coalesced, normally turning each allocator
+    page into one 128-KiB operation for Qwen3-8B.  Host spans are additionally
+    split at persistent registration-window boundaries.  The resulting batch
+    uses only CUDA copy engines; no gather/scatter kernel occupies an SM.
+    """
+
+    if _cuda_driver_batch_memcpy() is None:
+        return False
+    indices = np.asarray(device_indices, dtype=np.int64)
+    if indices.ndim != 1:
+        raise ValueError("registered batch-copy indices must be one-dimensional")
+    if not indices.size:
+        return True
+    device_layers = tuple(snapshot.device_pool.k_buffer) + tuple(
+        snapshot.device_pool.v_buffer
+    )
+    if any(
+        int(layer.stride(0)) * int(layer.element_size()) != int(snapshot.item_size)
+        for layer in device_layers
+    ):
+        return False
+    device_capacity = min(int(layer.shape[0]) for layer in device_layers)
+    if int(indices.min()) < 0 or int(indices.max()) >= device_capacity:
+        raise ValueError("registered batch-copy device index is out of bounds")
+    run_starts = np.concatenate(
+        (
+            np.asarray((0,), dtype=np.int64),
+            np.flatnonzero(np.diff(indices) != 1).astype(np.int64) + 1,
+        )
+    )
+    run_ends = np.concatenate(
+        (run_starts[1:], np.asarray((indices.size,), dtype=np.int64))
+    )
+    run_lengths = run_ends - run_starts
+    run_device_starts = indices[run_starts]
+
+    host_pointer_rows = []
+    device_pointer_rows = []
+    item_size = int(snapshot.item_size)
+    for kv_index, device_layers in enumerate(
+        (snapshot.device_pool.k_buffer, snapshot.device_pool.v_buffer)
+    ):
+        for layer_index in range(int(snapshot.layer_num)):
+            host_layer = snapshot.kv_buffer[
+                kv_index,
+                layer_index,
+                int(host_start) : int(host_start) + int(indices.size),
+            ]
+            host_pointer_rows.append(
+                np.uint64(host_layer.data_ptr())
+                + run_starts.astype(np.uint64) * np.uint64(item_size)
+            )
+            device_pointer_rows.append(
+                np.uint64(device_layers[layer_index].data_ptr())
+                + run_device_starts.astype(np.uint64) * np.uint64(item_size)
+            )
+    host_pointers = np.concatenate(host_pointer_rows)
+    device_pointers = np.concatenate(device_pointer_rows)
+    remaining_sizes = np.tile(
+        run_lengths.astype(np.uint64) * np.uint64(item_size),
+        int(snapshot.layer_num) * 2,
+    )
+
+    # Split the rare operation that crosses a separately registered cache
+    # window.  Work is vectorized over every operation, so descriptor creation
+    # does not hold the Python GIL for thousands of pointer-by-pointer appends.
+    host_rounds = []
+    device_rounds = []
+    size_rounds = []
+    arena = getattr(snapshot, "_arena_mapping", None)
+    while remaining_sizes.size:
+        if arena is None:
+            round_sizes = remaining_sizes
+        else:
+            relative = host_pointers - np.uint64(arena.raw.data_ptr())
+            to_boundary = np.uint64(arena.window_bytes) - (
+                relative % np.uint64(arena.window_bytes)
+            )
+            round_sizes = np.minimum(remaining_sizes, to_boundary)
+        host_rounds.append(host_pointers)
+        device_rounds.append(device_pointers)
+        size_rounds.append(round_sizes)
+        has_tail = remaining_sizes > round_sizes
+        if not np.any(has_tail):
+            break
+        host_pointers = host_pointers[has_tail] + round_sizes[has_tail]
+        device_pointers = device_pointers[has_tail] + round_sizes[has_tail]
+        remaining_sizes = remaining_sizes[has_tail] - round_sizes[has_tail]
+    host_pointers = np.concatenate(host_rounds)
+    device_pointers = np.concatenate(device_rounds)
+    sizes = np.concatenate(size_rounds)
+    destinations = device_pointers if host_to_device else host_pointers
+    sources = host_pointers if host_to_device else device_pointers
+    return _cuda_batch_memcpy_async(
+        destinations, sources, sizes, stream=stream
+    )
+
+
+def _device_indices_to_host(indices) -> list[int]:
+    """Materialize the tiny token-index vector outside the Forward thread."""
+
+    if torch.is_tensor(indices):
+        if indices.is_cuda:
+            with torch.cuda.device(indices.device):
+                indices = indices.detach().to(device="cpu", dtype=torch.int64)
+        else:
+            indices = indices.detach().to(dtype=torch.int64)
+        return [int(value) for value in indices.tolist()]
+    return [int(value) for value in indices]
+
+
+def _is_memfd_backing_path(path: str) -> bool:
+    """Return whether ``path`` is the narrow cross-process memfd form."""
+
+    parts = str(path).split("/")
+    return (
+        len(parts) == 5
+        and parts[0] == ""
+        and parts[1] == "proc"
+        and parts[2].isdigit()
+        and parts[3] == "fd"
+        and parts[4].isdigit()
+    )
+
+
+def _validate_shared_host_backing_path(path: str, *, create: bool = False) -> None:
+    """Limit data-plane mappings to owned tmpfs files or anonymous memfds."""
+
+    if str(path).startswith("/dev/shm/"):
+        return
+    if not create and _is_memfd_backing_path(path):
+        return
+    raise ValueError(
+        "shared Host snapshot must use /dev/shm or a published memfd descriptor"
+    )
+
+
+def _open_shared_host_backing(path: str, flags: int, mode: int = 0o600) -> int:
+    """Open and authenticate a shared Host data-plane backing object."""
+
+    create = bool(flags & os.O_CREAT)
+    _validate_shared_host_backing_path(path, create=create)
+    fd = os.open(path, flags, mode)
+    if _is_memfd_backing_path(path):
+        try:
+            target = os.readlink(f"/proc/self/fd/{fd}")
+            if not target.startswith("/memfd:sglang-agentic-host-arena-"):
+                raise ValueError("published Host descriptor is not an agentic memfd")
+        except BaseException:
+            os.close(fd)
+            raise
+    return fd
+
+
+def _create_agentic_host_memfd() -> int:
+    """Create anonymous shared memory outside the /dev/shm mount quota."""
+
+    name = f"sglang-agentic-host-arena-{os.getpid()}"
+    create = getattr(os, "memfd_create", None)
+    if create is not None:
+        return int(create(name, getattr(os, "MFD_CLOEXEC", _MFD_CLOEXEC)))
+    if _HOST_MEMFD_CREATE is None:
+        raise RuntimeError("memfd Host backend is unavailable on this platform")
+    ctypes.set_errno(0)
+    fd = int(_HOST_MEMFD_CREATE(name.encode(), _MFD_CLOEXEC))
+    if fd < 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+    return fd
 
 
 def supports_agentic_kv_spill(storage_backend) -> bool:
@@ -144,6 +524,50 @@ def _copy_layer_first_host_range(
                 source_view.data_ptr(),
                 bytes_per_layer_range,
             )
+
+
+class HostCopyWorkerPool:
+    """Small daemon pool for pageable<->pinned Host copies.
+
+    CUDA progress threads must remain cheap: a large synchronous memmove there
+    delays polling every other transfer and competes with the model scheduler's
+    Python control path.  Jobs retain their tensor/mmap references through the
+    Future, and callers keep the corresponding bounce slot reserved until that
+    Future reaches a physical completion boundary.
+
+    Threads inherit the model process' CPU affinity and NUMA memory policy, so
+    launch scripts can place them with the same per-engine numactl binding.
+    """
+
+    def __init__(self, name: str, workers: int):
+        self._jobs: queue.Queue = queue.Queue()
+        self._threads = []
+        for worker_id in range(max(1, int(workers))):
+            thread = threading.Thread(
+                target=self._worker,
+                name=f"{name}-{worker_id}",
+                daemon=True,
+            )
+            thread.start()
+            self._threads.append(thread)
+
+    def submit(self, function, /, *args, **kwargs) -> Future:
+        future = Future()
+        self._jobs.put((future, function, args, kwargs))
+        return future
+
+    def _worker(self) -> None:
+        while True:
+            future, function, args, kwargs = self._jobs.get()
+            if not future.set_running_or_notify_cancel():
+                continue
+            started_at = time.perf_counter()
+            try:
+                function(*args, **kwargs)
+            except BaseException as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(time.perf_counter() - started_at)
 
 
 @dataclass
@@ -1819,7 +2243,10 @@ class SharedHostStagingLedger:
 
         def callback(entries):
             current = entries.get(snapshot_id)
-            if current is None or current.get("p_owner") != owner:
+            if current is None or owner not in {
+                current.get("p_owner"),
+                current.get("recovery_owner"),
+            }:
                 return False, False
             state = current.get("state")
             if state == HostStageState.FAILED.value:
@@ -1858,7 +2285,8 @@ class SharedHostStagingLedger:
             current = entries.get(snapshot_id)
             if (
                 current is None
-                or current.get("p_owner") != owner
+                or owner
+                not in {current.get("p_owner"), current.get("recovery_owner")}
                 or int(current.get("tp_size", 1)) != int(tp_size)
                 or current.get("state")
                 not in {
@@ -1902,7 +2330,9 @@ class SharedHostStagingLedger:
 
         def callback(entries):
             current = entries.get(snapshot_id)
-            if current is None or current.get("p_owner") != owner:
+            if current is None or current.get(
+                "recovery_owner", current.get("p_owner")
+            ) != owner:
                 return False, False
             if current.get("state") in {
                 HostStageState.HBM_READY.value,
@@ -1936,7 +2366,9 @@ class SharedHostStagingLedger:
 
         def callback(entries):
             current = entries.get(snapshot_id)
-            if current is None or current.get("p_owner") != owner:
+            if current is None or current.get(
+                "recovery_owner", current.get("p_owner")
+            ) != owner:
                 return False, False
             if current.get("state") == HostStageState.CONSUMED.value:
                 return True, False
@@ -1961,7 +2393,9 @@ class SharedHostStagingLedger:
 
         def callback(entries):
             current = entries.get(snapshot_id)
-            if current is None or current.get("p_owner") != owner:
+            if current is None or current.get(
+                "recovery_owner", current.get("p_owner")
+            ) != owner:
                 return False, False
             if current.get("state") == HostStageState.RETRY_PENDING.value:
                 return True, False
@@ -1993,7 +2427,7 @@ class SharedHostStagingLedger:
             current = entries.get(snapshot_id)
             if (
                 current is None
-                or current.get("p_owner") != owner
+                or current.get("recovery_owner", current.get("p_owner")) != owner
                 or current.get("state")
                 not in {
                     HostStageState.RETRY_PENDING.value,
@@ -2032,6 +2466,7 @@ class SharedHostStagingLedger:
         *,
         tp_rank: int,
         tp_size: int,
+        recovery: bool = False,
     ) -> bool:
         """Atomically admit one TP rank into Host->device loading.
 
@@ -2043,9 +2478,14 @@ class SharedHostStagingLedger:
 
         def callback(entries):
             current = entries.get(snapshot_id)
+            expected_owner = (
+                current.get("recovery_owner", current.get("p_owner"))
+                if current is not None and recovery
+                else None if current is None else current.get("p_owner")
+            )
             if (
                 current is None
-                or current.get("p_owner") != owner
+                or expected_owner != owner
                 or int(current.get("tp_size", 1)) != int(tp_size)
                 or current.get("state")
                 not in {
@@ -2065,6 +2505,29 @@ class SharedHostStagingLedger:
 
         return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
 
+    def assign_d2p_recovery_domain(self, snapshot_id: str, domain: int) -> bool:
+        """Pin the Host-ready generation to one independently selected P."""
+
+        domain = int(domain)
+
+        def callback(entries):
+            current = entries.get(snapshot_id)
+            if current is None or current.get("state") not in {
+                HostStageState.HOST_READY.value,
+                HostStageState.H2D_LOADING.value,
+            }:
+                return False, False
+            previous = current.get("recovery_domain")
+            if previous is not None and int(previous) != domain:
+                return False, False
+            changed = previous is None
+            current["recovery_domain"] = domain
+            if changed:
+                current["updated_at"] = time.time()
+            return True, changed
+
+        return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
+
     def claim_d2p_recovery_rank(
         self,
         snapshot_id: str,
@@ -2073,6 +2536,7 @@ class SharedHostStagingLedger:
         tp_rank: int,
         tp_size: int,
         claim_id: str,
+        recovery_domain: Optional[int] = None,
     ) -> bool:
         """Pin a D->P Host snapshot before allocating any P workset pages.
 
@@ -2089,7 +2553,6 @@ class SharedHostStagingLedger:
             current = entries.get(snapshot_id)
             if (
                 current is None
-                or current.get("p_owner") != owner
                 or int(current.get("tp_size", 1)) != int(tp_size)
                 or current.get("state")
                 not in {
@@ -2097,6 +2560,15 @@ class SharedHostStagingLedger:
                     HostStageState.H2D_LOADING.value,
                 }
             ):
+                return False, False
+            selected_domain = current.get("recovery_domain")
+            if recovery_domain is not None and (
+                selected_domain is None
+                or int(selected_domain) != int(recovery_domain)
+            ):
+                return False, False
+            recovery_owner = current.get("recovery_owner")
+            if recovery_owner not in {None, owner}:
                 return False, False
             recovery_claim_id = current.get("recovery_claim_id")
             if recovery_claim_id not in {None, claim_id}:
@@ -2113,6 +2585,7 @@ class SharedHostStagingLedger:
                 "lease_id": None,
             }
             current["recovery_claim_id"] = claim_id
+            current["recovery_owner"] = owner
             current["recovery_claims"] = claims
             current["state"] = HostStageState.H2D_LOADING.value
             if changed:
@@ -2145,7 +2618,7 @@ class SharedHostStagingLedger:
             claim = claims.get(rank_key)
             if (
                 current is None
-                or current.get("p_owner") != owner
+                or current.get("recovery_owner", current.get("p_owner")) != owner
                 or int(current.get("tp_size", 1)) != int(tp_size)
                 or current.get("state") != HostStageState.H2D_LOADING.value
                 or current.get("recovery_claim_id") != claim_id
@@ -2195,7 +2668,7 @@ class SharedHostStagingLedger:
             claim = claims.get(rank_key)
             if (
                 current is None
-                or current.get("p_owner") != owner
+                or current.get("recovery_owner", current.get("p_owner")) != owner
                 or int(current.get("tp_size", 1)) != int(tp_size)
                 or current.get("state")
                 not in {
@@ -2251,7 +2724,7 @@ class SharedHostStagingLedger:
             claim = claims.get(rank_key)
             if (
                 current is None
-                or current.get("p_owner") != owner
+                or current.get("recovery_owner", current.get("p_owner")) != owner
                 or int(current.get("tp_size", 1)) != int(tp_size)
                 or current.get("state")
                 not in {
@@ -2261,7 +2734,11 @@ class SharedHostStagingLedger:
                 or current.get("recovery_claim_id") != claim_id
                 or claim is None
                 or claim.get("claim_id") != claim_id
-                or claim.get("phase") in {"io_inflight", "handed"}
+                or claim.get("phase") == "handed"
+                or (
+                    claim.get("phase") == "io_inflight"
+                    and current.get("state") != HostStageState.ABORTING.value
+                )
             ):
                 return False, False
             attached_lease_id = claim.get("lease_id")
@@ -2312,7 +2789,7 @@ class SharedHostStagingLedger:
             current = entries.get(snapshot_id)
             if (
                 current is None
-                or current.get("p_owner") != owner
+                or current.get("recovery_owner", current.get("p_owner")) != owner
                 or int(current.get("tp_size", 1)) != int(tp_size)
                 or current.get("state")
                 not in {
@@ -2633,7 +3110,11 @@ class SharedHostStagingLedger:
     ) -> bool:
         def callback(entries):
             current = entries.get(snapshot_id)
-            if current is None or (owner is not None and current.get("p_owner") != owner):
+            if current is None or (
+                owner is not None
+                and owner
+                not in {current.get("p_owner"), current.get("recovery_owner")}
+            ):
                 return False, False
             current_state = current.get("state")
             if state.value == current_state:
@@ -2781,17 +3262,265 @@ class LayerFirstD2HStaging:
         )
 
 
+class _RegisteredHostArenaMapping:
+    """Process-local persistent mmap with a bounded registered-window cache."""
+
+    def __init__(self, path: str):
+        self.path = str(path)
+        fd = _open_shared_host_backing(path, os.O_RDWR)
+        try:
+            self.byte_size = int(os.fstat(fd).st_size)
+            self.mapping = mmap.mmap(fd, self.byte_size, access=mmap.ACCESS_WRITE)
+        finally:
+            os.close(fd)
+        self.raw = torch.frombuffer(
+            self.mapping, dtype=torch.uint8, count=self.byte_size
+        )
+        self.window_bytes = max(
+            mmap.ALLOCATIONGRANULARITY,
+            int(float(os.getenv("SGLANG_AGENTIC_KV_REGISTER_WINDOW_GIB", "8")) * (1024**3)),
+        )
+        self.window_bytes = (
+            self.window_bytes // mmap.ALLOCATIONGRANULARITY
+            * mmap.ALLOCATIONGRANULARITY
+        )
+        self._windows: dict[int, dict[str, Any]] = {}
+        self._users = 0
+        self._prewarm_started = False
+        self._prewarm_thread: Optional[threading.Thread] = None
+
+    def prewarm(self, device) -> None:
+        """Start one background pass that registers every backing window.
+
+        Sparse D->P recovery may not revisit a 256-GiB arena window during a
+        finite workload warmup.  Leaving registration lazy then charges a
+        one-time page-pin cost to an otherwise fast measurement-period H2D.
+        The first transport user therefore starts an eager pass, but does not
+        run that pass inline: registering a 256-GiB arena can take tens of
+        seconds and must not stall D2H/H2D progress.  The worker registers and
+        releases one cache window at a time so request-level DMA can interleave
+        at every window boundary.  Later request extents still use the normal
+        acquire/release ownership and eviction rules.
+        """
+
+        enabled = os.getenv(
+            "SGLANG_AGENTIC_KV_REGISTER_EAGER_ARENA", "0"
+        ).strip().lower() not in {"0", "false", "no", "off"}
+        if not enabled:
+            return
+        with _REGISTERED_HOST_ARENAS_LOCK:
+            if self._prewarm_started:
+                return
+            self._prewarm_started = True
+            worker = threading.Thread(
+                target=self._prewarm_windows,
+                args=(device,),
+                name="agentic-host-register-prewarm",
+                daemon=True,
+            )
+            self._prewarm_thread = worker
+        try:
+            worker.start()
+        except BaseException:
+            # The normal request-level acquire remains fully functional even
+            # when a background thread cannot be created.
+            logger.exception(
+                "AgenticKV registered_arena_prewarm_start_failed "
+                "path=%s bytes=%d; continuing with request-level registration",
+                self.path,
+                self.byte_size,
+            )
+
+    def _prewarm_windows(self, device) -> None:
+        started_at = time.perf_counter()
+        completed_windows = 0
+        try:
+            for offset in range(0, self.byte_size, self.window_bytes):
+                windows = self.acquire(
+                    offset,
+                    min(self.window_bytes, self.byte_size - offset),
+                    device,
+                )
+                try:
+                    completed_windows += len(windows)
+                finally:
+                    self.release(windows)
+                # Give request-level transport workers waiting for the same
+                # registry mutex an explicit scheduling point.
+                time.sleep(0)
+        except BaseException:
+            # Prewarming is only a latency optimization.  Partially registered
+            # windows remain valid cache entries and the request-level acquire
+            # can still use them or fall back before any DMA submission.
+            logger.exception(
+                "AgenticKV registered_arena_prewarm_failed path=%s bytes=%d; "
+                "continuing with request-level registration",
+                self.path,
+                self.byte_size,
+            )
+            return
+        logger.info(
+            "AgenticKV registered_arena_prewarm_complete path=%s bytes=%d "
+            "windows=%d elapsed_s=%.3f",
+            self.path,
+            self.byte_size,
+            completed_windows,
+            time.perf_counter() - started_at,
+        )
+
+    def acquire(self, offset: int, byte_size: int, device) -> tuple[int, ...]:
+        first = int(offset) // self.window_bytes * self.window_bytes
+        last = int(offset) + int(byte_size)
+        offsets = tuple(range(first, last, self.window_bytes))
+        acquired: list[int] = []
+        with _REGISTERED_HOST_ARENAS_LOCK, torch.cuda.device(device):
+            try:
+                for window_offset in offsets:
+                    entry = self._windows.get(window_offset)
+                    if entry is None:
+                        window_size = min(
+                            self.window_bytes, self.byte_size - window_offset
+                        )
+                        global_limit = max(
+                            self.window_bytes,
+                            int(
+                                float(
+                                    os.getenv(
+                                        "SGLANG_AGENTIC_KV_REGISTER_CACHE_GIB", "64"
+                                    )
+                                )
+                                * (1024**3)
+                            ),
+                        )
+                        while (
+                            sum(
+                                int(item["bytes"])
+                                for arena in _REGISTERED_HOST_ARENAS.values()
+                                for item in arena._windows.values()
+                            )
+                            + window_size
+                            > global_limit
+                        ):
+                            victims = [
+                                (item["used_at"], arena, current_offset, item)
+                                for arena in _REGISTERED_HOST_ARENAS.values()
+                                for current_offset, item in arena._windows.items()
+                                if int(item["refs"]) == 0
+                            ]
+                            if not victims:
+                                raise MemoryError(
+                                    "registered Host window cache is fully referenced"
+                                )
+                            _, victim_arena, victim_offset, victim = min(
+                                victims, key=lambda value: value[0]
+                            )
+                            cudart = torch.cuda.cudart()
+                            result = cudart.cudaHostUnregister(
+                                victim_arena.raw.data_ptr() + victim_offset
+                            )
+                            if result != cudart.cudaError.success:
+                                raise RuntimeError(
+                                    f"cached cudaHostUnregister returned {result}"
+                                )
+                            victim_arena._windows.pop(victim_offset)
+                        cudart = torch.cuda.cudart()
+                        result = cudart.cudaHostRegister(
+                            self.raw.data_ptr() + window_offset, window_size, 0
+                        )
+                        if result != cudart.cudaError.success:
+                            raise RuntimeError(
+                                f"cached cudaHostRegister returned {result}"
+                            )
+                        entry = self._windows[window_offset] = {
+                            "bytes": window_size,
+                            "refs": 0,
+                            "used_at": time.monotonic(),
+                        }
+                    entry["refs"] = int(entry["refs"]) + 1
+                    entry["used_at"] = time.monotonic()
+                    acquired.append(window_offset)
+            except BaseException:
+                for window_offset in acquired:
+                    self._windows[window_offset]["refs"] -= 1
+                raise
+        return tuple(acquired)
+
+    def release(self, windows: tuple[int, ...]) -> None:
+        with _REGISTERED_HOST_ARENAS_LOCK:
+            for window_offset in windows:
+                entry = self._windows.get(int(window_offset))
+                if entry is None or int(entry["refs"]) <= 0:
+                    raise RuntimeError("registered Host window reference underflow")
+                entry["refs"] -= 1
+                entry["used_at"] = time.monotonic()
+
+
+_REGISTERED_HOST_ARENAS: dict[tuple[int, int, str], _RegisteredHostArenaMapping] = {}
+_REGISTERED_HOST_ARENAS_LOCK = threading.Lock()
+
+
+def _registered_host_arena(path: str, device) -> _RegisteredHostArenaMapping:
+    fd = _open_shared_host_backing(path, os.O_RDWR)
+    try:
+        stat = os.fstat(fd)
+        key = (int(stat.st_dev), int(stat.st_ino), str(path))
+    finally:
+        os.close(fd)
+    with _REGISTERED_HOST_ARENAS_LOCK:
+        stale = []
+        for current_key, current in _REGISTERED_HOST_ARENAS.items():
+            if current_key == key or current._users or any(
+                int(item["refs"]) for item in current._windows.values()
+            ):
+                continue
+            try:
+                current_stat = os.stat(current_key[2])
+                still_same = (
+                    int(current_stat.st_dev), int(current_stat.st_ino)
+                ) == current_key[:2]
+            except OSError:
+                still_same = False
+            if not still_same:
+                stale.append((current_key, current))
+        with torch.cuda.device(device):
+            for current_key, current in stale:
+                cudart = torch.cuda.cudart()
+                for window_offset in tuple(current._windows):
+                    result = cudart.cudaHostUnregister(
+                        current.raw.data_ptr() + window_offset
+                    )
+                    if result != cudart.cudaError.success:
+                        raise RuntimeError(
+                            f"stale cached cudaHostUnregister returned {result}"
+                        )
+                    current._windows.pop(window_offset)
+                current.raw = None
+                current.mapping.close()
+                _REGISTERED_HOST_ARENAS.pop(current_key)
+        arena = _REGISTERED_HOST_ARENAS.get(key)
+        if arena is None:
+            arena = _REGISTERED_HOST_ARENAS[key] = _RegisteredHostArenaMapping(path)
+        arena._users += 1
+    # This function is reached from D2H/H2D transport workers, never from the
+    # model forward stream.  prewarm() only starts a one-shot background pass,
+    # so discovering a new arena never synchronously stalls transport progress.
+    arena.prewarm(device)
+    return arena
+
+
 class SharedMHAHostSnapshot:
     """One request-generation extent mapped by both P and its owning D.
 
     The hot on-disk shape is layer-first and snapshot-local:
     ``[K/V, layer, token, head, head_dim]``.  This lets D gather scattered KV
     into a small reusable HBM slot and then use contiguous PCIe DMA into Host.
-    The file lives in tmpfs, and the
-    mapping stays pageable.  D and P move bounded chunks through a reusable
-    pinned bounce buffer instead of cudaHostRegister-ing this request-sized
-    mapping.  It therefore contains exactly one physical Host copy without
-    putting multi-GiB registration work on either model process' CUDA context.
+    The backing object lives either in tmpfs or an anonymous memfd, and the
+    mapping starts pageable.  By default the I/O worker registers this exact
+    request extent on first use, so CUDA DMA reaches the final Shared-Arena
+    bytes directly and no CPU commit copy is required.  Registration is
+    deliberately lazy (never done by the model forward thread), and failure
+    falls back to the bounded pinned-bounce pipeline while GPU ownership is
+    still unchanged.
     """
 
     def __init__(
@@ -2804,8 +3533,7 @@ class SharedMHAHostSnapshot:
         create: bool,
         file_offset: int = 0,
     ):
-        if not path.startswith("/dev/shm/"):
-            raise ValueError("shared Host snapshot must reside in /dev/shm")
+        _validate_shared_host_backing_path(path, create=create)
         if not hasattr(device_pool, "k_buffer") or not hasattr(device_pool, "v_buffer"):
             raise ValueError("shared Host arena V1 requires an MHA KV pool")
         self.path = path
@@ -2829,8 +3557,15 @@ class SharedMHAHostSnapshot:
         self.file_offset = int(file_offset)
         if self.file_offset < 0 or self.file_offset % mmap.ALLOCATIONGRANULARITY:
             raise ValueError("shared Host extent offset must be mmap-aligned")
+        self._registered_dma_enabled = os.getenv(
+            "SGLANG_AGENTIC_KV_REGISTERED_EXTENT_DMA", "1"
+        ).strip().lower() not in {"0", "false", "no", "off"} and hasattr(
+            device_pool, "device"
+        )
+        self._arena_mapping = None
+        self._owns_mapping = True
         flags = os.O_RDWR | (os.O_CREAT | os.O_EXCL if create else 0)
-        fd = os.open(path, flags, 0o600)
+        fd = _open_shared_host_backing(path, flags, 0o600)
         try:
             if create:
                 if self.file_offset:
@@ -2838,15 +3573,31 @@ class SharedMHAHostSnapshot:
                 os.ftruncate(fd, self.byte_size)
             elif os.fstat(fd).st_size < self.file_offset + self.byte_size:
                 raise ValueError("shared Host extent file is smaller than the snapshot")
-            self.mapping = mmap.mmap(
-                fd,
-                self.byte_size,
-                access=mmap.ACCESS_WRITE,
-                offset=self.file_offset,
-            )
         finally:
             os.close(fd)
-        raw = torch.frombuffer(self.mapping, dtype=torch.uint8, count=self.byte_size)
+        if self._registered_dma_enabled and not create:
+            self._arena_mapping = _registered_host_arena(
+                path, self.device_pool.device
+            )
+            self.mapping = self._arena_mapping.mapping
+            raw = self._arena_mapping.raw[
+                self.file_offset : self.file_offset + self.byte_size
+            ]
+            self._owns_mapping = False
+        else:
+            fd = _open_shared_host_backing(path, os.O_RDWR)
+            try:
+                self.mapping = mmap.mmap(
+                    fd,
+                    self.byte_size,
+                    access=mmap.ACCESS_WRITE,
+                    offset=self.file_offset,
+                )
+            finally:
+                os.close(fd)
+            raw = torch.frombuffer(
+                self.mapping, dtype=torch.uint8, count=self.byte_size
+            )
         self.kv_buffer = raw.view(self.dtype).view(
             2,
             self.layer_num,
@@ -2856,6 +3607,73 @@ class SharedMHAHostSnapshot:
         )
         self._raw = raw
         self._closed = False
+        self._cuda_host_registered = False
+        self._registered_windows: tuple[int, ...] = ()
+        self._cuda_host_registration_failed = False
+        self._cuda_host_registration_lock = threading.Lock()
+        self.cuda_host_registration_seconds = 0.0
+
+    @property
+    def cuda_host_registered(self) -> bool:
+        return bool(self._cuda_host_registered)
+
+    def prepare_registered_host_dma(self) -> bool:
+        """Register the final extent for direct DMA, or select safe fallback.
+
+        Callers invoke this on an existing transport/Host-copy worker.  A
+        registration error occurs before any CUDA transfer is submitted, so
+        retaining the pageable mapping and using the old bounce path preserves
+        the original ownership protocol.
+        """
+
+        if not self._registered_dma_enabled or self._cuda_host_registration_failed:
+            return False
+        if self._cuda_host_registered:
+            return True
+        with self._cuda_host_registration_lock:
+            if self._cuda_host_registered:
+                return True
+            if self._cuda_host_registration_failed:
+                return False
+            started_at = time.perf_counter()
+            try:
+                if self._arena_mapping is not None:
+                    self._registered_windows = self._arena_mapping.acquire(
+                        self.file_offset,
+                        self.byte_size,
+                        self.device_pool.device,
+                    )
+                else:
+                    with torch.cuda.device(self.device_pool.device):
+                        cudart = torch.cuda.cudart()
+                        result = cudart.cudaHostRegister(
+                            self._raw.data_ptr(), self.byte_size, 0
+                        )
+                        if result != cudart.cudaError.success:
+                            raise RuntimeError(f"cudaHostRegister returned {result}")
+            except BaseException:
+                self._cuda_host_registration_failed = True
+                logger.exception(
+                    "AgenticKV registered-extent DMA unavailable path=%s "
+                    "offset=%d bytes=%d; using pinned-bounce fallback",
+                    self.path,
+                    self.file_offset,
+                    self.byte_size,
+                )
+                return False
+            self.cuda_host_registration_seconds = (
+                time.perf_counter() - started_at
+            )
+            self._cuda_host_registered = True
+            logger.info(
+                "AgenticKV registered_host_extent path=%s offset=%d bytes=%d "
+                "registration_ms=%.3f",
+                self.path,
+                self.file_offset,
+                self.byte_size,
+                self.cuda_host_registration_seconds * 1000.0,
+            )
+            return True
 
     @property
     def k_buffer(self):
@@ -2864,6 +3682,34 @@ class SharedMHAHostSnapshot:
     @property
     def v_buffer(self):
         return self.kv_buffer[1]
+
+    def _registered_token_spans(self, host_view, token_count: int):
+        """Split a contiguous layer range at CUDA registration boundaries."""
+
+        token_count = int(token_count)
+        if self._arena_mapping is None or not self._cuda_host_registered:
+            return ((0, token_count),)
+        relative = int(host_view.data_ptr()) - int(
+            self._arena_mapping.raw.data_ptr()
+        )
+        spans = []
+        token_offset = 0
+        while token_offset < token_count:
+            current = relative + token_offset * self.item_size
+            bytes_to_boundary = self._arena_mapping.window_bytes - (
+                current % self._arena_mapping.window_bytes
+            )
+            span_tokens = min(
+                token_count - token_offset,
+                bytes_to_boundary // self.item_size,
+            )
+            if span_tokens <= 0:
+                raise RuntimeError(
+                    "registered Host window boundary splits one KV token"
+                )
+            spans.append((token_offset, token_offset + span_tokens))
+            token_offset += span_tokens
+        return tuple(spans)
 
     def start_backup_from_device(
         self, source_indices, stream, *, staging=None, host_bounce=None
@@ -2889,6 +3735,7 @@ class SharedMHAHostSnapshot:
         staging=None,
         host_bounce=None,
         launch_fence: Optional[H2DLaunchFence] = None,
+        source_indices_host=None,
     ):
         """Launch one D2H chunk into a fixed pinned bounce buffer.
 
@@ -2912,55 +3759,124 @@ class SharedMHAHostSnapshot:
                 self.device_pool,
                 int(os.getenv("SGLANG_AGENTIC_KV_D2H_STAGING_TOKENS", "1024")),
             )
-        if host_bounce is None:
-            raise ValueError("pageable Host snapshots require a pinned D2H bounce")
-        if len(source_indices) > host_bounce.token_capacity:
-            raise ValueError("D2H chunk is larger than the pinned Host bounce")
+        registered = self.prepare_registered_host_dma()
+        if not registered:
+            if host_bounce is None:
+                raise ValueError("pageable Host snapshots require a pinned D2H bounce")
+            if len(source_indices) > host_bounce.token_capacity:
+                raise ValueError("D2H chunk is larger than the pinned Host bounce")
         start_event = torch.cuda.Event(enable_timing=True)
         if launch_fence is None:
             launch_fence = H2DLaunchFence(event=torch.cuda.Event(enable_timing=True))
         event = launch_fence.event
-        copy_refs = [source_indices, original_source_indices, staging, host_bounce]
+        copy_refs = [
+            source_indices,
+            original_source_indices,
+            staging,
+            self,
+        ]
+        if source_indices_host is not None:
+            if len(source_indices_host) != len(source_indices):
+                raise ValueError("Host source-index mirror has the wrong length")
+            copy_refs.append(source_indices_host)
+        if not registered:
+            copy_refs.append(host_bounce)
         launch_fence.copy_refs = copy_refs
         try:
             with torch.cuda.stream(stream):
                 # The event is the release authority if CUDA accepts any part
                 # of this D2H launch and a later submission raises.
                 launch_fence.submitted = True
-                if not source_indices.is_cuda or source_indices.dtype != torch.int64:
+                start_event.record(stream)
+                batch_submitted = False
+                if registered and source_indices_host is not None:
+                    batch_submitted = _registered_indexed_batch_copy(
+                        self,
+                        device_indices=source_indices_host,
+                        host_start=destination_start,
+                        stream=stream,
+                        host_to_device=False,
+                    )
+                    if batch_submitted is not False:
+                        copy_refs.append(batch_submitted)
+                if not batch_submitted and (
+                    not source_indices.is_cuda
+                    or source_indices.dtype != torch.int64
+                ):
                     source_indices = source_indices.to(
                         device=self.device_pool.device,
                         dtype=torch.int64,
                         non_blocking=True,
                     )
                     copy_refs.append(source_indices)
-                start_event.record(stream)
-                for start in range(0, len(source_indices), staging.token_capacity):
-                    count = min(staging.token_capacity, len(source_indices) - start)
-                    source_chunk = source_indices[start : start + count]
-                    local_indices = staging.local_indices[:count]
-                    transfer_kv_all_layer(
-                        src_k_layers=self.device_pool.k_data_ptrs,
-                        dst_k_layers=staging.k_data_ptrs,
-                        src_v_layers=self.device_pool.v_data_ptrs,
-                        dst_v_layers=staging.v_data_ptrs,
-                        src_indices=source_chunk,
-                        dst_indices=local_indices,
-                        item_size=self.item_size,
-                        num_layers=self.layer_num,
-                        block_quota=8,
-                        num_warps_per_block=32,
-                    )
-                    for layer_id in range(self.layer_num):
-                        host_bounce.k_buffer[layer_id, start : start + count].copy_(
-                            staging.k_buffer[layer_id][:count], non_blocking=True
+                if not batch_submitted:
+                    for start in range(0, len(source_indices), staging.token_capacity):
+                        count = min(staging.token_capacity, len(source_indices) - start)
+                        source_chunk = source_indices[start : start + count]
+                        local_indices = staging.local_indices[:count]
+                        transfer_kv_all_layer(
+                            src_k_layers=self.device_pool.k_data_ptrs,
+                            dst_k_layers=staging.k_data_ptrs,
+                            src_v_layers=self.device_pool.v_data_ptrs,
+                            dst_v_layers=staging.v_data_ptrs,
+                            src_indices=source_chunk,
+                            dst_indices=local_indices,
+                            item_size=self.item_size,
+                            num_layers=self.layer_num,
+                            block_quota=8,
+                            num_warps_per_block=32,
                         )
-                        host_bounce.v_buffer[layer_id, start : start + count].copy_(
-                            staging.v_buffer[layer_id][:count], non_blocking=True
-                        )
+                        host_start = destination_start + start
+                        host_end = host_start + count
+                        for layer_id in range(self.layer_num):
+                            destination_k = (
+                                self.k_buffer[layer_id, host_start:host_end]
+                                if registered
+                                else host_bounce.k_buffer[layer_id, start : start + count]
+                            )
+                            destination_v = (
+                                self.v_buffer[layer_id, host_start:host_end]
+                                if registered
+                                else host_bounce.v_buffer[layer_id, start : start + count]
+                            )
+                            for span_start, span_end in self._registered_token_spans(
+                                destination_k, count
+                            ):
+                                destination_span = destination_k[span_start:span_end]
+                                source_span = staging.k_buffer[layer_id][
+                                    span_start:span_end
+                                ]
+                                if registered:
+                                    _cuda_memcpy_async(
+                                        destination_span,
+                                        source_span,
+                                        byte_size=(span_end - span_start) * self.item_size,
+                                        kind=_CUDA_MEMCPY_DEVICE_TO_HOST,
+                                        stream=stream,
+                                    )
+                                else:
+                                    destination_span.copy_(source_span, non_blocking=True)
+                            for span_start, span_end in self._registered_token_spans(
+                                destination_v, count
+                            ):
+                                destination_span = destination_v[span_start:span_end]
+                                source_span = staging.v_buffer[layer_id][
+                                    span_start:span_end
+                                ]
+                                if registered:
+                                    _cuda_memcpy_async(
+                                        destination_span,
+                                        source_span,
+                                        byte_size=(span_end - span_start) * self.item_size,
+                                        kind=_CUDA_MEMCPY_DEVICE_TO_HOST,
+                                        stream=stream,
+                                    )
+                                else:
+                                    destination_span.copy_(source_span, non_blocking=True)
                 event.record(stream)
                 launch_fence.armed = True
-                source_indices.record_stream(stream)
+                if bool(getattr(source_indices, "is_cuda", False)):
+                    source_indices.record_stream(stream)
                 if bool(getattr(original_source_indices, "is_cuda", False)):
                     original_source_indices.record_stream(stream)
         except Exception:
@@ -2985,6 +3901,10 @@ class SharedMHAHostSnapshot:
     ) -> None:
         """Copy a completed pinned D2H chunk into the tmpfs snapshot."""
 
+        if self._cuda_host_registered:
+            # The CUDA completion event is already the durability fence: DMA
+            # landed in the final Shared-Arena address.
+            return
         destination_start = int(destination_start)
         token_count = int(token_count)
         destination_end = destination_start + token_count
@@ -3007,6 +3927,7 @@ class SharedMHAHostSnapshot:
         staging=None,
         host_bounce=None,
         launch_fence: Optional[H2DLaunchFence] = None,
+        device_indices_host=None,
     ):
         """Launch one pageable Host -> pinned bounce -> P-HBM chunk.
 
@@ -3020,8 +3941,6 @@ class SharedMHAHostSnapshot:
         snapshots is safe by stream ordering.
         """
 
-        from sgl_kernel.kvcacheio import transfer_kv_all_layer
-
         source_start = int(source_start)
         token_count = len(device_indices)
         if source_start < 0 or source_start + token_count > self.token_count:
@@ -3031,12 +3950,41 @@ class SharedMHAHostSnapshot:
             raise ValueError("pageable Host snapshots require a pinned H2D bounce")
         if token_count > host_bounce.token_capacity:
             raise ValueError("H2D chunk is larger than the pinned Host bounce")
-        if staging is None:
-            staging = LayerFirstD2HStaging(self.device_pool, token_count)
-        if staging.token_capacity < token_count:
-            raise ValueError("H2D staging buffer is smaller than the chunk")
-        # CPU copy happens before CUDA submission and touches only a bounded,
-        # already-pinned allocation.  No CUDA driver registration is needed.
+        self.prepare_load_range_to_bounce(
+            source_start=source_start,
+            token_count=token_count,
+            host_bounce=host_bounce,
+        )
+        return self.start_load_range_from_bounce_to_device(
+            device_indices,
+            stream,
+            staging=staging,
+            host_bounce=host_bounce,
+            source_start=source_start,
+            launch_fence=launch_fence,
+            device_indices_host=device_indices_host,
+        )
+
+    def prepare_load_range_to_bounce(
+        self, *, source_start: int, token_count: int, host_bounce
+    ) -> None:
+        """Copy one pageable Host range into a pinned bounce on CPU.
+
+        This phase intentionally has no CUDA side effect, so production callers
+        can run it on a NUMA-local Host-copy worker and retain the Host extent as
+        its physical source fence until the returned Future completes.
+        """
+
+        source_start = int(source_start)
+        token_count = int(token_count)
+        if source_start < 0 or source_start + token_count > self.token_count:
+            raise ValueError("H2D chunk falls outside shared Host extent")
+        if self.prepare_registered_host_dma():
+            # Registration itself ran on this Host-copy worker.  The caller's
+            # next CUDA operation can now DMA directly from the final extent.
+            return
+        if host_bounce is None or token_count > host_bounce.token_capacity:
+            raise ValueError("H2D chunk is larger than the pinned Host bounce")
         _copy_layer_first_host_range(
             host_bounce.kv_buffer,
             self.kv_buffer,
@@ -3044,13 +3992,49 @@ class SharedMHAHostSnapshot:
             source_start=source_start,
             token_count=token_count,
         )
+
+    def start_load_range_from_bounce_to_device(
+        self,
+        device_indices,
+        stream,
+        *,
+        staging=None,
+        host_bounce=None,
+        source_start: int = 0,
+        launch_fence: Optional[H2DLaunchFence] = None,
+        device_indices_host=None,
+    ):
+        """Launch a previously prepared pinned bounce into destination HBM."""
+
+        from sgl_kernel.kvcacheio import transfer_kv_all_layer
+
+        token_count = len(device_indices)
+        original_device_indices = device_indices
+        registered = self._cuda_host_registered
+        source_start = int(source_start)
+        if source_start < 0 or source_start + token_count > self.token_count:
+            raise ValueError("H2D chunk falls outside shared Host extent")
+        if not registered and (
+            host_bounce is None or token_count > host_bounce.token_capacity
+        ):
+            raise ValueError("H2D chunk is larger than the pinned Host bounce")
+        if staging is None:
+            staging = LayerFirstD2HStaging(self.device_pool, token_count)
+        if staging.token_capacity < token_count:
+            raise ValueError("H2D staging buffer is smaller than the chunk")
         start_event = torch.cuda.Event(enable_timing=True)
         if launch_fence is None:
             launch_fence = H2DLaunchFence(
                 event=torch.cuda.Event(enable_timing=True)
             )
         event = launch_fence.event
-        copy_refs = [device_indices, staging, host_bounce]
+        copy_refs = [device_indices, staging, self]
+        if device_indices_host is not None:
+            if len(device_indices_host) != len(device_indices):
+                raise ValueError("Host destination-index mirror has the wrong length")
+            copy_refs.append(device_indices_host)
+        if not registered:
+            copy_refs.append(host_bounce)
         launch_fence.copy_refs = copy_refs
         try:
             with torch.cuda.stream(stream):
@@ -3058,6 +4042,29 @@ class SharedMHAHostSnapshot:
                 # submitted copy.  The pre-created event is the only release
                 # authority for both Host and destination HBM.
                 launch_fence.submitted = True
+                start_event.record(stream)
+                if registered and device_indices_host is not None:
+                    batch_submitted = _registered_indexed_batch_copy(
+                        self,
+                        device_indices=device_indices_host,
+                        host_start=source_start,
+                        stream=stream,
+                        host_to_device=True,
+                    )
+                    if batch_submitted:
+                        copy_refs.append(batch_submitted)
+                        event.record(stream)
+                        launch_fence.armed = True
+                        if bool(getattr(device_indices, "is_cuda", False)):
+                            device_indices.record_stream(stream)
+                        if bool(
+                            getattr(original_device_indices, "is_cuda", False)
+                        ):
+                            original_device_indices.record_stream(stream)
+                        self._last_h2d_start_event = start_event
+                        copy_refs.extend((original_device_indices, start_event))
+                        launch_fence.copy_refs = copy_refs
+                        return event, tuple(copy_refs)
                 if not device_indices.is_cuda or device_indices.dtype != torch.int64:
                     device_indices = device_indices.to(
                         device=self.device_pool.device,
@@ -3065,15 +4072,53 @@ class SharedMHAHostSnapshot:
                         non_blocking=True,
                     )
                     copy_refs.append(device_indices)
-                start_event.record(stream)
                 source_indices = staging.local_indices[:token_count]
+                source_end = source_start + token_count
                 for layer_id in range(self.layer_num):
-                    staging.k_buffer[layer_id][:token_count].copy_(
-                        host_bounce.k_buffer[layer_id, :token_count], non_blocking=True
+                    source_k = (
+                        self.k_buffer[layer_id, source_start:source_end]
+                        if registered
+                        else host_bounce.k_buffer[layer_id, :token_count]
                     )
-                    staging.v_buffer[layer_id][:token_count].copy_(
-                        host_bounce.v_buffer[layer_id, :token_count], non_blocking=True
+                    source_v = (
+                        self.v_buffer[layer_id, source_start:source_end]
+                        if registered
+                        else host_bounce.v_buffer[layer_id, :token_count]
                     )
+                    for span_start, span_end in self._registered_token_spans(
+                        source_k, token_count
+                    ):
+                        destination_span = staging.k_buffer[layer_id][
+                            span_start:span_end
+                        ]
+                        source_span = source_k[span_start:span_end]
+                        if registered:
+                            _cuda_memcpy_async(
+                                destination_span,
+                                source_span,
+                                byte_size=(span_end - span_start) * self.item_size,
+                                kind=_CUDA_MEMCPY_HOST_TO_DEVICE,
+                                stream=stream,
+                            )
+                        else:
+                            destination_span.copy_(source_span, non_blocking=True)
+                    for span_start, span_end in self._registered_token_spans(
+                        source_v, token_count
+                    ):
+                        destination_span = staging.v_buffer[layer_id][
+                            span_start:span_end
+                        ]
+                        source_span = source_v[span_start:span_end]
+                        if registered:
+                            _cuda_memcpy_async(
+                                destination_span,
+                                source_span,
+                                byte_size=(span_end - span_start) * self.item_size,
+                                kind=_CUDA_MEMCPY_HOST_TO_DEVICE,
+                                stream=stream,
+                            )
+                        else:
+                            destination_span.copy_(source_span, non_blocking=True)
                 transfer_kv_all_layer(
                     src_k_layers=staging.k_data_ptrs,
                     dst_k_layers=self.device_pool.k_data_ptrs,
@@ -3129,9 +4174,30 @@ class SharedMHAHostSnapshot:
     def close(self, *, unlink: bool = False) -> None:
         if self._closed:
             return
+        if self._cuda_host_registered:
+            if self._arena_mapping is not None:
+                self._arena_mapping.release(self._registered_windows)
+                self._registered_windows = ()
+            else:
+                with torch.cuda.device(self.device_pool.device):
+                    cudart = torch.cuda.cudart()
+                    result = cudart.cudaHostUnregister(self._raw.data_ptr())
+                    if result != cudart.cudaError.success:
+                        # Closing an mmap still visible to CUDA would turn a late DMA
+                        # into use-after-unmap.  Keep the mapping leased and let the
+                        # owner retry cleanup instead.
+                        raise RuntimeError(f"cudaHostUnregister returned {result}")
+            self._cuda_host_registered = False
         self.kv_buffer = None
         self._raw = None
-        self.mapping.close()
+        if self._owns_mapping:
+            self.mapping.close()
+        elif self._arena_mapping is not None:
+            with _REGISTERED_HOST_ARENAS_LOCK:
+                if self._arena_mapping._users <= 0:
+                    raise RuntimeError("registered Host arena user underflow")
+                self._arena_mapping._users -= 1
+        self.mapping = None
         self._closed = True
         if unlink:
             try:
@@ -3170,7 +4236,7 @@ class PinnedMHAHostBounce:
 
 
 class LazySharedMHAHostSnapshot:
-    """A granted tmpfs extent whose P-side pinned mapping is built later.
+    """A granted shared-Host extent whose P-side mapping is built later.
 
     Creating and CUDA-registering a multi-GiB mapping can take seconds under
     burst load.  D needs only an existing file of the correct size in order to
@@ -3191,8 +4257,7 @@ class LazySharedMHAHostSnapshot:
         create: bool = True,
         file_offset: int = 0,
     ):
-        if not path.startswith("/dev/shm/"):
-            raise ValueError("shared Host snapshot must reside in /dev/shm")
+        _validate_shared_host_backing_path(path, create=create)
         self.path = path
         self.token_count = int(token_count)
         self.device_pool = device_pool
@@ -3209,7 +4274,7 @@ class LazySharedMHAHostSnapshot:
         self._closed = False
         self._lock = threading.Lock()
         flags = os.O_RDWR | (os.O_CREAT | os.O_EXCL if create else 0)
-        fd = os.open(path, flags, 0o600)
+        fd = _open_shared_host_backing(path, flags, 0o600)
         try:
             if create:
                 if self.file_offset:
@@ -3240,7 +4305,7 @@ class LazySharedMHAHostSnapshot:
             # pool exists to avoid.
             if not self.requires_prefault:
                 return
-            fd = os.open(self.path, os.O_RDWR)
+            fd = _open_shared_host_backing(self.path, os.O_RDWR)
         try:
             # ftruncate creates a sparse tmpfs file.  Reserve the complete
             # backing store before touching any page so capacity exhaustion is
@@ -3321,7 +4386,7 @@ class LazySharedMHAHostSnapshot:
 
 
 class SharedHostSnapshotArena:
-    """One process-lifetime tmpfs arena with request-generation suballocation.
+    """One process-lifetime Host arena with request-generation suballocation.
 
     The complete file is physically allocated and first-touched once at P
     startup, under the P process' NUMA memory policy. A snapshot subsequently
@@ -3329,30 +4394,43 @@ class SharedHostSnapshotArena:
     the same subrange, so request-level ownership is preserved without
     per-snapshot ``ftruncate``, ``fallocate`` or prefault workers.
 
-    The arena intentionally remains pageable. Transfers use the existing
-    bounded pinned bounce buffers; this avoids registering hundreds of GiB
-    with every CUDA context while still removing sparse-tmpfs page faults from
-    the serving hot path.
+    The arena itself remains pageable.  A live request acquires only its
+    covering windows from a bounded process-local registration cache and
+    releases their references before its extent lease is returned.  This keeps
+    DMA direct without registering the complete hundreds-of-GiB arena or
+    repeating page registration for recycled offsets.
     """
 
     _ALIGNMENT = mmap.ALLOCATIONGRANULARITY
 
-    def __init__(self, directory: str, capacity_bytes: int):
+    def __init__(
+        self, directory: str, capacity_bytes: int, *, backend: str = "tmpfs"
+    ):
         if not directory.startswith("/dev/shm/"):
-            raise ValueError("shared Host arena must reside in /dev/shm")
+            raise ValueError(
+                "shared Host arena control directory must reside in /dev/shm"
+            )
         self.directory = directory.rstrip("/")
+        self.backend = str(backend).strip().lower()
+        if self.backend not in {"tmpfs", "memfd"}:
+            raise ValueError("shared Host arena backend must be tmpfs or memfd")
         self.capacity_bytes = self._align_down(int(capacity_bytes))
         if self.capacity_bytes <= 0:
             raise ValueError("shared Host arena capacity must be positive")
         os.makedirs(self.directory, mode=0o700, exist_ok=True)
-        self.path = os.path.join(
-            self.directory, f"preallocated-arena-{os.getpid()}.kv"
-        )
-        fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        self._backing_fd = -1
+        if self.backend == "memfd":
+            fd = _create_agentic_host_memfd()
+            self.path = f"/proc/{os.getpid()}/fd/{fd}"
+        else:
+            self.path = os.path.join(
+                self.directory, f"preallocated-arena-{os.getpid()}.kv"
+            )
+            fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
         mapping = None
         try:
             os.ftruncate(fd, self.capacity_bytes)
-            # Reserve tmpfs backing before publishing the arena. Capacity
+            # Reserve physical backing before publishing the arena. Capacity
             # failure is therefore a startup error, never a SIGBUS after D
             # has relinquished request ownership.
             os.posix_fallocate(fd, 0, self.capacity_bytes)
@@ -3363,16 +4441,20 @@ class SharedHostSnapshotArena:
             if mapping is not None:
                 mapping.close()
             os.close(fd)
-            try:
-                os.unlink(self.path)
-            except FileNotFoundError:
-                pass
+            if self.backend == "tmpfs":
+                try:
+                    os.unlink(self.path)
+                except FileNotFoundError:
+                    pass
             raise
         else:
-            os.close(fd)
+            if self.backend == "memfd":
+                self._backing_fd = fd
+            else:
+                os.close(fd)
 
-        # First-touch while this P process is NUMA-bound. tmpfs retains the
-        # backing pages after this temporary mapping is closed.
+        # First-touch while this P process is NUMA-bound. The backing object
+        # retains the pages after this temporary mapping is closed.
         anchor = ctypes.c_char.from_buffer(mapping)
         address = ctypes.addressof(anchor)
         started_at = time.monotonic()
@@ -3391,10 +4473,14 @@ class SharedHostSnapshotArena:
         except BaseException:
             del anchor
             mapping.close()
-            try:
-                os.unlink(self.path)
-            except FileNotFoundError:
-                pass
+            if self.backend == "memfd":
+                os.close(self._backing_fd)
+                self._backing_fd = -1
+            else:
+                try:
+                    os.unlink(self.path)
+                except FileNotFoundError:
+                    pass
             raise
         else:
             del anchor
@@ -3518,10 +4604,15 @@ class SharedHostSnapshotArena:
             self._active_extents.clear()
             self._free_extents = []
             self.used_bytes = 0
-            try:
-                os.unlink(self.path)
-            except FileNotFoundError:
-                pass
+            if self.backend == "memfd":
+                if self._backing_fd >= 0:
+                    os.close(self._backing_fd)
+                    self._backing_fd = -1
+            else:
+                try:
+                    os.unlink(self.path)
+                except FileNotFoundError:
+                    pass
             self._closed = True
 
 
@@ -3550,6 +4641,7 @@ class AgenticPHostStagingManager:
         page_size: int,
         arena_directory: str,
         arena_capacity_bytes: int,
+        arena_backend: str = "tmpfs",
         high_watermark: float = 0.90,
         low_watermark: float = 0.75,
         hard_watermark: float = 0.95,
@@ -3595,7 +4687,9 @@ class AgenticPHostStagingManager:
         self.expected_tool_seconds = expected_tool_seconds or {}
         self.eviction_controller = eviction_controller
         self.arena = SharedHostSnapshotArena(
-            arena_directory, int(arena_capacity_bytes)
+            arena_directory,
+            int(arena_capacity_bytes),
+            backend=arena_backend,
         )
         # Kept for scheduler runtime accounting compatibility.  The new slow
         # path reserves no fixed P-HBM staging slots.
@@ -3618,6 +4712,21 @@ class AgenticPHostStagingManager:
         self.h2d_chunk_tokens = max(
             1, int(os.getenv("SGLANG_AGENTIC_KV_P_H2D_CHUNK_TOKENS", "1024"))
         )
+        self._h2d_bounce_depth = max(
+            2, int(os.getenv("SGLANG_AGENTIC_KV_P_H2D_BOUNCE_DEPTH", "2"))
+        )
+        self._h2d_host_copy_pool = HostCopyWorkerPool(
+            f"agentic-p-h2d-host-copy-{os.getpid()}",
+            max(
+                1,
+                int(
+                    os.getenv(
+                        "SGLANG_AGENTIC_KV_P_H2D_HOST_COPY_WORKERS",
+                        str(min(2, self.max_h2d_inflight)),
+                    )
+                ),
+            ),
+        )
         # Slow ingress is launched by each D on its own CUDA stream.  P owns
         # only the latency-sensitive demand H2D stream.
         current_device = torch.cuda.current_device()
@@ -3639,11 +4748,16 @@ class AgenticPHostStagingManager:
                     "staging": LayerFirstD2HStaging(
                         self.device_pool, self.h2d_chunk_tokens
                     ),
-                    "host_bounce": PinnedMHAHostBounce(
-                        self.device_pool, self.h2d_chunk_tokens
+                    "host_bounces": tuple(
+                        PinnedMHAHostBounce(
+                            self.device_pool, self.h2d_chunk_tokens
+                        )
+                        for _ in range(self._h2d_bounce_depth)
                     ),
                 }
             )
+        for lane in self._h2d_lanes:
+            lane["host_bounce"] = lane["host_bounces"][0]
         # Compatibility aliases for focused tests and out-of-tree diagnostics.
         self._h2d_stream = self._h2d_lanes[0]["stream"]
         self._h2d_staging = self._h2d_lanes[0]["staging"]
@@ -3738,16 +4852,21 @@ class AgenticPHostStagingManager:
         self._control_last_stats = time.monotonic()
         self._control_thread = None
         logger.info(
-            "Agentic shared Host arena enabled directory=%s capacity_gib=%.1f "
+            "Agentic shared Host arena enabled directory=%s backend=%s "
+            "capacity_gib=%.1f "
             "reserved_hbm_mib=0 h2d_priority=%d h2d_max_inflight=%d "
             "h2d_chunk_tokens=%d host_bounce=preallocated_pinned "
-            "arena_preallocated=true preallocation_s=%.3f",
+            "arena_preallocated=true preallocation_s=%.3f "
+            "h2d_bounce_depth=%d host_copy_workers=%d",
             self.arena.directory,
+            self.arena.backend,
             self.arena.capacity_bytes / (1024**3),
             h2d_priority,
             self.max_h2d_inflight,
             self.h2d_chunk_tokens,
             self.arena.preallocation_seconds,
+            self._h2d_bounce_depth,
+            len(self._h2d_host_copy_pool._threads),
         )
         if self._async_control:
             try:
@@ -4124,10 +5243,52 @@ class AgenticPHostStagingManager:
         snapshot = record.get("snapshot")
         if snapshot is None:
             return True
+        if record.get("remote_host"):
+            try:
+                snapshot.close(unlink=False)
+            except Exception:
+                logger.exception("Failed to close remote Shared-Host mapping")
+                return False
+            record.pop("snapshot", None)
+            return True
         if not self.arena.release(snapshot):
             return False
         record.pop("snapshot", None)
         return True
+
+    def _release_consumed_owned_host(self, ledger_entries, *, snapshot_ids=None) -> None:
+        """Return an arena extent after remote recovery reaches a safe terminal."""
+
+        ids = ledger_entries.keys() if snapshot_ids is None else snapshot_ids
+        for snapshot_id in ids:
+            entry = ledger_entries.get(snapshot_id)
+            if (
+                entry is None
+                or entry.get("p_owner") != self.owner
+                or entry.get("state")
+                not in {
+                    HostStageState.CONSUMED.value,
+                    HostStageState.FAILED.value,
+                }
+            ):
+                continue
+            with self._get_state_lock():
+                record = self.host_ready.get(snapshot_id)
+                if record is None or record.get("loading"):
+                    continue
+                self.host_ready.pop(snapshot_id, None)
+            if not self._release_record(record):
+                with self._get_state_lock():
+                    self.host_ready.setdefault(snapshot_id, record)
+                continue
+            logger.info(
+                "AgenticKV shared_host_remote_recovery_release "
+                "snapshot=%s host_domain=%d recovery_domain=%s state=%s",
+                snapshot_id,
+                getattr(self, "arena_domain", -1),
+                entry.get("recovery_domain"),
+                entry.get("state"),
+            )
 
     def _fail_active(self, snapshot_id: str, reason: str, *, free_host: bool = True) -> None:
         with self._get_state_lock():
@@ -4435,6 +5596,7 @@ class AgenticPHostStagingManager:
                 (self._spill_score(record, now), snapshot_id, record)
                 for snapshot_id, record in self.host_ready.items()
                 if not record.get("loading")
+                and not record.get("remote_host")
                 and not record.get("spill_blocked_reason")
             ]
             if not candidates:
@@ -4621,6 +5783,7 @@ class AgenticPHostStagingManager:
                     (snapshot_id, record)
                     for snapshot_id, record in self.host_ready.items()
                     if not record.get("loading")
+                    and not record.get("remote_host")
                 ),
                 key=lambda item: self._host_eviction_key(item[0], item[1]),
             )
@@ -4802,6 +5965,7 @@ class AgenticPHostStagingManager:
         if full_snapshot is not None:
             self._poll_active(self._ledger_entries_cache)
             self._poll_aborting(self._ledger_entries_cache)
+            self._release_consumed_owned_host(self._ledger_entries_cache)
             self._progress_host_evictions(self._ledger_entries_cache)
             self._maybe_evict_shared_host()
             self._admit_batch(
@@ -4819,6 +5983,10 @@ class AgenticPHostStagingManager:
                 snapshot_ids=changed_snapshot_ids,
             )
             self._poll_aborting(
+                self._ledger_entries_cache,
+                snapshot_ids=changed_snapshot_ids,
+            )
+            self._release_consumed_owned_host(
                 self._ledger_entries_cache,
                 snapshot_ids=changed_snapshot_ids,
             )
@@ -4921,6 +6089,59 @@ class AgenticPHostStagingManager:
         with self._get_state_lock():
             return request_generation.snapshot_id in self.host_ready
 
+    def _recovery_targets_this_manager(self, entry: dict[str, Any]) -> bool:
+        domain = entry.get("recovery_domain")
+        if domain is None:
+            # Backward-compatible single-P/non-dynamic route.
+            return entry.get("p_owner") == self.owner
+        return int(domain) == int(self.arena_domain)
+
+    def _import_remote_host_record(
+        self, snapshot_id: str, entry: dict[str, Any]
+    ) -> Optional[dict[str, Any]]:
+        """Map a Host extent owned by another arena for local recovery."""
+
+        if entry.get("p_owner") == self.owner:
+            return None
+        rank_grants = entry.get("rank_grants", {})
+        grant = rank_grants.get(str(self.tp_rank))
+        if grant is None and self.tp_size == 1:
+            grants = entry.get("grants", [])
+            grant = None if not grants else grants[0]
+        if grant is None:
+            return None
+        snapshot = LazySharedMHAHostSnapshot(
+            path=str(grant["arena_path"]),
+            token_count=int(grant.get("token_count", entry["token_count"])),
+            device_pool=self.device_pool,
+            byte_size=int(grant.get("byte_size", entry["byte_size"])),
+            allocation_bytes=int(grant.get("byte_size", entry["byte_size"])),
+            create=False,
+            file_offset=int(grant.get("arena_offset", 0)),
+        )
+        record = {
+            "offer": dict(entry),
+            "snapshot": snapshot,
+            "loading": False,
+            "ready_at": float(entry.get("updated_at", time.time())),
+            "remote_host": True,
+        }
+        with self._get_state_lock():
+            previous = self.host_ready.get(snapshot_id)
+            if previous is not None:
+                snapshot.close(unlink=False)
+                return previous
+            self.host_ready[snapshot_id] = record
+        logger.info(
+            "AgenticKV shared_host_remote_map snapshot=%s host_domain=%s "
+            "recovery_domain=%d tp_rank=%d",
+            snapshot_id,
+            entry.get("arena_domain"),
+            self.arena_domain,
+            self.tp_rank,
+        )
+        return record
+
     def drain_scheduler_events(self) -> tuple[tuple[str, str], ...]:
         """Drain completed control edges without reading the file ledger."""
 
@@ -4965,6 +6186,39 @@ class AgenticPHostStagingManager:
             if reservations is not None:
                 reservations.pop(snapshot_id, None)
 
+    def _retire_stale_direct_before_slow(self, snapshot_id: str) -> bool:
+        """Fence an obsolete Direct owner before Slow consumes an H2D lane.
+
+        Host placement and recovery routing are independent, so the P that
+        observed HOST_READY (and retired its local Direct race) need not be
+        the P selected for H2D.  Repeat the owner-scoped transition on the
+        selected recovery P.  While an old physical Direct lease is waiting
+        for the scheduler-owned allocator release, return ``True`` so Slow
+        holds neither a recovery claim nor an H2D lane.
+        """
+
+        broker = self.workset_broker
+        direct_owner_fn = getattr(broker, "direct_owner", None)
+        supersede = getattr(broker, "supersede_unstarted", None)
+        get_lease = getattr(broker, "get", None)
+        if not (
+            callable(direct_owner_fn)
+            and callable(supersede)
+            and callable(get_lease)
+        ):
+            # Compatibility for focused fixtures using a minimal broker.
+            return False
+        direct_owner = direct_owner_fn(snapshot_id)
+        supersede(snapshot_id, owner=direct_owner)
+        owner_has_unretired_work = getattr(
+            broker, "owner_has_unretired_work", None
+        )
+        if callable(owner_has_unretired_work):
+            return bool(
+                owner_has_unretired_work(snapshot_id, owner=direct_owner)
+            )
+        return get_lease(snapshot_id, owner=direct_owner) is not None
+
     def _h2d_lane_resources(self, lane_id: int):
         """Return the isolated stream/bounce/staging resources for one lane."""
 
@@ -4996,10 +6250,12 @@ class AgenticPHostStagingManager:
                 )
             )
         return bool(
-            self.ledger.transition(
+            self.ledger.begin_host_load_rank(
                 request_generation.snapshot_id,
-                HostStageState.H2D_LOADING,
-                owner=self.owner,
+                self.owner,
+                tp_rank=0,
+                tp_size=1,
+                recovery=True,
             )
         )
 
@@ -5059,16 +6315,81 @@ class AgenticPHostStagingManager:
         snapshot_store.complete_slow_fallback(current)
         return True
 
-    def _start_h2d_chunk(self, load: dict[str, Any]) -> None:
-        """Launch one slow-path H2D chunk on the dedicated I/O stream."""
+    def _submit_h2d_prefetch(self, load: dict[str, Any], start: int) -> bool:
+        """Stage one pageable Host chunk into an idle pinned bounce."""
+
+        if load.get("prefetch_future") is not None:
+            return False
+        device_indices = load["device_indices"]
+        start = int(start)
+        if start >= len(device_indices):
+            return False
+        end = min(start + self.h2d_chunk_tokens, len(device_indices))
+        lane = AgenticPHostStagingManager._h2d_lane_resources(
+            self, int(load.get("h2d_lane_id", 0))
+        )
+        bounces = tuple(lane.get("host_bounces", (lane["host_bounce"],)))
+        current_bounce = load.get("dma_bounce_index")
+        bounce_index = (start // max(1, self.h2d_chunk_tokens)) % len(bounces)
+        if current_bounce is not None and bounce_index == int(current_bounce):
+            if len(bounces) == 1:
+                return False
+            bounce_index = (bounce_index + 1) % len(bounces)
+        snapshot = load["record"]["snapshot"]
+        function = getattr(snapshot, "prepare_load_range_to_bounce", None)
+        args = ()
+        kwargs = {
+            "source_start": start,
+            "token_count": end - start,
+            "host_bounce": bounces[bounce_index],
+        }
+        pool = getattr(self, "_h2d_host_copy_pool", None)
+        if function is None:
+            # Compatibility for focused mocks and external snapshot adapters.
+            future = Future()
+            future.set_result(0.0)
+            load["prefetch_legacy"] = True
+        elif pool is None:
+            # Lightweight fixtures do not construct background workers.  Keep
+            # their deterministic behavior while production always uses the
+            # asynchronous NUMA-local pool initialized above.
+            future = Future()
+            started_at = time.perf_counter()
+            try:
+                function(*args, **kwargs)
+            except BaseException as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(time.perf_counter() - started_at)
+        else:
+            future = pool.submit(function, *args, **kwargs)
+        load.update(
+            prefetch_future=future,
+            prefetch_start=start,
+            prefetch_end=end,
+            prefetch_bounce_index=bounce_index,
+        )
+        return True
+
+    @staticmethod
+    def _clear_h2d_prefetch(load: dict[str, Any]) -> None:
+        for key in (
+            "prefetch_future",
+            "prefetch_start",
+            "prefetch_end",
+            "prefetch_bounce_index",
+            "prefetch_legacy",
+        ):
+            load.pop(key, None)
+
+    def _start_h2d_chunk(self, load: dict[str, Any]) -> bool:
+        """Launch one asynchronously prefetched H2D chunk."""
 
         record = load["record"]
         device_indices = load["device_indices"]
         lane = AgenticPHostStagingManager._h2d_lane_resources(
             self, int(load.get("h2d_lane_id", 0))
         )
-        start = int(load.get("offset", 0))
-        end = min(start + self.h2d_chunk_tokens, len(device_indices))
         if not load.get("io_inflight"):
             self.workset_broker.mark_io_inflight(
                 load["request_generation"].snapshot_id,
@@ -5093,6 +6414,40 @@ class AgenticPHostStagingManager:
                     "Slow recovery lost Host ownership before H2D"
                 )
             load["io_inflight"] = True
+        if load.get("prefetch_future") is None:
+            AgenticPHostStagingManager._submit_h2d_prefetch(
+                self, load, int(load.get("offset", 0))
+            )
+        future = load.get("prefetch_future")
+        if future is None or not future.done():
+            return False
+        cpu_elapsed = float(future.result())
+        start = int(load["prefetch_start"])
+        end = int(load["prefetch_end"])
+        device_indices_host = None
+        snapshot = record["snapshot"]
+        if (
+            bool(getattr(snapshot, "cuda_host_registered", False))
+            and _cuda_driver_batch_memcpy() is not None
+        ):
+            try:
+                device_indices_host = _device_indices_to_host(
+                    device_indices[start:end]
+                )
+            except BaseException:
+                logger.exception(
+                    "AgenticKV H2D index mirror failed snapshot=%s; "
+                    "using scatter fallback",
+                    load["request_generation"].snapshot_id,
+                )
+        bounce_index = int(load["prefetch_bounce_index"])
+        bounces = tuple(lane.get("host_bounces", (lane["host_bounce"],)))
+        host_bounce = bounces[bounce_index]
+        legacy_h2d = bool(load.get("prefetch_legacy"))
+        AgenticPHostStagingManager._clear_h2d_prefetch(load)
+        load["host_copy_elapsed_seconds"] = float(
+            load.get("host_copy_elapsed_seconds", 0.0)
+        ) + cpu_elapsed
         launch_fence = H2DLaunchFence(
             event=torch.cuda.Event(enable_timing=True)
         )
@@ -5102,17 +6457,33 @@ class AgenticPHostStagingManager:
         load["launch_fence"] = launch_fence
         load["event"] = launch_fence.event
         record["loading"] = "h2d"
-        event, copy_refs = record["snapshot"].start_load_range_to_device(
-            device_indices[start:end],
-            lane["stream"],
-            source_start=start,
-            staging=lane["staging"],
-            host_bounce=lane["host_bounce"],
-            launch_fence=launch_fence,
-        )
+        if legacy_h2d:
+            event, copy_refs = record["snapshot"].start_load_range_to_device(
+                device_indices[start:end],
+                lane["stream"],
+                source_start=start,
+                staging=lane["staging"],
+                host_bounce=host_bounce,
+                launch_fence=launch_fence,
+            )
+        else:
+            event, copy_refs = (
+                record["snapshot"].start_load_range_from_bounce_to_device(
+                    device_indices[start:end],
+                    lane["stream"],
+                    staging=lane["staging"],
+                    host_bounce=host_bounce,
+                    source_start=start,
+                    launch_fence=launch_fence,
+                    device_indices_host=device_indices_host,
+                )
+            )
         load["event"] = event
         load["copy_refs"] = copy_refs
         load["chunk_end"] = end
+        load["dma_bounce_index"] = bounce_index
+        # CPU-prefetch the next disjoint chunk while this DMA/scatter runs.
+        AgenticPHostStagingManager._submit_h2d_prefetch(self, load, end)
         if start == 0:
             logger.info(
                 "AgenticKV shared_host_h2d_start snapshot=%s tokens=%d "
@@ -5122,6 +6493,7 @@ class AgenticPHostStagingManager:
                 int(record["offer"]["byte_size"]),
                 int(load.get("h2d_lane_id", 0)),
             )
+        return True
 
     def _release_completed_h2d_host(self, load: dict[str, Any]) -> bool:
         """Release Host only after every TP shard is Radix-bound."""
@@ -5135,9 +6507,16 @@ class AgenticPHostStagingManager:
         with self._get_state_lock():
             if load.get("host_released"):
                 return True
+        if not self._release_record(record):
+            # Keep both load and host_ready records as retry carriers for a
+            # transient cudaHostUnregister/arena-release failure.
+            return False
+        with self._get_state_lock():
+            if load.get("host_released"):
+                return True
             load["host_released"] = True
-            self.host_ready.pop(snapshot_id, None)
-        self._release_record(record)
+            if self.host_ready.get(snapshot_id) is record:
+                self.host_ready.pop(snapshot_id, None)
         logger.info(
             "AgenticKV shared_host_h2d_release snapshot=%s tp_rank=%d "
             "reason=all_tp_shards_radix_bound",
@@ -5148,6 +6527,16 @@ class AgenticPHostStagingManager:
 
     def _discard_failed_h2d_load(self, rid: str, load: dict[str, Any]) -> bool:
         """Quiesce one failed shard and retain Host for a group retry."""
+        prefetch = load.get("prefetch_future")
+        if prefetch is not None:
+            prefetch.cancel()
+            if not prefetch.done():
+                return False
+            try:
+                prefetch.result()
+            except BaseException:
+                pass
+            AgenticPHostStagingManager._clear_h2d_prefetch(load)
         launch_fence = load.get("launch_fence")
         if launch_fence is not None and launch_fence.submitted:
             if launch_fence.unavailable or not launch_fence.armed:
@@ -5180,7 +6569,22 @@ class AgenticPHostStagingManager:
                     load["request_generation"].snapshot_id,
                 )
                 return False
-        if not load.get("drop_host_on_abort"):
+        drop_host_on_abort = bool(load.get("drop_host_on_abort"))
+        if drop_host_on_abort:
+            try:
+                if not self.ledger.request_host_load_failure(
+                    load["request_generation"].snapshot_id,
+                    self.owner,
+                    reason="request_aborted",
+                ):
+                    return False
+            except Exception:
+                logger.exception(
+                    "AgenticKV shared_host_abort_publish_retry snapshot=%s",
+                    load["request_generation"].snapshot_id,
+                )
+                return False
+        else:
             try:
                 if not self.ledger.request_d2p_retry(
                     load["request_generation"].snapshot_id,
@@ -5212,6 +6616,85 @@ class AgenticPHostStagingManager:
                 ):
                     return False
             load["io_quiesced"] = True
+        if drop_host_on_abort:
+            snapshot_id = load["request_generation"].snapshot_id
+            workset_lease = load.get("workset_lease")
+            if not load.get("device_released"):
+                self.workset_broker.request_release(
+                    snapshot_id, workset_lease
+                )
+                load["device_released"] = True
+            entry = self.ledger.get(snapshot_id)
+            claims = {} if entry is None else entry.get("recovery_claims", {})
+            rank_claim = claims.get(str(int(self.tp_rank)))
+            if rank_claim is not None:
+                claim_id = str(
+                    rank_claim.get(
+                        "claim_id",
+                        load.get("recovery_claim_id", ""),
+                    )
+                )
+                if not self.ledger.cancel_d2p_recovery_rank(
+                    snapshot_id,
+                    self.owner,
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
+                    claim_id=claim_id,
+                    lease_id=(
+                        None
+                        if workset_lease is None
+                        else int(workset_lease.lease_id)
+                    ),
+                ):
+                    return False
+            record = load["record"]
+            # A remote record is only this rank's mmap of another P's Host
+            # extent, so it can be closed after this rank's DMA fence.  A
+            # colocated record is the physical TP shard, however, and must
+            # remain in host_ready until every rank has drained and the shared
+            # ledger reaches FAILED.  Releasing it here would let rank 0 reuse
+            # Host pages while a peer rank can still have H2D in flight.
+            remote_host = bool(record.get("remote_host"))
+            if remote_host and not load.get("host_released"):
+                if not self._release_record(record):
+                    return False
+                load["host_released"] = True
+                with self._get_state_lock():
+                    if self.host_ready.get(snapshot_id) is record:
+                        self.host_ready.pop(snapshot_id, None)
+            else:
+                with self._get_state_lock():
+                    record["loading"] = False
+                    self.host_ready[snapshot_id] = record
+            try:
+                if not self.ledger.mark_host_load_rank_drained(
+                    snapshot_id,
+                    self.owner,
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
+                ):
+                    return False
+            except Exception:
+                logger.exception(
+                    "AgenticKV shared_host_abort_drain_retry snapshot=%s",
+                    snapshot_id,
+                )
+                return False
+            with self._get_state_lock():
+                if self.loads.get(rid) is load:
+                    self.loads.pop(rid, None)
+                record["loading"] = False
+            terminal_entry = self.ledger.get(snapshot_id)
+            if (
+                terminal_entry is not None
+                and terminal_entry.get("state") == HostStageState.FAILED.value
+            ):
+                self._release_consumed_owned_host(
+                    {snapshot_id: terminal_entry},
+                    snapshot_ids=(snapshot_id,),
+                )
+            AgenticPHostStagingManager._release_h2d_lane(self, snapshot_id)
+            return True
         with self._get_state_lock():
             if self.loads.get(rid) is not load:
                 return True
@@ -5224,35 +6707,21 @@ class AgenticPHostStagingManager:
                 load["device_released"] = True
             record = load["record"]
             record["loading"] = False
-            if load.get("drop_host_on_abort") and not load.get("host_released"):
-                self._release_record(load["record"])
-                load["host_released"] = True
-            elif not load.get("drop_host_on_abort"):
-                self.host_ready[load["request_generation"].snapshot_id] = record
-                AgenticPHostStagingManager._notify_scheduler(
-                    self,
-                    "host_ready",
-                    load["request_generation"].snapshot_id,
-                )
+            self.host_ready[load["request_generation"].snapshot_id] = record
+            AgenticPHostStagingManager._notify_scheduler(
+                self,
+                "host_ready",
+                load["request_generation"].snapshot_id,
+            )
         AgenticPHostStagingManager._release_h2d_lane(
             self, load["request_generation"].snapshot_id
         )
-        if load.get("drop_host_on_abort"):
-            ledger = getattr(self, "ledger", None)
-            if ledger is not None:
-                ledger.transition(
-                    load["request_generation"].snapshot_id,
-                    HostStageState.FAILED,
-                    owner=self.owner,
-                    reason="request_aborted",
-                )
-        else:
-            self.ledger.complete_d2p_retry_rank(
-                load["request_generation"].snapshot_id,
-                self.owner,
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
-            )
+        self.ledger.complete_d2p_retry_rank(
+            load["request_generation"].snapshot_id,
+            self.owner,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+        )
         return True
 
     def _publish_d2p_hbm_ready(self, load: dict[str, Any]) -> bool:
@@ -5281,16 +6750,26 @@ class AgenticPHostStagingManager:
         )
         record = load["record"]
         h2d_elapsed_ms = float(load["gpu_elapsed_ms"])
+        h2d_wall_seconds = max(
+            0.0,
+            time.monotonic() - float(load.get("wall_started_at", time.monotonic())),
+        )
         logger.info(
             "AgenticKV shared_host_h2d_complete snapshot=%s tokens=%d "
-            "elapsed_ms=%.3f gib_per_s=%.3f async_progress=true",
+            "elapsed_ms=%.3f host_copy_ms=%.3f wall_ms=%.3f "
+            "gib_per_s=%.3f e2e_gib_per_s=%.3f async_progress=true",
             snapshot_id,
             int(record["offer"]["token_count"]),
             h2d_elapsed_ms,
+            float(load.get("host_copy_elapsed_seconds", 0.0)) * 1000.0,
+            h2d_wall_seconds * 1000.0,
             0.0
             if not math.isfinite(h2d_elapsed_ms)
             else int(record["offer"]["byte_size"])
             / max(h2d_elapsed_ms / 1000.0, 1e-9)
+            / (1024**3),
+            int(record["offer"]["byte_size"])
+            / max(h2d_wall_seconds, 1e-9)
             / (1024**3),
         )
         return True
@@ -5383,6 +6862,8 @@ class AgenticPHostStagingManager:
                 load["offset"] = int(load["chunk_end"])
                 load["event"] = None
                 load["copy_refs"] = None
+                load.pop("dma_bounce_index", None)
+                load.pop("launch_fence", None)
                 if load["offset"] < len(load["device_indices"]):
                     self._start_h2d_chunk(load)
                     continue
@@ -5518,11 +6999,20 @@ class AgenticPHostStagingManager:
                 )
                 if current is not context:
                     continue
-                record = self.host_ready.pop(snapshot_id, None)
-            if record is not None and not self._release_record(record):
+                record = self.host_ready.get(snapshot_id)
+            # As in the in-flight abort path, only a rank-local remote mapping
+            # may be discarded before the group terminal ACK.  The physical
+            # Host-owner shard stays discoverable for the terminal-state
+            # release scan.
+            if record is not None and record.get("remote_host"):
+                if not self._release_record(record):
+                    continue
                 with self._get_state_lock():
-                    self.host_ready.setdefault(snapshot_id, record)
-                continue
+                    if self.host_ready.get(snapshot_id) is record:
+                        self.host_ready.pop(snapshot_id, None)
+            elif record is not None:
+                with self._get_state_lock():
+                    record["loading"] = False
             if not self.ledger.mark_host_load_rank_drained(
                 snapshot_id,
                 self.owner,
@@ -5536,6 +7026,15 @@ class AgenticPHostStagingManager:
                 )
                 if current is context:
                     self._prestart_recovery_aborts.pop(snapshot_id, None)
+            terminal_entry = self.ledger.get(snapshot_id)
+            if (
+                terminal_entry is not None
+                and terminal_entry.get("state") == HostStageState.FAILED.value
+            ):
+                self._release_consumed_owned_host(
+                    {snapshot_id: terminal_entry},
+                    snapshot_ids=(snapshot_id,),
+                )
             AgenticPHostStagingManager._release_h2d_lane(self, snapshot_id)
 
     def abort_request(self, rid: str, request_generation) -> None:
@@ -5552,16 +7051,98 @@ class AgenticPHostStagingManager:
             else:
                 record = self.host_ready.get(snapshot_id)
                 if record is not None:
-                    record["abort_requested"] = True
-                    record["loading"] = "abort_pending"
-                    pending = getattr(self, "_prestart_recovery_aborts", None)
-                    if pending is None:
-                        pending = self._prestart_recovery_aborts = {}
-                    pending[snapshot_id] = {
-                        "rid": str(rid),
-                        "request_generation": request_generation,
-                    }
-                    prestart_abort = True
+                    # A P that owns the physical Host arena also keeps a local
+                    # host_ready record when another P is the selected recovery
+                    # owner.  Aborting an obsolete Direct HTTP attempt on the
+                    # Host owner must not reinterpret that arena record as this
+                    # request's Slow claim and destroy the only durable copy.
+                    entry = self.ledger.get(snapshot_id)
+                    expected_claim_id = self.workset_broker.slow_owner(
+                        snapshot_id, rid
+                    )
+                    claims = {} if entry is None else entry.get(
+                        "recovery_claims", {}
+                    )
+                    rank_claim = claims.get(str(int(self.tp_rank)))
+                    record_claim_id = record.get("recovery_claim_id")
+                    loading = record.get("loading")
+                    targets_this_manager = bool(
+                        entry is not None
+                        and self._recovery_targets_this_manager(entry)
+                        and entry.get("recovery_owner") in {None, self.owner}
+                    )
+                    # The Router may cancel after assigning this P but before
+                    # gate_request() publishes its rank claim.  Pin the exact
+                    # request/rank first so the normal fenced abort can retire
+                    # the selected Host snapshot instead of leaking it in
+                    # HOST_READY until pressure eviction.
+                    can_join_selected_abort = bool(
+                        targets_this_manager
+                        and rank_claim is None
+                        and entry.get("state")
+                        in {
+                            HostStageState.HOST_READY.value,
+                            HostStageState.H2D_LOADING.value,
+                        }
+                        and entry.get("recovery_claim_id")
+                        in {None, expected_claim_id}
+                    )
+                    if (
+                        can_join_selected_abort
+                        and self.ledger.claim_d2p_recovery_rank(
+                            snapshot_id,
+                            self.owner,
+                            tp_rank=self.tp_rank,
+                            tp_size=self.tp_size,
+                            claim_id=expected_claim_id,
+                            recovery_domain=getattr(self, "arena_domain", None),
+                        )
+                    ):
+                        entry = self.ledger.get(snapshot_id)
+                        claims = entry.get("recovery_claims", {})
+                        rank_claim = claims.get(str(int(self.tp_rank)))
+                    joins_group_abort = bool(
+                        targets_this_manager
+                        and entry.get("state") == HostStageState.ABORTING.value
+                        and entry.get("h2d_abort_started", False)
+                        and int(self.tp_rank)
+                        not in {
+                            int(value)
+                            for value in entry.get("loader_drained_ranks", [])
+                        }
+                    )
+                    owns_claim = targets_this_manager and (
+                        record_claim_id == expected_claim_id
+                        or (
+                            rank_claim is not None
+                            and rank_claim.get("claim_id") == expected_claim_id
+                        )
+                        # Close the small window after the local record is
+                        # selected but before its ledger claim is visible.
+                        or loading == "h2d_claiming"
+                        # A peer TP rank may have already frozen the group in
+                        # ABORTING before this rank received the same cancel.
+                        # This rank owns no DMA and must still publish its
+                        # quiescent ACK so the group can reach FAILED.
+                        or joins_group_abort
+                    )
+                    if owns_claim:
+                        record["abort_requested"] = True
+                        record["loading"] = "abort_pending"
+                        pending = getattr(
+                            self, "_prestart_recovery_aborts", None
+                        )
+                        if pending is None:
+                            pending = self._prestart_recovery_aborts = {}
+                        pending[snapshot_id] = {
+                            "rid": str(rid),
+                            "request_generation": request_generation,
+                        }
+                        prestart_abort = True
+                    else:
+                        self.workset_broker.cancel_unstarted(
+                            snapshot_id, owner=expected_claim_id
+                        )
                 else:
                     self.workset_broker.cancel_unstarted(
                         snapshot_id,
@@ -5980,6 +7561,23 @@ class AgenticPHostStagingManager:
             else ledger_cache.get(snapshot_id)
         )
         if ledger_entry is not None and ledger_entry.get("state") in {
+            HostStageState.HOST_READY.value,
+            HostStageState.H2D_LOADING.value,
+            HostStageState.HBM_READY.value,
+        }:
+            # Host placement and recovery-P selection are independent. A
+            # request that reached the former Host owner before Router
+            # redirected it must remain metadata-only there.
+            if not self._recovery_targets_this_manager(ledger_entry):
+                return True
+            if record is None and ledger_entry.get("state") in {
+                HostStageState.HOST_READY.value,
+                HostStageState.H2D_LOADING.value,
+            }:
+                record = self._import_remote_host_record(
+                    snapshot_id, ledger_entry
+                )
+        if ledger_entry is not None and ledger_entry.get("state") in {
             HostStageState.FAILED.value,
             HostStageState.RECOMPUTE_REQUIRED.value,
         }:
@@ -6010,6 +7608,15 @@ class AgenticPHostStagingManager:
             }:
                 return True
             return None
+        # DIRECT_READY -> Slow is a monotonic lifecycle boundary.  Retire a
+        # racing Direct allocation on this selected recovery P before taking
+        # the finite Slow admission resource.  In particular, do not pin a
+        # Host claim or occupy an H2D lane while the scheduler is still
+        # freeing the obsolete Direct workset.
+        if AgenticPHostStagingManager._retire_stale_direct_before_slow(
+            self, snapshot_id
+        ):
+            return True
         with self._get_state_lock():
             # Re-read under the ownership lock: the background spill worker
             # may have claimed the record after the first discovery read.
@@ -6122,6 +7729,7 @@ class AgenticPHostStagingManager:
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
                 claim_id=recovery_claim_id,
+                recovery_domain=self.arena_domain,
             )
         except Exception:
             recovery_claimed = False
@@ -6215,6 +7823,8 @@ class AgenticPHostStagingManager:
                 "offset": 0,
                 "chunk_end": 0,
                 "gpu_elapsed_ms": 0.0,
+                "host_copy_elapsed_seconds": 0.0,
+                "wall_started_at": time.monotonic(),
                 "start_allowed": False,
                 "io_complete": False,
                 "host_released": False,
@@ -6671,24 +8281,60 @@ class AgenticDHostStagingClient:
         lane_count = max(
             1, int(os.getenv("SGLANG_AGENTIC_KV_D2H_INFLIGHT", "4"))
         )
+        self._d2h_dma_limit = lane_count
+        self._d2h_bounce_depth = max(
+            2, int(os.getenv("SGLANG_AGENTIC_KV_D2H_BOUNCE_DEPTH", "2"))
+        )
+        self._d2h_host_copy_pool = HostCopyWorkerPool(
+            f"agentic-d-d2h-host-copy-{os.getpid()}",
+            max(
+                1,
+                int(
+                    os.getenv(
+                        "SGLANG_AGENTIC_KV_D2H_HOST_COPY_WORKERS",
+                        str(lane_count),
+                    )
+                ),
+            ),
+        )
+        # A CUDA submission without an armed completion event has no safe
+        # allocator or mapping-release boundary. Such records are retained for
+        # process lifetime instead of converting uncertainty into use-after-free.
+        self._d2h_dma_quarantine: list[tuple[Any, ...]] = []
         staging_tokens = int(
             os.getenv("SGLANG_AGENTIC_KV_D2H_STAGING_TOKENS", "256")
         )
-        self._d2h_lanes = [
-            {
-                "stream": torch.cuda.Stream(
-                    device=torch.cuda.current_device(), priority=d2h_priority
-                ),
-                "staging": LayerFirstD2HStaging(
-                    self.device_pool, staging_tokens
-                ),
-                "host_bounce": PinnedMHAHostBounce(
-                    self.device_pool, self._d2h_chunk_tokens
-                ),
-                "snapshot_id": None,
-            }
-            for _ in range(lane_count)
-        ]
+        # Each physical DMA lane owns one HBM gather buffer/stream but several
+        # pinned bounce slots.  After DMA into bounce[0], its CPU commit may run
+        # while the same stream and gather buffer service bounce[1].  This
+        # doubles pipeline depth without doubling the expensive HBM staging.
+        self._d2h_lanes = []
+        for dma_group in range(lane_count):
+            stream = torch.cuda.Stream(
+                device=torch.cuda.current_device(), priority=d2h_priority
+            )
+            staging = LayerFirstD2HStaging(self.device_pool, staging_tokens)
+            for _ in range(self._d2h_bounce_depth):
+                self._d2h_lanes.append(
+                    {
+                        "stream": stream,
+                        "staging": staging,
+                        "host_bounce": PinnedMHAHostBounce(
+                            self.device_pool, self._d2h_chunk_tokens
+                        ),
+                        "snapshot_id": None,
+                        "phase": "free",
+                        "dma_group": dma_group,
+                    }
+                )
+        # A bounce slot is pipeline depth, not an independent snapshot slot.
+        # Counting every bounce here admitted eight snapshots onto four DMA
+        # groups and round-robin progress kept all eight complete generations
+        # resident in D HBM.  One active snapshot per physical DMA group lets
+        # bounce[0] commit on CPU while bounce[1] receives the next chunk,
+        # without increasing the number of concurrent gather/DMA operations
+        # that can contend with Decode Forward.
+        self.max_active_writes = lane_count
 
     def set_target(self, *, prefill_domain: int, arena_numa_node: int) -> None:
         """Apply TP0's route before this rank publishes its shard offer."""
@@ -6770,16 +8416,69 @@ class AgenticDHostStagingClient:
         write = candidate.get("arena_write")
         if write is None:
             return True
-        event = write.get("event")
-        if event is not None and not event.query():
+        chunks = write.get("chunks", {})
+        physically_quiesced = True
+        for lane_id, chunk in tuple(chunks.items()):
+            cpu_future = chunk.get("cpu_future")
+            if cpu_future is not None:
+                cpu_future.cancel()
+                if not cpu_future.done():
+                    physically_quiesced = False
+                    continue
+                try:
+                    cpu_future.result()
+                except BaseException:
+                    pass
+            launch_fence = chunk.get("launch_fence")
+            if launch_fence is not None and launch_fence.submitted:
+                if launch_fence.unavailable or not launch_fence.armed:
+                    if not chunk.get("dma_quarantined"):
+                        chunk["dma_quarantined"] = True
+                        quarantine = getattr(self, "_d2h_dma_quarantine", None)
+                        if quarantine is None:
+                            quarantine = self._d2h_dma_quarantine = []
+                        quarantine.append(
+                            (
+                                write.get("snapshot"),
+                                launch_fence,
+                                chunk.get("copy_refs"),
+                                candidate,
+                            )
+                        )
+                        logger.error(
+                            "AgenticKV D2H cleanup found an unfenced CUDA "
+                            "submission snapshot=%s; retaining D source, Host "
+                            "mapping, bounce, and lane for process lifetime",
+                            candidate["manifest"].snapshot_id,
+                        )
+                    physically_quiesced = False
+                    continue
+                if not launch_fence.event.query():
+                    physically_quiesced = False
+                    continue
+            event = chunk.get("event")
+            if event is not None and not event.query():
+                physically_quiesced = False
+                continue
+        if not physically_quiesced:
+            return False
+        try:
+            write["snapshot"].close(unlink=False)
+        except Exception:
+            # The physically fenced snapshot remains the cleanup carrier.  In
+            # particular, an unregister failure must not make its lane or mmap
+            # reusable until a later cleanup visit succeeds.
+            logger.exception(
+                "AgenticKV D2H registered extent cleanup retry snapshot=%s",
+                candidate["manifest"].snapshot_id,
+            )
             return False
         candidate.pop("arena_write", None)
-        lane_id = write.pop("lane_id", None)
-        if lane_id is not None:
+        for lane_id in tuple(chunks):
             lane = self._d2h_lanes[int(lane_id)]
             if lane["snapshot_id"] == candidate["manifest"].snapshot_id:
                 lane["snapshot_id"] = None
-        write["snapshot"].close(unlink=False)
+                lane["phase"] = "free"
         return True
 
     def _cleanup_relay_senders(self, candidate: dict[str, Any]) -> None:
@@ -6921,14 +8620,32 @@ class AgenticDHostStagingClient:
             create=False,
             file_offset=int(grant.get("arena_offset", 0)),
         )
-        candidate["arena_write"] = {
+        write = candidate["arena_write"] = {
             "snapshot": snapshot,
-            "event": None,
-            "copy_refs": None,
-            "offset": 0,
-            "chunk_end": 0,
+            "chunks": {},
+            "next_offset": 0,
+            "retry_ranges": [],
+            "committed_tokens": 0,
             "gpu_elapsed_ms": 0.0,
+            "host_copy_elapsed_seconds": 0.0,
+            "wall_started_at": time.monotonic(),
         }
+        if _cuda_driver_batch_memcpy() is not None:
+            if torch.is_tensor(source_token_indices) and source_token_indices.is_cuda:
+                copy_pool = getattr(self, "_d2h_host_copy_pool", None)
+                if copy_pool is not None:
+                    def populate_index_mirror():
+                        write["source_indices_host"] = _device_indices_to_host(
+                            source_token_indices
+                        )
+
+                    write["index_mirror_future"] = copy_pool.submit(
+                        populate_index_mirror
+                    )
+            else:
+                write["source_indices_host"] = _device_indices_to_host(
+                    source_token_indices
+                )
         logger.info(
             "AgenticKV shared_host_d2h_start snapshot=%s bytes=%d "
             "chunk_tokens=%d",
@@ -6946,28 +8663,76 @@ class AgenticDHostStagingClient:
 
         snapshot_id = candidate["manifest"].snapshot_id
         write = candidate["arena_write"]
-        if write["event"] is not None:
+        index_future = write.get("index_mirror_future")
+        if index_future is not None:
+            if not index_future.done():
+                return False
+            write.pop("index_mirror_future", None)
+            try:
+                index_future.result()
+            except BaseException:
+                # Index mirroring is only a fast-path preparation.  The
+                # existing gather kernel remains a complete fallback.
+                write.pop("source_indices_host", None)
+                logger.exception(
+                    "AgenticKV D2H index mirror failed snapshot=%s; "
+                    "using gather fallback",
+                    snapshot_id,
+                )
+        chunks = write["chunks"]
+        if len(chunks) >= int(getattr(self, "_d2h_bounce_depth", 2)):
             return False
+        # Multiple DMA submissions for one snapshot do not improve the CPU
+        # commit pipeline, but they do increase gather pressure on Forward.
+        # Wait only for the DMA boundary (not CPU commit) before submitting
+        # the next chunk from this snapshot.
+        if any(chunk.get("phase") == "dma" for chunk in chunks.values()):
+            return False
+        dma_inflight = sum(
+            lane.get("phase") == "dma" for lane in self._d2h_lanes
+        )
+        if dma_inflight >= int(getattr(self, "_d2h_dma_limit", len(self._d2h_lanes))):
+            return False
+        busy_dma_groups = {
+            int(lane.get("dma_group", index))
+            for index, lane in enumerate(self._d2h_lanes)
+            if lane.get("phase") == "dma"
+        }
         lane_id = next(
             (
                 index
                 for index, lane in enumerate(self._d2h_lanes)
-                if lane["snapshot_id"] is None
+                if lane["snapshot_id"] is None and lane.get("phase", "free") == "free"
+                and int(lane.get("dma_group", index)) not in busy_dma_groups
             ),
             None,
         )
         if lane_id is None:
             return False
         lane = self._d2h_lanes[lane_id]
-        start = int(write["offset"])
-        if start >= len(source_token_indices):
-            return False
-        end = min(start + self._d2h_chunk_tokens, len(source_token_indices))
+        retry_ranges = write["retry_ranges"]
+        if retry_ranges:
+            start, end = retry_ranges[0]
+            range_kind = "retry"
+        else:
+            start = int(write["next_offset"])
+            if start >= len(source_token_indices):
+                return False
+            end = min(start + self._d2h_chunk_tokens, len(source_token_indices))
+            range_kind = "new"
         launch_fence = H2DLaunchFence(
             event=torch.cuda.Event(enable_timing=True)
         )
-        write["lane_id"] = lane_id
         lane["snapshot_id"] = snapshot_id
+        lane["phase"] = "dma"
+        chunk = {
+            "start": int(start),
+            "end": int(end),
+            "phase": "dma",
+            "event": None,
+            "copy_refs": None,
+            "launch_fence": launch_fence,
+        }
         try:
             event, refs = write["snapshot"].start_backup_range_from_device(
                 source_token_indices[start:end],
@@ -6976,6 +8741,11 @@ class AgenticDHostStagingClient:
                 staging=lane["staging"],
                 host_bounce=lane["host_bounce"],
                 launch_fence=launch_fence,
+                source_indices_host=(
+                    write["source_indices_host"][start:end]
+                    if write.get("source_indices_host") is not None
+                    else None
+                ),
             )
         except Exception as exc:
             if launch_fence.submitted:
@@ -6983,12 +8753,16 @@ class AgenticDHostStagingClient:
                 # No pageable Host bytes are committed from this failed
                 # bounce. Once the fence drains, progress() reopens the same
                 # complete extent and retries from the unchanged offset.
-                write["launch_fence"] = launch_fence
-                write["launch_error"] = exc
-                write["copy_refs"] = launch_fence.copy_refs
-                write["event"] = (
+                chunk["launch_error"] = exc
+                chunk["copy_refs"] = launch_fence.copy_refs
+                chunk["event"] = (
                     launch_fence.event if launch_fence.armed else None
                 )
+                chunks[lane_id] = chunk
+                if range_kind == "retry":
+                    retry_ranges.pop(0)
+                else:
+                    write["next_offset"] = int(end)
                 if launch_fence.unavailable:
                     logger.error(
                         "AgenticKV D2H launch has no completion fence "
@@ -6997,7 +8771,7 @@ class AgenticDHostStagingClient:
                     )
             else:
                 lane["snapshot_id"] = None
-                write.pop("lane_id", None)
+                lane["phase"] = "free"
                 candidate["arena_write_retry_at"] = time.monotonic() + 0.05
                 logger.exception(
                     "AgenticKV D2H launch failed before submission "
@@ -7005,10 +8779,16 @@ class AgenticDHostStagingClient:
                     snapshot_id,
                 )
             return False
-        write["event"] = event
-        write["copy_refs"] = refs
-        write["launch_fence"] = launch_fence
-        write["chunk_end"] = end
+        chunk["event"] = event
+        chunk["copy_refs"] = refs
+        chunk["start_event"] = getattr(
+            write["snapshot"], "_last_d2h_start_event", None
+        )
+        chunks[lane_id] = chunk
+        if range_kind == "retry":
+            retry_ranges.pop(0)
+        else:
+            write["next_offset"] = int(end)
         return True
 
     def progress(
@@ -7176,16 +8956,61 @@ class AgenticDHostStagingClient:
                 return "waiting"
             write = candidate["arena_write"]
             candidate.pop("arena_write_retry_at", None)
-        if write.get("launch_error") is not None:
-            launch_fence = write.get("launch_fence")
+        chunks = write["chunks"]
+
+        # Retire at most one physical stage per progress visit.  This keeps the
+        # control worker bounded while allowing DMA(N+1) to run as soon as the
+        # previous DMA hands bounce[N] to an independent CPU commit worker.
+        for lane_id, chunk in tuple(chunks.items()):
+            cpu_future = chunk.get("cpu_future")
+            if cpu_future is None or not cpu_future.done():
+                continue
+            lane = self._d2h_lanes[int(lane_id)]
+            try:
+                cpu_elapsed = float(cpu_future.result())
+            except BaseException:
+                # D remains the unique authoritative owner.  Re-copy this
+                # disjoint range; a partial pageable write is never published.
+                write["retry_ranges"].append(
+                    (int(chunk["start"]), int(chunk["end"]))
+                )
+                candidate["arena_write_retry_at"] = time.monotonic() + 0.05
+                logger.exception(
+                    "AgenticKV pageable Host D2H commit failed "
+                    "snapshot=%s offset=%d; retaining D source and retrying",
+                    snapshot_id,
+                    int(chunk["start"]),
+                )
+            else:
+                write["host_copy_elapsed_seconds"] = float(
+                    write.get("host_copy_elapsed_seconds", 0.0)
+                ) + cpu_elapsed
+                write["committed_tokens"] = int(
+                    write.get("committed_tokens", 0)
+                ) + int(chunk["end"]) - int(chunk["start"])
+                candidate.pop("arena_write_retry_at", None)
+            chunks.pop(lane_id, None)
+            lane["snapshot_id"] = None
+            lane["phase"] = "free"
+            return "waiting"
+
+        for lane_id, chunk in tuple(chunks.items()):
+            if chunk.get("launch_error") is None:
+                continue
+            launch_fence = chunk.get("launch_fence")
             if launch_fence is None or launch_fence.unavailable:
                 return "waiting"
-            event = write.get("event")
+            event = chunk.get("event")
             if event is None or not event.query():
                 return "waiting"
             event.synchronize()
-            if not self._cleanup_write(candidate):
-                return "waiting"
+            lane = self._d2h_lanes[int(lane_id)]
+            lane["snapshot_id"] = None
+            lane["phase"] = "free"
+            chunks.pop(lane_id, None)
+            write["retry_ranges"].append(
+                (int(chunk["start"]), int(chunk["end"]))
+            )
             candidate["arena_write_retry_at"] = time.monotonic() + 0.05
             logger.warning(
                 "AgenticKV drained partial D2H launch snapshot=%s; retrying "
@@ -7193,35 +9018,79 @@ class AgenticDHostStagingClient:
                 snapshot_id,
             )
             return "waiting"
-        if write["event"] is None:
-            self._start_write_chunk(candidate, source_token_indices)
+
+        for lane_id, chunk in tuple(chunks.items()):
+            if chunk.get("phase") != "dma":
+                continue
+            event = chunk.get("event")
+            if event is None or not event.query():
+                continue
+            start_event = chunk.get("start_event")
+            if start_event is not None:
+                chunk_elapsed_ms = float(start_event.elapsed_time(event))
+                if math.isfinite(chunk_elapsed_ms):
+                    write["gpu_elapsed_ms"] += chunk_elapsed_ms
+            lane = self._d2h_lanes[int(lane_id)]
+            chunk["event"] = None
+            chunk["phase"] = "cpu"
+            lane["phase"] = "cpu"
+            copy_pool = getattr(self, "_d2h_host_copy_pool", None)
+            copy_args = (lane["host_bounce"],)
+            copy_kwargs = {
+                "destination_start": int(chunk["start"]),
+                "token_count": int(chunk["end"]) - int(chunk["start"]),
+            }
+            if copy_pool is None:
+                future = Future()
+                started_at = time.perf_counter()
+                try:
+                    write["snapshot"].commit_backup_range_from_bounce(
+                        *copy_args, **copy_kwargs
+                    )
+                except BaseException as exc:
+                    future.set_exception(exc)
+                else:
+                    future.set_result(time.perf_counter() - started_at)
+            else:
+                future = copy_pool.submit(
+                    write["snapshot"].commit_backup_range_from_bounce,
+                    *copy_args,
+                    **copy_kwargs,
+                )
+            chunk["cpu_future"] = future
             return "waiting"
-        if not write["event"].query():
+
+        has_unassigned_range = bool(write["retry_ranges"]) or int(
+            write["next_offset"]
+        ) < len(source_token_indices)
+        if has_unassigned_range:
+            if time.monotonic() >= float(
+                candidate.get("arena_write_retry_at", 0.0)
+            ) and self._start_write_chunk(candidate, source_token_indices):
+                return "waiting"
+            if chunks:
+                return "waiting"
             return "waiting"
-        chunk_elapsed_ms = write["snapshot"]._last_d2h_start_event.elapsed_time(
-            write["event"]
-        )
-        chunk_start = int(write["offset"])
-        chunk_end = int(write["chunk_end"])
-        lane_id = int(write.pop("lane_id"))
-        lane = self._d2h_lanes[lane_id]
-        write["snapshot"].commit_backup_range_from_bounce(
-            lane["host_bounce"],
-            destination_start=chunk_start,
-            token_count=chunk_end - chunk_start,
-        )
-        write["gpu_elapsed_ms"] += chunk_elapsed_ms
-        write["offset"] = int(write["chunk_end"])
-        write["event"] = None
-        write["copy_refs"] = None
-        lane["snapshot_id"] = None
-        if write["offset"] < len(source_token_indices):
-            # Do not submit the next chunk in this call.  Returning to the
-            # progress loop gives the default-priority Decode stream a chance
-            # to enqueue its next forward before more background copy work.
+
+        if chunks:
             return "waiting"
+        if int(write.get("committed_tokens", 0)) != len(source_token_indices):
+            logger.error(
+                "AgenticKV D2H commit accounting mismatch snapshot=%s "
+                "committed=%d expected=%d; retaining D source",
+                snapshot_id,
+                int(write.get("committed_tokens", 0)),
+                len(source_token_indices),
+            )
+            return "waiting"
+
         d2h_elapsed_ms = float(write["gpu_elapsed_ms"])
         d2h_bytes = write["snapshot"].byte_size
+        d2h_wall_seconds = max(
+            0.0,
+            time.monotonic()
+            - float(write.get("wall_started_at", time.monotonic())),
+        )
         elapsed_ready = time.time()
         if not self._cleanup_write(candidate):
             return "waiting"
@@ -7240,11 +9109,15 @@ class AgenticDHostStagingClient:
             return "failed"
         logger.info(
             "AgenticKV shared_host_d2h_complete snapshot=%s completed_at=%.6f "
-            "elapsed_ms=%.3f gib_per_s=%.3f",
+            "elapsed_ms=%.3f host_copy_ms=%.3f wall_ms=%.3f gib_per_s=%.3f "
+            "e2e_gib_per_s=%.3f",
             snapshot_id,
             elapsed_ready,
             d2h_elapsed_ms,
+            float(write.get("host_copy_elapsed_seconds", 0.0)) * 1000.0,
+            d2h_wall_seconds * 1000.0,
             d2h_bytes / max(d2h_elapsed_ms / 1000.0, 1e-9) / (1024**3),
+            d2h_bytes / max(d2h_wall_seconds, 1e-9) / (1024**3),
         )
         if self.tp_size == 1:
             ready = True

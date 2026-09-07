@@ -8,7 +8,9 @@ import tempfile
 import threading
 import time
 from collections import deque
+from concurrent.futures import Future
 from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -78,6 +80,7 @@ from sglang.srt.disaggregation.p2d_host_staging import (
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler import (
+    AgenticEarlyDirectReceive,
     AgenticPWorksetLeaseBroker,
     Scheduler,
 )
@@ -815,6 +818,75 @@ def test_host_ready_tombstone_rejects_a_late_direct_intent_but_not_slow():
     assert broker.owner_is_superseded(snapshot_id, owner=direct_owner)
 
 
+def test_direct_terminal_drop_retires_and_tombstones_active_workset():
+    """A completed Direct abort cannot leave or recreate an active lease."""
+
+    class Allocator:
+        def __init__(self):
+            self.freed = []
+
+        @staticmethod
+        def alloc(count):
+            return torch.arange(count, dtype=torch.int64)
+
+        def free(self, indices):
+            self.freed.append(indices.clone())
+
+    snapshot_id = "direct-terminal-retire:0"
+    request = RequestGeneration("direct-terminal-retire", 0)
+    broker = AgenticPWorksetLeaseBroker(page_size=4)
+    direct_owner = broker.direct_owner(snapshot_id)
+    allocator = Allocator()
+    assert broker.request(
+        snapshot_id, parent_tokens=4, prompt_tokens=8, owner=direct_owner
+    )
+    broker.service(allocator)
+    lease = broker.get(snapshot_id, owner=direct_owner)
+    assert lease is not None
+
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.tp_size = 1
+    scheduler.agentic_p_workset_broker = broker
+    scheduler.agentic_early_direct_poll_lock = threading.RLock()
+    scheduler.agentic_early_direct_receives = {}
+    scheduler.agentic_early_direct_terminal = {}
+    scheduler._agentic_clear_direct_receiver = lambda *_args: None
+    entry = AgenticEarlyDirectReceive(
+        request=SimpleNamespace(snapshot_id=snapshot_id),
+        manifest=SimpleNamespace(),
+        claim_id="direct-claim",
+        receiver=SimpleNamespace(clear=lambda: None),
+        device_indices=None,
+        started_at=time.monotonic(),
+        arrived_at=time.time(),
+        workset_lease=lease,
+        transport_poll=KVPoll.Failed,
+    )
+    scheduler.agentic_early_direct_receives[snapshot_id] = entry
+
+    scheduler._agentic_drop_early_direct_receive(
+        entry,
+        snapshot_store=object(),
+        release_claim=False,
+        reason="direct_setup_deadline_unstarted",
+    )
+
+    assert broker.owner_is_superseded(snapshot_id, owner=direct_owner)
+    assert lease.state == "releasing"
+    broker.service(allocator)
+    assert broker.get(snapshot_id) is None
+    assert len(allocator.freed) == 1
+    assert not broker.request(
+        snapshot_id, parent_tokens=4, prompt_tokens=8, owner=direct_owner
+    )
+    assert broker.request(
+        snapshot_id,
+        parent_tokens=4,
+        prompt_tokens=8,
+        owner=broker.slow_owner(snapshot_id, "child"),
+    )
+
+
 def test_tp0_retires_a_superseded_direct_from_an_already_frozen_plan():
     class Allocator:
         def alloc(self, count):
@@ -839,6 +911,38 @@ def test_tp0_retires_a_superseded_direct_from_an_already_frozen_plan():
     _plan, retirements, _handoffs = broker.prepare_tp_control(2)
     assert retirements == (snapshot_id,)
     assert snapshot_id in broker.tp_retire_candidates
+
+
+def test_tp_retire_commit_prevents_late_materialization_from_frozen_plan():
+    """A never-allocated frozen entry is terminal once TP retirement commits."""
+
+    class Allocator:
+        def __init__(self):
+            self.allocations = []
+
+        def alloc(self, count):
+            self.allocations.append(count)
+            return torch.arange(count, dtype=torch.int64)
+
+        @staticmethod
+        def free(_indices):
+            raise AssertionError("unmaterialized work has no pages to free")
+
+    snapshot_id = "retire-before-service:0"
+    broker = AgenticPWorksetLeaseBroker(page_size=4)
+    owner = broker.direct_owner(snapshot_id)
+    broker.install_tp_plan(1, [(snapshot_id, owner, 4, 8)])
+
+    assert broker.supersede_unstarted(snapshot_id, owner=owner)
+    assert broker.owner_has_unretired_work(snapshot_id, owner=owner)
+    assert broker.prepare_tp_retire(snapshot_id)
+    assert broker.commit_tp_retire(snapshot_id)
+
+    allocator = Allocator()
+    broker.service(allocator)
+    assert allocator.allocations == []
+    assert broker.get(snapshot_id) is None
+    assert not broker.owner_has_unretired_work(snapshot_id, owner=owner)
 
 
 def test_old_direct_plan_cannot_retire_the_new_slow_owner():
@@ -914,10 +1018,10 @@ def test_frozen_direct_plan_stays_rank_consistent_during_slow_transition():
     ]
     for broker in brokers:
         broker.install_tp_plan(1, plan)
-    assert not brokers[0].supersede_unstarted(
-        snapshot_id, owner=direct_owner
-    )
-    assert brokers[0].request(snapshot_id, 4, 8, owner=slow_owner)
+    assert brokers[0].supersede_unstarted(snapshot_id, owner=direct_owner)
+    # A successor owner cannot enter while the old snapshot-scoped TP
+    # retirement is waiting for its group ACK.
+    assert not brokers[0].request(snapshot_id, 4, 8, owner=slow_owner)
 
     for broker, allocator in zip(brokers, allocators):
         broker.service(allocator)
@@ -1842,11 +1946,42 @@ def test_slow_h2d_abort_and_rollback_wait_for_physical_terminal():
     broker.mark_io_inflight(request.snapshot_id, lease, attempt)
 
     event = Event()
-    record = {}
+    # This focused test models a recovery P's rank-local remote mmap.  The
+    # mapping may close after its own H2D fence; physical Host-owner TP shards
+    # are covered by the group-atomic test below.
+    record = {"remote_host": True}
+    ledger_state = {"value": HostStageState.H2D_LOADING.value, "claims": {}}
+
+    class Ledger:
+        def request_host_load_failure(self, *_args, **_kwargs):
+            ledger_state["value"] = HostStageState.ABORTING.value
+            return True
+
+        def get(self, _snapshot_id):
+            return {
+                "state": ledger_state["value"],
+                "recovery_claims": {
+                    "0": {
+                        "claim_id": owner,
+                        "phase": "io_inflight",
+                        "lease_id": lease.lease_id,
+                    }
+                },
+            }
+
+        def cancel_d2p_recovery_rank(self, *_args, **_kwargs):
+            ledger_state["claims"] = {}
+            return True
+
+        def mark_host_load_rank_drained(self, *_args, **_kwargs):
+            ledger_state["value"] = HostStageState.FAILED.value
+            return True
+
     load = {
         "record": record,
         "request_generation": request,
         "workset_lease": lease,
+        "recovery_claim_id": owner,
         "io_attempt": attempt,
         "io_inflight": True,
         "io_quiesced": False,
@@ -1855,6 +1990,11 @@ def test_slow_h2d_abort_and_rollback_wait_for_physical_terminal():
         ),
     }
     manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
+    manager.owner = "p:test"
+    manager.tp_rank = 0
+    manager.tp_size = 1
+    manager.ledger = Ledger()
+    manager._state_lock = threading.RLock()
     manager.workset_broker = broker
     manager.tree_cache = SimpleNamespace()
     manager.loads = {rid: load}
@@ -1862,7 +2002,8 @@ def test_slow_h2d_abort_and_rollback_wait_for_physical_terminal():
     manager._control_wakeup = SimpleNamespace(set=lambda: None)
     manager._h2d_poisoned = False
     released_host = []
-    manager._release_record = lambda current: released_host.append(current)
+    manager._h2d_lane_reservations = {request.snapshot_id: 0}
+    manager._release_record = lambda current: released_host.append(current) or True
 
     req = SimpleNamespace(rid=rid)
     manager.abort_request(rid, request)
@@ -1881,6 +2022,163 @@ def test_slow_h2d_abort_and_rollback_wait_for_physical_terminal():
     assert broker.get(request.snapshot_id, owner=owner) is None
     assert len(allocator.freed) == 1
     assert released_host == [record]
+    assert ledger_state["value"] == HostStageState.FAILED.value
+
+
+def test_tp2_inflight_h2d_abort_waits_for_every_rank_fence():
+    class Allocator:
+        @staticmethod
+        def alloc(count):
+            return torch.arange(count, dtype=torch.int64)
+
+        @staticmethod
+        def free(_indices):
+            return None
+
+    class Event:
+        def __init__(self, ready):
+            self.ready = ready
+
+        def query(self):
+            return self.ready
+
+        def synchronize(self):
+            assert self.ready
+
+    ledger, path = _ledger()
+    request = RequestGeneration("tp2-inflight-abort", 1)
+    snapshot_id = request.snapshot_id
+    owner = "p-group:inflight"
+    rid = "tp2-inflight-child"
+    managers = []
+    events = [Event(True), Event(False)]
+    released = []
+
+    class Arena:
+        def __init__(self, rank):
+            self.rank = rank
+
+        def release(self, snapshot):
+            # No physical Host shard may be released while another TP rank is
+            # still nonterminal.
+            assert ledger.get(snapshot_id)["state"] == HostStageState.FAILED.value
+            released.append((self.rank, snapshot))
+            return True
+    try:
+        ledger.offer(
+            {
+                "snapshot_id": snapshot_id,
+                "token_count": 8,
+                "byte_size": 4096,
+                "tp_size": 2,
+            }
+        )
+
+        def publish_ready(entries):
+            entries[snapshot_id].update(
+                p_owner=owner,
+                arena_domain=0,
+                recovery_domain=0,
+                state=HostStageState.HOST_READY.value,
+                updated_at=time.time(),
+            )
+            return True, True
+
+        ledger._mutate(publish_ready, event_snapshot_id=snapshot_id)
+        claim_id = AgenticPWorksetLeaseBroker.slow_owner(snapshot_id, rid)
+        for rank in range(2):
+            broker = AgenticPWorksetLeaseBroker(page_size=4)
+            broker.request(snapshot_id, 8, 12, owner=claim_id)
+            broker.service(Allocator())
+            lease = broker.get(snapshot_id, owner=claim_id)
+            assert lease is not None
+            assert ledger.claim_d2p_recovery_rank(
+                snapshot_id,
+                owner,
+                tp_rank=rank,
+                tp_size=2,
+                claim_id=claim_id,
+                recovery_domain=0,
+            )
+            assert ledger.attach_d2p_recovery_lease_rank(
+                snapshot_id,
+                owner,
+                tp_rank=rank,
+                tp_size=2,
+                claim_id=claim_id,
+                lease_id=lease.lease_id,
+            )
+            attempt = f"slow-h2d:{rank}"
+            assert broker.begin_io_attempt(snapshot_id, lease, attempt)
+            broker.mark_io_inflight(snapshot_id, lease, attempt)
+            assert ledger.mark_d2p_recovery_phase_rank(
+                snapshot_id,
+                owner,
+                tp_rank=rank,
+                tp_size=2,
+                claim_id=claim_id,
+                lease_id=lease.lease_id,
+                phase="io_inflight",
+            )
+            snapshot = object()
+            record = {"loading": "h2d", "snapshot": snapshot}
+            load = {
+                "record": record,
+                "request_generation": request,
+                "workset_lease": lease,
+                "recovery_claim_id": claim_id,
+                "io_attempt": attempt,
+                "io_inflight": True,
+                "io_quiesced": False,
+                "launch_fence": H2DLaunchFence(
+                    event=events[rank], submitted=True, armed=True
+                ),
+            }
+            manager = AgenticPHostStagingManager.__new__(
+                AgenticPHostStagingManager
+            )
+            manager.owner = owner
+            manager.arena_domain = 0
+            manager.tp_rank = rank
+            manager.tp_size = 2
+            manager.ledger = ledger
+            manager.arena = Arena(rank)
+            manager._state_lock = threading.RLock()
+            manager.workset_broker = broker
+            manager.loads = {rid: load}
+            manager.host_ready = {snapshot_id: record}
+            manager._h2d_lane_reservations = {snapshot_id: 0}
+            manager._control_wakeup = SimpleNamespace(set=lambda: None)
+            manager._h2d_poisoned = False
+            managers.append((manager, load))
+
+        for manager, _load in managers:
+            manager.abort_request(rid, request)
+
+        assert managers[0][0]._discard_failed_h2d_load(rid, managers[0][1])
+        first = ledger.get(snapshot_id)
+        assert first["state"] == HostStageState.ABORTING.value
+        assert first["loader_drained_ranks"] == [0]
+        assert released == []
+        assert snapshot_id in managers[0][0].host_ready
+        assert not managers[1][0]._discard_failed_h2d_load(rid, managers[1][1])
+        assert ledger.get(snapshot_id)["state"] == HostStageState.ABORTING.value
+        assert released == []
+
+        events[1].ready = True
+        assert managers[1][0]._discard_failed_h2d_load(rid, managers[1][1])
+        final = ledger.get(snapshot_id)
+        assert final["state"] == HostStageState.FAILED.value
+        assert final["loader_drained_ranks"] == [0, 1]
+        assert final["recovery_claims"] == {}
+        # Production control workers observe this terminal ledger edge on all
+        # ranks.  Drive that scan explicitly in the unit test.
+        for manager, _load in managers:
+            manager._release_consumed_owned_host({snapshot_id: final})
+        assert sorted(rank for rank, _snapshot in released) == [0, 1]
+        assert all(snapshot_id not in manager.host_ready for manager, _ in managers)
+    finally:
+        os.unlink(path)
 
 
 def test_aborted_request_quarantines_direct_dma_without_fake_abort():
@@ -2681,7 +2979,7 @@ def test_final_confirmation_outranks_permanently_failing_direct_setup():
     assert completed == [candidate]
 
 
-def test_slow_path_selects_lowest_pressure_logical_prefill(monkeypatch):
+def test_slow_path_selects_largest_remaining_host_arena(monkeypatch):
     with tempfile.NamedTemporaryFile(mode="w", dir="/dev/shm", delete=False) as f:
         json.dump(
             {
@@ -2690,7 +2988,7 @@ def test_slow_path_selects_lowest_pressure_logical_prefill(monkeypatch):
                     {
                         "domain": 0,
                         "pending_tokens": 30000,
-                        "hbm_used_tokens": 80000,
+                        "hbm_used_tokens": 1000,
                         "hbm_capacity_tokens": 100000,
                         "arena_used_bytes": 80,
                         "arena_capacity_bytes": 100,
@@ -2700,7 +2998,7 @@ def test_slow_path_selects_lowest_pressure_logical_prefill(monkeypatch):
                     {
                         "domain": 1,
                         "pending_tokens": 5000,
-                        "hbm_used_tokens": 20000,
+                        "hbm_used_tokens": 99000,
                         "hbm_capacity_tokens": 100000,
                         "arena_used_bytes": 10,
                         "arena_capacity_bytes": 100,
@@ -2727,8 +3025,8 @@ def test_slow_path_selects_lowest_pressure_logical_prefill(monkeypatch):
                 manager, domain
             )
         )
-        domain, numa_nodes = DecodeKVCacheOffloadManager._select_slow_prefill_domain(
-            manager
+        domain, numa_nodes = DecodeKVCacheOffloadManager._select_slow_host_domain(
+            manager, byte_size=20
         )
         assert domain == 1
         assert numa_nodes == [0, 1]
@@ -2851,6 +3149,153 @@ def test_d2p_host_source_is_retained_until_all_radix_binds():
             os.unlink(path)
         except FileNotFoundError:
             pass
+
+
+def test_d2p_host_owner_and_recovery_p_owner_are_independent():
+    ledger, path = _ledger()
+    snapshot_id = "request:remote-recovery"
+    host_owner = "p-group:host-p0"
+    recovery_owner = "p-group:compute-p1"
+    claim_id = "slow:remote-recovery"
+    try:
+        for rank in range(2):
+            offer = _rank_offer(rank)
+            offer["snapshot_id"] = snapshot_id
+            offer["arena_domain"] = 0
+            ledger.offer(offer)
+        for rank in range(2):
+            assert ledger.claim_rank(
+                snapshot_id, host_owner, tp_rank=rank, tp_size=2
+            )
+            assert ledger.publish_rank_grant(
+                snapshot_id,
+                host_owner,
+                {
+                    "kind": "shared_host_extent",
+                    "arena_path": f"/dev/shm/remote-rank-{rank}",
+                    "arena_offset": 0,
+                    "byte_size": 1024,
+                    "token_count": 128,
+                },
+                tp_rank=rank,
+                tp_size=2,
+            )
+        for rank in range(2):
+            assert ledger.complete_host_write(
+                snapshot_id, 100 + rank, tp_rank=rank, tp_size=2
+            )
+
+        assert ledger.assign_d2p_recovery_domain(snapshot_id, 1)
+        for rank in range(2):
+            assert ledger.claim_d2p_recovery_rank(
+                snapshot_id,
+                recovery_owner,
+                tp_rank=rank,
+                tp_size=2,
+                claim_id=claim_id,
+                recovery_domain=1,
+            )
+            assert ledger.attach_d2p_recovery_lease_rank(
+                snapshot_id,
+                recovery_owner,
+                tp_rank=rank,
+                tp_size=2,
+                claim_id=claim_id,
+                lease_id=1000 + rank,
+            )
+            assert ledger.prepare_tp_host_load_rank(
+                snapshot_id, recovery_owner, tp_rank=rank, tp_size=2
+            )
+        for rank in range(2):
+            assert ledger.complete_d2p_host_load_rank(
+                snapshot_id, recovery_owner, tp_rank=rank, tp_size=2
+            )
+        for rank in range(2):
+            assert ledger.complete_host_bind_rank(
+                snapshot_id, recovery_owner, tp_rank=rank, tp_size=2
+            )
+
+        terminal = ledger.get(snapshot_id)
+        assert terminal["state"] == HostStageState.CONSUMED.value
+        assert terminal["p_owner"] == host_owner
+        assert terminal["recovery_owner"] == recovery_owner
+        assert terminal["recovery_domain"] == 1
+    finally:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
+def test_remote_recovery_p_maps_host_owner_extent_without_taking_arena_lease():
+    with tempfile.NamedTemporaryFile(dir="/dev/shm") as extent:
+        extent.truncate(mmap.ALLOCATIONGRANULARITY)
+        manager = object.__new__(AgenticPHostStagingManager)
+        manager.tp_rank = 0
+        manager.tp_size = 1
+        manager.owner = "p:compute"
+        manager.arena_domain = 1
+        manager.device_pool = SimpleNamespace()
+        manager.host_ready = {}
+        manager._state_lock = threading.RLock()
+        entry = {
+            "snapshot_id": "request:remote-map",
+            "state": HostStageState.HOST_READY.value,
+            "p_owner": "p:host",
+            "arena_domain": 0,
+            "recovery_domain": 1,
+            "token_count": 64,
+            "token_digest": "digest",
+            "byte_size": mmap.ALLOCATIONGRANULARITY,
+            "grants": [
+                {
+                    "arena_path": extent.name,
+                    "arena_offset": 0,
+                    "byte_size": mmap.ALLOCATIONGRANULARITY,
+                    "token_count": 64,
+                }
+            ],
+        }
+
+        record = manager._import_remote_host_record(entry["snapshot_id"], entry)
+
+        assert record is manager.host_ready[entry["snapshot_id"]]
+        assert record["remote_host"] is True
+        assert record["snapshot"].path == extent.name
+        assert manager._release_record(record)
+        assert "snapshot" not in record
+
+
+def test_host_owner_releases_extent_after_remote_recovery_consumed():
+    released = []
+    snapshot = object()
+    manager = object.__new__(AgenticPHostStagingManager)
+    manager.owner = "p:host"
+    manager.arena_domain = 0
+    manager._state_lock = threading.RLock()
+    manager.host_ready = {
+        "request:remote-consumed": {
+            "snapshot": snapshot,
+            "loading": False,
+            "offer": {"token_count": 64},
+        }
+    }
+    manager.arena = SimpleNamespace(
+        release=lambda value: released.append(value) or True
+    )
+    entries = {
+        "request:remote-consumed": {
+            "state": HostStageState.CONSUMED.value,
+            "p_owner": "p:host",
+            "arena_domain": 0,
+            "recovery_domain": 1,
+        }
+    }
+
+    manager._release_consumed_owned_host(entries)
+
+    assert released == [snapshot]
+    assert manager.host_ready == {}
 
 
 def test_tp_p2d_host_commit_is_order_independent():
@@ -3421,6 +3866,94 @@ def test_d2p_missing_active_ledger_entry_fails_closed_without_recompute():
     assert client.progress(candidate, []) == "waiting"
 
 
+def test_d2p_abort_quarantines_unfenced_partial_dma_before_any_release():
+    snapshot_id = "slow:unfenced-abort"
+
+    class Snapshot:
+        def __init__(self):
+            self.closed = False
+
+        def close(self, *, unlink):
+            self.closed = True
+
+    snapshot = Snapshot()
+    launch_fence = H2DLaunchFence(event=SimpleNamespace(query=lambda: False))
+    launch_fence.submitted = True
+    launch_fence.unavailable = True
+    candidate = {
+        "manifest": SimpleNamespace(snapshot_id=snapshot_id),
+        "arena_write": {
+            "snapshot": snapshot,
+            "chunks": {
+                0: {
+                    "event": None,
+                    "copy_refs": [object()],
+                    "start": 0,
+                    "end": 1,
+                    "phase": "dma",
+                    "launch_fence": launch_fence,
+                }
+            },
+            "next_offset": 1,
+            "retry_ranges": [],
+            "committed_tokens": 0,
+            "gpu_elapsed_ms": 0.0,
+        },
+    }
+    drained = []
+    client = AgenticDHostStagingClient.__new__(AgenticDHostStagingClient)
+    client.tp_rank = 0
+    client.tp_size = 1
+    client._d2h_dma_quarantine = []
+    client._d2h_lanes = [
+        {"snapshot_id": snapshot_id, "host_bounce": object(), "phase": "dma"}
+    ]
+    client.ledger = SimpleNamespace(
+        get=lambda _snapshot_id: {"state": HostStageState.ABORTING.value},
+        mark_writer_rank_drained=lambda *_args, **_kwargs: drained.append(True),
+    )
+
+    assert client.progress(candidate, []) == "waiting"
+    assert candidate.get("arena_write") is not None
+    assert snapshot.closed is False
+    assert client._d2h_lanes[0]["snapshot_id"] == snapshot_id
+    assert len(client._d2h_dma_quarantine) == 1
+    assert drained == []
+
+
+def test_d2p_cleanup_retries_unregister_before_releasing_lane():
+    snapshot_id = "slow:unregister-retry"
+
+    class Snapshot:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self, *, unlink):
+            assert unlink is False
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("injected cudaHostUnregister failure")
+
+    snapshot = Snapshot()
+    candidate = {
+        "manifest": SimpleNamespace(snapshot_id=snapshot_id),
+        "arena_write": {
+            "snapshot": snapshot,
+            "chunks": {0: {"event": SimpleNamespace(query=lambda: True)}},
+        },
+    }
+    client = AgenticDHostStagingClient.__new__(AgenticDHostStagingClient)
+    client._d2h_lanes = [{"snapshot_id": snapshot_id, "phase": "cpu"}]
+
+    assert client._cleanup_write(candidate) is False
+    assert candidate.get("arena_write") is not None
+    assert client._d2h_lanes[0] == {"snapshot_id": snapshot_id, "phase": "cpu"}
+
+    assert client._cleanup_write(candidate) is True
+    assert candidate.get("arena_write") is None
+    assert client._d2h_lanes[0] == {"snapshot_id": None, "phase": "free"}
+
+
 def test_d2p_slow_writer_uses_independent_copy_lanes():
     class Snapshot:
         def __init__(self):
@@ -3432,14 +3965,18 @@ def test_d2p_slow_writer_uses_independent_copy_lanes():
 
     client = AgenticDHostStagingClient.__new__(AgenticDHostStagingClient)
     client._d2h_chunk_tokens = 4
+    client._d2h_bounce_depth = 2
+    client._d2h_dma_limit = 2
     client._d2h_lanes = [
         {
             "stream": object(),
             "staging": object(),
             "host_bounce": object(),
             "snapshot_id": None,
+            "phase": "free",
+            "dma_group": index // 2,
         }
-        for _ in range(2)
+        for index in range(4)
     ]
 
     def candidate(snapshot_id):
@@ -3447,10 +3984,10 @@ def test_d2p_slow_writer_uses_independent_copy_lanes():
             "manifest": SimpleNamespace(snapshot_id=snapshot_id),
             "arena_write": {
                 "snapshot": Snapshot(),
-                "event": None,
-                "copy_refs": None,
-                "offset": 0,
-                "chunk_end": 0,
+                "chunks": {},
+                "next_offset": 0,
+                "retry_ranges": [],
+                "committed_tokens": 0,
                 "gpu_elapsed_ms": 0.0,
             },
         }
@@ -3458,16 +3995,58 @@ def test_d2p_slow_writer_uses_independent_copy_lanes():
     first = candidate("slow:1")
     second = candidate("slow:2")
     third = candidate("slow:3")
+    fourth = candidate("slow:4")
     indices = torch.arange(8)
 
     assert client._start_write_chunk(first, indices)
+    first_lane = next(iter(first["arena_write"]["chunks"]))
+    # DMA(1) completed and its bounce is now CPU-owned; group 0's stream and
+    # HBM gather buffer may feed its alternate bounce for the *same snapshot*.
+    first["arena_write"]["chunks"][first_lane]["phase"] = "cpu"
+    client._d2h_lanes[first_lane]["phase"] = "cpu"
+    assert client._start_write_chunk(first, indices)
+    assert tuple(first["arena_write"]["chunks"]) == (0, 1)
+    # A second snapshot still uses the other physical DMA group.  No third
+    # DMA may start while both groups are occupied.
     assert client._start_write_chunk(second, indices)
     assert not client._start_write_chunk(third, indices)
-    assert first["arena_write"]["lane_id"] != second["arena_write"]["lane_id"]
-    assert {lane["snapshot_id"] for lane in client._d2h_lanes} == {
-        "slow:1",
-        "slow:2",
+    assert not client._start_write_chunk(fourth, indices)
+    assert tuple(second["arena_write"]["chunks"]) == (2,)
+
+
+def test_d2p_slow_control_uses_sticky_bounded_round_robin_window():
+    manager = DecodeKVCacheOffloadManager.__new__(DecodeKVCacheOffloadManager)
+    manager._agentic_candidates_lock = threading.RLock()
+    manager.agentic_direct_candidates = {
+        f"slow:{index}": {"staging": True} for index in range(10)
     }
+    manager._agentic_slow_active_ids = {}
+    manager._agentic_slow_progress_cursor = 0
+    manager._agentic_slow_active_limit = 6
+    manager._agentic_slow_progress_budget = 2
+    manager.agentic_host_staging_client = SimpleNamespace(max_active_writes=6)
+
+    slices = [
+        tuple(
+            snapshot_id
+            for snapshot_id, _ in manager._agentic_bounded_slow_candidate_items()
+        )
+        for _ in range(3)
+    ]
+    assert slices == [
+        ("slow:0", "slow:1"),
+        ("slow:2", "slow:3"),
+        ("slow:4", "slow:5"),
+    ]
+    assert tuple(manager._agentic_slow_active_ids) == tuple(
+        f"slow:{index}" for index in range(6)
+    )
+
+    manager._agentic_candidate_pop("slow:0")
+    manager._agentic_bounded_slow_candidate_items()
+    assert tuple(manager._agentic_slow_active_ids) == tuple(
+        f"slow:{index}" for index in range(1, 7)
+    )
 
 
 def test_d2p_active_host_write_can_progress_without_ledger_poll():
@@ -3475,10 +4054,10 @@ def test_d2p_active_host_write_can_progress_without_ledger_poll():
         "manifest": SimpleNamespace(snapshot_id="slow:local"),
         "arena_write": {
             "snapshot": object(),
-            "event": None,
-            "copy_refs": None,
-            "offset": 0,
-            "chunk_end": 0,
+            "chunks": {},
+            "next_offset": 0,
+            "retry_ranges": [],
+            "committed_tokens": 0,
             "gpu_elapsed_ms": 0.0,
         },
     }
@@ -3489,7 +4068,7 @@ def test_d2p_active_host_write_can_progress_without_ledger_poll():
     client._start_write_chunk = lambda _candidate, _indices: False
 
     assert client.has_active_local_write(candidate)
-    assert client.progress(candidate, [], local_write_only=True) == "waiting"
+    assert client.progress(candidate, [0], local_write_only=True) == "waiting"
 
 
 def test_shared_arena_spill_capability_has_one_compatibility_rule():
@@ -3536,12 +4115,22 @@ def test_tp1_d2p_local_write_uses_final_commit_as_durability_fence(
         "manifest": SimpleNamespace(snapshot_id=snapshot_id),
         "arena_write": {
             "snapshot": snapshot,
-            "event": Event(),
-            "copy_refs": object(),
-            "offset": 0,
-            "chunk_end": 1,
+            "chunks": {
+                0: {
+                    "event": Event(),
+                    "copy_refs": object(),
+                    "start": 0,
+                    "end": 1,
+                    "phase": "dma",
+                    "start_event": StartEvent(),
+                }
+            },
+            "next_offset": 1,
+            "retry_ranges": [],
+            "committed_tokens": 0,
             "gpu_elapsed_ms": 0.0,
-            "lane_id": 0,
+            "host_copy_elapsed_seconds": 0.0,
+            "wall_started_at": time.monotonic(),
         },
     }
     drained = []
@@ -3549,7 +4138,7 @@ def test_tp1_d2p_local_write_uses_final_commit_as_durability_fence(
     client.tp_rank = 0
     client.tp_size = 1
     client._d2h_lanes = [
-        {"snapshot_id": snapshot_id, "host_bounce": object()}
+        {"snapshot_id": snapshot_id, "host_bounce": object(), "phase": "dma"}
     ]
     client.ledger = SimpleNamespace(
         complete_host_write=lambda *args, **kwargs: commit_succeeds,
@@ -3563,11 +4152,218 @@ def test_tp1_d2p_local_write_uses_final_commit_as_durability_fence(
     )
     client._cleanup_relay_senders = lambda _candidate: None
 
+    # DMA completion, CPU commit retirement and final durability publication
+    # are three independently bounded progress stages.
+    assert (
+        client.progress(candidate, torch.arange(1), local_write_only=True)
+        == "waiting"
+    )
+    assert (
+        client.progress(candidate, torch.arange(1), local_write_only=True)
+        == "waiting"
+    )
     assert client.progress(candidate, torch.arange(1), local_write_only=True) == expected
     assert snapshot.commits == [{"destination_start": 0, "token_count": 1}]
     assert snapshot.closed
     assert client._d2h_lanes[0]["snapshot_id"] is None
     assert bool(drained) is (not commit_succeeds)
+
+
+def test_d2p_pageable_commit_retains_d_source_and_bounce_until_cpu_fence():
+    snapshot_id = "slow:async-cpu-fence"
+
+    class Event:
+        def query(self):
+            return True
+
+    class StartEvent:
+        def elapsed_time(self, _event):
+            return 2.0
+
+    class Snapshot:
+        byte_size = 2048
+        _last_d2h_start_event = StartEvent()
+
+        def __init__(self):
+            self.commits = []
+            self.closed = False
+
+        def commit_backup_range_from_bounce(self, bounce, **kwargs):
+            self.commits.append((bounce, kwargs))
+
+        def close(self, *, unlink):
+            assert not unlink
+            self.closed = True
+
+    class ControlledPool:
+        def __init__(self):
+            self.job = None
+            self.future = Future()
+
+        def submit(self, function, *args, **kwargs):
+            self.job = (function, args, kwargs)
+            return self.future
+
+    snapshot = Snapshot()
+    bounce = object()
+    candidate = {
+        "manifest": SimpleNamespace(snapshot_id=snapshot_id),
+        "arena_write": {
+            "snapshot": snapshot,
+            "chunks": {
+                0: {
+                    "event": Event(),
+                    "copy_refs": object(),
+                    "start": 0,
+                    "end": 1,
+                    "phase": "dma",
+                    "start_event": StartEvent(),
+                }
+            },
+            "next_offset": 1,
+            "retry_ranges": [],
+            "committed_tokens": 0,
+            "gpu_elapsed_ms": 0.0,
+            "host_copy_elapsed_seconds": 0.0,
+            "wall_started_at": time.monotonic(),
+        },
+    }
+    pool = ControlledPool()
+    client = AgenticDHostStagingClient.__new__(AgenticDHostStagingClient)
+    client.tp_rank = 0
+    client.tp_size = 1
+    client._d2h_lanes = [
+        {"snapshot_id": snapshot_id, "host_bounce": bounce, "phase": "dma"}
+    ]
+    client._d2h_host_copy_pool = pool
+    client.ledger = SimpleNamespace(
+        complete_host_write=lambda *_args, **_kwargs: True,
+        get=lambda _snapshot_id: pytest.fail(
+            "TP1 final commit must not perform a second ledger read"
+        ),
+    )
+    client._cleanup_relay_senders = lambda _candidate: None
+
+    assert (
+        client.progress(candidate, torch.arange(1), local_write_only=True)
+        == "waiting"
+    )
+    assert snapshot.commits == []
+    assert candidate.get("arena_write") is not None
+    assert client._d2h_lanes[0]["phase"] == "cpu"
+
+    function, args, kwargs = pool.job
+    function(*args, **kwargs)
+    pool.future.set_result(0.003)
+    assert (
+        client.progress(candidate, torch.arange(1), local_write_only=True)
+        == "waiting"
+    )
+    assert client.progress(candidate, torch.arange(1), local_write_only=True) == "host_ready"
+    assert snapshot.commits == [
+        (bounce, {"destination_start": 0, "token_count": 1})
+    ]
+    assert snapshot.closed
+    assert client._d2h_lanes[0]["phase"] == "free"
+
+
+def test_d2p_next_dma_overlaps_previous_cpu_commit_without_extra_dma_pressure():
+    snapshot_id = "slow:pipelined-commit"
+
+    class Event:
+        def __init__(self, ready):
+            self.ready = ready
+
+        def query(self):
+            return self.ready
+
+    class StartEvent:
+        def elapsed_time(self, _event):
+            return 1.0
+
+    class Snapshot:
+        byte_size = 4096
+
+        def __init__(self):
+            self.started = []
+
+        def start_backup_range_from_device(self, indices, **kwargs):
+            self.started.append((indices.clone(), kwargs))
+            self._last_d2h_start_event = StartEvent()
+            return Event(False), object()
+
+        def commit_backup_range_from_bounce(self, *_args, **_kwargs):
+            raise AssertionError("controlled Future must fence the CPU commit")
+
+    class ControlledPool:
+        def __init__(self):
+            self.future = Future()
+
+        def submit(self, *_args, **_kwargs):
+            return self.future
+
+    snapshot = Snapshot()
+    first_event = Event(True)
+    candidate = {
+        "manifest": SimpleNamespace(snapshot_id=snapshot_id),
+        "arena_write": {
+            "snapshot": snapshot,
+            "chunks": {
+                0: {
+                    "event": first_event,
+                    "copy_refs": object(),
+                    "start": 0,
+                    "end": 4,
+                    "phase": "dma",
+                    "start_event": StartEvent(),
+                }
+            },
+            "next_offset": 4,
+            "retry_ranges": [],
+            "committed_tokens": 0,
+            "gpu_elapsed_ms": 0.0,
+            "host_copy_elapsed_seconds": 0.0,
+            "wall_started_at": time.monotonic(),
+        },
+    }
+    client = AgenticDHostStagingClient.__new__(AgenticDHostStagingClient)
+    client.tp_rank = 0
+    client.tp_size = 1
+    client._d2h_chunk_tokens = 4
+    client._d2h_bounce_depth = 2
+    client._d2h_dma_limit = 1
+    client._d2h_host_copy_pool = ControlledPool()
+    client._d2h_lanes = [
+        {
+            "snapshot_id": snapshot_id,
+            "host_bounce": object(),
+            "phase": "dma",
+            "stream": object(),
+            "staging": object(),
+            "dma_group": 0,
+        },
+        {
+            "snapshot_id": None,
+            "host_bounce": object(),
+            "phase": "free",
+            "stream": object(),
+            "staging": object(),
+            "dma_group": 0,
+        },
+    ]
+
+    indices = torch.arange(8)
+    # Visit 1 hands chunk 0 to the CPU worker.  Its Future remains pending.
+    assert client.progress(candidate, indices, local_write_only=True) == "waiting"
+    assert client._d2h_lanes[0]["phase"] == "cpu"
+    # Visit 2 is allowed to launch chunk 1 into the alternate bounce, while
+    # the prior CPU Future still owns bounce 0.  DMA inflight remains capped at 1.
+    assert client.progress(candidate, indices, local_write_only=True) == "waiting"
+    chunks = candidate["arena_write"]["chunks"]
+    assert set(chunks) == {0, 1}
+    assert chunks[0]["cpu_future"] is client._d2h_host_copy_pool.future
+    assert chunks[1]["phase"] == "dma"
+    assert sum(lane["phase"] == "dma" for lane in client._d2h_lanes) == 1
 
 
 def test_d2p_shared_arena_offer_omits_unused_spill_hashes():
@@ -3728,6 +4524,49 @@ def test_shared_host_arena_stale_release_cannot_free_recycled_owner():
     arena.release(second)
     arena.close()
     os.rmdir(directory)
+
+
+def test_shared_host_memfd_arena_is_cross_process_mappable_and_auto_reclaimed():
+    directory = tempfile.mkdtemp(dir="/dev/shm")
+    arena = SharedHostSnapshotArena(
+        directory, 4 * 1024 * 1024, backend="memfd"
+    )
+    path = arena.path
+    assert path.startswith(f"/proc/{os.getpid()}/fd/")
+    assert os.readlink(path).startswith("/memfd:sglang-agentic-host-arena-")
+    assert os.listdir(directory) == []
+
+    remote_fd = os.open(path, os.O_RDWR)
+    remote_mapping = mmap.mmap(remote_fd, 4096, access=mmap.ACCESS_WRITE)
+    try:
+        remote_mapping[:12] = b"shared-memfd"
+        owner_fd = os.open(path, os.O_RDWR)
+        try:
+            owner_mapping = mmap.mmap(owner_fd, 4096, access=mmap.ACCESS_WRITE)
+            try:
+                assert owner_mapping[:12] == b"shared-memfd"
+            finally:
+                owner_mapping.close()
+        finally:
+            os.close(owner_fd)
+
+        arena.close()
+        assert not os.path.exists(path)
+        # Existing D/P mappings keep the anonymous object alive long enough
+        # to drain in-flight I/O even after the owner closes its descriptor.
+        assert remote_mapping[:12] == b"shared-memfd"
+    finally:
+        remote_mapping.close()
+        os.close(remote_fd)
+        arena.close()
+        os.rmdir(directory)
+
+
+def test_shared_host_memfd_path_rejects_unrelated_process_descriptors():
+    with tempfile.TemporaryFile() as unrelated:
+        path = f"/proc/{os.getpid()}/fd/{unrelated.fileno()}"
+        with pytest.raises(ValueError, match="not an agentic memfd"):
+            host_staging_module._open_shared_host_backing(path, os.O_RDWR)
 
 
 def _cpu_registered_p2d_arena(page_count=4):
@@ -4473,6 +5312,7 @@ def test_slow_h2d_lanes_cap_workset_intents_before_hbm_allocation():
     manager._ledger_entries_cache = {}
     manager.tp_rank = 0
     manager.tp_size = 1
+    manager.arena_domain = 0
     manager.owner = "p:test"
     manager.workset_broker = Broker()
     manager.ledger = SimpleNamespace(
@@ -4497,7 +5337,8 @@ def test_slow_h2d_lanes_cap_workset_intents_before_hbm_allocation():
             "loading": False,
         }
         manager._ledger_entries_cache[request.snapshot_id] = {
-            "state": HostStageState.HOST_READY.value
+            "state": HostStageState.HOST_READY.value,
+            "p_owner": manager.owner,
         }
 
     for request, req in zip(requests, reqs):
@@ -4511,6 +5352,120 @@ def test_slow_h2d_lanes_cap_workset_intents_before_hbm_allocation():
     assert manager.gate_request(reqs[4], requests[4]) is True
     assert len(requested) == 5
     assert manager._h2d_lane_reservations[requests[4].snapshot_id] == 1
+
+
+def test_selected_recovery_p_retires_direct_before_claiming_slow_lane():
+    """TP frozen Direct cannot pin cross-P Slow claim/lane before retire."""
+
+    class Allocator:
+        def __init__(self):
+            self.available = 32
+
+        def available_size(self):
+            return self.available
+
+        def alloc(self, count):
+            self.available -= count
+            return torch.arange(count, dtype=torch.int64)
+
+        def free(self, indices):
+            self.available += int(indices.numel())
+
+    snapshot_id = "cross-p-direct-slow:0"
+    slow_requests = []
+    recovery_claims = []
+
+    request = RequestGeneration("cross-p-direct-slow", 0)
+    req = SimpleNamespace(rid="child", origin_input_ids=[11, 22])
+    broker = AgenticPWorksetLeaseBroker(page_size=4)
+    direct_owner = broker.direct_owner(snapshot_id)
+    broker.install_tp_plan(1, [(snapshot_id, direct_owner, 4, 8)])
+    allocator = Allocator()
+    manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
+    manager._state_lock = threading.RLock()
+    manager.max_h2d_inflight = 4
+    manager._h2d_lane_reservations = {}
+    manager.active = {}
+    manager.aborting = {}
+    manager.loads = {}
+    manager.tp_rank = 0
+    manager.tp_size = 1
+    manager.arena_domain = 3
+    manager.owner = "p:recovery"
+    manager.workset_broker = broker
+    record = {
+        "snapshot": SimpleNamespace(_materialized=object()),
+        "offer": {
+            "token_count": 1,
+            "token_digest": token_ids_digest([11]),
+            "byte_size": 128,
+        },
+        "loading": False,
+    }
+    manager.host_ready = {snapshot_id: record}
+    ledger_entry = {
+        "state": HostStageState.HOST_READY.value,
+        "p_owner": "p:host-owner",
+        "recovery_domain": manager.arena_domain,
+        "recovery_owner": manager.owner,
+    }
+    manager._ledger_entries_cache = {snapshot_id: ledger_entry}
+    manager.ledger = SimpleNamespace(
+        get=lambda _snapshot_id: ledger_entry,
+        claim_d2p_recovery_rank=lambda *_args, **_kwargs: recovery_claims.append(
+            (_args, _kwargs)
+        )
+        or True,
+    )
+
+    # The scheduler owns physical release.  Until it has serviced that
+    # release, Slow consumes no shared-ledger claim and no finite H2D lane.
+    assert manager.gate_request(req, request) is True
+    assert broker.owner_is_superseded(snapshot_id, owner=direct_owner)
+    assert broker.owner_has_unretired_work(snapshot_id, owner=direct_owner)
+    assert recovery_claims == []
+    assert slow_requests == []
+    assert manager._h2d_lane_reservations == {}
+
+    # The immutable epoch still materializes exactly as broadcast, but Slow
+    # remains Host-only while that Direct lease awaits group retirement.
+    broker.service(allocator)
+    assert broker.get(snapshot_id, owner=direct_owner) is not None
+    assert manager.gate_request(req, request) is True
+    assert recovery_claims == []
+    assert manager._h2d_lane_reservations == {}
+
+    # The next TP control epoch retires the old owner on every rank.  Only
+    # after physical service frees its pages may Slow claim Host and a lane.
+    _plan, retirements, _handoffs = broker.prepare_tp_control(2)
+    assert retirements == (snapshot_id,)
+    assert broker.owner_has_unretired_work(snapshot_id, owner=direct_owner)
+    assert manager.gate_request(req, request) is True
+    assert recovery_claims == []
+    assert manager._h2d_lane_reservations == {}
+    assert not broker.request(
+        snapshot_id,
+        parent_tokens=1,
+        prompt_tokens=2,
+        owner=broker.slow_owner(snapshot_id, req.rid),
+    )
+    assert broker.commit_tp_retire(snapshot_id)
+    broker.service(allocator)
+    assert not broker.owner_has_unretired_work(
+        snapshot_id, owner=direct_owner
+    )
+
+    original_request = broker.request
+
+    def record_slow_request(*args, **kwargs):
+        slow_requests.append((args, kwargs))
+        return original_request(*args, **kwargs)
+
+    broker.request = record_slow_request
+    assert manager.gate_request(req, request) is True
+    assert len(recovery_claims) == 1
+    assert len(slow_requests) == 1
+    assert manager._h2d_lane_reservations == {snapshot_id: 0}
 
 
 def test_d2p_recovery_claim_fences_eviction_before_workset_allocation():
@@ -4788,6 +5743,141 @@ def test_abort_releases_exact_granted_workset_before_host_snapshot():
         os.unlink(path)
 
 
+def test_redirect_abort_on_host_owner_preserves_remote_recovery_snapshot():
+    """An obsolete Direct attempt cannot abort another P's Slow recovery."""
+
+    ledger, path = _ledger()
+    request = RequestGeneration("redirect-host-owner", 1)
+    snapshot_id = request.snapshot_id
+    host_owner = "p:host-domain-0"
+    recovery_owner = "p:recovery-domain-1"
+    released = []
+    try:
+        ledger.offer(
+            {
+                "snapshot_id": snapshot_id,
+                "token_count": 8,
+                "byte_size": 4096,
+                "tp_size": 1,
+            }
+        )
+
+        def publish_remote_recovery(entries):
+            entries[snapshot_id].update(
+                p_owner=host_owner,
+                arena_domain=0,
+                recovery_domain=1,
+                recovery_owner=recovery_owner,
+                state=HostStageState.H2D_LOADING.value,
+                recovery_claim_id="slow:remote",
+                recovery_claims={
+                    "0": {"claim_id": "slow:remote", "phase": "pinned"}
+                },
+                updated_at=time.time(),
+            )
+            return True, True
+
+        ledger._mutate(publish_remote_recovery, event_snapshot_id=snapshot_id)
+        manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
+        manager._state_lock = threading.RLock()
+        manager.owner = host_owner
+        manager.arena_domain = 0
+        manager.tp_rank = 0
+        manager.tp_size = 1
+        manager.ledger = ledger
+        manager.workset_broker = AgenticPWorksetLeaseBroker(page_size=4)
+        manager.loads = {}
+        manager.host_ready = {
+            snapshot_id: {
+                "loading": False,
+                "snapshot": object(),
+                "offer": {"token_count": 8, "byte_size": 4096},
+            }
+        }
+        manager._h2d_lane_reservations = {}
+        manager._control_wakeup = SimpleNamespace(set=lambda: None)
+        manager._release_record = lambda record: released.append(record) or True
+
+        manager.abort_request("obsolete-direct-rid", request)
+
+        entry = ledger.get(snapshot_id)
+        assert entry["state"] == HostStageState.H2D_LOADING.value
+        assert entry["recovery_owner"] == recovery_owner
+        assert snapshot_id in manager.host_ready
+        assert released == []
+        assert not getattr(manager, "_prestart_recovery_aborts", {})
+    finally:
+        os.unlink(path)
+
+
+def test_tp2_selected_unclaimed_abort_drains_late_rank():
+    """Every rank ACKs an abort even when rank 0 froze the group first."""
+
+    ledger, path = _ledger()
+    request = RequestGeneration("tp2-selected-abort", 1)
+    snapshot_id = request.snapshot_id
+    owner = "p-group:selected"
+    rid = "selected-child"
+    managers = []
+    try:
+        ledger.offer(
+            {
+                "snapshot_id": snapshot_id,
+                "token_count": 8,
+                "byte_size": 4096,
+                "tp_size": 2,
+            }
+        )
+
+        def publish_selected(entries):
+            entries[snapshot_id].update(
+                p_owner=owner,
+                arena_domain=0,
+                recovery_domain=0,
+                state=HostStageState.HOST_READY.value,
+                updated_at=time.time(),
+            )
+            return True, True
+
+        ledger._mutate(publish_selected, event_snapshot_id=snapshot_id)
+        for rank in range(2):
+            manager = AgenticPHostStagingManager.__new__(
+                AgenticPHostStagingManager
+            )
+            manager._state_lock = threading.RLock()
+            manager.owner = owner
+            manager.arena_domain = 0
+            manager.tp_rank = rank
+            manager.tp_size = 2
+            manager.ledger = ledger
+            manager.workset_broker = AgenticPWorksetLeaseBroker(page_size=4)
+            manager.loads = {}
+            manager.host_ready = {
+                snapshot_id: {
+                    "loading": False,
+                    "snapshot": object(),
+                    "offer": {"token_count": 8, "byte_size": 4096},
+                }
+            }
+            manager._h2d_lane_reservations = {}
+            manager._control_wakeup = SimpleNamespace(set=lambda: None)
+            manager._release_record = lambda _record: True
+            managers.append(manager)
+
+        managers[0].abort_request(rid, request)
+        first = ledger.get(snapshot_id)
+        assert first["state"] == HostStageState.ABORTING.value
+        assert first["loader_drained_ranks"] == [0]
+
+        managers[1].abort_request(rid, request)
+        final = ledger.get(snapshot_id)
+        assert final["state"] == HostStageState.FAILED.value
+        assert final["loader_drained_ranks"] == [0, 1]
+        assert final["recovery_claims"] == {}
+    finally:
+        os.unlink(path)
+
+
 @pytest.mark.parametrize("with_lease", [False, True])
 def test_tp2_prestart_abort_is_group_atomic(with_lease):
     class Allocator:
@@ -4852,6 +5942,7 @@ def test_tp2_prestart_abort_is_group_atomic(with_lease):
             )
             manager._state_lock = threading.RLock()
             manager.owner = owner
+            manager.arena_domain = 0
             manager.tp_rank = rank
             manager.tp_size = 2
             manager.ledger = ledger
@@ -4881,6 +5972,7 @@ def test_tp2_prestart_abort_is_group_atomic(with_lease):
         assert final["loader_drained_ranks"] == [0, 1]
         assert final["recovery_claims"] == {}
         for manager in managers:
+            manager._release_consumed_owned_host({snapshot_id: final})
             assert snapshot_id not in manager.host_ready
             assert snapshot_id not in manager._prestart_recovery_aborts
             assert manager.workset_broker.eviction_blocker(snapshot_id) is None
@@ -5006,7 +6098,10 @@ def test_prestart_abort_retries_first_ledger_mutation_error():
         manager._release_record = lambda record: released.append(record) or True
 
         manager.abort_request(rid, request)
-        assert ledger.get(snapshot_id)["state"] == HostStageState.HOST_READY.value
+        # The exact selected rank is pinned before the fenced abort begins;
+        # a transient failure publishing ABORTING must retain that claim and
+        # the complete Host snapshot for retry.
+        assert ledger.get(snapshot_id)["state"] == HostStageState.H2D_LOADING.value
         assert snapshot_id in manager._prestart_recovery_aborts
         assert released == []
 
@@ -5065,7 +6160,10 @@ def test_tp_slow_lane_retries_transient_prepare_without_start_or_leak():
     class Ledger:
         @staticmethod
         def get(_snapshot_id):
-            return {"state": HostStageState.HOST_READY.value}
+            return {
+                "state": HostStageState.HOST_READY.value,
+                "p_owner": "p:test",
+            }
 
         @staticmethod
         def claim_d2p_recovery_rank(*_args, **_kwargs):
@@ -5103,6 +6201,7 @@ def test_tp_slow_lane_retries_transient_prepare_without_start_or_leak():
     manager._ledger_entries_cache = None
     manager.tp_rank = 0
     manager.tp_size = 2
+    manager.arena_domain = 0
     manager.owner = "p:test"
     manager.workset_broker = Broker()
     manager.ledger = Ledger()
@@ -5173,7 +6272,7 @@ def test_tp1_slow_handoff_failure_retains_host_load_and_lane_for_retry():
         mark_d2p_recovery_phase_rank=lambda *_args, **_kwargs: True,
     )
     manager._complete_shared_host_manifest = lambda _request: True
-    manager._release_record = lambda selected: released_host.append(selected)
+    manager._release_record = lambda selected: released_host.append(selected) or True
 
     assert manager.gate_request(req, request) is True
     assert manager.loads[req.rid] is load
@@ -5187,6 +6286,35 @@ def test_tp1_slow_handoff_failure_retains_host_load_and_lane_for_retry():
     assert request.snapshot_id not in manager.host_ready
     assert manager._h2d_lane_reservations == {}
     assert released_host == [record]
+
+
+def test_d2p_h2d_release_retries_unregister_before_dropping_host_record():
+    snapshot_id = "slow:h2d-unregister-retry"
+    record = {"snapshot": object()}
+    load = {
+        "request_generation": SimpleNamespace(snapshot_id=snapshot_id),
+        "record": record,
+        "host_released": False,
+    }
+    release_results = iter((False, True))
+    manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
+    manager._state_lock = threading.RLock()
+    manager.tp_rank = 0
+    manager.host_ready = {snapshot_id: record}
+    manager.ledger = SimpleNamespace(
+        get=lambda _snapshot_id: {"state": HostStageState.CONSUMED.value}
+    )
+    manager._release_record = lambda selected: (
+        selected is record and next(release_results)
+    )
+
+    assert manager._release_completed_h2d_host(load) is False
+    assert load["host_released"] is False
+    assert manager.host_ready[snapshot_id] is record
+
+    assert manager._release_completed_h2d_host(load) is True
+    assert load["host_released"] is True
+    assert snapshot_id not in manager.host_ready
 
 
 def test_tp2_slow_handoff_failure_retains_commit_context_for_retry():
@@ -5225,7 +6353,7 @@ def test_tp2_slow_handoff_failure_retains_commit_context_for_retry():
         get=lambda _snapshot_id: {"state": HostStageState.CONSUMED.value},
         mark_d2p_recovery_phase_rank=lambda *_args, **_kwargs: True,
     )
-    manager._release_record = lambda selected: released_host.append(selected)
+    manager._release_record = lambda selected: released_host.append(selected) or True
 
     assert manager.gate_request(req, request) is True
     assert req._agentic_host_rank_loaded is True
@@ -5685,63 +6813,40 @@ def test_tp_direct_and_slow_group_commands_progress_together():
     assert list(scheduler.agentic_early_direct_completion_queue) == [snapshot_id]
 
 
-def _tp1_edge_scheduler(req, load):
+def _tp1_common_scheduler(req, load):
     scheduler = object.__new__(Scheduler)
     scheduler.tp_size = 1
-    scheduler.agentic_kv_waiting_by_rid = {req.rid: (req, time.monotonic())}
-    scheduler.agentic_kv_waiting_by_parent = {}
-    scheduler.agentic_kv_progress_queues = {
-        "fast": deque(),
-        "slow": deque([req.rid]),
-        "new": deque(),
-    }
-    scheduler.agentic_kv_progress_enqueued = {req.rid}
-    scheduler.agentic_kv_retry_heap = []
-    scheduler.agentic_kv_retry_deadlines = {}
-    scheduler.agentic_kv_retry_sequence = 0
     scheduler.agentic_kv_waiting_queue = [(req, time.monotonic())]
-    scheduler.agentic_kv_waiting_tombstones = 0
     scheduler.agentic_early_direct_completion_queue = deque()
     scheduler.agentic_early_direct_poll_lock = nullcontext()
-    scheduler.agentic_host_staging_manager = SimpleNamespace(
-        loads={req.rid: load}, drain_scheduler_events=lambda: ()
-    )
-    scheduler.agentic_p_workset_broker = SimpleNamespace(
-        drain_grant_events=lambda: ()
-    )
-    scheduler._agentic_should_defer = lambda *_args, **_kwargs: True
+    scheduler.agentic_host_staging_manager = SimpleNamespace(loads={req.rid: load})
     return scheduler
 
 
-@pytest.mark.parametrize(
-    ("load", "expects_retry"),
-    [
-        ({"io_complete": False, "ledger_prepare_pending": False}, False),
-        ({"io_complete": False, "ledger_prepare_pending": True}, True),
-        ({"io_complete": True, "ledger_prepare_pending": False}, True),
-    ],
-)
-def test_tp1_slow_edge_retries_only_scheduler_owned_boundaries(
-    monkeypatch, load, expects_retry
-):
-    """One H2D edge remains live through transient bind/ledger boundaries."""
+def test_tp1_slow_is_revisited_by_common_admission(monkeypatch):
+    """TP=1 uses the same per-tick arrival scan as TP>1."""
 
     monkeypatch.setenv("SGLANG_AGENTIC_KV_ADMISSION_BATCH", "1")
-    monkeypatch.setenv("SGLANG_AGENTIC_KV_SLOW_AGING_SECONDS", "0")
     req = SimpleNamespace(rid="slow-child", _agentic_kv_queue_class="slow")
-    scheduler = _tp1_edge_scheduler(req, load)
+    scheduler = _tp1_common_scheduler(
+        req, {"io_complete": True, "ledger_prepare_pending": False}
+    )
+    visits = []
+    scheduler._agentic_should_defer = (
+        lambda request, *_args, **_kwargs: visits.append(request.rid) or True
+    )
 
     Scheduler._drain_agentic_kv_waiting_queue_tp1(scheduler)
+    Scheduler._drain_agentic_kv_waiting_queue_tp1(scheduler)
 
-    assert (req.rid in scheduler.agentic_kv_retry_deadlines) is expects_retry
+    assert visits == [req.rid, req.rid]
+    assert [item[0] for item in scheduler.agentic_kv_waiting_queue] == [req]
 
 
-def test_tp1_edge_queue_ages_slow_recovery_ahead_of_continuous_direct(
+def test_tp1_uses_arrival_order_independent_of_kv_source(
     monkeypatch,
 ):
     monkeypatch.setenv("SGLANG_AGENTIC_KV_ADMISSION_BATCH", "2")
-    monkeypatch.setenv("SGLANG_AGENTIC_KV_SLOW_AGING_SECONDS", "0")
-    monkeypatch.setenv("SGLANG_AGENTIC_KV_NEW_AGING_SECONDS", "1000")
     fast = [
         SimpleNamespace(rid=f"fast-{index}", _agentic_kv_queue_class="fast")
         for index in range(3)
@@ -5750,29 +6855,12 @@ def test_tp1_edge_queue_ages_slow_recovery_ahead_of_continuous_direct(
     requests = fast + [slow]
     scheduler = object.__new__(Scheduler)
     scheduler.tp_size = 1
-    scheduler.agentic_kv_waiting_by_rid = {
-        req.rid: (req, time.monotonic() - 10) for req in requests
-    }
-    scheduler.agentic_kv_waiting_by_parent = {}
-    scheduler.agentic_kv_progress_queues = {
-        "fast": deque(req.rid for req in fast),
-        "slow": deque([slow.rid]),
-        "new": deque(),
-    }
-    scheduler.agentic_kv_progress_enqueued = {req.rid for req in requests}
-    scheduler.agentic_kv_retry_heap = []
-    scheduler.agentic_kv_retry_deadlines = {}
-    scheduler.agentic_kv_retry_sequence = 0
     scheduler.agentic_kv_waiting_queue = [
-        scheduler.agentic_kv_waiting_by_rid[req.rid] for req in requests
+        (req, time.monotonic() - 10) for req in requests
     ]
-    scheduler.agentic_kv_waiting_tombstones = 0
     scheduler.agentic_early_direct_completion_queue = deque()
     scheduler.agentic_early_direct_poll_lock = nullcontext()
     scheduler.agentic_host_staging_manager = None
-    scheduler.agentic_p_workset_broker = SimpleNamespace(
-        drain_grant_events=lambda: ()
-    )
     visited = []
     scheduler._agentic_should_defer = (
         lambda req, *_args, **_kwargs: visited.append(req.rid) or True
@@ -5780,10 +6868,10 @@ def test_tp1_edge_queue_ages_slow_recovery_ahead_of_continuous_direct(
 
     Scheduler._drain_agentic_kv_waiting_queue_tp1(scheduler)
 
-    assert visited == [slow.rid, fast[0].rid]
+    assert visited == [fast[0].rid, fast[1].rid, fast[2].rid, slow.rid]
 
 
-def test_prefill_priority_puts_owned_worksets_before_unrunnable_fast_fallbacks():
+def test_prefill_admission_puts_owned_worksets_first_without_source_priority():
     fallback_fast = SimpleNamespace(_agentic_kv_queue_class="fast")
     owned_slow = SimpleNamespace(
         _agentic_kv_queue_class="slow",
@@ -7049,7 +8137,6 @@ def test_completed_direct_session_returned_by_p_enters_slow_without_recompute():
         ),
         _publish_agentic_route=lambda *_args, **_kwargs: True,
     )
-
     DecodeKVCacheOffloadManager._check_agentic_direct_progress(
         manager, progress_relay=False
     )
@@ -7057,6 +8144,1086 @@ def test_completed_direct_session_returned_by_p_enters_slow_without_recompute():
     assert candidate["local_send_complete"] is True
     assert candidate["staging"] is True
     assert staged == [(candidate, manifest)]
+
+
+def test_fast_arrival_and_direct_setup_share_one_deadline(monkeypatch):
+    monkeypatch.setenv("SGLANG_AGENTIC_KV_DIRECT_HANDSHAKE_TIMEOUT", "2")
+    request = RequestGeneration("request-shared-direct-deadline", 7)
+    snapshot_id = request.snapshot_id
+    now = time.monotonic()
+    manifest = SimpleNamespace(
+        snapshot_id=snapshot_id,
+        request=request,
+        claim_id="direct:edge-claim",
+        state=SnapshotState.DIRECT_LOADING,
+        token_count=1024,
+    )
+
+    class Sender:
+        def poll(self):
+            return KVPoll.WaitingForInput
+
+        def init(self, *_args, **_kwargs):
+            pytest.fail("an expired shared deadline must not initialize Direct")
+
+        def send(self, *_args, **_kwargs):
+            pytest.fail("an expired shared deadline must not launch Direct")
+
+    candidate = {
+        "req": object(),
+        "metadata": SimpleNamespace(current=SimpleNamespace()),
+        "manifest": manifest,
+        "sender": Sender(),
+        "source_page_indices": [1],
+        "sent": False,
+        "staging": False,
+        # Tool returned more than two seconds ago, but P claimed only now.
+        # The claim must not reset the tool-return-relative deadline.
+        "fast_arrival_seen": False,
+        "fast_arrival_seen_at": None,
+        "claimed_at": now - 0.1,
+        "created_at": now - 3.0,
+        "fallback_retry_at": 0.0,
+        "io_lock": threading.RLock(),
+    }
+    staged = []
+    aborts = []
+    releases = []
+
+    marker_store = SimpleNamespace(
+        publish_direct_abort=lambda current, claim_id, fence_kind: aborts.append(
+            (current, claim_id, fence_kind)
+        )
+    )
+
+    def observe_tool_arrival(value, _now):
+        value["fast_arrival_seen"] = True
+        value["fast_arrival_seen_at"] = now - 2.1
+        return "arrived"
+
+    manager = SimpleNamespace(
+        tp_world_size=1,
+        tp_rank=0,
+        agentic_fast_threshold=2.0,
+        agentic_direct_setup_timeout=2.0,
+        agentic_force_slow_path=False,
+        agentic_relay_worker=None,
+        agentic_early_claim_store=marker_store,
+        agentic_host_staging_client=object(),
+        _agentic_candidate_items=lambda: ((snapshot_id, candidate),),
+        _agentic_try_final_confirmation=lambda _candidate: False,
+        _agentic_candidate_is_live_locked=lambda sid, value: (
+            sid == snapshot_id and value is candidate
+        ),
+        _agentic_try_early_claim=observe_tool_arrival,
+        _agentic_direct_manifest=lambda *_args, **_kwargs: manifest,
+        _agentic_try_tool_confirmation=lambda _candidate: True,
+        _agentic_release_early_claim=lambda *_args: releases.append(_args[1]),
+        _agentic_direct_kv_usage=lambda: 0.5,
+        _start_agentic_host_staging=lambda value, current: (
+            staged.append((value, current)) or value.update(staging=True) or True
+        ),
+        _publish_agentic_route=lambda *_args, **_kwargs: True,
+    )
+    manager._agentic_publish_unstarted_direct_abort = (
+        lambda candidate_value, current_manifest, **kwargs: (
+            DecodeKVCacheOffloadManager._agentic_publish_unstarted_direct_abort(
+                manager, candidate_value, current_manifest, **kwargs
+            )
+        )
+    )
+
+    DecodeKVCacheOffloadManager._check_agentic_direct_progress(
+        manager, progress_relay=False
+    )
+
+    # DIRECT_LOADING belongs to P.  D publishes a negative-send fence and
+    # waits for P to return the claim instead of attempting an illegal Slow
+    # CAS (or retrying it forever).
+    assert aborts == [(request, "direct:edge-claim", "unstarted")]
+    assert releases == ["direct_setup_expired"]
+    assert candidate["direct_abort_claim_id"] == "direct:edge-claim"
+    assert candidate["staging"] is False
+    assert staged == []
+
+    # Repeated D progress while P is acknowledging the fence is silent and
+    # idempotent: no second marker, impossible Slow CAS, or fallback storm.
+    DecodeKVCacheOffloadManager._check_agentic_direct_progress(
+        manager, progress_relay=False
+    )
+    assert aborts == [(request, "direct:edge-claim", "unstarted")]
+    assert releases == ["direct_setup_expired"]
+    assert staged == []
+
+    # P's cancellation acknowledgement is the DIRECT_LOADING->DIRECT_READY
+    # transition.  The next D pass can now acquire and start Slow normally.
+    manifest.state = SnapshotState.DIRECT_READY
+    DecodeKVCacheOffloadManager._check_agentic_direct_progress(
+        manager, progress_relay=False
+    )
+    assert candidate["staging"] is True
+    assert staged == [(candidate, manifest)]
+
+
+def test_direct_abort_publish_failure_is_backed_off_and_does_not_send():
+    request = RequestGeneration("direct-abort-publish-retry", 1)
+    manifest = SimpleNamespace(
+        request=request,
+        snapshot_id=request.snapshot_id,
+        claim_id="direct:publish-retry",
+    )
+    candidate = {"fast_arrival_seen": True}
+    attempts = []
+
+    def fail_publish(*_args, **_kwargs):
+        attempts.append(time.monotonic())
+        raise OSError("injected tmpfs publication failure")
+
+    manager = SimpleNamespace(
+        tp_world_size=1,
+        agentic_early_claim_store=SimpleNamespace(
+            publish_direct_abort=fail_publish
+        ),
+        _agentic_try_tool_confirmation=lambda _candidate: True,
+        _agentic_release_early_claim=lambda *_args: pytest.fail(
+            "an unpublished fence cannot release ingress markers"
+        ),
+    )
+    method = DecodeKVCacheOffloadManager._agentic_publish_unstarted_direct_abort
+
+    assert method(manager, candidate, manifest, reason="test") is True
+    assert len(attempts) == 1
+    assert candidate["direct_abort_publish_retry_at"] > time.monotonic()
+    assert candidate["direct_abort_publish_error_logged"] is True
+    assert "direct_abort_claim_id" not in candidate
+
+    # A hot D progress loop observes the retry deadline and performs no
+    # additional filesystem operation or exception log.
+    assert method(manager, candidate, manifest, reason="test") is True
+    assert len(attempts) == 1
+
+
+def test_partial_direct_send_exception_is_fenced_before_slow_fallback():
+    request = RequestGeneration("direct-partial-submit", 1)
+    snapshot_id = request.snapshot_id
+    manifest = SimpleNamespace(
+        request=request,
+        snapshot_id=snapshot_id,
+        claim_id="direct:partial-submit",
+        state=SnapshotState.DIRECT_LOADING,
+        token_count=1024,
+    )
+
+    class Sender:
+        def __init__(self):
+            self.status = KVPoll.WaitingForInput
+            self.xfer_handles = []
+            self.fenced = []
+
+        def poll(self):
+            return self.status
+
+        def init(self, *_args, **_kwargs):
+            return None
+
+        def send(self, *_args, **_kwargs):
+            self.xfer_handles.append(object())
+            raise RuntimeError("injected failure after DMA post")
+
+        def fence_failed_launch(self, error):
+            self.fenced.append(error)
+            self.status = KVPoll.Transferring
+            return self.status
+
+    sender = Sender()
+    candidate = {
+        "req": object(),
+        "metadata": SimpleNamespace(current=request),
+        "manifest": manifest,
+        "sender": sender,
+        "source_page_indices": [1],
+        "sent": False,
+        "staging": False,
+        "fast_arrival_seen": True,
+        "fast_arrival_seen_at": time.monotonic(),
+        "claimed_at": time.monotonic(),
+        "created_at": time.monotonic(),
+        "fallback_retry_at": 0.0,
+        "io_lock": threading.RLock(),
+    }
+    staged = []
+    aborts = []
+    manager = SimpleNamespace(
+        tp_world_size=1,
+        tp_rank=0,
+        agentic_fast_threshold=2.0,
+        agentic_direct_setup_timeout=2.0,
+        agentic_force_slow_path=False,
+        agentic_relay_worker=None,
+        agentic_early_claim_store=SimpleNamespace(
+            publish_direct_abort=lambda *_args, **_kwargs: aborts.append(True)
+        ),
+        agentic_host_staging_client=object(),
+        _agentic_candidate_items=lambda: ((snapshot_id, candidate),),
+        _agentic_try_final_confirmation=lambda _candidate: False,
+        _agentic_candidate_is_live_locked=lambda _sid, value: value is candidate,
+        _agentic_direct_manifest=lambda *_args, **_kwargs: manifest,
+        _agentic_try_tool_confirmation=lambda _candidate: True,
+        _agentic_release_early_claim=lambda *_args: None,
+        _agentic_direct_kv_usage=lambda: 0.5,
+        _start_agentic_host_staging=lambda value, current: (
+            staged.append((value, current)) or value.update(staging=True) or True
+        ),
+        _publish_agentic_route=lambda *_args, **_kwargs: True,
+    )
+    manager._agentic_publish_unstarted_direct_abort = (
+        lambda candidate_value, current_manifest, **kwargs: (
+            DecodeKVCacheOffloadManager._agentic_publish_unstarted_direct_abort(
+                manager, candidate_value, current_manifest, **kwargs
+            )
+        )
+    )
+
+    DecodeKVCacheOffloadManager._check_agentic_direct_progress(
+        manager, progress_relay=False
+    )
+    assert candidate["sent"] is True
+    assert candidate["direct_launch_failed"] is True
+    assert len(sender.xfer_handles) == 1
+    assert len(sender.fenced) == 1
+    assert aborts == []
+    assert staged == []
+
+    # Once every posted handle is terminal, D publishes a claim-scoped
+    # no-future-write fence. P can use it even if its final notification was
+    # lost, but D still retains the source and cannot enter Slow yet.
+    sender.status = KVPoll.Failed
+    DecodeKVCacheOffloadManager._check_agentic_direct_progress(
+        manager, progress_relay=False
+    )
+    assert aborts == [True]
+    assert candidate["direct_abort_claim_id"] == "direct:partial-submit"
+    assert staged == []
+
+    # P observes its failed receiver and returns the claim.  Only then can D
+    # move the intact source into Shared Host.
+    manifest.state = SnapshotState.DIRECT_READY
+    manifest.claim_id = None
+    DecodeKVCacheOffloadManager._check_agentic_direct_progress(
+        manager, progress_relay=False
+    )
+    assert staged == [(candidate, manifest)]
+
+
+def test_tp1_unstarted_direct_abort_returns_claim_then_releases_workset():
+    request = RequestGeneration("direct-abort-unstarted", 1)
+    claim_id = "direct:unstarted"
+    manifest = SimpleNamespace(
+        request=request,
+        snapshot_id=request.snapshot_id,
+        state=SnapshotState.DIRECT_LOADING,
+        claim_id=claim_id,
+        created_at=time.time() - 1.0,
+    )
+    lease = SimpleNamespace(state="io_inflight")
+    clears = []
+    releases = []
+    marker_removals = []
+    lifecycle_releases = []
+    abort_reads = []
+
+    class Broker:
+        @staticmethod
+        def mark_io_quiesced(snapshot_id, current_lease, attempt):
+            assert snapshot_id == request.snapshot_id
+            assert current_lease is lease
+            assert attempt == claim_id
+            current_lease.state = "active"
+            return True
+
+        @staticmethod
+        def request_release(snapshot_id, current_lease, **_kwargs):
+            releases.append((snapshot_id, current_lease))
+            current_lease.state = "releasing"
+
+    class SnapshotStore:
+        @staticmethod
+        def load(current, require_ready=False):
+            assert current == request
+            assert require_ready is False
+            return manifest
+
+        @staticmethod
+        def release_direct_claim(current, current_claim_id):
+            assert current is manifest
+            assert current_claim_id == claim_id
+            lifecycle_releases.append(current_claim_id)
+            if len(lifecycle_releases) == 1:
+                raise RuntimeError("injected transient manifest failure")
+            current.state = SnapshotState.DIRECT_READY
+            current.claim_id = None
+            return current
+
+    def read_direct_abort(*_args, **kwargs):
+        abort_reads.append(kwargs)
+        return {"kind": "direct-abort", "claim_id": claim_id}
+
+    marker_store = SimpleNamespace(
+        read_direct_abort=read_direct_abort,
+        remove_direct_abort=lambda current: marker_removals.append(current),
+    )
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.tp_size = 1
+    scheduler.agentic_p_workset_broker = Broker()
+    scheduler.agentic_early_direct_poll_lock = threading.RLock()
+    scheduler.agentic_early_direct_terminal = {}
+    scheduler._agentic_clear_direct_receiver = lambda *_args: clears.append(
+        "metadata"
+    )
+    receiver = SimpleNamespace(clear=lambda: clears.append("receiver"))
+    entry = AgenticEarlyDirectReceive(
+        request=request,
+        manifest=manifest,
+        claim_id=claim_id,
+        receiver=receiver,
+        device_indices=None,
+        started_at=time.monotonic(),
+        arrived_at=time.time() - 3.0,
+        workset_lease=lease,
+        io_attempt=claim_id,
+        transport_poll=KVPoll.WaitingForInput,
+    )
+    scheduler.agentic_early_direct_receives = {request.snapshot_id: entry}
+
+    # A transient lifecycle publication failure keeps the quiesced receiver,
+    # workset and marker retryable.  D still owns and pins the source.
+    assert scheduler._agentic_handle_unstarted_direct_abort(
+        entry,
+        SnapshotStore(),
+        marker_store,
+        KVPoll.WaitingForInput,
+        2.0,
+    )
+    assert lifecycle_releases == [claim_id]
+    assert abort_reads[0]["max_age_seconds"] == float("inf")
+    assert request.snapshot_id in scheduler.agentic_early_direct_receives
+    assert clears == []
+    assert releases == []
+    assert marker_removals == []
+    assert entry.direct_abort_retry_at > time.monotonic()
+    assert entry.direct_abort_error_logged is True
+
+    entry.direct_abort_retry_at = 0.0
+    assert scheduler._agentic_handle_unstarted_direct_abort(
+        entry,
+        SnapshotStore(),
+        marker_store,
+        KVPoll.WaitingForInput,
+        2.0,
+    )
+
+    assert lifecycle_releases == [claim_id, claim_id]
+    assert manifest.state is SnapshotState.DIRECT_READY
+    assert clears == ["receiver", "metadata"]
+    assert releases == [(request.snapshot_id, lease)]
+    assert marker_removals == [request]
+    assert request.snapshot_id not in scheduler.agentic_early_direct_receives
+
+
+def test_p_direct_abort_lookup_starts_after_deadline_and_backs_off_misses():
+    request = RequestGeneration("direct-abort-negative-lookup", 1)
+    reads = []
+    entry = AgenticEarlyDirectReceive(
+        request=request,
+        manifest=SimpleNamespace(created_at=time.time()),
+        claim_id="direct:negative-lookup",
+        receiver=object(),
+        device_indices=None,
+        started_at=time.monotonic(),
+        arrived_at=time.time(),
+    )
+    marker_store = SimpleNamespace(
+        read_direct_abort=lambda *_args, **_kwargs: reads.append(_kwargs) or None
+    )
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.tp_size = 1
+    method = Scheduler._agentic_handle_unstarted_direct_abort
+
+    assert not method(
+        scheduler, entry, object(), marker_store, KVPoll.WaitingForInput, 2.0
+    )
+    assert reads == []
+
+    entry.arrived_at = time.time() - 3.0
+    assert not method(
+        scheduler, entry, object(), marker_store, KVPoll.WaitingForInput, 2.0
+    )
+    assert len(reads) == 1
+    assert not method(
+        scheduler, entry, object(), marker_store, KVPoll.WaitingForInput, 2.0
+    )
+    assert len(reads) == 1
+    assert entry.direct_abort_next_poll_at > time.monotonic()
+    assert entry.direct_abort_absent_delay == 0.1
+
+
+def test_direct_abort_never_releases_pages_when_transport_is_inflight():
+    request = RequestGeneration("direct-abort-inflight", 1)
+    claim_id = "direct:inflight"
+    lease = SimpleNamespace(state="io_inflight")
+    release_requests = []
+    entry = AgenticEarlyDirectReceive(
+        request=request,
+        manifest=SimpleNamespace(created_at=time.time() - 1.0),
+        claim_id=claim_id,
+        receiver=SimpleNamespace(
+            clear=lambda: pytest.fail("in-flight receiver must stay registered")
+        ),
+        device_indices=None,
+        started_at=time.monotonic(),
+        arrived_at=time.time() - 3.0,
+        workset_lease=lease,
+        io_attempt=claim_id,
+        transport_poll=KVPoll.Transferring,
+    )
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.tp_size = 1
+    scheduler.agentic_p_workset_broker = SimpleNamespace(
+        request_release=lambda *args, **kwargs: release_requests.append(
+            (args, kwargs)
+        ),
+        mark_io_quiesced=lambda *_args: pytest.fail(
+            "in-flight DMA is not a cancellation fence"
+        ),
+    )
+    marker_store = SimpleNamespace(
+        read_direct_abort=lambda *_args, **_kwargs: {
+            "kind": "direct-abort",
+            "claim_id": claim_id,
+        }
+    )
+
+    assert scheduler._agentic_handle_unstarted_direct_abort(
+        entry,
+        SimpleNamespace(),
+        marker_store,
+        KVPoll.Transferring,
+        2.0,
+    )
+    assert entry.abort_requested is True
+    assert entry.abort_release_claim is True
+    assert entry.abort_reason == "direct_abort_after_transfer_started"
+    assert len(release_requests) == 1
+    assert lease.state == "io_inflight"
+
+
+def test_terminal_direct_fence_returns_claim_immediately_on_inotify_edge():
+    request = RequestGeneration("direct-abort-terminal", 1)
+    claim_id = "direct:terminal"
+    manifest = SimpleNamespace(
+        request=request,
+        snapshot_id=request.snapshot_id,
+        state=SnapshotState.DIRECT_LOADING,
+        claim_id=claim_id,
+        created_at=time.time(),
+    )
+    lease = SimpleNamespace(state="io_inflight")
+
+    class Broker:
+        @staticmethod
+        def mark_io_quiesced(snapshot_id, current_lease, attempt):
+            assert snapshot_id == request.snapshot_id
+            assert current_lease is lease
+            assert attempt == claim_id
+            current_lease.state = "active"
+            return True
+
+        @staticmethod
+        def request_release(_snapshot_id, current_lease, **_kwargs):
+            current_lease.state = "releasing"
+
+    class SnapshotStore:
+        @staticmethod
+        def load(current, require_ready=False):
+            assert current == request
+            assert require_ready is False
+            return manifest
+
+        @staticmethod
+        def release_direct_claim(current, current_claim_id):
+            assert current is manifest
+            assert current_claim_id == claim_id
+            current.state = SnapshotState.DIRECT_READY
+            current.claim_id = None
+            return current
+
+    marker_path = Path("/dev/shm/direct-terminal.json")
+    marker_store = SimpleNamespace(
+        direct_abort_path=lambda _request: marker_path,
+        read_direct_abort=lambda *_args, **_kwargs: {
+            "kind": "direct-abort",
+            "claim_id": claim_id,
+            "fence_kind": "terminal",
+        },
+        remove_direct_abort=lambda _request: None,
+    )
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.tp_size = 1
+    scheduler.agentic_p_workset_broker = Broker()
+    scheduler.agentic_early_direct_poll_lock = threading.RLock()
+    scheduler.agentic_early_direct_terminal = {}
+    scheduler.agentic_direct_abort_pending_names = {marker_path.name}
+    scheduler._agentic_clear_direct_receiver = lambda *_args: None
+    entry = AgenticEarlyDirectReceive(
+        request=request,
+        manifest=manifest,
+        claim_id=claim_id,
+        receiver=SimpleNamespace(clear=lambda: None),
+        device_indices=None,
+        started_at=time.monotonic(),
+        # The ordinary 2s deadline has not expired. The explicit terminal
+        # event should still resolve the failed Direct immediately.
+        arrived_at=time.time(),
+        workset_lease=lease,
+        io_attempt=claim_id,
+        transport_poll=KVPoll.Transferring,
+    )
+    scheduler.agentic_early_direct_receives = {request.snapshot_id: entry}
+
+    assert scheduler._agentic_handle_unstarted_direct_abort(
+        entry,
+        SnapshotStore(),
+        marker_store,
+        KVPoll.Transferring,
+        2.0,
+    )
+    assert manifest.state is SnapshotState.DIRECT_READY
+    assert request.snapshot_id not in scheduler.agentic_early_direct_receives
+    assert marker_path.name not in scheduler.agentic_direct_abort_pending_names
+
+
+def test_tp2_d_abort_marker_waits_for_every_source_rank_fence():
+    directory = tempfile.mkdtemp(prefix="d2p-abort-d-", dir="/dev/shm")
+    try:
+        request = RequestGeneration("direct-abort-d-tp2", 1)
+        manifest = SimpleNamespace(
+            request=request,
+            snapshot_id=request.snapshot_id,
+            state=SnapshotState.DIRECT_LOADING,
+            claim_id="direct:tp2-d",
+        )
+        published = []
+
+        def manager(rank):
+            return SimpleNamespace(
+                tp_world_size=2,
+                tp_rank=rank,
+                agentic_tp_direct_abort_mailbox=TPGroupMailbox(
+                    "test-d2p-abort-d",
+                    tp_rank=rank,
+                    tp_size=2,
+                    directory=directory,
+                ),
+                agentic_early_claim_store=SimpleNamespace(
+                    publish_direct_abort=lambda *args, **kwargs: published.append(
+                        (args, kwargs)
+                    )
+                ),
+                _agentic_try_tool_confirmation=lambda _candidate: True,
+                _agentic_release_early_claim=lambda *_args: None,
+            )
+
+        rank0 = manager(0)
+        rank1 = manager(1)
+        candidate0 = {"sent": False}
+        candidate1 = {"sent": True}
+        method = DecodeKVCacheOffloadManager._agentic_publish_unstarted_direct_abort
+
+        # Rank 0 is locally quiescent but cannot publish a group fence yet.
+        assert method(
+            rank0,
+            candidate0,
+            manifest,
+            reason="deadline",
+            fence_kind="unstarted",
+        )
+        assert published == []
+
+        # Rank 1 reports only after its already-posted handle is terminal.
+        assert method(
+            rank1,
+            candidate1,
+            manifest,
+            reason="terminal",
+            fence_kind="terminal",
+        )
+        assert published == []
+
+        assert method(
+            rank0,
+            candidate0,
+            manifest,
+            reason="all-ranks-terminal",
+            fence_kind="unstarted",
+        )
+        assert len(published) == 1
+        assert published[0][1]["claim_id"] == "direct:tp2-d"
+        assert published[0][1]["fence_kind"] == "terminal"
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_tp2_follower_observes_abort_mailbox_without_scheduler_broadcast():
+    directory = tempfile.mkdtemp(prefix="d2p-abort-follower-", dir="/dev/shm")
+    try:
+        snapshot_id = "direct-abort-follower:1"
+        rank0_mailbox = TPGroupMailbox(
+            "test-d2p-abort-follower",
+            tp_rank=0,
+            tp_size=2,
+            directory=directory,
+        )
+        rank1_mailbox = TPGroupMailbox(
+            "test-d2p-abort-follower",
+            tp_rank=1,
+            tp_size=2,
+            directory=directory,
+        )
+        rank0_mailbox.publish_local_progress(snapshot_id, 2)
+        candidate = {
+            "req": object(),
+            "manifest": SimpleNamespace(snapshot_id=snapshot_id),
+            "sender": None,
+            "sent": False,
+            # The native scheduler broadcast has not reached this rank and
+            # local sender setup has not happened. The independent mailbox
+            # still has to stop setup and close the group fence.
+            "tp_command": "wait",
+            "io_lock": threading.RLock(),
+        }
+        manager = SimpleNamespace(
+            tp_world_size=2,
+            tp_rank=1,
+            agentic_relay_worker=None,
+            agentic_tp_direct_abort_mailbox=rank1_mailbox,
+            _agentic_candidate_items=lambda: ((snapshot_id, candidate),),
+            _agentic_candidate_is_live_locked=lambda sid, value: (
+                sid == snapshot_id and value is candidate
+            ),
+        )
+
+        DecodeKVCacheOffloadManager._check_agentic_tp_follower_progress(
+            manager, progress_relay=False, progress_class="direct"
+        )
+
+        assert candidate["tp_direct_abort_requested"] is True
+        assert rank1_mailbox.local_status(snapshot_id) == 2
+
+        # After TP0 observes P's DIRECT_READY acknowledgement, its Slow
+        # command authoritatively exits the local abort tombstone even if a
+        # stale peer status file is still visible.
+        candidate["tp_command"] = "slow"
+        candidate["manifest"].state = SnapshotState.SLOW_FALLBACK
+        candidate["local_prepared"] = True
+        candidate["setup_committed"] = True
+        candidate["setup_logged"] = True
+        candidate["source_token_indices"] = [1]
+        manager.agentic_host_staging_client = None
+        manager._start_agentic_host_staging = (
+            lambda value, _manifest: value.update(staging=True) or True
+        )
+        DecodeKVCacheOffloadManager._check_agentic_tp_follower_progress(
+            manager, progress_relay=False, progress_class="slow"
+        )
+        assert candidate.get("tp_direct_abort_requested") is None
+        assert candidate["staging"] is True
+        assert rank1_mailbox.local_status(snapshot_id) is None
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_tp2_rank0_exits_abort_after_p_returns_claim_and_starts_slow():
+    directory = tempfile.mkdtemp(prefix="d2p-abort-ack-", dir="/dev/shm")
+    try:
+        request = RequestGeneration("direct-abort-ack-tp2", 1)
+        snapshot_id = request.snapshot_id
+        loading = SimpleNamespace(
+            request=request,
+            snapshot_id=snapshot_id,
+            state=SnapshotState.DIRECT_LOADING,
+            claim_id="direct:tp2-ack",
+            token_count=16,
+        )
+        ready = SimpleNamespace(
+            request=request,
+            snapshot_id=snapshot_id,
+            state=SnapshotState.DIRECT_READY,
+            claim_id=None,
+            token_count=16,
+        )
+        candidate = {
+            "req": object(),
+            "metadata": SimpleNamespace(current=request),
+            "manifest": loading,
+            "sender": SimpleNamespace(poll=lambda: KVPoll.WaitingForInput),
+            "sent": False,
+            "staging": False,
+            "tp_direct_abort_requested": True,
+            "direct_abort_claim_id": "direct:tp2-ack",
+            "created_at": time.monotonic(),
+            "claimed_at": time.monotonic(),
+            "fallback_retry_at": 0.0,
+            "fast_arrival_seen": True,
+            "io_lock": threading.RLock(),
+        }
+        staged = []
+        mailbox = TPGroupMailbox(
+            "test-d2p-abort-ack",
+            tp_rank=0,
+            tp_size=2,
+            directory=directory,
+        )
+        original_clear_group = mailbox.clear_group
+        clear_attempts = []
+
+        def flaky_clear_group(current_snapshot_id):
+            clear_attempts.append(current_snapshot_id)
+            if len(clear_attempts) == 1:
+                raise OSError("injected TP abort cleanup failure")
+            return original_clear_group(current_snapshot_id)
+
+        mailbox.clear_group = flaky_clear_group
+
+        def load_manifest(value, _metadata, _now, force=False):
+            assert value is candidate
+            if force:
+                value["manifest"] = ready
+            return value["manifest"]
+
+        manager = SimpleNamespace(
+            tp_world_size=2,
+            tp_rank=0,
+            agentic_fast_threshold=2.0,
+            agentic_direct_setup_timeout=2.0,
+            agentic_force_slow_path=False,
+            agentic_relay_worker=None,
+            agentic_early_claim_store=object(),
+            agentic_tp_direct_abort_mailbox=mailbox,
+            agentic_host_staging_client=object(),
+            _agentic_candidate_items=lambda: ((snapshot_id, candidate),),
+            _agentic_try_final_confirmation=lambda _candidate: False,
+            _agentic_candidate_is_live_locked=lambda sid, value: (
+                sid == snapshot_id and value is candidate
+            ),
+            _agentic_direct_manifest=load_manifest,
+            _agentic_try_early_claim=lambda *_args: "missing",
+            _agentic_try_tool_confirmation=lambda _candidate: True,
+            _agentic_release_early_claim=lambda *_args: None,
+            _agentic_direct_kv_usage=lambda: 0.5,
+            _start_agentic_host_staging=lambda value, current: (
+                staged.append((value, current))
+                or value.update(staging=True)
+                or True
+            ),
+            _publish_agentic_route=lambda *_args, **_kwargs: True,
+        )
+
+        DecodeKVCacheOffloadManager._check_agentic_direct_progress(
+            manager, progress_relay=False
+        )
+
+        assert candidate["tp_direct_abort_requested"] is True
+        assert candidate["direct_abort_claim_id"] == "direct:tp2-ack"
+        assert candidate["staging"] is False
+        assert staged == []
+
+        candidate["tp_abort_mailbox_retry_at"] = 0.0
+        DecodeKVCacheOffloadManager._check_agentic_direct_progress(
+            manager, progress_relay=False
+        )
+
+        assert candidate.get("tp_direct_abort_requested") is None
+        assert candidate.get("direct_abort_claim_id") is None
+        assert candidate["staging"] is True
+        assert staged == [(candidate, ready)]
+        assert clear_attempts == [snapshot_id, snapshot_id]
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_tp2_follower_rechecks_abort_under_sender_post_lock():
+    snapshot_id = "direct-abort-post-race:1"
+    published = []
+
+    class RacingMailbox:
+        def __init__(self):
+            self.reads = 0
+
+        def local_status(self, _snapshot_id, rank):
+            self.reads += 1
+            # The loop-level scan sees no abort on either rank. The second
+            # scan, immediately before sender.poll/init/send, observes TP0's
+            # newly published fence.
+            return 2 if self.reads >= 3 and rank == 0 else None
+
+        @staticmethod
+        def publish_local_progress(_snapshot_id, status):
+            published.append(status)
+
+    sender = SimpleNamespace(
+        poll=lambda: pytest.fail("post-lock abort recheck must precede poll"),
+        init=lambda *_args, **_kwargs: pytest.fail("must not initialize"),
+        send=lambda *_args, **_kwargs: pytest.fail("must not post DMA"),
+    )
+    candidate = {
+        "req": object(),
+        "manifest": SimpleNamespace(snapshot_id=snapshot_id),
+        "sender": sender,
+        "source_page_indices": [1],
+        "sent": False,
+        "tp_command": "direct",
+        "local_prepared": True,
+        "setup_committed": True,
+        "setup_logged": True,
+        "io_lock": threading.RLock(),
+    }
+    manager = SimpleNamespace(
+        tp_world_size=2,
+        tp_rank=1,
+        agentic_relay_worker=None,
+        agentic_tp_direct_abort_mailbox=RacingMailbox(),
+        _agentic_candidate_items=lambda: ((snapshot_id, candidate),),
+        _agentic_candidate_is_live_locked=lambda sid, value: (
+            sid == snapshot_id and value is candidate
+        ),
+    )
+
+    DecodeKVCacheOffloadManager._check_agentic_tp_follower_progress(
+        manager, progress_relay=False, progress_class="direct"
+    )
+
+    assert candidate["sent"] is False
+    assert candidate["tp_direct_abort_requested"] is True
+    assert published == [2]
+
+
+def test_tp2_follower_rechecks_command_epoch_under_sender_post_lock(monkeypatch):
+    snapshot_id = "direct-slow-command-race:1"
+    sender = SimpleNamespace(
+        poll=lambda: pytest.fail("stale Direct epoch must not poll sender"),
+        init=lambda *_args, **_kwargs: pytest.fail("must not initialize"),
+        send=lambda *_args, **_kwargs: pytest.fail("must not post DMA"),
+    )
+    candidate = {
+        "req": object(),
+        "manifest": SimpleNamespace(snapshot_id=snapshot_id),
+        "sender": sender,
+        "source_page_indices": [1],
+        "sent": False,
+        "tp_command": "direct",
+        "local_prepared": True,
+        "setup_committed": True,
+        "setup_logged": True,
+        "io_lock": threading.RLock(),
+    }
+    mailbox = SimpleNamespace(local_status=lambda *_args: None)
+    manager = SimpleNamespace(
+        tp_world_size=2,
+        tp_rank=1,
+        agentic_relay_worker=None,
+        agentic_tp_direct_abort_mailbox=mailbox,
+        _agentic_candidate_items=lambda: ((snapshot_id, candidate),),
+        _agentic_candidate_is_live_locked=lambda sid, value: (
+            sid == snapshot_id and value is candidate
+        ),
+    )
+
+    def install_slow_between_checks(_self, value, _now):
+        # Model _apply_tp_candidate_command winning after the loop-level
+        # action read but before the sender-post critical section.
+        with value["io_lock"]:
+            value["tp_command"] = "slow"
+            value["manifest"].state = SnapshotState.SLOW_FALLBACK
+            value.pop("tp_direct_abort_requested", None)
+        return True
+
+    monkeypatch.setattr(
+        DecodeKVCacheOffloadManager,
+        "_progress_agentic_direct_candidate_setup",
+        install_slow_between_checks,
+    )
+
+    DecodeKVCacheOffloadManager._check_agentic_tp_follower_progress(
+        manager, progress_relay=False, progress_class="direct"
+    )
+
+    assert candidate["sent"] is False
+    assert candidate["tp_command"] == "slow"
+
+
+def test_tp_abort_mailbox_write_failures_are_backed_off_per_request():
+    calls = []
+
+    def fail_write():
+        calls.append(True)
+        raise OSError("injected tmpfs failure")
+
+    candidate = {}
+    d_manager = SimpleNamespace()
+    d_method = DecodeKVCacheOffloadManager._agentic_tp_abort_mailbox_write
+    assert not d_method(d_manager, candidate, "mailbox-backoff:1", fail_write)
+    assert candidate["tp_direct_abort_requested"] is True
+    assert candidate["tp_abort_mailbox_error_logged"] is True
+    assert candidate["tp_abort_mailbox_retry_at"] > time.monotonic()
+    assert not d_method(d_manager, candidate, "mailbox-backoff:1", fail_write)
+    assert len(calls) == 1
+
+    entry = SimpleNamespace(
+        request=RequestGeneration("p-mailbox-backoff", 1)
+    )
+    p_scheduler = Scheduler.__new__(Scheduler)
+    p_method = Scheduler._agentic_tp_abort_mailbox_write
+    assert not p_method(p_scheduler, entry, fail_write)
+    assert entry.tp_abort_mailbox_error_logged is True
+    assert entry.tp_abort_mailbox_retry_at > time.monotonic()
+    assert not p_method(p_scheduler, entry, fail_write)
+    assert len(calls) == 2
+
+
+def test_tp2_p_abort_returns_claim_only_after_every_destination_rank_fence():
+    directory = tempfile.mkdtemp(prefix="d2p-abort-p-", dir="/dev/shm")
+    try:
+        request = RequestGeneration("direct-abort-p-tp2", 1)
+        claim_id = "direct:tp2-p"
+        manifest = SimpleNamespace(
+            request=request,
+            snapshot_id=request.snapshot_id,
+            state=SnapshotState.DIRECT_LOADING,
+            claim_id=claim_id,
+            created_at=time.time(),
+        )
+        marker_path = Path(directory) / "group-terminal.json"
+        lifecycle_releases = []
+        marker_removals = []
+
+        class SnapshotStore:
+            @staticmethod
+            def load(current, require_ready=False):
+                assert current == request
+                assert require_ready is False
+                return manifest
+
+            @staticmethod
+            def release_direct_claim(current, current_claim_id):
+                assert current is manifest
+                assert current_claim_id == claim_id
+                lifecycle_releases.append(current_claim_id)
+                current.state = SnapshotState.DIRECT_READY
+                current.claim_id = None
+                return current
+
+        marker_store = SimpleNamespace(
+            direct_abort_path=lambda _request: marker_path,
+            read_direct_abort=lambda *_args, **_kwargs: {
+                "kind": "direct-abort",
+                "claim_id": claim_id,
+                "fence_kind": "terminal",
+            },
+            remove_direct_abort=lambda current: marker_removals.append(current),
+        )
+
+        def scheduler_and_entry(rank):
+            lease = SimpleNamespace(state="io_inflight")
+
+            class Broker:
+                @staticmethod
+                def mark_io_quiesced(_snapshot_id, current_lease, attempt):
+                    assert current_lease is lease
+                    assert attempt == claim_id
+                    current_lease.state = "active"
+                    return True
+
+                @staticmethod
+                def request_release(_snapshot_id, current_lease, **_kwargs):
+                    current_lease.state = "releasing"
+
+            scheduler = Scheduler.__new__(Scheduler)
+            scheduler.tp_size = 2
+            scheduler.tp_rank = rank
+            scheduler.agentic_tp_direct_abort_mailbox = TPGroupMailbox(
+                "test-d2p-abort-p",
+                tp_rank=rank,
+                tp_size=2,
+                directory=directory,
+            )
+            scheduler.agentic_p_workset_broker = Broker()
+            scheduler.agentic_early_direct_poll_lock = threading.RLock()
+            scheduler.agentic_early_direct_terminal = {}
+            scheduler.agentic_direct_abort_pending_names = {marker_path.name}
+            scheduler._agentic_clear_direct_receiver = lambda *_args: None
+            entry = AgenticEarlyDirectReceive(
+                request=request,
+                manifest=manifest,
+                claim_id=claim_id,
+                receiver=SimpleNamespace(clear=lambda: None),
+                device_indices=None,
+                started_at=time.monotonic(),
+                arrived_at=time.time(),
+                workset_lease=lease,
+                io_attempt=claim_id,
+                transport_poll=KVPoll.WaitingForInput,
+            )
+            scheduler.agentic_early_direct_receives = {
+                request.snapshot_id: entry
+            }
+            return scheduler, entry
+
+        rank0, entry0 = scheduler_and_entry(0)
+        rank1, entry1 = scheduler_and_entry(1)
+        rank0_mailbox = rank0.agentic_tp_direct_abort_mailbox
+        original_clear_group = rank0_mailbox.clear_group
+        clear_attempts = []
+
+        def flaky_clear_group(current_snapshot_id):
+            clear_attempts.append(current_snapshot_id)
+            if len(clear_attempts) == 1:
+                raise OSError("injected P TP abort cleanup failure")
+            return original_clear_group(current_snapshot_id)
+
+        rank0_mailbox.clear_group = flaky_clear_group
+        method = Scheduler._agentic_handle_unstarted_direct_abort
+
+        # A single P rank may quiesce locally but cannot return shared state.
+        assert method(
+            rank1, entry1, SnapshotStore(), marker_store, KVPoll.WaitingForInput, 2.0
+        )
+        assert manifest.state is SnapshotState.DIRECT_LOADING
+        assert lifecycle_releases == []
+
+        # TP0 observes both destination fences and performs the sole CAS.
+        assert method(
+            rank0, entry0, SnapshotStore(), marker_store, KVPoll.WaitingForInput, 2.0
+        )
+        assert manifest.state is SnapshotState.DIRECT_READY
+        assert lifecycle_releases == [claim_id]
+        assert request.snapshot_id in rank0.agentic_early_direct_receives
+        assert marker_removals == []
+
+        entry0.tp_abort_mailbox_retry_at = 0.0
+        assert method(
+            rank0, entry0, SnapshotStore(), marker_store, KVPoll.WaitingForInput, 2.0
+        )
+        assert marker_removals == [request]
+        assert clear_attempts == [request.snapshot_id, request.snapshot_id]
+
+        # The follower then observes DIRECT_READY and releases its pages.
+        assert method(
+            rank1, entry1, SnapshotStore(), marker_store, KVPoll.WaitingForInput, 2.0
+        )
+        assert request.snapshot_id not in rank0.agentic_early_direct_receives
+        assert request.snapshot_id not in rank1.agentic_early_direct_receives
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
 
 
 @pytest.mark.parametrize("tp_world_size", [1, 2])
@@ -7099,7 +9266,7 @@ def test_slow_fallback_offer_retry_retains_d_kv_until_host_staging(tp_world_size
         tp_world_size=tp_world_size,
         tp_rank=0,
         agentic_fast_threshold=2.0,
-        agentic_early_claim_post_timeout=2.0,
+        agentic_direct_setup_timeout=2.0,
         agentic_relay_worker=None,
         agentic_early_claim_store=object(),
         agentic_host_staging_client=object(),
@@ -7166,7 +9333,7 @@ def test_force_slow_ablation_stages_immediately_without_direct_wait():
         tp_rank=0,
         agentic_force_slow_path=True,
         agentic_fast_threshold=2.0,
-        agentic_early_claim_post_timeout=2.0,
+        agentic_direct_setup_timeout=2.0,
         agentic_relay_worker=None,
         agentic_early_claim_store=object(),
         agentic_host_staging_client=object(),
@@ -7222,7 +9389,7 @@ def test_tp_slow_offer_uses_rank0_manifest_token_identity():
         agentic_direct_runtime=SimpleNamespace(
             manager=SimpleNamespace(kv_args=SimpleNamespace(kv_item_lens=[64]))
         ),
-        _assign_slow_prefill_target=lambda _candidate: None,
+        _assign_slow_host_target=lambda _candidate: None,
     )
     candidate = {
         "metadata": SimpleNamespace(current=request),
@@ -7231,7 +9398,7 @@ def test_tp_slow_offer_uses_rank0_manifest_token_identity():
         "tokens": [91, 92, 93],
         "source_token_indices": torch.tensor([3, 4, 5], dtype=torch.int64),
         "source_page_indices": [3],
-        "selected_arena_numa_nodes": [0, 1],
+        "selected_host_numa_nodes": [0, 1],
     }
 
     assert DecodeKVCacheOffloadManager._start_agentic_host_staging(
@@ -7242,7 +9409,68 @@ def test_tp_slow_offer_uses_rank0_manifest_token_identity():
     assert captured[0]["token_digest"] == manifest.token_digest
 
 
-def test_random_routing_ablation_selects_one_deterministic_slow_p(monkeypatch):
+@pytest.mark.parametrize("tp_world_size", [1, 2])
+def test_slow_host_selection_reserves_complete_tp_snapshot_bytes(tp_world_size):
+    """A Direct manifest's zero byte_size must not reach Host routing."""
+
+    request = RequestGeneration("tp-slow-byte-accounting", 1)
+    manifest = SnapshotManifest(
+        request=request,
+        page_keys=(),
+        token_count=8,
+        byte_size=0,
+        state=SnapshotState.SLOW_FALLBACK,
+        token_digest=token_ids_digest(list(range(8))),
+        tp_size=tp_world_size,
+    )
+    selected = []
+    offered = []
+
+    def assign(candidate):
+        selected.append(candidate["slow_host_reservation_bytes"])
+        candidate["selected_host_domain"] = 1
+        candidate["selected_host_numa_nodes"] = list(range(tp_world_size))
+
+    manager = SimpleNamespace(
+        tp_world_size=tp_world_size,
+        tp_rank=0,
+        agentic_host_staging_client=SimpleNamespace(
+            retain_logical_hashes=False,
+            arena_domain=0,
+            arena_numa_node=0,
+            offer=lambda **kwargs: offered.append(kwargs),
+        ),
+        agentic_direct_runtime=SimpleNamespace(
+            manager=SimpleNamespace(
+                kv_args=SimpleNamespace(kv_item_lens=[64, 128])
+            )
+        ),
+        _assign_slow_host_target=assign,
+    )
+    candidate = {
+        "metadata": SimpleNamespace(current=request),
+        "tokens": list(range(8)),
+        "source_token_indices": torch.arange(8, dtype=torch.int64),
+        "source_page_indices": [3, 4, 5],
+    }
+
+    assert DecodeKVCacheOffloadManager._start_agentic_host_staging(
+        manager, candidate, manifest
+    )
+    # Each rank writes 3 * (64 + 128) bytes; Host selection reserves both
+    # shards because pressure is published per logical TP domain.
+    assert selected == [576 * tp_world_size]
+    assert offered[0]["byte_size"] == 576
+    assert offered[0]["arena_domain"] == 1
+
+
+def test_slow_host_selector_rejects_unknown_snapshot_size():
+    manager = SimpleNamespace()
+    with pytest.raises(ValueError, match="positive complete TP snapshot size"):
+        DecodeKVCacheOffloadManager._select_slow_host_domain(manager)
+
+
+def test_random_routing_ablation_selects_one_deterministic_slow_host(monkeypatch):
     monkeypatch.setenv("SGLANG_PD_ABLATION_RANDOM_ROUTING", "1")
     monkeypatch.setenv("SGLANG_PD_ABLATION_RANDOM_SEED", "2026")
     monkeypatch.setenv("SGLANG_AGENTIC_KV_PREFILL_DOMAIN_COUNT", "2")
@@ -7253,14 +9481,14 @@ def test_random_routing_ablation_selects_one_deterministic_slow_p(monkeypatch):
         _prefill_domain_numa_nodes=lambda domain: [domain],
     )
 
-    DecodeKVCacheOffloadManager._assign_slow_prefill_target(manager, candidate)
-    first = candidate["selected_prefill_domain"]
+    DecodeKVCacheOffloadManager._assign_slow_host_target(manager, candidate)
+    first = candidate["selected_host_domain"]
     assert first in {0, 1}
-    assert candidate["selected_arena_numa_nodes"] == [first]
+    assert candidate["selected_host_numa_nodes"] == [first]
 
     # Repeated calls are idempotent and cannot split one snapshot across P's.
-    DecodeKVCacheOffloadManager._assign_slow_prefill_target(manager, candidate)
-    assert candidate["selected_prefill_domain"] == first
+    DecodeKVCacheOffloadManager._assign_slow_host_target(manager, candidate)
+    assert candidate["selected_host_domain"] == first
 
 
 def test_nixl_sender_records_each_posted_handle_once_and_completes():

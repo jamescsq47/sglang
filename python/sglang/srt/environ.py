@@ -331,6 +331,9 @@ class Envs:
     SGLANG_AGENTIC_KV_STAGING_LEDGER_PATH = EnvStr("")
     SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_DIR = EnvStr("")
     SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_GIB = EnvFloat(128.0)
+    # ``memfd`` keeps pageable KV data in ordinary CPU memory without using
+    # the /dev/shm mount quota. ``tmpfs`` retains the legacy file backend.
+    SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_BACKEND = EnvStr("tmpfs")
     # NUMA-aware remote-D relay.  Arena-local D workers reserve fixed HBM
     # chunks and relay remote-D KV via NVLink before their local PCIe D2H.
     SGLANG_AGENTIC_KV_RELAY_ENABLED = EnvBool(False)

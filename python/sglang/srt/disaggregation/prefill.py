@@ -1057,8 +1057,8 @@ class SchedulerDisaggregationPrefillMixin:
                 with self._prefill_transfer_poll_lock:
                     req._async_prefill_transfer_consumer_active = False
                     req._async_prefill_transfer_poll = poll
-                    if self.tp_size == 1:
-                        self._prefill_transfer_terminal_queue.append(key)
+                if getattr(self, "tp_size", 1) == 1:
+                    self._prefill_transfer_terminal_queue.append(key)
             elif not self._prefill_transfer_stop.is_set():
                 # Keep the transfer active but relinquish this worker after
                 # one step, so later P results cannot be starved by waiters.
@@ -1443,7 +1443,7 @@ class SchedulerDisaggregationPrefillMixin:
         elif was_throttled:
             below_count = not max_inflight or inflight <= resume_inflight
             # HBM hysteresis must not override the independent request/token
-            # credits.  The previous branch resumed New work below the low
+            # credits.  The previous branch resumed compute admission below the low
             # watermark even when completed P-ready KV was already 2x over its
             # token cap, causing an avoidable P-HBM saturation burst.
             throttled = (
@@ -1458,7 +1458,7 @@ class SchedulerDisaggregationPrefillMixin:
             logger.info(
                 "P-ready compute-ahead %s token_usage=%.3f inflight=%d "
                 "ready_tokens=%d/%d available_tokens=%d evictable_tokens=%d "
-                "high=%.2f low=%.2f request_cap=%d mode=%s scope=new_only",
+                "high=%.2f low=%.2f request_cap=%d mode=%s scope=all_ready_worksets",
                 "throttled" if throttled else "resumed",
                 token_usage,
                 inflight,
@@ -1490,29 +1490,13 @@ class SchedulerDisaggregationPrefillMixin:
 
         self.process_prefill_chunk()
 
-        throttle_new = self._should_throttle_p_ready_compute_ahead()
-        if not throttle_new:
+        throttle_compute = self._should_throttle_p_ready_compute_ahead()
+        if not throttle_compute:
             batch = self.get_new_batch_prefill()
         else:
-            # P-ready is a soft cap.  Hold only initial/new requests while
-            # allowing Direct and slow-path parent turns to enter Prefill and
-            # release pressure from D.  Preserve the strict fast > slow > new
-            # order when the held work is restored.
-            held_new = [
-                req
-                for req in self.waiting_queue
-                if getattr(req, "_agentic_kv_queue_class", "new") == "new"
-            ]
-            self.waiting_queue = [
-                req
-                for req in self.waiting_queue
-                if getattr(req, "_agentic_kv_queue_class", "new") != "new"
-            ]
-            batch = self.get_new_batch_prefill()
-            self.waiting_queue.extend(held_new)
-            prioritize = getattr(self, "_prioritize_agentic_prefill_ready", None)
-            if prioritize is not None:
-                prioritize()
+            # Backpressure applies to the complete native queue. KV source is
+            # not a compute-admission priority class.
+            batch = None
         batch = self.maybe_prepare_mlp_sync_batch(batch)
 
         if batch:

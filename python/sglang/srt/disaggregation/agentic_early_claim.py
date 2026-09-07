@@ -399,10 +399,16 @@ class AgenticEarlyClaimStore:
         self.final_directory = self.directory / "finals"
         self.tool_directory = self.directory / "tool-valid"
         self.route_directory = self.directory / "routes"
+        # D publishes one exact claim-scoped fence here when the shared
+        # Direct setup deadline expires before its sender is submitted.  P
+        # must observe this negative-send guarantee before recycling a
+        # receiver whose transport still reports WaitingForInput.
+        self.direct_abort_directory = self.directory / "direct-aborts"
         self.marker_directory.mkdir(parents=True, exist_ok=True)
         self.final_directory.mkdir(parents=True, exist_ok=True)
         self.tool_directory.mkdir(parents=True, exist_ok=True)
         self.route_directory.mkdir(parents=True, exist_ok=True)
+        self.direct_abort_directory.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
     def _digest(request: RequestGeneration) -> str:
@@ -419,6 +425,9 @@ class AgenticEarlyClaimStore:
 
     def route_path(self, request: RequestGeneration) -> Path:
         return self.route_directory / f"{self._digest(request)}.json"
+
+    def direct_abort_path(self, request: RequestGeneration) -> Path:
+        return self.direct_abort_directory / f"{self._digest(request)}.json"
 
     def producer_path(self, request: RequestGeneration) -> Path:
         # Keep producer tombstones at the top level so the run-script's
@@ -581,6 +590,7 @@ class AgenticEarlyClaimStore:
         *,
         route: str,
         prefill_domain: int,
+        arena_domain: Optional[int] = None,
         arena_numa_node: Optional[int] = None,
         snapshot_tokens: Optional[int] = None,
     ) -> dict[str, Any]:
@@ -609,6 +619,8 @@ class AgenticEarlyClaimStore:
             "published_at": time.time(),
             "publisher_pid": os.getpid(),
         }
+        if arena_domain is not None:
+            payload["arena_domain"] = int(arena_domain)
         self._publish_payload(self.route_path(request), payload)
         return payload
 
@@ -641,6 +653,36 @@ class AgenticEarlyClaimStore:
         """Confirm that the application parser accepted a real tool call."""
 
         return self._publish(self.tool_path(request), request, "tool")
+
+    def publish_direct_abort(
+        self,
+        request: RequestGeneration,
+        *,
+        claim_id: str,
+        fence_kind: str = "unstarted",
+    ) -> dict[str, Any]:
+        """Publish D's proof that an exact Direct claim can no longer write.
+
+        ``unstarted`` promises that sender DMA was never submitted and never
+        will be. ``terminal`` promises that every submitted local transport
+        handle has reached its physical DONE/ERR fence. Neither marker is an
+        ownership transition: D remains the authoritative source until P
+        returns DIRECT_LOADING to DIRECT_READY and Slow completes normally.
+        """
+
+        if not claim_id:
+            raise ValueError("direct abort claim_id must be non-empty")
+        if fence_kind not in {"unstarted", "terminal"}:
+            raise ValueError("direct abort fence_kind must be unstarted or terminal")
+        return self._publish(
+            self.direct_abort_path(request),
+            request,
+            "direct-abort",
+            extra={
+                "claim_id": str(claim_id),
+                "fence_kind": fence_kind,
+            },
+        )
 
     @staticmethod
     def _read(
@@ -761,6 +803,30 @@ class AgenticEarlyClaimStore:
             max_age_seconds=max_age_seconds,
         )
 
+    def read_direct_abort(
+        self,
+        request: RequestGeneration,
+        *,
+        claim_id: str,
+        not_before: float,
+        max_age_seconds: float,
+    ) -> Optional[dict[str, Any]]:
+        payload = self._read(
+            self.direct_abort_path(request),
+            request,
+            not_before=not_before,
+            max_age_seconds=max_age_seconds,
+        )
+        if (
+            payload is None
+            or payload.get("kind") != "direct-abort"
+            or payload.get("claim_id") != claim_id
+            or payload.get("fence_kind", "unstarted")
+            not in {"unstarted", "terminal"}
+        ):
+            return None
+        return payload
+
     def remove_arrival(self, request: RequestGeneration) -> None:
         """Remove only the ingress marker; no capacity ledger is involved."""
 
@@ -778,5 +844,11 @@ class AgenticEarlyClaimStore:
     def remove_tool(self, request: RequestGeneration) -> None:
         try:
             self.tool_path(request).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def remove_direct_abort(self, request: RequestGeneration) -> None:
+        try:
+            self.direct_abort_path(request).unlink(missing_ok=True)
         except OSError:
             pass
