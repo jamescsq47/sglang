@@ -65,6 +65,7 @@ from sglang.srt.disaggregation.agentic_host_staging import (
     AgenticPHostStagingManager,
     SharedHostStagingLedger,
     create_agentic_storage_controller,
+    start_registered_host_arena_startup_prewarm,
     supports_agentic_kv_spill,
 )
 from sglang.srt.disaggregation.agentic_tp import (
@@ -2700,6 +2701,41 @@ class Scheduler(
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
             self.start_prefill_transfer_progress_worker()
+
+        self.agentic_host_register_prewarm_thread = None
+        if (
+            envs.SGLANG_AGENTIC_KV_LIFECYCLE.get()
+            and os.getenv(
+                "SGLANG_AGENTIC_KV_REGISTER_STARTUP_BARRIER", "0"
+            ).strip().lower()
+            not in {"0", "false", "no", "off"}
+            and self.server_args.disaggregation_mode
+            in {DisaggregationMode.PREFILL.value, DisaggregationMode.DECODE.value}
+        ):
+            role = (
+                "prefill"
+                if self.server_args.disaggregation_mode
+                == DisaggregationMode.PREFILL.value
+                else "decode"
+            )
+            d2p_manager = getattr(self, "agentic_host_staging_manager", None)
+            p2d_manager = getattr(self, "agentic_p2d_host_staging_manager", None)
+            self.agentic_host_register_prewarm_thread = (
+                start_registered_host_arena_startup_prewarm(
+                    role=role,
+                    engine_id=os.environ.get(
+                        "SGLANG_AGENTIC_KV_ENGINE_ID", f"{role}-{self.gpu_id}"
+                    ),
+                    tp_rank=self.tp_rank,
+                    device=self.device,
+                    d2p_arena_path=(
+                        None if d2p_manager is None else d2p_manager.arena.path
+                    ),
+                    p2d_arena_path=(
+                        None if p2d_manager is None else p2d_manager.arena.path
+                    ),
+                )
+            )
 
         # Init mm receiver for EPD disaggregation mode
         if (
