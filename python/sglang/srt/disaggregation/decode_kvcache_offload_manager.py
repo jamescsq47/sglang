@@ -26,6 +26,7 @@ from sglang.srt.disaggregation.agentic_host_staging import (
     supports_agentic_kv_spill,
 )
 from sglang.srt.disaggregation.agentic_tp import rank_env_int
+from sglang.srt.disaggregation.agentic_tp_control import TPGroupMailbox
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.kv_events import OffloadedState
 from sglang.srt.disaggregation.agentic_kv_lifecycle import (
@@ -38,7 +39,7 @@ from sglang.srt.disaggregation.agentic_kv_lifecycle import (
     token_ids_digest,
 )
 from sglang.srt.disaggregation.agentic_prefill_pressure import (
-    SharedHostPlacementReservations,
+    SharedPrefillPressureReservations,
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -209,12 +210,29 @@ class DecodeKVCacheOffloadManager:
         self.agentic_relay_runtime = None
         self.agentic_direct_candidates = {}
         self._agentic_candidates_lock = threading.RLock()
+        # Slow data-plane progress is sticky and bounded.  A full dictionary
+        # sweep gave every snapshot one chunk per pass, spreading work over
+        # dozens of D-owned generations and making none of them durable soon.
+        # The window is filled in arrival order, while a persistent cursor gives
+        # every active transfer one bounded progress visit.
+        self._agentic_slow_active_ids: dict[str, None] = {}
+        self._agentic_slow_progress_cursor = 0
+        self._agentic_slow_active_limit = max(
+            1, int(os.getenv("SGLANG_AGENTIC_KV_D2H_ACTIVE_SNAPSHOTS", "8"))
+        )
+        self._agentic_slow_progress_budget = max(
+            1, int(os.getenv("SGLANG_AGENTIC_KV_D2H_PROGRESS_BUDGET", "8"))
+        )
         # TP rank-local release intents are published by transport workers and
         # consumed by the scheduler's existing native broadcast.  Protect the
         # container itself; request/allocator mutation still happens only in
         # ``commit_tp_release`` on the scheduler thread.
         self._agentic_pending_release_lock = threading.RLock()
         self._agentic_tp_pending_releases = {}
+        # A request-generation remains physically owned while it moves from
+        # a transport candidate to the scheduler-owned release queue.  Keep a
+        # separate handoff table so capacity/idle accounting has no gap
+        # between those two containers.
         self._agentic_release_ownership = {}
         # Ordered, de-duplicated local retry queue.  A follower observes each
         # rank-0 release broadcast only once, so a busy local I/O lane must not
@@ -231,9 +249,11 @@ class DecodeKVCacheOffloadManager:
         # the P->D receiver that feeds Decode. Scheduler-owned allocator,
         # Radix, and running-batch mutations still arrive as small commit
         # events and remain on the scheduler thread.
-        self._decode_transport_async_enabled = self.agentic_enabled and os.getenv(
-            "SGLANG_DECODE_IO_ASYNC_PROGRESS", "1"
-        ).lower() in {"1", "true", "yes", "on"}
+        self._decode_transport_async_enabled = (
+            self.agentic_enabled
+            and os.getenv("SGLANG_DECODE_IO_ASYNC_PROGRESS", "1").lower()
+            in {"1", "true", "yes", "on"}
+        )
         # Every TP rank owns one independent physical KV shard.  Rank 0 still
         # decides the logical lifecycle, while all ranks progress their local
         # Direct/Slow I/O outside Decode Forward.
@@ -255,9 +275,7 @@ class DecodeKVCacheOffloadManager:
         self._decode_prealloc_queue = None
         self._decode_transfer_queue = None
         self._decode_io_cuda_device = torch.cuda.current_device()
-        legacy_interval = os.getenv(
-            "SGLANG_DECODE_IO_PROGRESS_INTERVAL_SECONDS", "0.005"
-        )
+        legacy_interval = os.getenv("SGLANG_DECODE_IO_PROGRESS_INTERVAL_SECONDS", "0.005")
         self._decode_io_intervals = {
             "transfer": max(
                 0.0005,
@@ -322,10 +340,16 @@ class DecodeKVCacheOffloadManager:
         self.agentic_force_slow_path = bool(
             envs.SGLANG_AGENTIC_KV_FORCE_SLOW_PATH.get()
         )
+        self.agentic_fast_direct_failure_recompute = bool(
+            envs.SGLANG_AGENTIC_KV_FAST_DIRECT_FAILURE_RECOMPUTE.get()
+        )
         self.agentic_early_claim_store = None
-        self.agentic_early_claim_post_timeout = max(
-            0.1,
-            float(os.getenv("SGLANG_AGENTIC_KV_EARLY_CLAIM_POST_TIMEOUT", "1.0")),
+        self.agentic_tp_direct_abort_mailbox = None
+        # One deadline starts when the tool result arrives and covers both P
+        # admission and Direct receiver/transfer setup.  Claiming the
+        # snapshot must not restart that clock.
+        self.agentic_direct_setup_timeout = max(
+            0.1, envs.SGLANG_AGENTIC_KV_DIRECT_HANDSHAKE_TIMEOUT.get()
         )
         self.agentic_early_claim_poll_interval = max(
             0.01,
@@ -333,23 +357,25 @@ class DecodeKVCacheOffloadManager:
         )
         if self.agentic_enabled and os.getenv(
             "SGLANG_AGENTIC_KV_EARLY_CLAIM", "0"
-        ).lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }:
+        ).lower() in {"1", "true", "yes", "on"}:
             early_claim_dir = os.getenv("SGLANG_AGENTIC_KV_EARLY_CLAIM_DIR", "")
             if not early_claim_dir:
                 p_ready_dir = os.getenv("SGLANG_PD_P_READY_DIR", "")
                 early_claim_dir = os.path.join(p_ready_dir, "early-claims")
             self.agentic_early_claim_store = AgenticEarlyClaimStore(early_claim_dir)
+            if self.tp_world_size > 1:
+                self.agentic_tp_direct_abort_mailbox = TPGroupMailbox(
+                    "d2p-direct-abort-d",
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_world_size,
+                    directory=os.getenv("SGLANG_PD_P_READY_DIR", "/dev/shm"),
+                )
             logger.info(
                 "AgenticKV fast_arrival enabled directory=%s "
-                "tool_timeout=%.3f admission_timeout=%.3f",
+                "tool_timeout=%.3f direct_setup_timeout=%.3f",
                 early_claim_dir,
                 self.agentic_fast_threshold,
-                self.agentic_early_claim_post_timeout,
+                self.agentic_direct_setup_timeout,
             )
         if self.agentic_enabled:
             backend = (
@@ -364,7 +390,9 @@ class DecodeKVCacheOffloadManager:
                 )
             self.agentic_snapshot_store = snapshot_store_factory()
             try:
-                tool_means = json.loads(envs.SGLANG_AGENTIC_KV_TOOL_MEAN_SECONDS.get())
+                tool_means = json.loads(
+                    envs.SGLANG_AGENTIC_KV_TOOL_MEAN_SECONDS.get()
+                )
                 tool_means = {
                     str(name): float(seconds) for name, seconds in tool_means.items()
                 }
@@ -381,13 +409,15 @@ class DecodeKVCacheOffloadManager:
                 capacity_bytes = int(
                     envs.SGLANG_AGENTIC_KV_CAPACITY_GIB.get() * (1024**3)
                 )
-                self.agentic_eviction_controller = SharedSnapshotEvictionController(
-                    self.agentic_snapshot_store,
-                    ledger_path=ledger_path,
-                    capacity_bytes=capacity_bytes,
-                    high_watermark=envs.SGLANG_AGENTIC_KV_HIGH_WATERMARK.get(),
-                    expected_tool_seconds=tool_means,
-                    reservation_ttl_seconds=envs.SGLANG_AGENTIC_KV_STALE_SECONDS.get(),
+                self.agentic_eviction_controller = (
+                    SharedSnapshotEvictionController(
+                        self.agentic_snapshot_store,
+                        ledger_path=ledger_path,
+                        capacity_bytes=capacity_bytes,
+                        high_watermark=envs.SGLANG_AGENTIC_KV_HIGH_WATERMARK.get(),
+                        expected_tool_seconds=tool_means,
+                        reservation_ttl_seconds=envs.SGLANG_AGENTIC_KV_STALE_SECONDS.get(),
+                    )
                 )
             else:
                 capacity_bytes = int(
@@ -425,10 +455,7 @@ class DecodeKVCacheOffloadManager:
                         envs.SGLANG_AGENTIC_KV_STAGING_LEDGER_PATH.get()
                         or f"{ledger_path}.staging"
                     )
-                    if (
-                        not ledger_path
-                        and not envs.SGLANG_AGENTIC_KV_STAGING_LEDGER_PATH.get()
-                    ):
+                    if not ledger_path and not envs.SGLANG_AGENTIC_KV_STAGING_LEDGER_PATH.get():
                         raise ValueError(
                             "P Host staging requires SGLANG_AGENTIC_KV_LEDGER_PATH "
                             "or SGLANG_AGENTIC_KV_STAGING_LEDGER_PATH"
@@ -470,7 +497,11 @@ class DecodeKVCacheOffloadManager:
                             envs.SGLANG_AGENTIC_KV_RELAY_STALE_SECONDS.get()
                         ),
                     )
-                    if relay_enabled and source_numa >= 0 and source_numa == arena_numa:
+                    if (
+                        relay_enabled
+                        and source_numa >= 0
+                        and source_numa == arena_numa
+                    ):
                         relay_id = envs.SGLANG_AGENTIC_KV_RELAY_ID.get()
                         if not relay_id:
                             relay_id = f"d-relay:{os.getpid()}"
@@ -574,8 +605,9 @@ class DecodeKVCacheOffloadManager:
             "agentic_direct": self._decode_agentic_direct_progress,
             "agentic_slow": self._decode_agentic_slow_progress,
         }
-        if self.agentic_relay_worker is not None and getattr(
-            self, "_agentic_relay_progress_isolated", False
+        if (
+            self.agentic_relay_worker is not None
+            and getattr(self, "_agentic_relay_progress_isolated", False)
         ):
             steps["relay"] = self.agentic_relay_worker.poll
         for name, step in steps.items():
@@ -621,7 +653,9 @@ class DecodeKVCacheOffloadManager:
         )
 
     def _decode_agentic_slow_progress(self) -> None:
-        self._check_agentic_direct_progress(progress_relay=False, progress_class="slow")
+        self._check_agentic_direct_progress(
+            progress_relay=False, progress_class="slow"
+        )
 
     def _decode_progress_pending(self, name: str) -> int:
         if name == "transfer":
@@ -638,14 +672,86 @@ class DecodeKVCacheOffloadManager:
         with self._agentic_candidates_lock:
             candidates = tuple(self.agentic_direct_candidates.values())
         if name == "agentic_direct":
-            return sum(1 for item in candidates if not item.get("staging"))
+            return sum(
+                1
+                for item in candidates
+                if not item.get("staging")
+            )
         if name == "agentic_slow":
-            return sum(1 for item in candidates if item.get("staging"))
+            return sum(
+                1
+                for item in candidates
+                if item.get("staging")
+            )
         return len(candidates)
 
     def _agentic_candidate_items(self):
         with getattr(self, "_agentic_candidates_lock", nullcontext()):
-            return tuple(getattr(self, "agentic_direct_candidates", {}).items())
+            return tuple(self.agentic_direct_candidates.items())
+
+    def _agentic_bounded_slow_candidate_items(self):
+        """Return one sticky, bounded round-robin Slow progress slice."""
+
+        with getattr(self, "_agentic_candidates_lock", nullcontext()):
+            candidates = getattr(self, "agentic_direct_candidates", None)
+            if candidates is None:
+                # Focused TP fixtures expose only the stable item accessor.
+                # Production managers always own the ordered dictionary.
+                candidates = dict(self._agentic_candidate_items())
+            active = getattr(self, "_agentic_slow_active_ids", None)
+            if active is None:
+                active = self._agentic_slow_active_ids = {}
+            for snapshot_id in tuple(active):
+                candidate = candidates.get(snapshot_id)
+                if candidate is None or not (
+                    candidate.get("staging") or candidate.get("tp_command") == "slow"
+                ):
+                    active.pop(snapshot_id, None)
+            configured_limit = max(
+                1, int(getattr(self, "_agentic_slow_active_limit", 8))
+            )
+            client = getattr(self, "agentic_host_staging_client", None)
+            physical_limit = int(
+                getattr(client, "max_active_writes", configured_limit)
+            )
+            active_limit = max(1, min(configured_limit, physical_limit))
+            if len(active) < active_limit:
+                for snapshot_id, candidate in candidates.items():
+                    if (
+                        len(active) >= active_limit
+                        or snapshot_id in active
+                        or not (
+                            candidate.get("staging")
+                            or candidate.get("tp_command") == "slow"
+                        )
+                    ):
+                        continue
+                    active[snapshot_id] = None
+            ordered = [
+                (snapshot_id, candidates[snapshot_id])
+                for snapshot_id in active
+                if snapshot_id in candidates
+            ]
+        if not ordered:
+            self._agentic_slow_progress_cursor = 0
+            return ()
+        budget = min(
+            len(ordered),
+            max(1, int(getattr(self, "_agentic_slow_progress_budget", 8))),
+        )
+        cursor = int(getattr(self, "_agentic_slow_progress_cursor", 0)) % len(
+            ordered
+        )
+        selected = tuple(
+            ordered[(cursor + index) % len(ordered)] for index in range(budget)
+        )
+        self._agentic_slow_progress_cursor = (cursor + budget) % len(ordered)
+        return selected
+
+    def _agentic_retire_slow_active(self, snapshot_id: str) -> None:
+        active = getattr(self, "_agentic_slow_active_ids", None)
+        if active is not None:
+            active.pop(snapshot_id, None)
 
     def _agentic_candidate_get(self, snapshot_id: str):
         with getattr(self, "_agentic_candidates_lock", nullcontext()):
@@ -654,15 +760,10 @@ class DecodeKVCacheOffloadManager:
     def _agentic_candidate_pop(self, snapshot_id: str):
         with getattr(self, "_agentic_candidates_lock", nullcontext()):
             candidate = self.agentic_direct_candidates.pop(snapshot_id, None)
-        # Host-placement credit covers the interval before every TP-local
-        # extent is visible in the shared staging ledger.  If this D abandons
-        # the generation first, settle that credit explicitly rather than
-        # leaving a capacity ghost until the safety TTL expires.
-        if candidate is not None:
-            reservations = getattr(self, "_host_placement_reservations", None)
-            if reservations is not None:
-                reservations.release(snapshot_id)
-        return candidate
+            active = getattr(self, "_agentic_slow_active_ids", None)
+            if active is not None:
+                active.pop(snapshot_id, None)
+            return candidate
 
     def _agentic_candidate_is_live_locked(self, snapshot_id: str, candidate) -> bool:
         """Validate a worker snapshot while its per-candidate I/O lock is held."""
@@ -693,7 +794,7 @@ class DecodeKVCacheOffloadManager:
             return tuple(pending.items())
 
     def _agentic_detached_ownership_items(self):
-        """Read candidate and pending ownership at one atomic boundary."""
+        """Read candidate and release-handoff ownership atomically."""
 
         with getattr(self, "_agentic_candidates_lock", nullcontext()):
             with getattr(self, "_agentic_pending_release_lock", nullcontext()):
@@ -721,27 +822,15 @@ class DecodeKVCacheOffloadManager:
                 candidate = getattr(self, "agentic_direct_candidates", {}).pop(
                     snapshot_id, None
                 )
+                active = getattr(self, "_agentic_slow_active_ids", None)
+                if active is not None:
+                    active.pop(snapshot_id, None)
         self._enqueue_agentic_release(
             req,
             start_offset,
             snapshot_id=snapshot_id,
             ownership_registered=True,
         )
-        if candidate is not None:
-            reservations = getattr(self, "_host_placement_reservations", None)
-            if reservations is not None:
-                try:
-                    reservations.release(snapshot_id)
-                except Exception:
-                    # The placement credit has a safety TTL.  Never let a
-                    # best-effort shared-file cleanup prevent the already
-                    # committed D KV/request-slot release from reaching the
-                    # scheduler.
-                    logger.exception(
-                        "AgenticKV Host placement credit cleanup failed "
-                        "snapshot=%s; release remains queued",
-                        snapshot_id,
-                    )
         return candidate
 
     def _decode_progress_loop(self, name: str, step) -> None:
@@ -823,14 +912,12 @@ class DecodeKVCacheOffloadManager:
                 if pending is None:
                     pending = self._agentic_tp_pending_releases = {}
                 pending.setdefault(
-                    snapshot_id, (req, int(start_offset))
+                    metadata.current.snapshot_id, (req, int(start_offset))
                 )
             return
         if not getattr(self, "_decode_io_async_enabled", False):
-            try:
-                self._release_finished_req(req, start_offset)
-            finally:
-                self._agentic_release_ownership_pop(snapshot_id)
+            self._release_finished_req(req, start_offset)
+            self._agentic_release_ownership_pop(snapshot_id)
             return
         start_offset = int(start_offset)
         committed_len = int(getattr(req, "kv_committed_len", 0))
@@ -839,16 +926,16 @@ class DecodeKVCacheOffloadManager:
         if page_size > 1:
             allocated_len = ceil_align(allocated_len, page_size)
         reserved_tokens = max(0, allocated_len - start_offset)
-        self._decode_pending_release_tokens = (
-            int(getattr(self, "_decode_pending_release_tokens", 0)) + reserved_tokens
-        )
+        self._decode_pending_release_tokens = int(
+            getattr(self, "_decode_pending_release_tokens", 0)
+        ) + reserved_tokens
         was_empty = self._decode_io_events.empty()
         self._decode_io_events.put(
             ("release_finished", snapshot_id, req, start_offset, reserved_tokens)
         )
         if was_empty:
-            self._decode_commit_ready_at = time.monotonic() + getattr(
-                self, "_decode_commit_interval", 0.0
+            self._decode_commit_ready_at = (
+                time.monotonic() + getattr(self, "_decode_commit_interval", 0.0)
             )
 
     def tp_pending_release_snapshot(self):
@@ -871,17 +958,19 @@ class DecodeKVCacheOffloadManager:
         if self.tp_world_size <= 1 or self.tp_rank != 0:
             return []
         commands = []
-        for (
-            snapshot_id,
-            candidate,
-        ) in DecodeKVCacheOffloadManager._agentic_candidate_items(self):
+        for snapshot_id, candidate in (
+            DecodeKVCacheOffloadManager._agentic_candidate_items(self)
+        ):
             manifest = candidate.get("manifest")
-            if not candidate.get("setup_committed", True):
+            if candidate.get("tp_direct_abort_requested"):
+                action = "direct_abort"
+            elif not candidate.get("setup_committed", True):
                 action = "wait"
             elif candidate.get("staging"):
                 action = "slow"
             elif candidate.get("sent") or (
-                manifest is not None and manifest.state is SnapshotState.DIRECT_LOADING
+                manifest is not None
+                and manifest.state is SnapshotState.DIRECT_LOADING
             ):
                 action = "direct"
             else:
@@ -900,8 +989,10 @@ class DecodeKVCacheOffloadManager:
                 )
                 command["arena_numa_nodes"] = list(
                     candidate.get(
-                        "selected_arena_numa_nodes",
-                        self._prefill_domain_numa_nodes(int(command["host_domain"])),
+                        "selected_host_numa_nodes",
+                        self._prefill_domain_numa_nodes(
+                            int(command["host_domain"])
+                        ),
                     )
                 )
             commands.append(command)
@@ -920,16 +1011,19 @@ class DecodeKVCacheOffloadManager:
                 pending = self._agentic_tp_pending_candidate_commands = {}
             pending[snapshot_id] = dict(command)
             return False
-        candidate["tp_command"] = str(command["action"])
-        if command.get("host_domain") is not None:
-            domain = int(command["host_domain"])
-            numa_nodes = [int(value) for value in command["arena_numa_nodes"]]
-            candidate["selected_host_domain"] = domain
-            candidate["selected_prefill_domain"] = domain
-            candidate["selected_arena_numa_nodes"] = numa_nodes
-        manifest_bytes = command.get("manifest")
-        if manifest_bytes is not None:
-            candidate["manifest"] = SnapshotManifest.from_bytes(manifest_bytes)
+        # Command action, route target and lifecycle manifest are one epoch.
+        # Serialize their installation with Direct sender submission so an
+        # old ``direct`` observation cannot post after ``slow`` is visible.
+        with candidate.get("io_lock", nullcontext()):
+            candidate["tp_command"] = str(command["action"])
+            if command.get("host_domain") is not None:
+                domain = int(command["host_domain"])
+                numa_nodes = [int(value) for value in command["arena_numa_nodes"]]
+                candidate["selected_host_domain"] = domain
+                candidate["selected_host_numa_nodes"] = numa_nodes
+            manifest_bytes = command.get("manifest")
+            if manifest_bytes is not None:
+                candidate["manifest"] = SnapshotManifest.from_bytes(manifest_bytes)
         pending = getattr(self, "_agentic_tp_pending_candidate_commands", None)
         if pending is not None:
             pending.pop(snapshot_id, None)
@@ -956,93 +1050,75 @@ class DecodeKVCacheOffloadManager:
         ]
 
     def _select_slow_host_domain(
-        self, snapshot_id: str = "", byte_size: int = 1
+        self, snapshot_id: str = "", byte_size: int = 0
     ) -> tuple[int, list[int]]:
-        """Choose storage using only effective Shared-Host free capacity.
+        """Choose a Shared-Host arena from the cached capacity snapshot.
 
-        This decision chooses where the durable snapshot lives, not which P
-        will eventually Prefill it.  The latter is selected independently
-        when the child request is ready to restore.
+        This is a tiny /dev/shm read performed only when a request actually
+        falls back.  It never queries P synchronously and therefore cannot
+        block Decode or the fast path.
         """
+
+        byte_size = int(byte_size)
+        if byte_size <= 0:
+            raise ValueError(
+                "D->P Slow Host routing requires a positive complete TP "
+                f"snapshot size, got {byte_size}"
+            )
 
         fallback = int(self.agentic_host_staging_client.arena_domain)
         if os.getenv(
             "SGLANG_PD_LATE_BIND_DYNAMIC_PREFILL_DOMAINS", ""
-        ).strip().lower() not in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }:
+        ).strip().lower() not in {"1", "true", "yes", "on"}:
             return fallback, self._prefill_domain_numa_nodes(fallback)
-        path = os.getenv(
-            "SGLANG_AGENTIC_KV_HOST_CAPACITY_PATH",
-            os.getenv("SGLANG_AGENTIC_KV_PREFILL_LOAD_PATH", ""),
-        ).strip()
+        path = os.getenv("SGLANG_AGENTIC_KV_PREFILL_LOAD_PATH", "").strip()
         try:
             with open(path, "r", encoding="utf-8") as handle:
                 payload = json.load(handle)
-            max_age = max(
-                1.0,
-                float(os.getenv("SGLANG_AGENTIC_KV_HOST_CAPACITY_MAX_AGE_S", "30")),
-            )
-            if time.time() - float(payload.get("published_at", 0.0)) > max_age:
-                raise ValueError("stale Host capacity snapshot")
+            if time.time() - float(payload.get("published_at", 0.0)) > 2.0:
+                raise ValueError("stale Prefill pressure snapshot")
             domains = payload.get("domains", ())
             if not domains:
-                raise ValueError("empty Host capacity snapshot")
+                raise ValueError("empty Prefill pressure snapshot")
             reservation_path = os.getenv(
-                "SGLANG_AGENTIC_KV_HOST_PLACEMENT_RESERVATION_PATH",
-                f"{path}.reservations" if path else "",
+                "SGLANG_AGENTIC_KV_PREFILL_RESERVATION_PATH",
+                f"{path}.reservations",
             )
-            reservations = getattr(self, "_host_placement_reservations", None)
+            reservations = getattr(self, "_prefill_pressure_reservations", None)
             if reservations is None or reservations.path != os.path.abspath(
                 reservation_path
             ):
-                reservations = SharedHostPlacementReservations(
+                reservations = SharedPrefillPressureReservations(
                     reservation_path,
                     ttl_seconds=float(
                         os.getenv(
-                            "SGLANG_AGENTIC_KV_HOST_PLACEMENT_RESERVATION_TTL_S",
-                            "300",
+                            "SGLANG_AGENTIC_KV_PREFILL_RESERVATION_TTL_S", "5"
                         )
                     ),
                 )
-                self._host_placement_reservations = reservations
-            source_numa = int(self.agentic_host_staging_client.source_numa_node)
-            local_domains = [
-                int(item["domain"])
-                for item in domains
-                if source_numa in self._prefill_domain_numa_nodes(int(item["domain"]))
-            ]
+                self._prefill_pressure_reservations = reservations
             selected = reservations.select_and_reserve(
                 snapshot_id or f"pid:{os.getpid()}:{time.time_ns()}",
                 byte_size,
                 domains,
-                local_domains=local_domains,
-                locality_slack_bytes=int(
-                    float(os.getenv("SGLANG_AGENTIC_KV_HOST_LOCALITY_SLACK_GIB", "8"))
-                    * (1024**3)
-                ),
             )
             logger.info(
-                "AgenticKV slow_host_select host=%d snapshot=%s bytes=%d "
-                "policy=max_free_locality_slack",
+                "AgenticKV slow_host_select arena=%d snapshot=%s bytes=%d "
+                "policy=max_remaining_host",
                 selected,
                 snapshot_id,
                 byte_size,
             )
             return selected, self._prefill_domain_numa_nodes(selected)
-        except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+        except (OSError, TypeError, ValueError, KeyError):
             logger.warning(
-                "AgenticKV slow_host_select_fallback host=%d path=%s reason=%s",
+                "AgenticKV slow_host_select_fallback arena=%d path=%s",
                 fallback,
                 path,
-                type(exc).__name__,
             )
             return fallback, self._prefill_domain_numa_nodes(fallback)
 
-    def _assign_slow_prefill_target(self, candidate) -> None:
+    def _assign_slow_host_target(self, candidate) -> None:
         if "selected_host_domain" in candidate:
             return
         if os.getenv("SGLANG_PD_ABLATION_RANDOM_ROUTING", "").strip().lower() in {
@@ -1063,27 +1139,26 @@ class DecodeKVCacheOffloadManager:
             domain = int.from_bytes(digest, "big") % count
             numa_nodes = self._prefill_domain_numa_nodes(domain)
             logger.info(
-                "AgenticKV slow_prefill_select_random P=%d snapshot=%s",
+                "AgenticKV slow_host_select_random arena=%d snapshot=%s",
                 domain,
                 snapshot_id,
             )
         else:
             manifest = candidate.get("manifest")
-            # Host placement is one logical request-generation decision.  The
-            # manifest byte size is rank-local, while the selected logical P
-            # owns one equally sized arena extent per TP shard.  Charge the
-            # complete TP snapshot so concurrent D groups cannot overbook a
-            # Host domain between capacity publications.
-            snapshot_bytes = int(getattr(manifest, "byte_size", 1)) * max(
-                1, int(getattr(manifest, "tp_size", self.tp_world_size))
-            )
+            reservation_bytes = candidate.get("slow_host_reservation_bytes")
+            if reservation_bytes is None:
+                # Compatibility for callers that already carry a materialized
+                # Host manifest.  New Direct fallbacks populate the exact
+                # complete-TP size before reaching this point.
+                reservation_bytes = int(getattr(manifest, "byte_size", 0)) * max(
+                    1, int(getattr(self, "tp_world_size", 1))
+                )
             domain, numa_nodes = self._select_slow_host_domain(
                 str(getattr(manifest, "snapshot_id", "")),
-                snapshot_bytes,
+                int(reservation_bytes),
             )
         candidate["selected_host_domain"] = domain
-        candidate["selected_prefill_domain"] = domain
-        candidate["selected_arena_numa_nodes"] = numa_nodes
+        candidate["selected_host_numa_nodes"] = numa_nodes
 
     def commit_tp_release(self, snapshot_id: str) -> bool:
         """Apply a TP release selected by the scheduler's native broadcast.
@@ -1114,14 +1189,14 @@ class DecodeKVCacheOffloadManager:
         try:
             if candidate is not None:
                 candidate["retired"] = True
-            DecodeKVCacheOffloadManager._agentic_pending_release_pop(self, snapshot_id)
+            DecodeKVCacheOffloadManager._agentic_pending_release_pop(
+                self, snapshot_id
+            )
             candidate = DecodeKVCacheOffloadManager._agentic_candidate_pop(
                 self, snapshot_id
             )
-            req = (
-                item[0]
-                if item is not None
-                else (None if candidate is None else candidate.get("req"))
+            req = item[0] if item is not None else (
+                None if candidate is None else candidate.get("req")
             )
             start_offset = int(item[1]) if item is not None else 0
             if req is None:
@@ -1166,11 +1241,9 @@ class DecodeKVCacheOffloadManager:
         started_at = time.perf_counter()
         committed = 0
         allocator = getattr(self, "token_to_kv_pool_allocator", None)
-        grouped_free = (
-            allocator is not None
-            and hasattr(allocator, "free_group_begin")
-            and not getattr(allocator, "debug_mode", False)
-        )
+        grouped_free = allocator is not None and hasattr(
+            allocator, "free_group_begin"
+        ) and not getattr(allocator, "debug_mode", False)
         if grouped_free:
             allocator.free_group_begin()
         try:
@@ -1228,15 +1301,7 @@ class DecodeKVCacheOffloadManager:
 
     @property
     def agentic_pending_release_token_count(self) -> int:
-        """Detached Decode KV awaiting transport or a scheduler free commit.
-
-        A finished request leaves the running batch as soon as its response is
-        produced, while its request-generation candidate still owns the D KV
-        until Direct/Slow handoff completes.  Radix accounts for the protected
-        prefix, so only the candidate's private, page-rounded tail belongs
-        here.  Without this handoff ownership the strict *idle* checker sees a
-        spurious one-page leak when the last running request finishes.
-        """
+        """Detached Decode KV awaiting transport or scheduler free commit."""
 
         reserved = 0
         # TP>1 uses the scheduler's existing native broadcast to commit a
@@ -1249,7 +1314,6 @@ class DecodeKVCacheOffloadManager:
             DecodeKVCacheOffloadManager._agentic_detached_ownership_items(self)
         )
         pending_snapshot_ids = {snapshot_id for snapshot_id, _ in pending_items}
-
         detached_reqs = [item[0] for _snapshot_id, item in pending_items]
         for snapshot_id, candidate in candidate_items:
             if snapshot_id in pending_snapshot_ids or candidate.get("retired"):
@@ -1292,8 +1356,9 @@ class DecodeKVCacheOffloadManager:
     def offload_kv_cache(self, req) -> bool:
         """Offload incremental KV cache for decode side."""
 
-        if not self.agentic_hostless and (
-            self.cache_controller is None or self.decode_host_mem_pool is None
+        if (
+            not self.agentic_hostless
+            and (self.cache_controller is None or self.decode_host_mem_pool is None)
         ):
             return False
 
@@ -1336,9 +1401,7 @@ class DecodeKVCacheOffloadManager:
                 "AgenticKV metadata_missing req=%s extra_key=%s custom_keys=%s",
                 req.rid,
                 req.extra_key,
-                sorted(
-                    (getattr(req.sampling_params, "custom_params", None) or {}).keys()
-                ),
+                sorted((getattr(req.sampling_params, "custom_params", None) or {}).keys()),
             )
 
         token_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx]
@@ -1575,7 +1638,9 @@ class DecodeKVCacheOffloadManager:
         self.wake_decode_io_progress()
         return True
 
-    def _progress_agentic_direct_candidate_setup(self, candidate, now: float) -> bool:
+    def _progress_agentic_direct_candidate_setup(
+        self, candidate, now: float
+    ) -> bool:
         """Prepare one local TP shard, then let rank zero publish the offer.
 
         Returning ``False`` means only "retry later".  The finished Decode
@@ -1679,6 +1744,7 @@ class DecodeKVCacheOffloadManager:
             )
         return True
 
+
     def _agentic_try_early_claim(self, candidate, now: float) -> str:
         """Return absent or arrived for the next-turn ingress marker."""
 
@@ -1699,7 +1765,11 @@ class DecodeKVCacheOffloadManager:
             max_age_seconds=max(
                 5.0,
                 self.agentic_fast_threshold
-                + self.agentic_early_claim_post_timeout
+                + getattr(
+                    self,
+                    "agentic_direct_setup_timeout",
+                    envs.SGLANG_AGENTIC_KV_DIRECT_HANDSHAKE_TIMEOUT.get(),
+                )
                 + 1.0,
             ),
         )
@@ -1716,15 +1786,21 @@ class DecodeKVCacheOffloadManager:
         candidate["fast_arrival_seen"] = True
         # Express the router's wall-clock arrival on this candidate's
         # monotonic timeline so scheduler polling delay does not silently
-        # extend the additional P-admission window.
-        candidate["fast_arrival_seen_at"] = candidate["created_at"] + arrival_offset
+        # extend the shared P-admission/Direct-setup window.
+        candidate["fast_arrival_seen_at"] = (
+            candidate["created_at"] + arrival_offset
+        )
         logger.info(
             "AgenticKV fast_arrival_seen snapshot=%s tokens=%d "
-            "tool_elapsed_s=%.6f admission_timeout_s=%.3f",
+            "tool_elapsed_s=%.6f direct_setup_timeout_s=%.3f",
             manifest.snapshot_id,
             manifest.token_count,
             arrival_offset,
-            self.agentic_early_claim_post_timeout,
+            getattr(
+                self,
+                "agentic_direct_setup_timeout",
+                envs.SGLANG_AGENTIC_KV_DIRECT_HANDSHAKE_TIMEOUT.get(),
+            ),
         )
         return "arrived"
 
@@ -1765,6 +1841,152 @@ class DecodeKVCacheOffloadManager:
                 manifest.snapshot_id,
                 reason,
             )
+
+    def _agentic_tp_abort_mailbox_write(
+        self, candidate, snapshot_id: str, operation
+    ) -> bool:
+        """Run one rare TP-abort write with bounded retry/logging."""
+
+        now = time.monotonic()
+        if now < float(candidate.get("tp_abort_mailbox_retry_at", 0.0)):
+            return False
+        try:
+            operation()
+        except OSError:
+            delay = max(
+                0.05,
+                float(candidate.get("tp_abort_mailbox_retry_delay", 0.05)),
+            )
+            candidate["tp_abort_mailbox_retry_at"] = now + delay
+            candidate["tp_abort_mailbox_retry_delay"] = min(1.0, delay * 2.0)
+            candidate["tp_direct_abort_requested"] = True
+            if not candidate.get("tp_abort_mailbox_error_logged"):
+                candidate["tp_abort_mailbox_error_logged"] = True
+                logger.exception(
+                    "AgenticKV TP Direct abort mailbox unavailable "
+                    "snapshot=%s action=retain_and_retry",
+                    snapshot_id,
+                )
+            return False
+        candidate["tp_abort_mailbox_retry_at"] = 0.0
+        candidate["tp_abort_mailbox_retry_delay"] = 0.05
+        return True
+
+    def _agentic_publish_unstarted_direct_abort(
+        self,
+        candidate,
+        manifest,
+        *,
+        reason: str,
+        fence_kind: str = "unstarted",
+    ) -> bool:
+        """Fence a Direct claim before asking P to release it.
+
+        ``DIRECT_LOADING`` is P's logical claim, so D may not overwrite it
+        with ``SLOW_FALLBACK``.  When the shared setup deadline expires before
+        this D worker submits sender DMA, this marker is the cross-process
+        negative-send fence: after publication D will never submit this claim.
+        A ``terminal`` fence is also valid after a failed partial launch, but
+        only once every registered transport handle has physically completed.
+        P can then quiesce its receiver and return the manifest to
+        ``DIRECT_READY``; D remains the physical KV owner throughout.
+
+        TP groups first reduce a no-future-write proof from every D shard;
+        only rank zero may publish the group marker.
+        """
+
+        if fence_kind not in {"unstarted", "terminal"}:
+            raise ValueError(f"invalid Direct abort fence kind: {fence_kind}")
+        if fence_kind == "unstarted" and candidate.get("sent"):
+            return False
+        if fence_kind == "terminal" and not candidate.get("sent"):
+            return False
+        claim_id = getattr(manifest, "claim_id", None)
+        if not claim_id:
+            return False
+        if candidate.get("direct_abort_claim_id") == claim_id:
+            return True
+        tp_size = int(getattr(self, "tp_world_size", 1))
+        if tp_size > 1:
+            mailbox = getattr(self, "agentic_tp_direct_abort_mailbox", None)
+            if mailbox is None:
+                return False
+            # 1 means cancellation requested but local DMA may still write;
+            # 2 is the rank-local physical no-future-write fence.
+            if not candidate.get("tp_direct_abort_requested"):
+                candidate["tp_direct_abort_requested"] = True
+                candidate["tp_announced_action"] = None
+            if not DecodeKVCacheOffloadManager._agentic_tp_abort_mailbox_write(
+                self,
+                candidate,
+                manifest.snapshot_id,
+                lambda: mailbox.publish_local_progress(manifest.snapshot_id, 2),
+            ):
+                return True
+            if getattr(self, "tp_rank", 0) != 0:
+                return True
+            statuses = [
+                mailbox.local_status(manifest.snapshot_id, rank)
+                for rank in range(tp_size)
+            ]
+            if any(status is None or int(status) < 2 for status in statuses):
+                return True
+            fence_kind = "terminal"
+        now = time.monotonic()
+        if now < float(candidate.get("direct_abort_publish_retry_at", 0.0)):
+            return True
+        store = getattr(self, "agentic_early_claim_store", None)
+        publish = getattr(store, "publish_direct_abort", None)
+        if not callable(publish):
+            return False
+        # Install the local no-future-write tombstone before making the fence
+        # visible cross-process. This ordering remains safe even if an
+        # out-of-tree caller accidentally drives two progress loops.
+        candidate["direct_abort_claim_id"] = claim_id
+        try:
+            candidate["direct_abort_tool_confirmed"] = bool(
+                candidate.get("fast_arrival_seen")
+            ) or bool(self._agentic_try_tool_confirmation(candidate))
+            publish(
+                manifest.request,
+                claim_id=claim_id,
+                fence_kind=fence_kind,
+            )
+        except Exception:
+            if candidate.get("direct_abort_claim_id") == claim_id:
+                candidate.pop("direct_abort_claim_id", None)
+            delay = max(
+                0.05,
+                float(candidate.get("direct_abort_publish_retry_delay", 0.05)),
+            )
+            candidate["direct_abort_publish_retry_at"] = now + delay
+            candidate["direct_abort_publish_retry_delay"] = min(1.0, delay * 2.0)
+            if not candidate.get("direct_abort_publish_error_logged"):
+                candidate["direct_abort_publish_error_logged"] = True
+                logger.exception(
+                    "AgenticKV direct_abort_publish_failed snapshot=%s claim=%s "
+                    "action=retain_and_retry",
+                    manifest.snapshot_id,
+                    claim_id,
+                )
+            return True
+        self._agentic_release_early_claim(candidate, "direct_setup_expired")
+        if tp_size > 1:
+            DecodeKVCacheOffloadManager._agentic_tp_abort_mailbox_write(
+                self,
+                candidate,
+                manifest.snapshot_id,
+                lambda: mailbox.clear_group(manifest.snapshot_id),
+            )
+        logger.warning(
+            "AgenticKV direct_abort_published snapshot=%s claim=%s "
+            "fence=%s reason=%s",
+            manifest.snapshot_id,
+            claim_id,
+            fence_kind,
+            reason,
+        )
+        return True
 
     def _agentic_try_final_confirmation(self, candidate) -> bool:
         store = getattr(self, "agentic_early_claim_store", None)
@@ -1832,7 +2054,9 @@ class DecodeKVCacheOffloadManager:
         # retries; no P can observe a route to this generation meanwhile.
         if not candidate.get("offer_published", True):
             try:
-                self.agentic_snapshot_store.publish_direct_offer(candidate["manifest"])
+                self.agentic_snapshot_store.publish_direct_offer(
+                    candidate["manifest"]
+                )
                 candidate["offer_published"] = True
             except Exception:
                 logger.exception(
@@ -1840,7 +2064,9 @@ class DecodeKVCacheOffloadManager:
                     metadata.current.snapshot_id,
                 )
                 return False
-        manifest = self._agentic_direct_manifest(candidate, metadata, now, force=True)
+        manifest = self._agentic_direct_manifest(
+            candidate, metadata, now, force=True
+        )
         if manifest.state is SnapshotState.DIRECT_READY:
             terminal = self.agentic_snapshot_store.finalize_direct_offer(
                 manifest,
@@ -1889,10 +2115,7 @@ class DecodeKVCacheOffloadManager:
             # its manifest update or releasing a transfer still in progress.
             if direct_manifest is None:
                 return None
-        elif (
-            direct_manifest is not None
-            and direct_manifest.state is not SnapshotState.SLOW_FALLBACK
-        ):
+        elif direct_manifest is not None and direct_manifest.state is not SnapshotState.SLOW_FALLBACK:
             raise RuntimeError(
                 f"cannot start slow snapshot from {direct_manifest.state.value}"
             )
@@ -2009,7 +2232,6 @@ class DecodeKVCacheOffloadManager:
     def _start_agentic_host_staging(self, candidate, manifest) -> bool | None:
         """Offer a complete D-GPU snapshot to P; D ownership is retained."""
 
-        self._assign_slow_prefill_target(candidate)
         metadata = candidate["metadata"]
         if manifest.state in {SnapshotState.DIRECT_READY, SnapshotState.DIRECT_LOADING}:
             fallback = self.agentic_snapshot_store.begin_slow_fallback(
@@ -2026,6 +2248,24 @@ class DecodeKVCacheOffloadManager:
         # Shared-Arena operation that may raise, so a retry remains idempotent
         # instead of trying to reacquire its own persistent claim.
         candidate["manifest"] = fallback
+        source_pages = candidate["source_page_indices"]
+        bytes_per_page = sum(
+            int(value)
+            for value in self.agentic_direct_runtime.manager.kv_args.kv_item_lens
+        )
+        rank_byte_size = bytes_per_page * len(source_pages)
+        if rank_byte_size <= 0:
+            raise RuntimeError(
+                "D->P Slow Host staging requires a positive rank-local "
+                f"snapshot size for {fallback.snapshot_id}"
+            )
+        # The pressure publisher reports capacity and usage for the complete
+        # logical TP arena.  Charge every shard before selecting the Host so
+        # concurrent fallbacks cannot all route against the same stale sample.
+        candidate["slow_host_reservation_bytes"] = rank_byte_size * max(
+            1, int(self.tp_world_size)
+        )
+        self._assign_slow_host_target(candidate)
         # TP followers do not own sampling metadata.  Their local ``Req`` may
         # carry a token-id view that is sufficient to address the same KV
         # positions but is not authoritative for the logical token digest.
@@ -2036,7 +2276,6 @@ class DecodeKVCacheOffloadManager:
         token_count = int(fallback.token_count)
         token_digest = fallback.token_digest
         token_indices = candidate["source_token_indices"]
-        source_pages = candidate["source_page_indices"]
         if int(token_indices.numel()) != token_count:
             raise RuntimeError(
                 "TP Host staging source length disagrees with the "
@@ -2048,17 +2287,13 @@ class DecodeKVCacheOffloadManager:
             if self.agentic_host_staging_client.retain_logical_hashes
             else []
         )
-        bytes_per_page = sum(
-            int(value)
-            for value in self.agentic_direct_runtime.manager.kv_args.kv_item_lens
-        )
         self.agentic_host_staging_client.offer(
             manifest=fallback,
             metadata=metadata,
             token_count=token_count,
             token_digest=token_digest,
             logical_hashes=logical_hashes,
-            byte_size=bytes_per_page * len(source_pages),
+            byte_size=rank_byte_size,
             arena_domain=int(
                 candidate.get(
                     "selected_host_domain",
@@ -2067,7 +2302,7 @@ class DecodeKVCacheOffloadManager:
             ),
             arena_numa_node=int(
                 candidate.get(
-                    "selected_arena_numa_nodes",
+                    "selected_host_numa_nodes",
                     [self.agentic_host_staging_client.arena_numa_node]
                     * self.tp_world_size,
                 )[self.tp_rank]
@@ -2119,6 +2354,75 @@ class DecodeKVCacheOffloadManager:
         self._publish_agentic_route(metadata.current, route="recompute")
         return True
 
+    def _finish_fast_direct_recompute(
+        self,
+        candidate,
+        metadata: AgenticRequestMetadata,
+        now: float,
+    ) -> bool:
+        """Publish the recompute route before relinquishing the only D copy."""
+
+        if now < candidate.get("fallback_retry_at", 0.0):
+            return False
+        if not self._publish_agentic_route(metadata.current, route="recompute"):
+            candidate["fallback_retry_at"] = now + 0.05
+            return False
+        snapshot_id = metadata.current.snapshot_id
+        self._agentic_release_early_claim(
+            candidate, "fast_direct_failure_recompute"
+        )
+        self._cleanup_agentic_direct_sender(candidate)
+        self._retire_candidate_for_release(snapshot_id, candidate["req"], 0)
+        logger.info(
+            "AgenticKV fast_direct_failure_recompute "
+            "snapshot=%s elapsed_s=%.6f",
+            snapshot_id,
+            now - candidate["created_at"],
+        )
+        return True
+
+    def _try_fast_direct_failure_recompute(
+        self,
+        candidate,
+        manifest: SnapshotManifest,
+        metadata: AgenticRequestMetadata,
+        now: float,
+    ) -> bool:
+        """Retire one failed fast Direct offer without splitting a TP group.
+
+        Rank zero is the sole lifecycle owner for a logical TP snapshot.  It
+        publishes the recompute route before the existing native TP release
+        handoff can free any rank's source shard.  Followers only execute the
+        resulting rank-zero command and must never terminalize independently.
+        """
+
+        if self.tp_world_size > 1 and self.tp_rank != 0:
+            return False
+        snapshot_id = metadata.current.snapshot_id
+        try:
+            terminal = self.agentic_snapshot_store.fail_direct_offer(
+                manifest,
+                owner_id=f"d-fast-recompute:{snapshot_id}",
+                reason="fast_direct_setup_timeout_recompute",
+            )
+        except Exception:
+            logger.exception(
+                "Failed to atomically retire Direct offer %s for recompute; "
+                "retaining D KV",
+                snapshot_id,
+            )
+            terminal = None
+        # The lifecycle claim is the linearization point.  A None result means
+        # P won the offer concurrently, so D retains its source and lets normal
+        # Direct progress finish.
+        if terminal is None or terminal.state is not SnapshotState.FAILED:
+            candidate["fallback_retry_at"] = now + 0.05
+            return False
+        candidate["fast_direct_recompute_terminalized"] = True
+        return DecodeKVCacheOffloadManager._finish_fast_direct_recompute(
+            self, candidate, metadata, now
+        )
+
     def _publish_agentic_route(
         self,
         request,
@@ -2126,6 +2430,7 @@ class DecodeKVCacheOffloadManager:
         route: str,
         snapshot_tokens: Optional[int] = None,
         prefill_domain: Optional[int] = None,
+        host_domain: Optional[int] = None,
     ) -> bool:
         # Route markers are a multi-P coordination primitive.  Keeping this
         # behind the explicit 2P+ feature flag preserves the proven 1P path
@@ -2138,22 +2443,41 @@ class DecodeKVCacheOffloadManager:
         if store is None:
             return True
         try:
+            is_host_route = route in {"host_writing", "host_ready"}
             selected_domain = (
-                int(prefill_domain)
-                if prefill_domain is not None
-                else int(os.environ.get("SGLANG_AGENTIC_KV_PREFILL_DOMAIN", "0"))
+                -1
+                if is_host_route and prefill_domain is None
+                else (
+                    int(prefill_domain)
+                    if prefill_domain is not None
+                    else int(
+                        os.environ.get("SGLANG_AGENTIC_KV_PREFILL_DOMAIN", "0")
+                    )
+                )
+            )
+            selected_host_domain = (
+                int(host_domain)
+                if host_domain is not None
+                else (
+                    selected_domain
+                    if is_host_route and selected_domain >= 0
+                    else None
+                )
             )
             arena_numa = (
-                self._prefill_domain_numa_nodes(selected_domain)[self.tp_rank]
-                if prefill_domain is not None
+                self._prefill_domain_numa_nodes(selected_host_domain)[self.tp_rank]
+                if selected_host_domain is not None
                 else envs.SGLANG_AGENTIC_KV_ARENA_NUMA_NODE.get()
             )
             store.publish_route(
                 request,
                 route=route,
                 prefill_domain=selected_domain,
+                arena_domain=selected_host_domain,
                 arena_numa_node=(
-                    arena_numa if route in {"host_writing", "host_ready"} else None
+                    arena_numa
+                    if route in {"host_writing", "host_ready"}
+                    else None
                 ),
                 snapshot_tokens=snapshot_tokens,
             )
@@ -2188,9 +2512,9 @@ class DecodeKVCacheOffloadManager:
         # Retry every locally deferred follower release in original broadcast
         # order.  The snapshot id remains present until its I/O lane quiesces;
         # later completions therefore cannot overwrite or strand it.
-        deferred_tp_releases = (
-            getattr(self, "_agentic_tp_deferred_releases", None) or {}
-        )
+        deferred_tp_releases = getattr(
+            self, "_agentic_tp_deferred_releases", None
+        ) or {}
         for deferred_tp_release in tuple(deferred_tp_releases)[:32]:
             self.commit_tp_release(deferred_tp_release)
         if getattr(self, "_decode_io_async_enabled", False):
@@ -2266,7 +2590,9 @@ class DecodeKVCacheOffloadManager:
 
         try:
             high_watermark = float(
-                os.environ.get("SGLANG_AGENTIC_KV_DIRECT_D_HBM_HIGH_WATERMARK", "0.70")
+                os.environ.get(
+                    "SGLANG_AGENTIC_KV_DIRECT_D_HBM_HIGH_WATERMARK", "0.70"
+                )
             )
         except ValueError:
             logger.exception("Invalid direct D-HBM high watermark")
@@ -2350,13 +2676,21 @@ class DecodeKVCacheOffloadManager:
                 # retain their original KV and the ledger falls back to direct
                 # cross-NUMA D2H after the relay drains its DMA.
                 logger.exception("Agentic relay worker poll failed")
-        candidate_items = self._agentic_candidate_items()
+        candidate_items = (
+            self._agentic_bounded_slow_candidate_items()
+            if progress_class == "slow"
+            else self._agentic_candidate_items()
+        )
         if not candidate_items:
             return
         now = time.monotonic()
         handshake_timeout = max(
-            self.agentic_fast_threshold,
-            envs.SGLANG_AGENTIC_KV_DIRECT_HANDSHAKE_TIMEOUT.get(),
+            0.1,
+            getattr(
+                self,
+                "agentic_direct_setup_timeout",
+                envs.SGLANG_AGENTIC_KV_DIRECT_HANDSHAKE_TIMEOUT.get(),
+            ),
         )
         for snapshot_id, candidate in candidate_items:
             is_slow = bool(candidate.get("staging"))
@@ -2441,7 +2775,7 @@ class DecodeKVCacheOffloadManager:
                         metadata.current,
                         route="host_ready",
                         snapshot_tokens=candidate["manifest"].token_count,
-                        prefill_domain=candidate.get("selected_prefill_domain"),
+                        host_domain=candidate.get("selected_host_domain"),
                     ):
                         # In multi-P mode this marker commits the P-domain
                         # destination.  Retain D KV and retry if publishing it
@@ -2450,9 +2784,7 @@ class DecodeKVCacheOffloadManager:
                     self._cleanup_agentic_direct_sender(candidate)
                     self._agentic_release_early_claim(candidate, "host_ready")
                     self._retire_candidate_for_release(snapshot_id, req, 0)
-                    logger.info(
-                        "AgenticKV d_release_after_p_host snapshot=%s", snapshot_id
-                    )
+                    logger.info("AgenticKV d_release_after_p_host snapshot=%s", snapshot_id)
                 elif outcome == "failed":
                     # D still owns the complete HBM copy here.  Hostless mode
                     # deliberately has no large emergency D Host pool: mark
@@ -2507,7 +2839,9 @@ class DecodeKVCacheOffloadManager:
             # Slow-only ablation preserves the same manifest/CAS and durable
             # Host ownership transition, but starts it immediately instead of
             # waiting for tool arrival or P Direct admission.
-            should_fallback = bool(getattr(self, "agentic_force_slow_path", False))
+            should_fallback = bool(
+                getattr(self, "agentic_force_slow_path", False)
+            )
             try:
                 with candidate["io_lock"]:
                     if not self._agentic_candidate_is_live_locked(
@@ -2524,6 +2858,85 @@ class DecodeKVCacheOffloadManager:
                     snapshot_id,
                 )
                 poll = KVPoll.Transferring
+
+            if self.tp_world_size > 1:
+                abort_mailbox = getattr(
+                    self, "agentic_tp_direct_abort_mailbox", None
+                )
+                if abort_mailbox is not None:
+                    peer_abort = any(
+                        (
+                            status := abort_mailbox.local_status(
+                                snapshot_id, rank
+                            )
+                        )
+                        is not None
+                        and int(status) >= 1
+                        for rank in range(self.tp_world_size)
+                    )
+                    if peer_abort:
+                        if not candidate.get("tp_direct_abort_requested"):
+                            candidate["tp_direct_abort_requested"] = True
+                            candidate["tp_announced_action"] = None
+                if candidate.get("tp_direct_abort_requested"):
+                    abort_claim_id = candidate.get("direct_abort_claim_id")
+                    if abort_claim_id:
+                        current = self._agentic_direct_manifest(
+                            candidate, metadata, now, force=True
+                        )
+                        if current.state not in {
+                            SnapshotState.DIRECT_LOADING,
+                            SnapshotState.P_RECEIVED,
+                        }:
+                            # P's lifecycle CAS is the group acknowledgement.
+                            # Drop the local tombstone and immediately let the
+                            # ordinary Slow transition run from DIRECT_READY.
+                            if abort_mailbox is not None and not (
+                                DecodeKVCacheOffloadManager._agentic_tp_abort_mailbox_write(
+                                    self,
+                                    candidate,
+                                    snapshot_id,
+                                    lambda: abort_mailbox.clear_group(snapshot_id),
+                                )
+                            ):
+                                # Keep the abort epoch intact and non-staging;
+                                # otherwise tp_candidate_commands would keep
+                                # broadcasting direct_abort while rank0 alone
+                                # starts Host D2H.
+                                continue
+                            candidate.pop("tp_direct_abort_requested", None)
+                            candidate.pop("direct_abort_claim_id", None)
+                            candidate["tp_announced_action"] = None
+                            if current.state is SnapshotState.DIRECT_READY:
+                                should_fallback = True
+                        else:
+                            continue
+                    else:
+                        if candidate.get("sent") and poll not in {
+                            KVPoll.Success,
+                            KVPoll.Failed,
+                        }:
+                            if abort_mailbox is not None:
+                                DecodeKVCacheOffloadManager._agentic_tp_abort_mailbox_write(
+                                    self,
+                                    candidate,
+                                    snapshot_id,
+                                    lambda: abort_mailbox.publish_local_progress(
+                                        snapshot_id, 1
+                                    ),
+                                )
+                            continue
+                        self._agentic_publish_unstarted_direct_abort(
+                            candidate,
+                            candidate["manifest"],
+                            reason="tp_group_direct_abort",
+                            fence_kind=(
+                                "terminal"
+                                if candidate.get("sent")
+                                else "unstarted"
+                            ),
+                        )
+                        continue
 
             if candidate["sent"]:
                 if poll == KVPoll.Transferring:
@@ -2556,7 +2969,35 @@ class DecodeKVCacheOffloadManager:
                 # received pages in Radix and atomically commits CONSUMED.
 
             manifest = self._agentic_direct_manifest(candidate, metadata, now)
-            if candidate["sent"] and manifest.state is SnapshotState.DIRECT_READY:
+            # Terminalizing the lifecycle and publishing the multi-P Router
+            # marker are separate control-plane writes.  Retain D's sole KV
+            # copy while retrying the latter; FAILED alone is not permission
+            # to release this request-generation.
+            if candidate.get("fast_direct_recompute_terminalized"):
+                DecodeKVCacheOffloadManager._finish_fast_direct_recompute(
+                    self, candidate, metadata, now
+                )
+                continue
+            if (
+                candidate["sent"]
+                and poll == KVPoll.Failed
+                and manifest.state is SnapshotState.DIRECT_LOADING
+            ):
+                # NixlKVSender reports Failed only after every registered
+                # handle is DONE/ERR. Publish that physical terminal fence so
+                # a receiver missing its final notification can safely return
+                # the claim; otherwise both sides can wait forever.
+                self._agentic_publish_unstarted_direct_abort(
+                    candidate,
+                    manifest,
+                    reason="sender_handles_terminal_failed",
+                    fence_kind="terminal",
+                )
+                continue
+            if (
+                candidate["sent"]
+                and manifest.state is SnapshotState.DIRECT_READY
+            ):
                 # P received the bytes but could not safely bind the complete
                 # request-generation into Radix, so it returned lifecycle
                 # ownership after the NIXL fence became terminal.  This is a
@@ -2568,30 +3009,179 @@ class DecodeKVCacheOffloadManager:
                     "falling back with D source intact",
                     snapshot_id,
                 )
+            if (
+                not candidate["sent"]
+                and manifest.state is SnapshotState.DIRECT_READY
+                and getattr(
+                    self,
+                    "agentic_fast_direct_failure_recompute",
+                    False,
+                )
+                and bool(candidate.get("direct_abort_tool_confirmed"))
+            ):
+                # P claimed this offer, but returned it before any NIXL
+                # handle was submitted.  The abort path removes the one-shot
+                # arrival marker, so an effectively-unbounded tool threshold
+                # must not make D wait for a second HTTP retry to rediscover
+                # an already-confirmed next turn.  DIRECT_READY proves that P
+                # returned ownership and no DMA is in flight; retire the
+                # generation through the same durable recompute transition as
+                # an ordinary fast Direct setup miss.
+                DecodeKVCacheOffloadManager._try_fast_direct_failure_recompute(
+                    self, candidate, manifest, metadata, now
+                )
+                continue
             if not candidate["sent"] and manifest.state is SnapshotState.DIRECT_LOADING:
                 if candidate["claimed_at"] is None:
                     candidate["claimed_at"] = now
-                if poll == KVPoll.WaitingForInput:
+                # P may win the DIRECT_READY->DIRECT_LOADING CAS before D's
+                # next marker poll.  Recover the original tool-arrival time
+                # here; otherwise that race would incorrectly start the
+                # shared deadline at claim time.
+                observe_arrival = getattr(self, "_agentic_try_early_claim", None)
+                if (
+                    candidate.get("fast_arrival_seen_at") is None
+                    and getattr(self, "agentic_early_claim_store", None) is not None
+                    and callable(observe_arrival)
+                ):
+                    observe_arrival(candidate, now)
+                # A fast-arrival candidate uses one tool-return-relative
+                # deadline for admission plus receiver/transfer setup.  A
+                # later claim does not receive a fresh handshake window.
+                setup_started_at = candidate.get("fast_arrival_seen_at")
+                if setup_started_at is None:
+                    setup_started_at = candidate["claimed_at"]
+                setup_expired = now - setup_started_at >= handshake_timeout
+                abort_claim_id = candidate.get("direct_abort_claim_id")
+                if abort_claim_id == getattr(manifest, "claim_id", None):
+                    # The negative-send fence is already visible to P.  Do
+                    # not retry sender submission or spam fallback CAS while
+                    # P is returning this claim to DIRECT_READY.
+                    continue
+                if candidate.get("direct_sender_init_failed"):
+                    self._agentic_publish_unstarted_direct_abort(
+                        candidate,
+                        manifest,
+                        reason="sender_init_failed_before_submit",
+                    )
+                    continue
+                if poll == KVPoll.WaitingForInput and not setup_expired:
                     with candidate["io_lock"]:
                         if not self._agentic_candidate_is_live_locked(
                             snapshot_id, candidate
                         ):
                             continue
                         page_indices = candidate["source_page_indices"]
-                        candidate["sender"].init(len(page_indices), aux_index=0)
-                        candidate["sender"].send(page_indices)
+                        try:
+                            candidate["sender"].init(
+                                len(page_indices), aux_index=0
+                            )
+                        except Exception:
+                            candidate["direct_sender_init_failed"] = True
+                            if not candidate.get("direct_sender_init_error_logged"):
+                                candidate["direct_sender_init_error_logged"] = True
+                                logger.exception(
+                                    "AgenticKV direct_sender_init_failed "
+                                    "snapshot=%s action=abort_unstarted",
+                                    snapshot_id,
+                                )
+                            self._agentic_publish_unstarted_direct_abort(
+                                candidate,
+                                manifest,
+                                reason="sender_init_failed_before_submit",
+                            )
+                            continue
+                        # Pessimistically record a possible submission before
+                        # entering NIXL.  send() may post a handle and then
+                        # raise, so setting this only after return would allow
+                        # a false "unstarted" abort and late-DMA page reuse.
                         candidate["sent"] = True
-                elif poll == KVPoll.Failed or (
-                    now - candidate["claimed_at"] >= handshake_timeout
+                        try:
+                            candidate["sender"].send(page_indices)
+                        except Exception as error:
+                            fence_failed_launch = getattr(
+                                candidate["sender"],
+                                "fence_failed_launch",
+                                None,
+                            )
+                            if callable(fence_failed_launch):
+                                try:
+                                    failed_poll = fence_failed_launch(error)
+                                except Exception:
+                                    failed_poll = KVPoll.Transferring
+                                    if not candidate.get(
+                                        "direct_launch_fence_error_logged"
+                                    ):
+                                        candidate[
+                                            "direct_launch_fence_error_logged"
+                                        ] = True
+                                        logger.exception(
+                                            "AgenticKV direct_launch_fence_failed "
+                                            "snapshot=%s action=quarantine_source",
+                                            snapshot_id,
+                                        )
+                            else:
+                                # An unknown transport cannot prove a partial
+                                # launch quiescent.  Keep ``sent`` true so the
+                                # D source is quarantined for process lifetime.
+                                failed_poll = KVPoll.Transferring
+                            candidate["direct_launch_failed"] = True
+                            if not candidate.get("direct_launch_error_logged"):
+                                candidate["direct_launch_error_logged"] = True
+                                logger.exception(
+                                    "AgenticKV direct_sender_submit_failed "
+                                    "snapshot=%s fenced_poll=%s",
+                                    snapshot_id,
+                                    failed_poll,
+                                )
+                            handles = getattr(
+                                candidate["sender"], "xfer_handles", None
+                            )
+                            if (
+                                failed_poll == KVPoll.Failed
+                                and handles is not None
+                                and not handles
+                            ):
+                                # NIXL's handle sink proves no transfer post
+                                # was reached.  Reclassify only this fully
+                                # fenced attempt as an unstarted abort.
+                                candidate["sent"] = False
+                                candidate["direct_sender_init_failed"] = True
+                                self._agentic_publish_unstarted_direct_abort(
+                                    candidate,
+                                    manifest,
+                                    reason="sender_failed_before_first_post",
+                                )
+                            continue
+                elif (
+                    setup_expired
+                    and callable(
+                        publish_abort := getattr(
+                            self,
+                            "_agentic_publish_unstarted_direct_abort",
+                            None,
+                        )
+                    )
+                    and publish_abort(
+                        candidate,
+                        manifest,
+                        reason="shared_setup_deadline",
+                    )
                 ):
-                    should_fallback = True
+                    continue
+                # DIRECT_LOADING is P's claim.  Whether setup expired, the
+                # local transport failed, or Slow-only mode was requested, D
+                # cannot acquire Slow until P either completes or returns the
+                # claim.  Waiting here also prevents an impossible Slow CAS
+                # from becoming a high-frequency log/control-plane loop.
+                continue
             elif not candidate["sent"] and manifest.state is SnapshotState.DIRECT_READY:
                 direct_elapsed = now - candidate["created_at"]
                 if getattr(self, "agentic_early_claim_store", None) is not None:
                     early_status = self._agentic_try_early_claim(candidate, now)
                     if early_status == "arrived":
                         arrived_at = candidate["fast_arrival_seen_at"]
-                        if now - arrived_at >= self.agentic_early_claim_post_timeout:
+                        if now - arrived_at >= handshake_timeout:
                             should_fallback = True
                     elif direct_elapsed >= self.agentic_fast_threshold:
                         should_fallback = True
@@ -2643,7 +3233,9 @@ class DecodeKVCacheOffloadManager:
                             snapshot_id, candidate
                         ):
                             continue
-                        started = self._start_agentic_host_staging(candidate, manifest)
+                        started = self._start_agentic_host_staging(
+                            candidate, manifest
+                        )
                 except Exception:
                     candidate["fallback_retry_at"] = now + 0.1
                     logger.exception(
@@ -2656,7 +3248,7 @@ class DecodeKVCacheOffloadManager:
                         metadata.current,
                         route="host_writing",
                         snapshot_tokens=candidate["manifest"].token_count,
-                        prefill_domain=candidate.get("selected_prefill_domain"),
+                        host_domain=candidate.get("selected_host_domain"),
                     )
                     continue
             elif manifest.state not in {
@@ -2691,20 +3283,57 @@ class DecodeKVCacheOffloadManager:
                 manifest = self._agentic_direct_manifest(
                     candidate, metadata, now, force=True
                 )
-                if (
-                    not candidate["sent"]
-                    and manifest.state is SnapshotState.DIRECT_LOADING
-                ):
-                    candidate["claimed_at"] = candidate["claimed_at"] or now
+                if manifest.state in {
+                    SnapshotState.DIRECT_LOADING,
+                    SnapshotState.P_RECEIVED,
+                }:
+                    if not candidate["sent"]:
+                        candidate["claimed_at"] = candidate["claimed_at"] or now
+                    continue
+                if manifest.state is SnapshotState.CONSUMED:
+                    self._cleanup_agentic_direct_sender(candidate)
+                    self._agentic_release_early_claim(candidate, "consumed")
+                    self._retire_candidate_for_release(snapshot_id, req, 0)
+                    continue
+                # Only DIRECT_READY proves that D still owns the complete
+                # snapshot after the force refresh. Any other state is handled
+                # by its normal progress branch on the next iteration; never
+                # overwrite a P-owned or terminal generation with recompute.
+                if manifest.state is not SnapshotState.DIRECT_READY:
                     continue
                 # Capture confirmation before releasing the tmpfs marker.
                 # release_early_claim removes both arrival and tool files for
                 # TP=1, so querying afterwards falsely reported
                 # tool_confirmed=False even when fast_arrival_seen had already
                 # been logged for this exact request-generation.
-                tool_confirmed = bool(candidate.get("fast_arrival_seen")) or bool(
-                    self._agentic_try_tool_confirmation(candidate)
+                tool_confirmed = (
+                    bool(candidate.get("fast_arrival_seen"))
+                    or bool(candidate.get("direct_abort_tool_confirmed"))
+                    or bool(self._agentic_try_tool_confirmation(candidate))
                 )
+                # Ablation semantics: a tool that arrived inside the fast
+                # window did get a Direct attempt. If that setup fails, move
+                # atomically from D-owned DIRECT_READY to recompute and free D
+                # HBM; do not consume Shared-Host capacity. Candidates whose
+                # tool missed the fast window retain the production Slow path.
+                if (
+                    getattr(
+                        self,
+                        "agentic_fast_direct_failure_recompute",
+                        False,
+                    )
+                    and (
+                        bool(candidate.get("fast_arrival_seen"))
+                        or (
+                            self.agentic_host_staging_client is None
+                            and tool_confirmed
+                        )
+                    )
+                ):
+                    DecodeKVCacheOffloadManager._try_fast_direct_failure_recompute(
+                        self, candidate, manifest, metadata, now
+                    )
+                    continue
                 self._agentic_release_early_claim(candidate, "slow_fallback")
                 logger.info(
                     "AgenticKV direct_fallback snapshot=%s elapsed_s=%.6f "
@@ -2774,7 +3403,7 @@ class DecodeKVCacheOffloadManager:
                         metadata.current,
                         route="host_writing",
                         snapshot_tokens=candidate["manifest"].token_count,
-                        prefill_domain=candidate.get("selected_prefill_domain"),
+                        host_domain=candidate.get("selected_host_domain"),
                     )
                     # The original reverse-NIXL room is reused by relay chunk
                     # zero.  It is cleaned after HOST_READY or direct fallback.
@@ -2796,11 +3425,98 @@ class DecodeKVCacheOffloadManager:
         relay_worker = getattr(self, "agentic_relay_worker", None)
         if progress_relay and relay_worker is not None:
             relay_worker.poll()
+        slow_progress_ids = (
+            {
+                snapshot_id
+                for snapshot_id, _ in (
+                    DecodeKVCacheOffloadManager._agentic_bounded_slow_candidate_items(
+                        self
+                    )
+                )
+            }
+            if progress_class == "slow"
+            else None
+        )
         for snapshot_id, candidate in self._agentic_candidate_items():
             action = candidate.get("tp_command", "wait")
+            abort_mailbox = getattr(
+                self, "agentic_tp_direct_abort_mailbox", None
+            )
+            if action == "slow" and candidate.get("tp_direct_abort_requested"):
+                # TP0 observed P's DIRECT_READY acknowledgement before it
+                # could authoritatively broadcast Slow. That command closes
+                # the follower's local abort phase and must override stale
+                # rank-mailbox files from peers still applying the command.
+                with candidate["io_lock"]:
+                    if candidate.get("tp_command") == "slow":
+                        candidate.pop("tp_direct_abort_requested", None)
+                        candidate.pop("direct_abort_claim_id", None)
+                        if abort_mailbox is not None:
+                            if not DecodeKVCacheOffloadManager._agentic_tp_abort_mailbox_write(
+                                self,
+                                candidate,
+                                snapshot_id,
+                                lambda: abort_mailbox.clear_local(snapshot_id),
+                            ):
+                                continue
+            peer_abort = abort_mailbox is not None and any(
+                (
+                    status := abort_mailbox.local_status(snapshot_id, rank)
+                )
+                is not None
+                and int(status) >= 1
+                for rank in range(self.tp_world_size)
+            )
+            if (
+                action == "direct_abort"
+                or (action != "slow" and peer_abort)
+                or candidate.get("tp_direct_abort_requested")
+            ):
+                # This check intentionally precedes local sender setup and the
+                # native TP command. A long model forward may delay action
+                # broadcast, but it must not delay the no-future-write fence.
+                with candidate["io_lock"]:
+                    if not self._agentic_candidate_is_live_locked(
+                        snapshot_id, candidate
+                    ):
+                        continue
+                    candidate["tp_direct_abort_requested"] = True
+                    if not candidate.get("sent"):
+                        local_fence = 2
+                    else:
+                        sender = candidate.get("sender")
+                        try:
+                            poll = (
+                                sender.poll()
+                                if sender is not None
+                                else KVPoll.Transferring
+                            )
+                        except Exception:
+                            poll = KVPoll.Transferring
+                        local_fence = (
+                            2
+                            if poll in {KVPoll.Success, KVPoll.Failed}
+                            else 1
+                        )
+                    if abort_mailbox is not None:
+                        DecodeKVCacheOffloadManager._agentic_tp_abort_mailbox_write(
+                            self,
+                            candidate,
+                            snapshot_id,
+                            lambda: abort_mailbox.publish_local_progress(
+                                snapshot_id, local_fence
+                            ),
+                        )
+                continue
             if progress_class == "direct" and action == "slow":
                 continue
             if progress_class == "slow" and action != "slow":
+                continue
+            if (
+                progress_class == "slow"
+                and slow_progress_ids is not None
+                and snapshot_id not in slow_progress_ids
+            ):
                 continue
             if not DecodeKVCacheOffloadManager._progress_agentic_direct_candidate_setup(
                 self, candidate, time.monotonic()
@@ -2821,26 +3537,115 @@ class DecodeKVCacheOffloadManager:
                             or manifest.state is not SnapshotState.SLOW_FALLBACK
                         ):
                             continue
-                        if not self._start_agentic_host_staging(candidate, manifest):
+                        if not self._start_agentic_host_staging(
+                            candidate, manifest
+                        ):
                             continue
                     client = self.agentic_host_staging_client
                     if client is not None:
-                        client.progress(candidate, candidate["source_token_indices"])
+                        client.progress(
+                            candidate, candidate["source_token_indices"]
+                        )
                 continue
 
             # DIRECT means rank 0 observed the group-visible P claim.  The
             # follower performs only its local NIXL send and never times out,
             # falls back, publishes a route, or frees KV independently.
             with candidate["io_lock"]:
-                if not self._agentic_candidate_is_live_locked(snapshot_id, candidate):
+                if not self._agentic_candidate_is_live_locked(
+                    snapshot_id, candidate
+                ):
+                    continue
+                # ``action`` was read before setup and may belong to the old
+                # command epoch. The authoritative Slow command installs its
+                # manifest under this same lock, so this recheck is the final
+                # no-late-DMA gate.
+                if candidate.get("tp_command", "wait") != "direct":
                     continue
                 sender = candidate["sender"]
-                poll = sender.poll()
+                # Direct and Slow are independent progress threads. Recheck
+                # under the same lock that guards sender submission: another
+                # thread may have observed abort after the loop-level check
+                # but before local setup completed. No local status2 can now
+                # become visible until send() has either posted or fenced.
+                peer_abort = abort_mailbox is not None and any(
+                    (
+                        status := abort_mailbox.local_status(snapshot_id, rank)
+                    )
+                    is not None
+                    and int(status) >= 1
+                    for rank in range(self.tp_world_size)
+                )
+                if peer_abort or candidate.get("tp_direct_abort_requested"):
+                    candidate["tp_direct_abort_requested"] = True
+                    if abort_mailbox is not None:
+                        DecodeKVCacheOffloadManager._agentic_tp_abort_mailbox_write(
+                            self,
+                            candidate,
+                            snapshot_id,
+                            lambda: abort_mailbox.publish_local_progress(
+                                snapshot_id,
+                                1 if candidate.get("sent") else 2,
+                            ),
+                        )
+                    continue
+                try:
+                    poll = sender.poll()
+                except Exception:
+                    candidate["tp_direct_abort_requested"] = True
+                    if abort_mailbox is not None:
+                        DecodeKVCacheOffloadManager._agentic_tp_abort_mailbox_write(
+                            self,
+                            candidate,
+                            snapshot_id,
+                            lambda: abort_mailbox.publish_local_progress(
+                                snapshot_id,
+                                1 if candidate.get("sent") else 2,
+                            ),
+                        )
+                    continue
                 if not candidate.get("sent") and poll == KVPoll.WaitingForInput:
                     page_indices = candidate["source_page_indices"]
-                    sender.init(len(page_indices), aux_index=0)
-                    sender.send(page_indices)
+                    try:
+                        sender.init(len(page_indices), aux_index=0)
+                    except Exception:
+                        candidate["tp_direct_abort_requested"] = True
+                        if abort_mailbox is not None:
+                            DecodeKVCacheOffloadManager._agentic_tp_abort_mailbox_write(
+                                self,
+                                candidate,
+                                snapshot_id,
+                                lambda: abort_mailbox.publish_local_progress(
+                                    snapshot_id, 2
+                                ),
+                            )
+                        continue
+                    # send() may post a handle before raising, so pessimistically
+                    # treat it as submitted until the sender proves otherwise.
                     candidate["sent"] = True
+                    try:
+                        sender.send(page_indices)
+                    except Exception as error:
+                        fence = getattr(sender, "fence_failed_launch", None)
+                        try:
+                            failed_poll = (
+                                fence(error)
+                                if callable(fence)
+                                else KVPoll.Transferring
+                            )
+                        except Exception:
+                            failed_poll = KVPoll.Transferring
+                        candidate["tp_direct_abort_requested"] = True
+                        if abort_mailbox is not None:
+                            DecodeKVCacheOffloadManager._agentic_tp_abort_mailbox_write(
+                                self,
+                                candidate,
+                                snapshot_id,
+                                lambda: abort_mailbox.publish_local_progress(
+                                    snapshot_id,
+                                    2 if failed_poll == KVPoll.Failed else 1,
+                                ),
+                            )
                 elif candidate.get("sent") and poll == KVPoll.Success:
                     candidate["local_send_complete"] = True
 

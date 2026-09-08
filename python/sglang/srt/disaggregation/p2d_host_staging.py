@@ -13,6 +13,7 @@ copy immutable, scheduler-pinned pages and publish completion state.
 """
 
 import logging
+import math
 import mmap
 import os
 import queue
@@ -22,17 +23,19 @@ from typing import Any, Optional
 
 import torch
 
-from sglang.srt.disaggregation.agentic_early_claim import (
-    AgenticDirectoryChangeWatcher,
-)
 from sglang.srt.disaggregation.agentic_host_staging import (
     H2DLaunchFence,
     HostStageState,
+    HostCopyWorkerPool,
     LayerFirstD2HStaging,
     P2D_RELEASE_HOST_OWNED,
     PinnedMHAHostBounce,
+    SharedHostSnapshotArena,
     SharedHostStagingLedger,
     SharedMHAHostSnapshot,
+    _cuda_driver_batch_memcpy,
+    _device_indices_to_host,
+    _registered_indexed_batch_copy,
 )
 from sglang.srt.disaggregation.base import KVPoll
 
@@ -40,6 +43,10 @@ logger = logging.getLogger(__name__)
 
 P2D_CUSTOM_SNAPSHOT_ID = "agentic_p2d_host_snapshot_id"
 P2D_CUSTOM_PREFILL_DOMAIN = "agentic_p2d_prefill_domain"
+# P->D Host snapshots are not evictable.  This is a reservation ceiling (the
+# environment variable retains its legacy ``HARD_WATERMARK`` name), not an
+# eviction watermark, so the default exposes the complete physical arena.
+P2D_HOST_CAPACITY_LIMIT_DEFAULT = 1.0
 
 # HOST_READY is a transient group-level notification, not a state that every
 # TP process is guaranteed to observe.  Once D starts (or finishes) loading,
@@ -176,6 +183,7 @@ class _RegisteredP2DHostSnapshot:
         staging,
         host_bounce=None,
         launch_fence: Optional[H2DLaunchFence] = None,
+        source_indices_host=None,
     ):
         """Gather KV and DMA it directly into the registered Shared Arena."""
 
@@ -194,10 +202,37 @@ class _RegisteredP2DHostSnapshot:
         event = launch_fence.event
         start_event = torch.cuda.Event(enable_timing=True)
         copy_refs = [source_indices, original_source_indices, staging, self]
+        if source_indices_host is not None:
+            if len(source_indices_host) != len(source_indices):
+                raise ValueError("Host source-index mirror has the wrong length")
+            copy_refs.append(source_indices_host)
         launch_fence.copy_refs = copy_refs
         try:
             with torch.cuda.stream(stream):
                 launch_fence.submitted = True
+                start_event.record(stream)
+                if source_indices_host is not None:
+                    batch_submitted = _registered_indexed_batch_copy(
+                        self,
+                        device_indices=source_indices_host,
+                        host_start=destination_start,
+                        stream=stream,
+                        host_to_device=False,
+                    )
+                    if batch_submitted:
+                        copy_refs.append(batch_submitted)
+                        event.record(stream)
+                        launch_fence.armed = True
+                        if bool(getattr(source_indices, "is_cuda", False)):
+                            source_indices.record_stream(stream)
+                        if bool(
+                            getattr(original_source_indices, "is_cuda", False)
+                        ):
+                            original_source_indices.record_stream(stream)
+                        self._last_d2h_start_event = start_event
+                        copy_refs.append(start_event)
+                        launch_fence.copy_refs = copy_refs
+                        return event, tuple(copy_refs)
                 if not source_indices.is_cuda or source_indices.dtype != torch.int64:
                     source_indices = source_indices.to(
                         device=self.device_pool.device,
@@ -205,7 +240,6 @@ class _RegisteredP2DHostSnapshot:
                         non_blocking=True,
                     )
                     copy_refs.append(source_indices)
-                start_event.record(stream)
                 for start in range(0, len(source_indices), staging.token_capacity):
                     count = min(staging.token_capacity, len(source_indices) - start)
                     source_chunk = source_indices[start : start + count]
@@ -392,15 +426,25 @@ class _RegisteredP2DHostArena:
                 merged.append((current_offset, current_length))
         self._free = merged
 
-    def release(self, snapshot) -> None:
+    def release(self, snapshot) -> bool:
         with self._lock:
-            active = self._active.pop(id(snapshot), None)
+            active = self._active.get(id(snapshot))
             if active is None or active[0] is not snapshot:
-                return
+                return True
             _, offset, allocation_bytes = active
-            snapshot.close(unlink=False)
+            try:
+                snapshot.close(unlink=False)
+            except Exception:
+                logger.exception(
+                    "Failed to close registered P->D extent offset=%d bytes=%d",
+                    offset,
+                    allocation_bytes,
+                )
+                return False
+            self._active.pop(id(snapshot), None)
             self.used_bytes = max(0, self.used_bytes - allocation_bytes)
             self._insert_free_locked(offset, allocation_bytes)
+            return True
 
     def usage(self) -> float:
         with self._lock:
@@ -444,10 +488,10 @@ class AgenticPToDHostStagingManager:
         numa_node: int,
         tp_rank: int = 0,
         tp_size: int = 1,
-        hard_watermark: float = 0.90,
+        hard_watermark: float = P2D_HOST_CAPACITY_LIMIT_DEFAULT,
     ):
         if not (0.0 < hard_watermark <= 1.0):
-            raise ValueError("P->D Host hard watermark must be in (0, 1]")
+            raise ValueError("P->D Host capacity limit must be in (0, 1]")
         self.ledger = ledger
         self.device_pool = device_pool
         self.page_size = int(page_size)
@@ -461,9 +505,25 @@ class AgenticPToDHostStagingManager:
             if self.tp_size == 1
             else f"p2d-p-group:{os.getenv('SGLANG_AGENTIC_KV_ENGINE_ID', 'prefill')}"
         )
-        self.arena = _RegisteredP2DHostArena(
-            arena_directory, int(arena_capacity_bytes), self.device_pool
-        )
+        self.arena_backend = os.getenv(
+            "SGLANG_AGENTIC_KV_P2D_HOST_ARENA_BACKEND", "memfd"
+        ).strip().lower()
+        if self.arena_backend == "registered_tmpfs":
+            self.arena = _RegisteredP2DHostArena(
+                arena_directory, int(arena_capacity_bytes), self.device_pool
+            )
+            arena_setup_seconds = self.arena.registration_seconds
+        elif self.arena_backend in {"memfd", "tmpfs"}:
+            self.arena = SharedHostSnapshotArena(
+                arena_directory,
+                int(arena_capacity_bytes),
+                backend=self.arena_backend,
+            )
+            arena_setup_seconds = self.arena.preallocation_seconds
+        else:
+            raise ValueError(
+                "P->D Host arena backend must be memfd, tmpfs, or registered_tmpfs"
+            )
         self.chunk_tokens = max(
             self.page_size,
             int(os.getenv("SGLANG_AGENTIC_KV_P2D_D2H_CHUNK_TOKENS", "512")),
@@ -475,12 +535,28 @@ class AgenticPToDHostStagingManager:
         self.worker_count = max(
             1, int(os.getenv("SGLANG_AGENTIC_KV_P2D_D2H_WORKERS", "4"))
         )
+        self._host_copy_pool = HostCopyWorkerPool(
+            f"agentic-p2d-d2h-host-copy-{os.getpid()}",
+            max(
+                1,
+                int(
+                    os.getenv(
+                        "SGLANG_AGENTIC_KV_P2D_D2H_HOST_COPY_WORKERS",
+                        str(self.worker_count),
+                    )
+                ),
+            ),
+        )
         self._worker_resources = [
             (
                 torch.cuda.Stream(
                     device=torch.cuda.current_device(), priority=0
                 ),
                 LayerFirstD2HStaging(self.device_pool, self.chunk_tokens),
+                tuple(
+                    PinnedMHAHostBounce(self.device_pool, self.chunk_tokens)
+                    for _ in range(2)
+                ),
             )
             for _ in range(self.worker_count)
         ]
@@ -493,11 +569,6 @@ class AgenticPToDHostStagingManager:
         self._prepared: dict[str, dict[str, Any]] = {}
         self._active: dict[str, dict[str, Any]] = {}
         self._results: dict[str, int] = {}
-        # Physical Host completion is an edge, not a condition that the
-        # generic P->D sender pool should have to rediscover by round-robin
-        # polling.  The P scheduler drains this queue at its next allocator-
-        # safe boundary and releases the source request-generation there.
-        self._scheduler_completions: queue.SimpleQueue = queue.SimpleQueue()
         self._records: dict[str, dict[str, Any]] = {}
         self._group_pending: dict[str, dict[str, Any]] = {}
         self._group_wakeup = threading.Event()
@@ -509,26 +580,8 @@ class AgenticPToDHostStagingManager:
         # that offer, so a long subsequent Prefill cannot pin completed KV in
         # P HBM merely because control progress is delayed.
         self._candidates: dict[str, dict[str, Any]] = {}
-        self._offer_events: queue.SimpleQueue = queue.SimpleQueue()
-        self._offer_resync = threading.Event()
         self._candidate_wakeup = threading.Event()
         self._stop = threading.Event()
-        self._ledger_watcher = None
-        self._ledger_watcher_thread = None
-        try:
-            self._ledger_watcher = AgenticDirectoryChangeWatcher(
-                self.ledger.event_directory
-            )
-            self._ledger_watcher_thread = threading.Thread(
-                target=self._ledger_watch_worker,
-                name=f"agentic-p2d-ledger-watch-{os.getpid()}",
-                daemon=True,
-            )
-        except Exception:
-            # Non-Linux compatibility keeps the bounded polling backstop.
-            logger.exception(
-                "P->D Host ledger inotify unavailable; using polling fallback"
-            )
         self._offer_thread = threading.Thread(
             target=self._offer_worker,
             name=f"agentic-p2d-offer-{os.getpid()}",
@@ -548,24 +601,22 @@ class AgenticPToDHostStagingManager:
             name=f"agentic-p2d-spill-completion-{os.getpid()}",
             daemon=True,
         )
-        if self._ledger_watcher_thread is not None:
-            self._ledger_watcher_thread.start()
         self._offer_thread.start()
         for thread in self._threads:
             thread.start()
         self._completion_thread.start()
         logger.info(
             "Agentic P->D Host staging enabled directory=%s capacity_gib=%.1f "
-            "P=%d numa=%d chunk_tokens=%d workers=%d registered_arena=true "
-            "registration_s=%.3f offer_events=%s",
+            "P=%d numa=%d chunk_tokens=%d workers=%d arena_backend=%s "
+            "arena_setup_s=%.3f",
             self.arena.directory,
             self.arena.capacity_bytes / (1024**3),
             self.prefill_domain,
             self.numa_node,
             self.chunk_tokens,
             self.worker_count,
-            self.arena.registration_seconds,
-            self._ledger_watcher is not None,
+            self.arena_backend,
+            arena_setup_seconds,
         )
 
     def _byte_size(self, token_count: int) -> int:
@@ -640,7 +691,6 @@ class AgenticPToDHostStagingManager:
                 "source_indices": source_indices,
                 "source_ready_event": source_ready_event,
             }
-        self._offer_events.put(snapshot_id)
         self._candidate_wakeup.set()
         return True
 
@@ -763,6 +813,8 @@ class AgenticPToDHostStagingManager:
                         "byte_size": byte_size,
                         "prefill_metadata": prefill_metadata,
                         "started_at": time.monotonic(),
+                        "gpu_elapsed_ms": 0.0,
+                        "host_copy_seconds": 0.0,
                         "snapshot": snapshot,
                         "grant": grant,
                     }
@@ -878,19 +930,6 @@ class AgenticPToDHostStagingManager:
             return result
         return int(KVPoll.Transferring) if active else None
 
-    def drain_scheduler_completions(self) -> tuple[str, ...]:
-        """Return newly durable Host snapshots without scanning manager state."""
-
-        completions = getattr(self, "_scheduler_completions", None)
-        if completions is None:
-            return ()
-        completed = []
-        while True:
-            try:
-                completed.append(completions.get_nowait())
-            except queue.Empty:
-                return tuple(completed)
-
     def prepare_scheduler_release(self, req) -> bool:
         """Atomically return final page ownership to the scheduler.
 
@@ -944,15 +983,9 @@ class AgenticPToDHostStagingManager:
         self._stop.set()
         self._candidate_wakeup.set()
         self._group_wakeup.set()
-        ledger_watcher = getattr(self, "_ledger_watcher", None)
-        if ledger_watcher is not None:
-            ledger_watcher.close()
         for _ in self._threads:
             self._work.put(None)
         self._offer_thread.join(timeout=2.0)
-        ledger_watcher_thread = getattr(self, "_ledger_watcher_thread", None)
-        if ledger_watcher_thread is not None:
-            ledger_watcher_thread.join(timeout=2.0)
         for thread in self._threads:
             thread.join(timeout=2.0)
         self._completion_thread.join(timeout=2.0)
@@ -962,8 +995,6 @@ class AgenticPToDHostStagingManager:
             *self._threads,
             self._completion_thread,
         ]
-        if ledger_watcher_thread is not None:
-            background_threads.append(ledger_watcher_thread)
         if self._dma_quarantine:
             # A submitted CUDA copy without a usable completion fence has no
             # safe reuse or teardown boundary.  Keep the registered mapping,
@@ -985,53 +1016,14 @@ class AgenticPToDHostStagingManager:
                 self.arena.release(record["snapshot"])
             self.arena.close()
 
-    def _ledger_watch_worker(self) -> None:
-        """Wake offer admission on ledger changes without periodic scans."""
-
-        watcher = self._ledger_watcher
-        while not self._stop.is_set() and watcher is not None:
-            paths, overflow = watcher.poll(timeout_seconds=0.1)
-            if overflow:
-                self._offer_resync.set()
-            for path in paths:
-                try:
-                    event = self.ledger.read_entry_event(path)
-                    snapshot_id = str(event.get("snapshot_id", ""))
-                except Exception:
-                    self._offer_resync.set()
-                    continue
-                if snapshot_id:
-                    self._offer_events.put(snapshot_id)
-            if paths or overflow:
-                self._candidate_wakeup.set()
-
     def _offer_worker(self) -> None:
         """Claim new D Host offers without waiting for the P scheduler."""
 
         while not self._stop.is_set():
-            # inotify is the normal wakeup; the timeout is only a lost-event
-            # recovery backstop and therefore need not generate high-rate
-            # per-candidate ledger reads.
-            signaled = self._candidate_wakeup.wait(timeout=0.5)
+            self._candidate_wakeup.wait(timeout=0.02)
             self._candidate_wakeup.clear()
-            if self._stop.is_set():
-                return
-            snapshot_ids = set()
-            while True:
-                try:
-                    snapshot_ids.add(self._offer_events.get_nowait())
-                except queue.Empty:
-                    break
             with self._lock:
-                if not signaled or self._offer_resync.is_set():
-                    candidates = list(self._candidates.items())
-                    self._offer_resync.clear()
-                else:
-                    candidates = [
-                        (snapshot_id, self._candidates[snapshot_id])
-                        for snapshot_id in snapshot_ids
-                        if snapshot_id in self._candidates
-                    ]
+                candidates = list(self._candidates.items())
             for snapshot_id, candidate in candidates:
                 if self._stop.is_set():
                     return
@@ -1085,6 +1077,7 @@ class AgenticPToDHostStagingManager:
         worker_id: int,
         stream: torch.cuda.Stream,
         staging: LayerFirstD2HStaging,
+        bounces: tuple[PinnedMHAHostBounce, ...],
     ) -> None:
         while not self._stop.is_set():
             try:
@@ -1098,24 +1091,104 @@ class AgenticPToDHostStagingManager:
             snapshot = record["snapshot"]
             launch_fence = None
             quarantined = False
+            commit_futures: dict[int, Any] = {}
             try:
+                snapshot.materialize()
                 source_indices = record["source_indices"]
                 source_ready_event = record.get("source_ready_event")
                 if source_ready_event is not None:
+                    # The scheduler clones source_indices on its current
+                    # stream under this same readiness fence.  Waiting here
+                    # blocks only the background D2H worker and prevents a
+                    # stale-but-in-range CPU mirror from silently selecting
+                    # the wrong KV pages for batch DMA.
+                    try:
+                        source_ready_event.synchronize()
+                    except BaseException:
+                        # A failed readiness wait gives us no proof that the
+                        # producer has stopped writing either the index clone
+                        # or the Prefill KV pages.  Publishing FAILED would let
+                        # the scheduler recycle those pages.  Retain every
+                        # physical owner for process lifetime and poison this
+                        # serialized lane instead.
+                        with self._lock:
+                            self._dma_quarantine.append(
+                                (
+                                    snapshot,
+                                    source_ready_event,
+                                    record,
+                                    stream,
+                                    staging,
+                                )
+                            )
+                        quarantined = True
+                        logger.exception(
+                            "P->D Host source-ready fence failed for %s; "
+                            "quarantining the lane and source pages",
+                            snapshot_id,
+                        )
+                        return
+                source_indices_host = None
+                if _cuda_driver_batch_memcpy() is not None:
+                    try:
+                        source_indices_host = _device_indices_to_host(source_indices)
+                    except BaseException:
+                        logger.exception(
+                            "P->D D2H index mirror failed snapshot=%s; "
+                            "using gather fallback",
+                            snapshot_id,
+                        )
+                if source_ready_event is not None:
                     stream.wait_event(source_ready_event)
                 token_count = int(record["token_count"])
-                for start in range(0, token_count, self.chunk_tokens):
+                for chunk_index, start in enumerate(
+                    range(0, token_count, self.chunk_tokens)
+                ):
                     end = min(start + self.chunk_tokens, token_count)
-                    launch_fence = H2DLaunchFence(event=torch.cuda.Event())
+                    bounce_index = chunk_index % len(bounces)
+                    previous_commit = commit_futures.pop(bounce_index, None)
+                    if previous_commit is not None:
+                        record["host_copy_seconds"] = record.get(
+                            "host_copy_seconds", 0.0
+                        ) + float(previous_commit.result())
+                    bounce = bounces[bounce_index]
+                    launch_fence = H2DLaunchFence(
+                        event=torch.cuda.Event(enable_timing=True)
+                    )
                     event, _ = snapshot.start_backup_range_from_device(
                         source_indices[start:end],
                         destination_start=start,
                         stream=stream,
                         staging=staging,
+                        host_bounce=bounce,
                         launch_fence=launch_fence,
+                        source_indices_host=(
+                            source_indices_host[start:end]
+                            if source_indices_host is not None
+                            else None
+                        ),
                     )
                     event.synchronize()
+                    start_event = getattr(snapshot, "_last_d2h_start_event", None)
+                    if start_event is not None:
+                        chunk_elapsed_ms = float(start_event.elapsed_time(event))
+                        if math.isfinite(chunk_elapsed_ms):
+                            record["gpu_elapsed_ms"] += chunk_elapsed_ms
                     launch_fence = None
+                    # The CUDA event closes only the HBM->pinned DMA.  Pageable
+                    # arena durability is a separate CPU-owned transition.  A
+                    # second bounce lets commit(N) overlap DMA(N+1).
+                    commit_futures[bounce_index] = self._host_copy_pool.submit(
+                        snapshot.commit_backup_range_from_bounce,
+                        destination_start=start,
+                        token_count=end - start,
+                        host_bounce=bounce,
+                    )
+                for future in commit_futures.values():
+                    record["host_copy_seconds"] = record.get(
+                        "host_copy_seconds", 0.0
+                    ) + float(future.result())
+                commit_futures.clear()
                 # Only a completely written extent may enter the reusable
                 # arena pool.  A failed partial D2H is unlinked on release.
                 snapshot.mark_populated()
@@ -1141,6 +1214,15 @@ class AgenticPToDHostStagingManager:
                         self._group_pending[snapshot_id] = record
                     self._group_wakeup.set()
             except Exception as exc:
+                # A pageable commit holds both the snapshot mapping and bounce
+                # ownership.  Drain it before publishing failure or allowing
+                # either object to be recycled.
+                for future in commit_futures.values():
+                    try:
+                        future.result()
+                    except BaseException:
+                        pass
+                commit_futures.clear()
                 if launch_fence is not None and launch_fence.submitted:
                     physically_quiesced = False
                     if launch_fence.armed and not launch_fence.unavailable:
@@ -1193,25 +1275,15 @@ class AgenticPToDHostStagingManager:
             self._group_pending.pop(snapshot_id, None)
             self._active.pop(snapshot_id, None)
             self._results[snapshot_id] = int(KVPoll.Success)
-        # Publish only after the durable result is level-triggered in
-        # ``_results``.  Queue delivery may race a scheduler visit, but the
-        # scheduler can always validate the result through poll()/release.
-        # TP ranks already publish one group terminal through their existing
-        # mailbox/control epoch.  This rank-local shortcut is TP1-only;
-        # enqueueing it on followers would leak and cannot authorize a group
-        # release decision.
-        if int(getattr(self, "tp_size", 1)) == 1:
-            completions = getattr(self, "_scheduler_completions", None)
-            if completions is None:
-                completions = queue.SimpleQueue()
-                self._scheduler_completions = completions
-            completions.put(snapshot_id)
         logger.info(
             "AgenticKV p2d_host_d2h_complete snapshot=%s tokens=%d "
-            "elapsed_ms=%.3f gib_per_s=%.3f worker=%d",
+            "elapsed_ms=%.3f gpu_ms=%.3f host_copy_ms=%.3f "
+            "gib_per_s=%.3f worker=%d",
             snapshot_id,
             int(record["token_count"]),
             elapsed * 1000.0,
+            float(record.get("gpu_elapsed_ms", 0.0)),
+            float(record.get("host_copy_seconds", 0.0)) * 1000.0,
             int(record["byte_size"]) / max(elapsed, 1e-9) / (1024**3),
             int(record.get("worker_id", -1)),
         )
@@ -1259,14 +1331,20 @@ class AgenticPToDHostStagingManager:
             with self._lock:
                 if snapshot_id in self._active:
                     continue
-                current = self._records.pop(snapshot_id, None)
-            if current is not None:
-                self.arena.release(current["snapshot"])
-                logger.info(
-                    "AgenticKV p2d_host_release snapshot=%s state=%s",
-                    snapshot_id,
-                    entry.get("state"),
-                )
+                current = self._records.get(snapshot_id)
+                if current is None:
+                    continue
+                if self.arena.release(current["snapshot"]) is False:
+                    # Keep the record as the sole retry carrier.  No source or
+                    # destination HBM ownership depends on it after terminal
+                    # state, so retrying on the completion worker is safe.
+                    continue
+                self._records.pop(snapshot_id, None)
+            logger.info(
+                "AgenticKV p2d_host_release snapshot=%s state=%s",
+                snapshot_id,
+                entry.get("state"),
+            )
 
 
 class AgenticPToDHostLoadManager:
@@ -1301,13 +1379,28 @@ class AgenticPToDHostLoadManager:
         self.worker_count = max(
             1, int(os.getenv("SGLANG_AGENTIC_KV_P2D_H2D_WORKERS", "4"))
         )
+        self._host_copy_pool = HostCopyWorkerPool(
+            f"agentic-p2d-h2d-host-copy-{os.getpid()}",
+            max(
+                1,
+                int(
+                    os.getenv(
+                        "SGLANG_AGENTIC_KV_P2D_H2D_HOST_COPY_WORKERS",
+                        str(min(2, self.worker_count)),
+                    )
+                ),
+            ),
+        )
         self._worker_resources = [
             (
                 torch.cuda.Stream(
                     device=torch.cuda.current_device(), priority=0
                 ),
                 LayerFirstD2HStaging(self.device_pool, self.chunk_tokens),
-                PinnedMHAHostBounce(self.device_pool, self.chunk_tokens),
+                tuple(
+                    PinnedMHAHostBounce(self.device_pool, self.chunk_tokens)
+                    for _ in range(2)
+                ),
             )
             for _ in range(self.worker_count)
         ]
@@ -1456,7 +1549,7 @@ class AgenticPToDHostLoadManager:
         worker_id: int,
         stream: torch.cuda.Stream,
         staging: LayerFirstD2HStaging,
-        bounce: PinnedMHAHostBounce,
+        bounces: tuple[PinnedMHAHostBounce, ...],
     ) -> None:
         while not self._stop.is_set():
             work = self._work.get()
@@ -1466,6 +1559,9 @@ class AgenticPToDHostLoadManager:
             started_at = time.monotonic()
             snapshot = None
             launch_fence = None
+            prefetch_future = None
+            host_copy_seconds = 0.0
+            gpu_elapsed_ms = 0.0
             try:
                 if receiver.abort_pending:
                     raise RuntimeError("P->D Host load aborted before H2D")
@@ -1483,20 +1579,64 @@ class AgenticPToDHostLoadManager:
                     create=False,
                     file_offset=int(grant.get("arena_offset", 0)),
                 )
-                for start in range(0, len(device_indices), self.chunk_tokens):
+                device_indices_host = None
+                if _cuda_driver_batch_memcpy() is not None:
+                    try:
+                        device_indices_host = _device_indices_to_host(device_indices)
+                    except BaseException:
+                        logger.exception(
+                            "P->D H2D index mirror failed snapshot=%s; "
+                            "using scatter fallback",
+                            receiver.snapshot_id,
+                        )
+                ranges = [
+                    (start, min(start + self.chunk_tokens, len(device_indices)))
+                    for start in range(0, len(device_indices), self.chunk_tokens)
+                ]
+                if ranges:
+                    first_start, first_end = ranges[0]
+                    prefetch_future = self._host_copy_pool.submit(
+                        snapshot.prepare_load_range_to_bounce,
+                        source_start=first_start,
+                        token_count=first_end - first_start,
+                        host_bounce=bounces[0],
+                    )
+                for chunk_index, (start, end) in enumerate(ranges):
+                    host_copy_seconds += float(prefetch_future.result())
+                    prefetch_future = None
+                    bounce = bounces[chunk_index % len(bounces)]
                     end = min(start + self.chunk_tokens, len(device_indices))
                     launch_fence = H2DLaunchFence(
                         event=torch.cuda.Event(enable_timing=True)
                     )
-                    event, _ = snapshot.start_load_range_to_device(
+                    event, _ = snapshot.start_load_range_from_bounce_to_device(
                         device_indices[start:end],
                         stream,
-                        source_start=start,
                         staging=staging,
                         host_bounce=bounce,
+                        source_start=start,
                         launch_fence=launch_fence,
+                        device_indices_host=(
+                            device_indices_host[start:end]
+                            if device_indices_host is not None
+                            else None
+                        ),
                     )
+                    if chunk_index + 1 < len(ranges):
+                        next_start, next_end = ranges[chunk_index + 1]
+                        next_bounce = bounces[(chunk_index + 1) % len(bounces)]
+                        prefetch_future = self._host_copy_pool.submit(
+                            snapshot.prepare_load_range_to_bounce,
+                            source_start=next_start,
+                            token_count=next_end - next_start,
+                            host_bounce=next_bounce,
+                        )
                     event.synchronize()
+                    start_event = getattr(snapshot, "_last_h2d_start_event", None)
+                    if start_event is not None:
+                        chunk_elapsed_ms = float(start_event.elapsed_time(event))
+                        if math.isfinite(chunk_elapsed_ms):
+                            gpu_elapsed_ms += chunk_elapsed_ms
                     launch_fence = None
                     if receiver.abort_pending:
                         raise RuntimeError("P->D Host load aborted after H2D fence")
@@ -1520,7 +1660,11 @@ class AgenticPToDHostLoadManager:
                     "token_count": len(device_indices),
                     "byte_size": int(grant["byte_size"]),
                     "worker_id": worker_id,
+                    "host_copy_seconds": host_copy_seconds,
+                    "gpu_elapsed_ms": gpu_elapsed_ms,
+                    "snapshot": snapshot,
                 }
+                snapshot = None
                 current = self.ledger.get(receiver.snapshot_id)
                 if (
                     current is not None
@@ -1533,6 +1677,13 @@ class AgenticPToDHostLoadManager:
                         self._group_pending[receiver.snapshot_id] = completion
                     self._group_wakeup.set()
             except Exception as exc:
+                if prefetch_future is not None:
+                    # The Host mapping and bounce stay owned until this physical
+                    # CPU read has stopped, just like a CUDA completion fence.
+                    try:
+                        prefetch_future.result()
+                    except BaseException:
+                        pass
                 try:
                     self.ledger.request_host_load_failure(
                         receiver.snapshot_id,
@@ -1584,29 +1735,69 @@ class AgenticPToDHostLoadManager:
                         0 if receiver._grant is None else receiver._grant["byte_size"]
                     ),
                     "worker_id": worker_id,
+                    "host_copy_seconds": host_copy_seconds,
+                    "gpu_elapsed_ms": gpu_elapsed_ms,
                     "failure": exc,
+                    "snapshot": snapshot,
                 }
+                snapshot = None
                 with self._completion_lock:
                     self._group_pending[receiver.snapshot_id] = completion
                 self._group_wakeup.set()
                 logger.exception("P->D Host H2D failed for %s", receiver.snapshot_id)
             finally:
                 if snapshot is not None:
-                    snapshot.close(unlink=False)
+                    try:
+                        snapshot.close(unlink=False)
+                    except Exception:
+                        # This is reachable only before a normal completion
+                        # carrier is formed.  Retain the registered mapping in
+                        # process-lifetime quarantine rather than killing the
+                        # loader thread or unmapping memory CUDA may know.
+                        self._dma_quarantine.append(
+                            (snapshot, None, device_indices, receiver)
+                        )
+                        logger.exception(
+                            "P->D Host orphan mapping cleanup quarantined for %s",
+                            receiver.snapshot_id,
+                        )
 
-    def _finish_h2d_success(self, completion: dict[str, Any]) -> None:
+    def _close_h2d_completion_snapshot(self, completion: dict[str, Any]) -> bool:
+        snapshot = completion.get("snapshot")
+        if snapshot is None:
+            return True
+        try:
+            snapshot.close(unlink=False)
+        except Exception:
+            logger.exception(
+                "P->D Host H2D registered extent cleanup retry snapshot=%s",
+                completion["receiver"].snapshot_id,
+            )
+            return False
+        completion.pop("snapshot", None)
+        return True
+
+    def _finish_h2d_success(self, completion: dict[str, Any]) -> bool:
         receiver = completion["receiver"]
+        if not self._close_h2d_completion_snapshot(completion):
+            with self._completion_lock:
+                self._group_pending[receiver.snapshot_id] = completion
+            self._group_wakeup.set()
+            return False
         with self._completion_lock:
             self._group_pending.pop(receiver.snapshot_id, None)
         receiver.mark_terminal(KVPoll.Success)
         elapsed = time.monotonic() - float(completion["started_at"])
         logger.info(
             "AgenticKV p2d_host_h2d_complete snapshot=%s tokens=%d "
-            "elapsed_ms=%.3f gib_per_s=%.3f D_domain=%d numa=%d "
+            "elapsed_ms=%.3f gpu_ms=%.3f host_copy_ms=%.3f "
+            "gib_per_s=%.3f D_domain=%d numa=%d "
             "arena_numa=%d cross_numa=%s worker=%d",
             receiver.snapshot_id,
             int(completion["token_count"]),
             elapsed * 1000.0,
+            float(completion.get("gpu_elapsed_ms", 0.0)),
+            float(completion.get("host_copy_seconds", 0.0)) * 1000.0,
             int(completion["byte_size"]) / max(elapsed, 1e-9) / (1024**3),
             self.decode_domain,
             self.numa_node,
@@ -1618,6 +1809,7 @@ class AgenticPToDHostLoadManager:
             bool(getattr(receiver, "_cross_numa", False)),
             int(completion["worker_id"]),
         )
+        return True
 
     def _progress_group_completions_once(self) -> int:
         with self._completion_lock:
@@ -1646,6 +1838,8 @@ class AgenticPToDHostLoadManager:
             try:
                 _raise_if_p2d_host_failed(snapshot_id, current)
             except Exception as exc:
+                if not self._close_h2d_completion_snapshot(completion):
+                    continue
                 with self._completion_lock:
                     self._group_pending.pop(snapshot_id, None)
                 completion["receiver"].mark_terminal(

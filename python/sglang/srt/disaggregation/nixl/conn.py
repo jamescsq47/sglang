@@ -237,7 +237,15 @@ class NixlKVManager(CommonKVManager):
             self.transfer_statuses: Dict[int, TransferStatus] = defaultdict(
                 TransferStatus
             )
-            self._start_heartbeat_checker_thread()
+            if getattr(
+                server_args, "agentic_reverse_disable_peer_heartbeat", False
+            ):
+                logger.info(
+                    "NIXL peer-removal heartbeat disabled for the isolated "
+                    "agentic reverse manager"
+                )
+            else:
+                self._start_heartbeat_checker_thread()
         else:
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
