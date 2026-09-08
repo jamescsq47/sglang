@@ -340,6 +340,9 @@ class DecodeKVCacheOffloadManager:
         self.agentic_force_slow_path = bool(
             envs.SGLANG_AGENTIC_KV_FORCE_SLOW_PATH.get()
         )
+        self.agentic_fast_direct_failure_recompute = bool(
+            envs.SGLANG_AGENTIC_KV_FAST_DIRECT_FAILURE_RECOMPUTE.get()
+        )
         self.agentic_early_claim_store = None
         self.agentic_tp_direct_abort_mailbox = None
         # One deadline starts when the tool result arrives and covers both P
@@ -2351,6 +2354,75 @@ class DecodeKVCacheOffloadManager:
         self._publish_agentic_route(metadata.current, route="recompute")
         return True
 
+    def _finish_fast_direct_recompute(
+        self,
+        candidate,
+        metadata: AgenticRequestMetadata,
+        now: float,
+    ) -> bool:
+        """Publish the recompute route before relinquishing the only D copy."""
+
+        if now < candidate.get("fallback_retry_at", 0.0):
+            return False
+        if not self._publish_agentic_route(metadata.current, route="recompute"):
+            candidate["fallback_retry_at"] = now + 0.05
+            return False
+        snapshot_id = metadata.current.snapshot_id
+        self._agentic_release_early_claim(
+            candidate, "fast_direct_failure_recompute"
+        )
+        self._cleanup_agentic_direct_sender(candidate)
+        self._retire_candidate_for_release(snapshot_id, candidate["req"], 0)
+        logger.info(
+            "AgenticKV fast_direct_failure_recompute "
+            "snapshot=%s elapsed_s=%.6f",
+            snapshot_id,
+            now - candidate["created_at"],
+        )
+        return True
+
+    def _try_fast_direct_failure_recompute(
+        self,
+        candidate,
+        manifest: SnapshotManifest,
+        metadata: AgenticRequestMetadata,
+        now: float,
+    ) -> bool:
+        """Retire one failed fast Direct offer without splitting a TP group.
+
+        Rank zero is the sole lifecycle owner for a logical TP snapshot.  It
+        publishes the recompute route before the existing native TP release
+        handoff can free any rank's source shard.  Followers only execute the
+        resulting rank-zero command and must never terminalize independently.
+        """
+
+        if self.tp_world_size > 1 and self.tp_rank != 0:
+            return False
+        snapshot_id = metadata.current.snapshot_id
+        try:
+            terminal = self.agentic_snapshot_store.fail_direct_offer(
+                manifest,
+                owner_id=f"d-fast-recompute:{snapshot_id}",
+                reason="fast_direct_setup_timeout_recompute",
+            )
+        except Exception:
+            logger.exception(
+                "Failed to atomically retire Direct offer %s for recompute; "
+                "retaining D KV",
+                snapshot_id,
+            )
+            terminal = None
+        # The lifecycle claim is the linearization point.  A None result means
+        # P won the offer concurrently, so D retains its source and lets normal
+        # Direct progress finish.
+        if terminal is None or terminal.state is not SnapshotState.FAILED:
+            candidate["fallback_retry_at"] = now + 0.05
+            return False
+        candidate["fast_direct_recompute_terminalized"] = True
+        return DecodeKVCacheOffloadManager._finish_fast_direct_recompute(
+            self, candidate, metadata, now
+        )
+
     def _publish_agentic_route(
         self,
         request,
@@ -2897,6 +2969,15 @@ class DecodeKVCacheOffloadManager:
                 # received pages in Radix and atomically commits CONSUMED.
 
             manifest = self._agentic_direct_manifest(candidate, metadata, now)
+            # Terminalizing the lifecycle and publishing the multi-P Router
+            # marker are separate control-plane writes.  Retain D's sole KV
+            # copy while retrying the latter; FAILED alone is not permission
+            # to release this request-generation.
+            if candidate.get("fast_direct_recompute_terminalized"):
+                DecodeKVCacheOffloadManager._finish_fast_direct_recompute(
+                    self, candidate, metadata, now
+                )
+                continue
             if (
                 candidate["sent"]
                 and poll == KVPoll.Failed
@@ -2928,6 +3009,28 @@ class DecodeKVCacheOffloadManager:
                     "falling back with D source intact",
                     snapshot_id,
                 )
+            if (
+                not candidate["sent"]
+                and manifest.state is SnapshotState.DIRECT_READY
+                and getattr(
+                    self,
+                    "agentic_fast_direct_failure_recompute",
+                    False,
+                )
+                and bool(candidate.get("direct_abort_tool_confirmed"))
+            ):
+                # P claimed this offer, but returned it before any NIXL
+                # handle was submitted.  The abort path removes the one-shot
+                # arrival marker, so an effectively-unbounded tool threshold
+                # must not make D wait for a second HTTP retry to rediscover
+                # an already-confirmed next turn.  DIRECT_READY proves that P
+                # returned ownership and no DMA is in flight; retire the
+                # generation through the same durable recompute transition as
+                # an ordinary fast Direct setup miss.
+                DecodeKVCacheOffloadManager._try_fast_direct_failure_recompute(
+                    self, candidate, manifest, metadata, now
+                )
+                continue
             if not candidate["sent"] and manifest.state is SnapshotState.DIRECT_LOADING:
                 if candidate["claimed_at"] is None:
                     candidate["claimed_at"] = now
@@ -3180,9 +3283,23 @@ class DecodeKVCacheOffloadManager:
                 manifest = self._agentic_direct_manifest(
                     candidate, metadata, now, force=True
                 )
-                if manifest.state is SnapshotState.DIRECT_LOADING:
+                if manifest.state in {
+                    SnapshotState.DIRECT_LOADING,
+                    SnapshotState.P_RECEIVED,
+                }:
                     if not candidate["sent"]:
                         candidate["claimed_at"] = candidate["claimed_at"] or now
+                    continue
+                if manifest.state is SnapshotState.CONSUMED:
+                    self._cleanup_agentic_direct_sender(candidate)
+                    self._agentic_release_early_claim(candidate, "consumed")
+                    self._retire_candidate_for_release(snapshot_id, req, 0)
+                    continue
+                # Only DIRECT_READY proves that D still owns the complete
+                # snapshot after the force refresh. Any other state is handled
+                # by its normal progress branch on the next iteration; never
+                # overwrite a P-owned or terminal generation with recompute.
+                if manifest.state is not SnapshotState.DIRECT_READY:
                     continue
                 # Capture confirmation before releasing the tmpfs marker.
                 # release_early_claim removes both arrival and tool files for
@@ -3194,6 +3311,29 @@ class DecodeKVCacheOffloadManager:
                     or bool(candidate.get("direct_abort_tool_confirmed"))
                     or bool(self._agentic_try_tool_confirmation(candidate))
                 )
+                # Ablation semantics: a tool that arrived inside the fast
+                # window did get a Direct attempt. If that setup fails, move
+                # atomically from D-owned DIRECT_READY to recompute and free D
+                # HBM; do not consume Shared-Host capacity. Candidates whose
+                # tool missed the fast window retain the production Slow path.
+                if (
+                    getattr(
+                        self,
+                        "agentic_fast_direct_failure_recompute",
+                        False,
+                    )
+                    and (
+                        bool(candidate.get("fast_arrival_seen"))
+                        or (
+                            self.agentic_host_staging_client is None
+                            and tool_confirmed
+                        )
+                    )
+                ):
+                    DecodeKVCacheOffloadManager._try_fast_direct_failure_recompute(
+                        self, candidate, manifest, metadata, now
+                    )
+                    continue
                 self._agentic_release_early_claim(candidate, "slow_fallback")
                 logger.info(
                     "AgenticKV direct_fallback snapshot=%s elapsed_s=%.6f "

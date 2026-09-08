@@ -101,3 +101,49 @@ def test_decode_startup_prewarm_registers_both_directions(monkeypatch, tmp_path)
     )
     assert completion["registered_bytes"] == 4 * 1024
     assert not list((tmp_path / "failed").glob("*.json"))
+
+
+def test_direct_only_prefill_prewarm_uses_p2d_arena(monkeypatch, tmp_path):
+    """Disabling D->P Host must not disable P->D startup registration."""
+
+    _configure(monkeypatch, tmp_path, domain=0)
+    directory = tmp_path / "arenas"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "domain-1-rank-0.json").write_text(
+        json.dumps(
+            {
+                "domain": 1,
+                "tp_rank": 0,
+                "d2p_path": None,
+                "p2d_path": "p2d-1",
+                "owner_pid": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    mappings = {}
+
+    def open_mapping(path, device):
+        del device
+        mappings[path] = mapping = _FakeMapping(path)
+        return mapping
+
+    monkeypatch.setattr(staging, "_registered_host_arena", open_mapping)
+    worker = staging.start_registered_host_arena_startup_prewarm(
+        role="prefill",
+        engine_id="prefill-0",
+        tp_rank=0,
+        device="cuda:0",
+        d2p_arena_path=None,
+        p2d_arena_path="p2d-0",
+    )
+    (tmp_path / "start").touch()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert set(mappings) == {"p2d-0"}
+    completion = json.loads(
+        next((tmp_path / "complete").glob("*.json")).read_text(encoding="utf-8")
+    )
+    assert completion["arena_count"] == 1
+    assert not list((tmp_path / "failed").glob("*.json"))

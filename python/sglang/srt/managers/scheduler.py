@@ -4506,6 +4506,35 @@ class Scheduler(
                 queue.append((request, payload, None))
                 pending.add(snapshot_id)
 
+    def _agentic_early_direct_slots_used(self) -> int:
+        """Count physical or TP-granted reverse transfers on this P rank.
+
+        Completed receives no longer consume a NIXL lane even if their
+        workset remains pinned until the model request binds.  TP grants do
+        consume a lane before the local receiver becomes visible, so count
+        their request-generation exactly once as well.
+        """
+
+        poll_lock = getattr(self, "agentic_early_direct_poll_lock", nullcontext())
+        with poll_lock:
+            receives = dict(
+                getattr(self, "agentic_early_direct_receives", {})
+            )
+            physical = {
+                snapshot_id
+                for snapshot_id, entry in receives.items()
+                if entry.completed_at is None
+                and entry.transport_poll not in {KVPoll.Success, KVPoll.Failed}
+            }
+            # TP active state outlives local DMA completion until the logical
+            # group is bound.  Count only a grant that has not produced its
+            # local receiver yet; otherwise the receive state is the physical
+            # truth and a completed DMA immediately returns its lane.
+            granted = set(
+                getattr(self, "agentic_tp_direct_admission_active", {}).keys()
+            ) - set(receives)
+        return len(physical | granted)
+
     def _agentic_admit_queued_direct_receives(
         self,
         snapshot_store,
@@ -4537,6 +4566,10 @@ class Scheduler(
         if not isinstance(tp_active, dict):
             tp_active = {}
             self.agentic_tp_direct_admission_active = tp_active
+        direct_io_cap = max(
+            1, int(os.environ.get("SGLANG_AGENTIC_KV_DIRECT_IO_CAP", "4"))
+        )
+        direct_slots_used = Scheduler._agentic_early_direct_slots_used(self)
         # Examine each currently queued request once.  A large snapshot with
         # insufficient credit is rotated behind smaller requests instead of
         # causing head-of-line blocking; FIFO order is otherwise preserved.
@@ -4637,6 +4670,37 @@ class Scheduler(
                     ),
                 )
                 continue
+            # A TP follower is an executor, never an admission authority.
+            # Wait for rank0's exact generation grant before reserving any P
+            # pages; otherwise a burst of not-yet-granted arrivals can bypass
+            # the physical lane cap by accumulating invisible workset leases.
+            if tp_size > 1 and tp_rank != 0:
+                receipt = self.agentic_tp_direct_mailbox.receipt(
+                    request.snapshot_id
+                )
+                if receipt is None:
+                    with poll_lock:
+                        queue.append((request, payload, manifest))
+                        pending.add(request.snapshot_id)
+                    continue
+                if int(receipt) < 0 or int(receipt) >= 4:
+                    broker.cancel_unstarted(
+                        request.snapshot_id,
+                        owner=workset_owner,
+                    )
+                    self.agentic_early_direct_terminal[request.snapshot_id] = (
+                        time.monotonic()
+                    )
+                    continue
+            if direct_slots_used >= direct_io_cap:
+                # Keep the request metadata-only until a physical Direct lane
+                # reaches DONE/ERR.  In particular, do not acquire a workset
+                # lease here: a queued transfer must not consume P HBM merely
+                # because the shared NIXL agent is at its safe concurrency.
+                with poll_lock:
+                    queue.append((request, payload, manifest))
+                    pending.add(request.snapshot_id)
+                continue
             broker.request(
                 request.snapshot_id,
                 int(manifest.token_count),
@@ -4683,21 +4747,19 @@ class Scheduler(
                 # background progress worker start the local KV-head shard.
                 receipt = self.agentic_tp_direct_mailbox.receipt(request.snapshot_id)
                 if receipt is None:
-                    if manifest.state not in {
-                        SnapshotState.DIRECT_READY,
-                        SnapshotState.DIRECT_LOADING,
-                    }:
-                        broker.cancel_unstarted(
-                            request.snapshot_id,
-                            owner=workset_owner,
-                        )
-                        continue
+                    broker.cancel_unstarted(
+                        request.snapshot_id,
+                        owner=workset_owner,
+                    )
                     with poll_lock:
                         queue.append((request, payload, manifest))
                         pending.add(request.snapshot_id)
                     continue
                 if int(receipt) < 0 or int(receipt) >= 4:
-                    broker.request_release(request.snapshot_id, workset_lease)
+                    broker.cancel_unstarted(
+                        request.snapshot_id,
+                        owner=workset_owner,
+                    )
                     self.agentic_early_direct_terminal[request.snapshot_id] = (
                         time.monotonic()
                     )
@@ -4720,6 +4782,7 @@ class Scheduler(
                         prompt_tokens,
                         workset_lease,
                     )
+                direct_slots_used += 1
                 continue
             if manifest.state is not SnapshotState.DIRECT_READY:
                 broker.request_release(request.snapshot_id, workset_lease)
@@ -4742,6 +4805,7 @@ class Scheduler(
                     self.agentic_tp_direct_admission_active[request.snapshot_id] = (
                         active_item
                     )
+                direct_slots_used += 1
                 try:
                     self.agentic_tp_direct_mailbox.publish_receipt(
                         request.snapshot_id, 1
@@ -4764,6 +4828,7 @@ class Scheduler(
                             self.agentic_tp_direct_admission_active.pop(
                                 request.snapshot_id, None
                             )
+                            direct_slots_used -= 1
                         queue.appendleft((request, payload, manifest))
                         pending.add(request.snapshot_id)
                 continue
@@ -4776,6 +4841,7 @@ class Scheduler(
                 prefill_domain=(None if target_domain is None else int(target_domain)),
                 workset_lease=workset_lease,
             ):
+                direct_slots_used += 1
                 continue
 
             # Credit exhaustion and transient bootstrap setup both leave the

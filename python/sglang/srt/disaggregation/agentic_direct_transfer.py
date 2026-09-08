@@ -153,6 +153,16 @@ def create_agentic_direct_runtime(
         raise ValueError("reverse sender requires a dedicated bootstrap port")
 
     direct_args = copy.copy(server_args)
+    # The role-reversed receiver is a persistent, multi-peer data plane.  The
+    # stock Decode heartbeat tears down a peer after two busy-loop HTTP
+    # timeouts; doing that here can invalidate the shared NIXL agent while
+    # unrelated D->P transfers are still physically in flight.  Snapshot
+    # lifecycle state plus NIXL's physical handle fence already provide the
+    # request-local failure boundary, so this auxiliary manager must not run
+    # the ordinary instance-removal heartbeat.
+    direct_args.agentic_reverse_disable_peer_heartbeat = (
+        role is DisaggregationMode.DECODE
+    )
     bootstrap_server = None
     tp_size = max(1, int(getattr(server_args, "tp_size", 1)))
     tp_rank = int(engine_rank) % tp_size

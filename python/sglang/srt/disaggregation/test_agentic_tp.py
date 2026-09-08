@@ -8033,7 +8033,9 @@ def test_tp1_direct_release_waits_for_physical_nixl_completion(
     manifest = SimpleNamespace(state=manifest_state)
     candidate = {
         "req": SimpleNamespace(req_pool_idx=1),
-        "metadata": SimpleNamespace(current=SimpleNamespace()),
+        "metadata": SimpleNamespace(
+            current=SimpleNamespace(snapshot_id=snapshot_id)
+        ),
         "manifest": manifest,
         "sender": SimpleNamespace(poll=lambda: transport_poll),
         "sent": True,
@@ -8085,7 +8087,9 @@ def test_tp1_direct_poll_exception_quarantines_source_pages():
 
     candidate = {
         "req": SimpleNamespace(req_pool_idx=1),
-        "metadata": SimpleNamespace(current=SimpleNamespace()),
+        "metadata": SimpleNamespace(
+            current=SimpleNamespace(snapshot_id=snapshot_id)
+        ),
         "manifest": SimpleNamespace(state=SnapshotState.CONSUMED),
         "sender": SimpleNamespace(poll=unreadable_poll),
         "sent": True,
@@ -9384,6 +9388,740 @@ def test_force_slow_ablation_stages_immediately_without_direct_wait():
 
     assert staged == [(candidate, manifest)]
     assert candidate["staging"] is True
+
+
+@pytest.mark.parametrize(
+    (
+        "tp_world_size",
+        "fast_arrival_seen",
+        "host_enabled",
+        "expected_recompute",
+        "expected_stage",
+    ),
+    [
+        (1, True, True, True, False),
+        (2, True, True, True, False),
+        (1, False, True, False, True),
+        (1, False, False, True, False),
+    ],
+)
+def test_fast_direct_failure_recompute_keeps_slow_tools_on_host(
+    tp_world_size,
+    fast_arrival_seen,
+    host_enabled,
+    expected_recompute,
+    expected_stage,
+):
+    snapshot_id = f"request:fast-recompute:{fast_arrival_seen}"
+    manifest = SimpleNamespace(
+        snapshot_id=snapshot_id,
+        state=SnapshotState.DIRECT_READY,
+        token_count=1024,
+    )
+    candidate = {
+        "req": object(),
+        "metadata": SimpleNamespace(
+            current=SimpleNamespace(snapshot_id=snapshot_id)
+        ),
+        "manifest": manifest,
+        "sender": SimpleNamespace(poll=lambda: KVPoll.WaitingForInput),
+        "sent": False,
+        "staging": False,
+        "claimed_at": None,
+        "created_at": time.monotonic() - 2.0,
+        "fallback_retry_at": 0.0,
+        "io_lock": threading.RLock(),
+        "fast_arrival_seen": fast_arrival_seen,
+        "fast_arrival_seen_at": (
+            time.monotonic() - 1.5 if fast_arrival_seen else None
+        ),
+    }
+    recomputes = []
+    staged = []
+    releases = []
+    cleanups = []
+    manager = SimpleNamespace(
+        tp_world_size=tp_world_size,
+        tp_rank=0,
+        agentic_force_slow_path=False,
+        agentic_fast_direct_failure_recompute=True,
+        agentic_fast_threshold=1.0,
+        agentic_direct_setup_timeout=1.0,
+        agentic_early_claim_post_timeout=0.0,
+        agentic_relay_worker=None,
+        agentic_early_claim_store=object(),
+        agentic_host_staging_client=object() if host_enabled else None,
+        _agentic_candidate_items=lambda: ((snapshot_id, candidate),),
+        _agentic_try_final_confirmation=lambda _candidate: False,
+        _agentic_candidate_is_live_locked=lambda sid, value: (
+            sid == snapshot_id and value is candidate
+        ),
+        _agentic_try_early_claim=lambda _candidate, _now: (
+            "arrived" if fast_arrival_seen else "absent"
+        ),
+        _agentic_direct_manifest=lambda *_args, **_kwargs: manifest,
+        _agentic_try_tool_confirmation=lambda _candidate: True,
+        _agentic_release_early_claim=lambda *_args: None,
+        _agentic_direct_kv_usage=lambda: 0.5,
+        agentic_snapshot_store=SimpleNamespace(
+            fail_direct_offer=lambda *_args, **_kwargs: SimpleNamespace(
+                state=SnapshotState.FAILED
+            )
+        ),
+        _start_agentic_host_staging=lambda value, current: (
+            staged.append((value, current)) or value.update(staging=True) or True
+        ),
+        _publish_agentic_route=lambda *_args, **kwargs: (
+            recomputes.append(snapshot_id)
+            if kwargs.get("route") == "recompute"
+            else None
+        )
+        or True,
+        _cleanup_agentic_direct_sender=lambda value: cleanups.append(value),
+        _retire_candidate_for_release=lambda sid, req, offset: releases.append(
+            (sid, req, offset)
+        ),
+    )
+
+    DecodeKVCacheOffloadManager._check_agentic_direct_progress(
+        manager, progress_relay=False
+    )
+
+    assert bool(recomputes) is expected_recompute
+    assert bool(staged) is expected_stage
+    if expected_recompute:
+        assert releases == [(snapshot_id, candidate["req"], 0)]
+        assert cleanups == [candidate]
+    else:
+        assert not releases and not cleanups
+
+
+def test_unstarted_direct_abort_recomputes_without_a_second_arrival_marker():
+    snapshot_id = "request:unstarted-abort:0"
+    manifest = SimpleNamespace(
+        snapshot_id=snapshot_id,
+        state=SnapshotState.DIRECT_READY,
+        token_count=1024,
+    )
+    request = SimpleNamespace(snapshot_id=snapshot_id)
+    candidate = {
+        "req": object(),
+        "metadata": SimpleNamespace(current=request),
+        "manifest": manifest,
+        "sender": SimpleNamespace(poll=lambda: KVPoll.WaitingForInput),
+        "sent": False,
+        "staging": False,
+        "claimed_at": None,
+        "created_at": time.monotonic() - 2.0,
+        "fallback_retry_at": 0.0,
+        "io_lock": threading.RLock(),
+        # The first arrival marker was consumed by the failed P claim.  This
+        # durable bit must be enough to terminate instead of waiting for the
+        # effectively-unbounded tool threshold.
+        "direct_abort_tool_confirmed": True,
+        "fast_arrival_seen": False,
+        "fast_arrival_seen_at": None,
+    }
+    routes = []
+    releases = []
+    manager = SimpleNamespace(
+        tp_world_size=1,
+        tp_rank=0,
+        agentic_force_slow_path=False,
+        agentic_fast_direct_failure_recompute=True,
+        agentic_fast_threshold=31_536_000.0,
+        agentic_direct_setup_timeout=1.0,
+        agentic_early_claim_post_timeout=0.0,
+        agentic_relay_worker=None,
+        agentic_early_claim_store=object(),
+        agentic_host_staging_client=None,
+        _agentic_candidate_items=lambda: ((snapshot_id, candidate),),
+        _agentic_try_final_confirmation=lambda _candidate: False,
+        _agentic_direct_manifest=lambda *_args, **_kwargs: manifest,
+        _agentic_release_early_claim=lambda *_args: None,
+        agentic_snapshot_store=SimpleNamespace(
+            fail_direct_offer=lambda *_args, **_kwargs: SimpleNamespace(
+                state=SnapshotState.FAILED
+            )
+        ),
+        _publish_agentic_route=lambda *_args, **kwargs: (
+            routes.append(kwargs.get("route")) or True
+        ),
+        _cleanup_agentic_direct_sender=lambda _candidate: None,
+        _retire_candidate_for_release=lambda sid, req, offset: releases.append(
+            (sid, req, offset)
+        ),
+    )
+
+    DecodeKVCacheOffloadManager._check_agentic_direct_progress(
+        manager, progress_relay=False
+    )
+
+    assert routes == ["recompute"]
+    assert releases == [(snapshot_id, candidate["req"], 0)]
+
+
+@pytest.mark.parametrize(
+    ("refreshed_state", "expected_release"),
+    [(SnapshotState.P_RECEIVED, False), (SnapshotState.CONSUMED, True)],
+)
+def test_fast_direct_recompute_force_refresh_respects_p_ownership(
+    refreshed_state, expected_release
+):
+    snapshot_id = f"request:refresh-race:{refreshed_state.value}"
+    initial = SimpleNamespace(
+        snapshot_id=snapshot_id,
+        state=SnapshotState.DIRECT_READY,
+        token_count=1024,
+    )
+    refreshed = SimpleNamespace(
+        snapshot_id=snapshot_id,
+        state=refreshed_state,
+        token_count=1024,
+    )
+    candidate = {
+        "req": object(),
+        "metadata": SimpleNamespace(current=SimpleNamespace()),
+        "manifest": initial,
+        "sender": SimpleNamespace(poll=lambda: KVPoll.WaitingForInput),
+        "sent": False,
+        "staging": False,
+        "claimed_at": None,
+        "created_at": time.monotonic() - 2.0,
+        "fallback_retry_at": 0.0,
+        "io_lock": threading.RLock(),
+        "fast_arrival_seen": True,
+        "fast_arrival_seen_at": time.monotonic() - 1.5,
+    }
+    manifests = iter((initial, refreshed))
+    recomputes = []
+    releases = []
+    cleanups = []
+    manager = SimpleNamespace(
+        tp_world_size=1,
+        tp_rank=0,
+        agentic_force_slow_path=False,
+        agentic_fast_direct_failure_recompute=True,
+        agentic_fast_threshold=1.0,
+        agentic_direct_setup_timeout=1.0,
+        agentic_early_claim_post_timeout=0.0,
+        agentic_relay_worker=None,
+        agentic_early_claim_store=object(),
+        agentic_host_staging_client=object(),
+        _agentic_candidate_items=lambda: ((snapshot_id, candidate),),
+        _agentic_try_final_confirmation=lambda _candidate: False,
+        _agentic_candidate_is_live_locked=lambda sid, value: (
+            sid == snapshot_id and value is candidate
+        ),
+        _agentic_try_early_claim=lambda *_args: "arrived",
+        _agentic_direct_manifest=lambda *_args, **_kwargs: next(manifests),
+        _agentic_try_tool_confirmation=lambda _candidate: True,
+        _agentic_release_early_claim=lambda *_args: None,
+        _agentic_direct_kv_usage=lambda: 0.5,
+        _publish_agentic_failure=lambda *_args, **_kwargs: (
+            recomputes.append(snapshot_id) or True
+        ),
+        _start_agentic_host_staging=lambda *_args, **_kwargs: pytest.fail(
+            "P-owned refreshed state must not enter Host fallback"
+        ),
+        _cleanup_agentic_direct_sender=lambda value: cleanups.append(value),
+        _retire_candidate_for_release=lambda sid, req, offset: releases.append(
+            (sid, req, offset)
+        ),
+    )
+
+    DecodeKVCacheOffloadManager._check_agentic_direct_progress(
+        manager, progress_relay=False
+    )
+
+    assert not recomputes
+    assert bool(releases) is expected_release
+    assert bool(cleanups) is expected_release
+
+
+def test_fast_direct_recompute_atomic_claim_loss_retains_d_source():
+    """A concurrent P claim must win without D releasing or staging its KV."""
+
+    snapshot_id = "request:fast-recompute-claim-loss"
+    manifest = SimpleNamespace(
+        snapshot_id=snapshot_id,
+        state=SnapshotState.DIRECT_READY,
+        token_count=1024,
+    )
+    candidate = {
+        "req": object(),
+        "metadata": SimpleNamespace(
+            current=SimpleNamespace(snapshot_id=snapshot_id)
+        ),
+        "manifest": manifest,
+        "sender": SimpleNamespace(poll=lambda: KVPoll.WaitingForInput),
+        "sent": False,
+        "staging": False,
+        "claimed_at": None,
+        "created_at": time.monotonic() - 2.0,
+        "fallback_retry_at": 0.0,
+        "io_lock": threading.RLock(),
+        "fast_arrival_seen": True,
+        "fast_arrival_seen_at": time.monotonic() - 1.5,
+    }
+    routes = []
+    releases = []
+    cleanups = []
+    manager = SimpleNamespace(
+        tp_world_size=2,
+        tp_rank=0,
+        agentic_force_slow_path=False,
+        agentic_fast_direct_failure_recompute=True,
+        agentic_fast_threshold=1.0,
+        agentic_direct_setup_timeout=1.0,
+        agentic_early_claim_post_timeout=0.0,
+        agentic_relay_worker=None,
+        agentic_early_claim_store=object(),
+        agentic_host_staging_client=object(),
+        agentic_snapshot_store=SimpleNamespace(
+            fail_direct_offer=lambda *_args, **_kwargs: None
+        ),
+        _agentic_candidate_items=lambda: ((snapshot_id, candidate),),
+        _agentic_try_final_confirmation=lambda _candidate: False,
+        _agentic_candidate_is_live_locked=lambda sid, value: (
+            sid == snapshot_id and value is candidate
+        ),
+        _agentic_try_early_claim=lambda *_args: "arrived",
+        _agentic_direct_manifest=lambda *_args, **_kwargs: manifest,
+        _agentic_try_tool_confirmation=lambda _candidate: True,
+        _agentic_release_early_claim=lambda *_args: None,
+        _agentic_direct_kv_usage=lambda: 0.5,
+        _publish_agentic_route=lambda *_args, **_kwargs: routes.append(snapshot_id),
+        _start_agentic_host_staging=lambda *_args, **_kwargs: pytest.fail(
+            "atomic claim loss must not enter Host fallback"
+        ),
+        _cleanup_agentic_direct_sender=lambda value: cleanups.append(value),
+        _retire_candidate_for_release=lambda sid, req, offset: releases.append(
+            (sid, req, offset)
+        ),
+    )
+
+    DecodeKVCacheOffloadManager._check_agentic_direct_progress(
+        manager, progress_relay=False
+    )
+
+    assert routes == []
+    assert releases == []
+    assert cleanups == []
+    assert candidate["fallback_retry_at"] > time.monotonic() - 1.0
+
+
+def test_fast_direct_recompute_tp_release_uses_native_group_handoff():
+    """TP recompute retirement enters the existing rank-0 release broadcast."""
+
+    snapshot_id = "request:fast-recompute-tp:3"
+    req = SimpleNamespace(
+        sampling_params=SimpleNamespace(
+            custom_params={
+                "agentic_request_id": "request:fast-recompute-tp",
+                "agentic_generation": 3,
+                "agentic_parent_generation": 2,
+            }
+        )
+    )
+    candidate = {"req": req}
+    manager = SimpleNamespace(
+        tp_world_size=2,
+        agentic_direct_candidates={snapshot_id: candidate},
+        _agentic_candidates_lock=threading.RLock(),
+        _agentic_pending_release_lock=threading.RLock(),
+        _agentic_release_ownership={},
+        _agentic_tp_pending_releases={},
+        _agentic_slow_active_ids={},
+    )
+    manager._enqueue_agentic_release = (
+        lambda value, offset, **kwargs: DecodeKVCacheOffloadManager._enqueue_agentic_release(
+            manager, value, offset, **kwargs
+        )
+    )
+
+    retired = DecodeKVCacheOffloadManager._retire_candidate_for_release(
+        manager, snapshot_id, req, 0
+    )
+
+    assert retired is candidate
+    assert manager.agentic_direct_candidates == {}
+    assert manager._agentic_release_ownership == {snapshot_id: (req, 0)}
+    assert manager._agentic_tp_pending_releases == {snapshot_id: (req, 0)}
+    assert DecodeKVCacheOffloadManager.tp_pending_release_snapshot(manager) == snapshot_id
+
+
+def test_fast_direct_recompute_tp_follower_cannot_terminalize():
+    """Only TP rank zero may publish FAILED or a recompute route."""
+
+    snapshot_id = "request:fast-recompute-follower:2"
+    manifest = SimpleNamespace(
+        request=SimpleNamespace(snapshot_id=snapshot_id),
+        state=SnapshotState.DIRECT_READY,
+    )
+    calls = []
+    manager = SimpleNamespace(
+        tp_world_size=2,
+        tp_rank=1,
+        agentic_snapshot_store=SimpleNamespace(
+            fail_direct_offer=lambda *_args, **_kwargs: calls.append("fail")
+        ),
+        _publish_agentic_route=lambda *_args, **_kwargs: calls.append("route"),
+        _retire_candidate_for_release=lambda *_args, **_kwargs: calls.append(
+            "release"
+        ),
+    )
+    candidate = {"fallback_retry_at": 0.0}
+
+    assert not DecodeKVCacheOffloadManager._try_fast_direct_failure_recompute(
+        manager,
+        candidate,
+        manifest,
+        SimpleNamespace(current=manifest.request),
+        time.monotonic(),
+    )
+    assert calls == []
+    assert "fast_direct_recompute_terminalized" not in candidate
+
+
+def test_fast_direct_recompute_tp_rank0_routes_before_group_release():
+    """TP0 retains every source shard until recompute routing is durable."""
+
+    snapshot_id = "request:fast-recompute-rank0:2"
+    request = SimpleNamespace(snapshot_id=snapshot_id)
+    manifest = SimpleNamespace(
+        request=request,
+        state=SnapshotState.DIRECT_READY,
+    )
+    failed = SimpleNamespace(request=request, state=SnapshotState.FAILED)
+    events = []
+    route_results = iter((False, True))
+    manager = SimpleNamespace(
+        tp_world_size=2,
+        tp_rank=0,
+        agentic_snapshot_store=SimpleNamespace(
+            fail_direct_offer=lambda *_args, **_kwargs: (
+                events.append("terminalize") or failed
+            )
+        ),
+        _publish_agentic_route=lambda *_args, **_kwargs: (
+            events.append("route") or next(route_results)
+        ),
+        _agentic_release_early_claim=lambda *_args, **_kwargs: events.append(
+            "claim_cleanup"
+        ),
+        _cleanup_agentic_direct_sender=lambda *_args, **_kwargs: events.append(
+            "sender_cleanup"
+        ),
+        _retire_candidate_for_release=lambda *_args, **_kwargs: events.append(
+            "group_release"
+        ),
+    )
+    candidate = {
+        "req": object(),
+        "created_at": time.monotonic() - 2.0,
+        "fallback_retry_at": 0.0,
+    }
+    metadata = SimpleNamespace(current=request)
+
+    assert not DecodeKVCacheOffloadManager._try_fast_direct_failure_recompute(
+        manager, candidate, manifest, metadata, time.monotonic()
+    )
+    assert events == ["terminalize", "route"]
+    assert candidate["fast_direct_recompute_terminalized"] is True
+
+    candidate["fallback_retry_at"] = 0.0
+    assert DecodeKVCacheOffloadManager._finish_fast_direct_recompute(
+        manager, candidate, metadata, time.monotonic()
+    )
+    assert events == [
+        "terminalize",
+        "route",
+        "route",
+        "claim_cleanup",
+        "sender_cleanup",
+        "group_release",
+    ]
+
+
+def test_fast_direct_recompute_retries_route_before_releasing_d_kv():
+    """A transient Router-marker failure must retain the sole D snapshot."""
+
+    snapshot_id = "request:fast-recompute-route-retry"
+    direct = SimpleNamespace(
+        snapshot_id=snapshot_id,
+        state=SnapshotState.DIRECT_READY,
+        token_count=1024,
+    )
+    failed = SimpleNamespace(
+        snapshot_id=snapshot_id,
+        state=SnapshotState.FAILED,
+        token_count=1024,
+    )
+    candidate = {
+        "req": object(),
+        "metadata": SimpleNamespace(current=SimpleNamespace(snapshot_id=snapshot_id)),
+        "manifest": direct,
+        "sender": SimpleNamespace(poll=lambda: KVPoll.WaitingForInput),
+        "sent": False,
+        "staging": False,
+        "claimed_at": None,
+        "created_at": time.monotonic() - 2.0,
+        "fallback_retry_at": 0.0,
+        "io_lock": threading.RLock(),
+        "fast_arrival_seen": True,
+        "fast_arrival_seen_at": time.monotonic() - 1.5,
+    }
+    route_results = iter((False, True))
+    route_attempts = []
+    releases = []
+    cleanups = []
+    manager = SimpleNamespace(
+        tp_world_size=1,
+        tp_rank=0,
+        agentic_force_slow_path=False,
+        agentic_fast_direct_failure_recompute=True,
+        agentic_fast_threshold=1.0,
+        agentic_direct_setup_timeout=1.0,
+        agentic_early_claim_post_timeout=0.0,
+        agentic_relay_worker=None,
+        agentic_early_claim_store=object(),
+        agentic_host_staging_client=object(),
+        agentic_snapshot_store=SimpleNamespace(
+            fail_direct_offer=lambda *_args, **_kwargs: failed
+        ),
+        _agentic_candidate_items=lambda: ((snapshot_id, candidate),),
+        _agentic_try_final_confirmation=lambda _candidate: False,
+        _agentic_candidate_is_live_locked=lambda sid, value: (
+            sid == snapshot_id and value is candidate
+        ),
+        _agentic_try_early_claim=lambda *_args: "arrived",
+        _agentic_direct_manifest=lambda *_args, **_kwargs: (
+            failed
+            if candidate.get("fast_direct_recompute_terminalized")
+            else direct
+        ),
+        _agentic_try_tool_confirmation=lambda _candidate: True,
+        _agentic_release_early_claim=lambda *_args: None,
+        _agentic_direct_kv_usage=lambda: 0.5,
+        _publish_agentic_route=lambda *_args, **_kwargs: (
+            route_attempts.append(snapshot_id) or next(route_results)
+        ),
+        _start_agentic_host_staging=lambda *_args, **_kwargs: pytest.fail(
+            "recompute route retry must not enter Host fallback"
+        ),
+        _cleanup_agentic_direct_sender=lambda value: cleanups.append(value),
+        _retire_candidate_for_release=lambda sid, req, offset: releases.append(
+            (sid, req, offset)
+        ),
+    )
+
+    DecodeKVCacheOffloadManager._check_agentic_direct_progress(
+        manager, progress_relay=False
+    )
+    assert route_attempts == [snapshot_id]
+    assert releases == []
+    assert cleanups == []
+    assert candidate["fast_direct_recompute_terminalized"] is True
+
+    candidate["fallback_retry_at"] = 0.0
+    DecodeKVCacheOffloadManager._check_agentic_direct_progress(
+        manager, progress_relay=False
+    )
+    assert route_attempts == [snapshot_id, snapshot_id]
+    assert releases == [(snapshot_id, candidate["req"], 0)]
+    assert cleanups == [candidate]
+
+
+def test_early_direct_physical_cap_counts_inflight_and_tp_grants_once():
+    """The event-driven admission path shares the configured physical cap."""
+
+    inflight = SimpleNamespace(
+        completed_at=None,
+        transport_poll=KVPoll.WaitingForInput,
+    )
+    completed = SimpleNamespace(
+        completed_at=time.monotonic(),
+        transport_poll=KVPoll.Success,
+    )
+    scheduler = SimpleNamespace(
+        agentic_early_direct_poll_lock=threading.RLock(),
+        agentic_early_direct_receives={
+            "physical": inflight,
+            "granted-and-physical": inflight,
+            "completed": completed,
+        },
+        agentic_tp_direct_admission_active={
+            "granted": object(),
+            "granted-and-physical": object(),
+            "completed": object(),
+        },
+    )
+
+    assert Scheduler._agentic_early_direct_slots_used(scheduler) == 3
+
+
+def test_early_direct_admission_does_not_exceed_physical_cap(monkeypatch):
+    """A 32-arrival burst remains metadata-only while all eight lanes run."""
+
+    monkeypatch.setenv("SGLANG_PD_LATE_BIND_DYNAMIC_PREFILL_DOMAINS", "0")
+    monkeypatch.setenv("SGLANG_AGENTIC_KV_DIRECT_IO_CAP", "8")
+    arrived_at = time.time()
+    queued = []
+    for index in range(32):
+        request = RequestGeneration(f"cap-burst-{index}", 1)
+        manifest = SimpleNamespace(
+            request=request,
+            state=SnapshotState.DIRECT_READY,
+            created_at=arrived_at,
+            token_count=1024,
+        )
+        queued.append(
+            (
+                request,
+                {"arrived_at": arrived_at, "prompt_token_count": 2048},
+                manifest,
+            )
+        )
+    inflight = {
+        f"active-{index}": SimpleNamespace(
+            completed_at=None,
+            transport_poll=KVPoll.WaitingForInput,
+        )
+        for index in range(8)
+    }
+    broker = SimpleNamespace(
+        owner_is_superseded=lambda *_args, **_kwargs: False,
+        cancel_unstarted=lambda *_args, **_kwargs: None,
+        request=lambda *_args, **_kwargs: pytest.fail(
+            "a capped arrival must not reserve P HBM"
+        ),
+    )
+    scheduler = SimpleNamespace(
+        tp_size=1,
+        tp_rank=0,
+        agentic_early_claim_store=object(),
+        agentic_tp_direct_admission_active={},
+        agentic_early_direct_admission_queue=deque(queued),
+        agentic_early_direct_admission_ids={
+            request.snapshot_id for request, _, _ in queued
+        },
+        agentic_early_direct_receives=inflight,
+        agentic_early_direct_terminal={},
+        agentic_p_workset_broker=broker,
+    )
+
+    Scheduler._agentic_admit_queued_direct_receives(
+        scheduler,
+        SimpleNamespace(load=lambda *_args, **_kwargs: pytest.fail("cached")),
+        1.0,
+        threading.RLock(),
+    )
+
+    assert len(scheduler.agentic_early_direct_admission_queue) == 32
+    assert len(scheduler.agentic_early_direct_admission_ids) == 32
+    assert Scheduler._agentic_early_direct_slots_used(scheduler) == 8
+
+
+def test_tp_follower_waits_for_rank0_grant_before_leasing_workset(monkeypatch):
+    """TP followers keep a 32-arrival burst metadata-only until rank0 grants."""
+
+    monkeypatch.setenv("SGLANG_PD_LATE_BIND_DYNAMIC_PREFILL_DOMAINS", "0")
+    monkeypatch.setenv("SGLANG_AGENTIC_KV_DIRECT_IO_CAP", "8")
+    arrived_at = time.time()
+    queued = []
+    manifests = {}
+    for index in range(32):
+        request = RequestGeneration(f"tp-follower-cap-{index}", 1)
+        manifest = SimpleNamespace(
+            request=request,
+            state=SnapshotState.DIRECT_LOADING,
+            created_at=arrived_at,
+            token_count=1024,
+        )
+        manifests[request.snapshot_id] = manifest
+        queued.append(
+            (
+                request,
+                {"arrived_at": arrived_at, "prompt_token_count": 2048},
+                manifest,
+            )
+        )
+
+    receipts = {}
+    leases = {}
+    requests = []
+
+    def request_lease(snapshot_id, *_args, **_kwargs):
+        requests.append(snapshot_id)
+        leases[snapshot_id] = object()
+
+    broker = SimpleNamespace(
+        owner_is_superseded=lambda *_args, **_kwargs: False,
+        cancel_unstarted=lambda snapshot_id, **_kwargs: leases.pop(
+            snapshot_id, None
+        ),
+        request=request_lease,
+        get=lambda snapshot_id, **_kwargs: leases.get(snapshot_id),
+        request_release=lambda snapshot_id, *_args, **_kwargs: leases.pop(
+            snapshot_id, None
+        ),
+    )
+    scheduler = SimpleNamespace(
+        tp_size=2,
+        tp_rank=1,
+        agentic_early_claim_store=object(),
+        agentic_tp_direct_admission_active={},
+        agentic_early_direct_admission_queue=deque(queued),
+        agentic_early_direct_admission_ids={
+            request.snapshot_id for request, _, _ in queued
+        },
+        agentic_early_direct_receives={},
+        agentic_early_direct_terminal={},
+        agentic_tp_direct_local_failed=set(),
+        agentic_p_workset_broker=broker,
+        agentic_tp_direct_mailbox=SimpleNamespace(
+            receipt=lambda snapshot_id: receipts.get(snapshot_id)
+        ),
+    )
+    store = SimpleNamespace(
+        load=lambda request, require_ready=False: manifests[request.snapshot_id]
+    )
+
+    Scheduler._agentic_admit_queued_direct_receives(
+        scheduler, store, 1.0, threading.RLock()
+    )
+    assert requests == []
+    assert leases == {}
+    assert len(scheduler.agentic_early_direct_admission_queue) == 32
+
+    first_eight = [item[0].snapshot_id for item in queued[:8]]
+    receipts.update({snapshot_id: 1 for snapshot_id in first_eight})
+    Scheduler._agentic_admit_queued_direct_receives(
+        scheduler, store, 1.0, threading.RLock()
+    )
+    assert requests == first_eight
+    assert set(leases) == set(first_eight)
+    assert len(scheduler.agentic_tp_direct_admission_active) == 8
+    assert len(scheduler.agentic_early_direct_admission_queue) == 24
+
+    # One local DMA completes while its logical TP grant remains live until
+    # group bind. The physical lane is immediately reusable by exactly one
+    # newly granted generation.
+    completed_id = first_eight[0]
+    scheduler.agentic_early_direct_receives[completed_id] = SimpleNamespace(
+        completed_at=time.monotonic(),
+        transport_poll=KVPoll.Success,
+    )
+    ninth_id = queued[8][0].snapshot_id
+    receipts[ninth_id] = 1
+    Scheduler._agentic_admit_queued_direct_receives(
+        scheduler, store, 1.0, threading.RLock()
+    )
+    assert requests[-1] == ninth_id
+    assert len(requests) == 9
+    assert len(scheduler.agentic_early_direct_admission_queue) == 23
+    assert Scheduler._agentic_early_direct_slots_used(scheduler) == 8
 
 
 def test_tp_slow_offer_uses_rank0_manifest_token_identity():

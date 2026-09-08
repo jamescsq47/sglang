@@ -312,6 +312,10 @@ class Envs:
     # Ablation only: keep the request-generation lifecycle and Shared Host
     # recovery enabled while bypassing D->P Direct admission.
     SGLANG_AGENTIC_KV_FORCE_SLOW_PATH = EnvBool(False)
+    # Ablation only: when a fast tool has arrived but Direct setup misses its
+    # deadline, publish recompute instead of entering Shared Host. Slow tools
+    # still follow the ordinary Host path. The production default is off.
+    SGLANG_AGENTIC_KV_FAST_DIRECT_FAILURE_RECOMPUTE = EnvBool(False)
     SGLANG_AGENTIC_KV_DIRECT_BOOTSTRAP_PORT = EnvInt(0)
     SGLANG_AGENTIC_KV_DIRECT_HANDSHAKE_TIMEOUT = EnvFloat(2.0)
     SGLANG_AGENTIC_KV_HOST_TRANSITION_GRACE = EnvFloat(8.0)

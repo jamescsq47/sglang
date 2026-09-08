@@ -3671,8 +3671,10 @@ def start_registered_host_arena_startup_prewarm(
     domain = int(os.environ.get("SGLANG_AGENTIC_KV_PREFILL_DOMAIN", "-1"))
     if domain_count <= 0 or not 0 <= int(tp_rank) < tp_size:
         raise ValueError("invalid startup Host prewarm topology")
-    if role == "prefill" and (domain < 0 or d2p_arena_path is None):
-        raise ValueError("P startup Host prewarm requires its D->P arena")
+    if role == "prefill" and (
+        domain < 0 or (d2p_arena_path is None and p2d_arena_path is None)
+    ):
+        raise ValueError("P startup Host prewarm requires an enabled Host arena")
 
     arenas_dir = os.path.join(root, "arenas")
     complete_dir = os.path.join(root, "complete")
@@ -3689,7 +3691,9 @@ def start_registered_host_arena_startup_prewarm(
             {
                 "domain": domain,
                 "tp_rank": int(tp_rank),
-                "d2p_path": str(d2p_arena_path),
+                "d2p_path": (
+                    None if d2p_arena_path is None else str(d2p_arena_path)
+                ),
                 "p2d_path": (
                     None if p2d_arena_path is None else str(p2d_arena_path)
                 ),
@@ -3743,7 +3747,11 @@ def start_registered_host_arena_startup_prewarm(
             ]
             if len(rank_manifests) != domain_count:
                 raise RuntimeError("startup Host arena manifest rank coverage mismatch")
-            paths = [str(item["d2p_path"]) for item in rank_manifests]
+            paths = [
+                str(item["d2p_path"])
+                for item in rank_manifests
+                if item.get("d2p_path")
+            ]
             if role == "decode":
                 paths.extend(
                     str(item["p2d_path"])
