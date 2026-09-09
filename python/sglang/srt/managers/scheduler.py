@@ -301,34 +301,11 @@ class AgenticPWorksetLease:
     prompt_tokens: int
     allocated_tokens: int
     device_indices: torch.Tensor
-    parent_page_indices: Optional[np.ndarray]
-    page_mirror_host: Optional[torch.Tensor] = None
-    page_mirror_event: Any = None
-    page_mirror_submitted: bool = False
-    page_mirror_failed: bool = False
+    parent_page_indices: np.ndarray
     parent_bound: bool = False
     state: str = "active"
     suffix_cursor: int = 0
     io_attempt: Optional[str] = None
-
-    def page_mirror_quiescent(self) -> bool:
-        if self.page_mirror_event is None:
-            return not self.page_mirror_submitted
-        try:
-            return bool(self.page_mirror_event.query())
-        except Exception:
-            # A broken query is not completion. Quarantine exactly once and
-            # let the experiment supervisor stop; no CPU read or page reuse.
-            self.page_mirror_failed = True
-            self.page_mirror_submitted = True
-            self.page_mirror_event = None
-            logger.exception(
-                "AgenticKV direct_page_mirror_failure snapshot=%s lease=%d "
-                "quarantined=True stage=query",
-                self.snapshot_id,
-                self.lease_id,
-            )
-            return False
 
     @property
     def parent_indices(self) -> torch.Tensor:
@@ -349,23 +326,11 @@ class AgenticPWorksetLease:
         return self.suffix_indices[self.suffix_cursor :]
 
 
-@dataclass(frozen=True, slots=True)
-class AgenticDirectCapacityRefusal:
-    owner: str
-    required_tokens: int
-    available_tokens: int
-    checked_at: float
-
-
 class AgenticPWorksetLeaseBroker:
     """Thread-safe intent queue with scheduler-owned physical allocation."""
 
-    def __init__(self, page_size: int, *, capacity_recompute: bool = False):
+    def __init__(self, page_size: int):
         self.page_size = int(page_size)
-        self.capacity_recompute = bool(capacity_recompute)
-        self._capacity_eligible: set[str] = set()
-        self._direct_granted: set[str] = set()
-        self._capacity_refusals: Dict[str, AgenticDirectCapacityRefusal] = {}
         self._intents: Dict[str, Tuple[str, int, int]] = {}
         self._leases: Dict[str, AgenticPWorksetLease] = {}
         self._release_requested: Dict[str, int] = {}
@@ -411,7 +376,6 @@ class AgenticPWorksetLeaseBroker:
         prompt_tokens: int,
         *,
         owner: str = "legacy",
-        capacity_refusal_eligible: bool = False,
     ) -> bool:
         parent_tokens = int(parent_tokens)
         prompt_tokens = int(prompt_tokens)
@@ -441,43 +405,11 @@ class AgenticPWorksetLeaseBroker:
                 )
             pending = self._intents.get(snapshot_id)
             if pending is not None:
-                matches = pending == (owner, parent_tokens, prompt_tokens)
-                if (
-                    matches
-                    and capacity_refusal_eligible
-                    and owner == self.direct_owner(snapshot_id)
-                ):
-                    self._capacity_eligible.add(snapshot_id)
-                return matches
+                return pending == (owner, parent_tokens, prompt_tokens)
             if snapshot_id in self._release_requested:
                 return False
             self._intents[snapshot_id] = (owner, parent_tokens, prompt_tokens)
-            if capacity_refusal_eligible and owner == self.direct_owner(snapshot_id):
-                self._capacity_eligible.add(snapshot_id)
             return True
-
-    def has_capacity_refusal(self, snapshot_id: str) -> bool:
-        with self._lock:
-            return (
-                snapshot_id in self._capacity_refusals
-                and snapshot_id not in self._direct_granted
-            )
-
-    def capacity_refusal(
-        self, snapshot_id: str
-    ) -> Optional[AgenticDirectCapacityRefusal]:
-        """Expose a final allocator refusal only after its owner has retired.
-
-        A grant at any time disqualifies this generation. Group allocation
-        plans cannot generate a rank-local refusal in this TP1 implementation.
-        """
-        with self._lock:
-            refusal = self._capacity_refusals.get(snapshot_id)
-            if refusal is None or snapshot_id in self._direct_granted:
-                return None
-            if self.owner_has_unretired_work(snapshot_id, owner=refusal.owner):
-                return None
-            return refusal
 
     def get(
         self, snapshot_id: str, *, owner: Optional[str] = None
@@ -644,9 +576,6 @@ class AgenticPWorksetLeaseBroker:
                     and lease.lease_id == expected_id
                     and lease.state == "releasing"
                 ):
-                    if not lease.page_mirror_quiescent():
-                        self._release_requested[snapshot_id] = expected_id
-                        continue
                     self._leases.pop(snapshot_id, None)
                     allocator.free(
                         lease.remaining_suffix_indices
@@ -768,27 +697,6 @@ class AgenticPWorksetLeaseBroker:
                     (suffix_tokens + self.page_size - 1) // self.page_size
                 ) * self.page_size
                 allocated_tokens = parent_allocated + suffix_allocated
-                if (
-                    self.capacity_recompute
-                    and allocation_plan is None
-                    and owner == self.direct_owner(snapshot_id)
-                    and snapshot_id in self._capacity_eligible
-                    and snapshot_id not in self._direct_granted
-                ):
-                    available = max(0, allocator.available_size() - reserve_tokens)
-                    if available < allocated_tokens:
-                        # This is an authoritative allocation decision, not a
-                        # timeout/no-claim inference. Close the attempt before
-                        # exposing its evidence to the background publisher.
-                        self._capacity_refusals.setdefault(
-                            snapshot_id,
-                            AgenticDirectCapacityRefusal(
-                                owner, allocated_tokens, available, time.time()
-                            ),
-                        )
-                        self.supersede_unstarted(snapshot_id, owner=owner)
-                        self._allocation_failures += 1
-                        continue
                 if reserve_tokens and (
                     allocator.available_size() - reserve_tokens < allocated_tokens
                 ):
@@ -803,16 +711,8 @@ class AgenticPWorksetLeaseBroker:
                         break
                     continue
                 parent_indices = device_indices[:parent_allocated]
-                async_mirror = (
-                    self.capacity_recompute
-                    and self._tp_plan_epoch < 0
-                    and owner == self.direct_owner(snapshot_id)
-                    and parent_indices.is_cuda
-                )
-                page_indices = (
-                    None if async_mirror else kv_to_page_indices(
-                        parent_indices.cpu().numpy(), self.page_size
-                    )
+                page_indices = kv_to_page_indices(
+                    parent_indices.cpu().numpy(), self.page_size
                 )
                 self._leases[snapshot_id] = AgenticPWorksetLease(
                     snapshot_id=snapshot_id,
@@ -825,37 +725,6 @@ class AgenticPWorksetLeaseBroker:
                     device_indices=device_indices,
                     parent_page_indices=page_indices,
                 )
-                if self.capacity_recompute and owner == self.direct_owner(snapshot_id):
-                    self._direct_granted.add(snapshot_id)
-                if async_mirror:
-                    # Same producer stream: index generation -> tiny D2H ->
-                    # event. Do not synchronize the scheduler or its broker
-                    # lock. The exact lease owns both buffers until the event.
-                    lease = self._leases[snapshot_id]
-                    try:
-                        lease.page_mirror_host = torch.empty(
-                            parent_indices.shape,
-                            dtype=parent_indices.dtype,
-                            device="cpu",
-                            pin_memory=True,
-                        )
-                        mirror_event = torch.cuda.Event()
-                        lease.page_mirror_submitted = True
-                        lease.page_mirror_host.copy_(parent_indices, non_blocking=True)
-                        mirror_event.record()
-                        lease.page_mirror_event = mirror_event
-                    except Exception:
-                        # Never expose uninitialized CPU page IDs. If a copy
-                        # might have been queued without a recorded fence,
-                        # retain this lease until process teardown (fail closed).
-                        lease.page_mirror_failed = True
-                        self.supersede_unstarted(snapshot_id, owner=owner)
-                        logger.exception(
-                            "AgenticKV direct_page_mirror_failure snapshot=%s "
-                            "quarantined=%s",
-                            snapshot_id,
-                            lease.page_mirror_submitted,
-                        )
                 self._next_lease_id += 1
                 self._grants += 1
                 self._intents.pop(snapshot_id, None)
@@ -1078,25 +947,6 @@ class AgenticPWorksetLeaseBroker:
             events = tuple(self._grant_events)
             self._grant_events.clear()
             return events
-
-    def prepare_parent_page_indices(self, lease: AgenticPWorksetLease) -> bool:
-        """Publish only an exact live lease's completed CPU index mirror."""
-        with self._lock:
-            current = self._leases.get(lease.snapshot_id)
-            if (
-                current is not lease
-                or current.state != "active"
-                or current.page_mirror_failed
-            ):
-                return False
-            if current.parent_page_indices is not None:
-                return True
-            if not current.page_mirror_quiescent() or current.page_mirror_failed:
-                return False
-            current.parent_page_indices = kv_to_page_indices(
-                current.page_mirror_host.numpy(), self.page_size
-            )
-            return True
 
     def handoff_to_req(
         self, snapshot_id: str, req, lease: AgenticPWorksetLease
@@ -2268,11 +2118,7 @@ class Scheduler(
         # workers publish intents; only the scheduler services physical page
         # allocation and release, preserving allocator/Radix ownership rules.
         self.agentic_p_workset_broker = AgenticPWorksetLeaseBroker(
-            self.server_args.page_size,
-            capacity_recompute=(
-                envs.SGLANG_AGENTIC_KV_DIRECT_CAPACITY_RECOMPUTE.get()
-                and self.tp_size == 1
-            ),
+            self.server_args.page_size
         )
         # TP rank 0 owns one ordered set of Direct admissions.  A dedicated
         # tmpfs mailbox grants the same request-generation to every rank's
@@ -4689,44 +4535,6 @@ class Scheduler(
             ) - set(receives)
         return len(physical | granted)
 
-    def _agentic_publish_direct_capacity_refusal(
-        self, request, snapshot_store, domain
-    ) -> bool:
-        """Publish a retired allocator decision off the scheduler; retry races."""
-        refusal = self.agentic_p_workset_broker.capacity_refusal(request.snapshot_id)
-        if refusal is None:
-            return False
-        try:
-            current = snapshot_store.load(request, require_ready=False)
-            if current is None:
-                return False
-            if current.state is not SnapshotState.DIRECT_READY:
-                return True  # A claim/Slow/final transition won the lifecycle CAS.
-            terminal = snapshot_store.fail_direct_offer(
-                current,
-                owner_id=f"p-capacity:{domain}:{request.snapshot_id}",
-                reason=(
-                    "direct_workset_capacity_refused "
-                    f"required={refusal.required_tokens} "
-                    f"available={refusal.available_tokens} "
-                    f"p={domain} checked_at={refusal.checked_at:.6f}"
-                ),
-            )
-            if terminal is None:
-                return False
-            logger.info(
-                "AgenticKV direct_capacity_refused snapshot=%s "
-                "required=%d available=%d p=%d",
-                request.snapshot_id,
-                refusal.required_tokens,
-                refusal.available_tokens,
-                domain,
-            )
-            return True
-        except Exception:
-            logger.exception("Direct capacity refusal publication failed")
-            return False
-
     def _agentic_admit_queued_direct_receives(
         self,
         snapshot_store,
@@ -4802,17 +4610,6 @@ class Scheduler(
             if broker.owner_is_superseded(
                 request.snapshot_id, owner=workset_owner
             ):
-                if (
-                    getattr(broker, "capacity_recompute", False)
-                    and broker.has_capacity_refusal(request.snapshot_id)
-                    and not self._agentic_publish_direct_capacity_refusal(
-                        request, snapshot_store, configured_domain,
-                    )
-                ):
-                    with poll_lock:
-                        queue.append((request, payload, manifest))
-                        pending.add(request.snapshot_id)
-                    continue
                 # HOST_READY won the Direct/Slow race before this inotify
                 # marker reached the admission queue.  Consume the stale
                 # marker exactly once; the complete parent is already owned
@@ -4843,12 +4640,6 @@ class Scheduler(
                 # the ordinary timeout-to-Slow path rather than overcommitting.
                 continue
             prompt_tokens = int(prompt_tokens)
-            fast_tool = max(0.0, arrived_at - manifest.created_at) <= (
-                envs.SGLANG_AGENTIC_KV_FAST_TOOL_THRESHOLD.get()
-            )
-            if getattr(broker, "capacity_recompute", False) and not fast_tool:
-                broker.supersede_unstarted(request.snapshot_id, owner=workset_owner)
-                continue  # Slow tools never acquire Direct or capacity refusal.
             if prompt_tokens < int(manifest.token_count):
                 logger.warning(
                     "AgenticKV invalid workset marker snapshot=%s parent=%d prompt=%d",
@@ -4915,13 +4706,9 @@ class Scheduler(
                 int(manifest.token_count),
                 prompt_tokens,
                 owner=workset_owner,
-                capacity_refusal_eligible=fast_tool,
             )
             workset_lease = broker.get(request.snapshot_id, owner=workset_owner)
-            if workset_lease is None or (
-                getattr(broker, "capacity_recompute", False)
-                and not broker.prepare_parent_page_indices(workset_lease)
-            ):
+            if workset_lease is None:
                 with poll_lock:
                     queue.append((request, payload, manifest))
                     pending.add(request.snapshot_id)
@@ -6230,9 +6017,7 @@ class Scheduler(
         workset_lease = self.agentic_p_workset_broker.get(
             manifest.snapshot_id, owner=workset_owner
         )
-        if workset_lease is None or not (
-            self.agentic_p_workset_broker.prepare_parent_page_indices(workset_lease)
-        ):
+        if workset_lease is None:
             # The scheduler services the physical intent on its next safe
             # boundary.  D retains source KV and may independently time out to
             # Slow if a complete workset cannot be granted in time.

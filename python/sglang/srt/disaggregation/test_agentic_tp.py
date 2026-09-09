@@ -9391,26 +9391,15 @@ def test_force_slow_ablation_stages_immediately_without_direct_wait():
 
 
 @pytest.mark.parametrize(
-    (
-        "tp_world_size",
-        "fast_arrival_seen",
-        "host_enabled",
-        "expected_recompute",
-        "expected_stage",
-    ),
+    ("tp_world_size", "fast_arrival_seen", "expected_recompute", "expected_stage"),
     [
-        (1, True, True, True, False),
-        (2, True, True, True, False),
-        (1, False, True, False, True),
-        (1, False, False, True, False),
+        (1, True, True, False),
+        (2, True, True, False),
+        (1, False, False, True),
     ],
 )
 def test_fast_direct_failure_recompute_keeps_slow_tools_on_host(
-    tp_world_size,
-    fast_arrival_seen,
-    host_enabled,
-    expected_recompute,
-    expected_stage,
+    tp_world_size, fast_arrival_seen, expected_recompute, expected_stage
 ):
     snapshot_id = f"request:fast-recompute:{fast_arrival_seen}"
     manifest = SimpleNamespace(
@@ -9450,7 +9439,7 @@ def test_fast_direct_failure_recompute_keeps_slow_tools_on_host(
         agentic_early_claim_post_timeout=0.0,
         agentic_relay_worker=None,
         agentic_early_claim_store=object(),
-        agentic_host_staging_client=object() if host_enabled else None,
+        agentic_host_staging_client=object(),
         _agentic_candidate_items=lambda: ((snapshot_id, candidate),),
         _agentic_try_final_confirmation=lambda _candidate: False,
         _agentic_candidate_is_live_locked=lambda sid, value: (
@@ -9494,71 +9483,6 @@ def test_fast_direct_failure_recompute_keeps_slow_tools_on_host(
         assert cleanups == [candidate]
     else:
         assert not releases and not cleanups
-
-
-def test_unstarted_direct_abort_recomputes_without_a_second_arrival_marker():
-    snapshot_id = "request:unstarted-abort:0"
-    manifest = SimpleNamespace(
-        snapshot_id=snapshot_id,
-        state=SnapshotState.DIRECT_READY,
-        token_count=1024,
-    )
-    request = SimpleNamespace(snapshot_id=snapshot_id)
-    candidate = {
-        "req": object(),
-        "metadata": SimpleNamespace(current=request),
-        "manifest": manifest,
-        "sender": SimpleNamespace(poll=lambda: KVPoll.WaitingForInput),
-        "sent": False,
-        "staging": False,
-        "claimed_at": None,
-        "created_at": time.monotonic() - 2.0,
-        "fallback_retry_at": 0.0,
-        "io_lock": threading.RLock(),
-        # The first arrival marker was consumed by the failed P claim.  This
-        # durable bit must be enough to terminate instead of waiting for the
-        # effectively-unbounded tool threshold.
-        "direct_abort_tool_confirmed": True,
-        "fast_arrival_seen": False,
-        "fast_arrival_seen_at": None,
-    }
-    routes = []
-    releases = []
-    manager = SimpleNamespace(
-        tp_world_size=1,
-        tp_rank=0,
-        agentic_force_slow_path=False,
-        agentic_fast_direct_failure_recompute=True,
-        agentic_fast_threshold=31_536_000.0,
-        agentic_direct_setup_timeout=1.0,
-        agentic_early_claim_post_timeout=0.0,
-        agentic_relay_worker=None,
-        agentic_early_claim_store=object(),
-        agentic_host_staging_client=None,
-        _agentic_candidate_items=lambda: ((snapshot_id, candidate),),
-        _agentic_try_final_confirmation=lambda _candidate: False,
-        _agentic_direct_manifest=lambda *_args, **_kwargs: manifest,
-        _agentic_release_early_claim=lambda *_args: None,
-        agentic_snapshot_store=SimpleNamespace(
-            fail_direct_offer=lambda *_args, **_kwargs: SimpleNamespace(
-                state=SnapshotState.FAILED
-            )
-        ),
-        _publish_agentic_route=lambda *_args, **kwargs: (
-            routes.append(kwargs.get("route")) or True
-        ),
-        _cleanup_agentic_direct_sender=lambda _candidate: None,
-        _retire_candidate_for_release=lambda sid, req, offset: releases.append(
-            (sid, req, offset)
-        ),
-    )
-
-    DecodeKVCacheOffloadManager._check_agentic_direct_progress(
-        manager, progress_relay=False
-    )
-
-    assert routes == ["recompute"]
-    assert releases == [(snapshot_id, candidate["req"], 0)]
 
 
 @pytest.mark.parametrize(
