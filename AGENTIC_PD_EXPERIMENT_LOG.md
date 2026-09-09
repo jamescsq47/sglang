@@ -109,3 +109,17 @@ outcome, and the code issue exposed by the run.
 - Follow-up: treat this as the stage checkpoint for the decoupled P-ready Host
   pipeline. Optimize Direct admission and shutdown latency without weakening
   request-generation ownership, FIFO P-to-D commit, or strict parent-KV reuse.
+
+## 2026-09-09 current-method pure-recompute formal ablation
+
+- Commit tested: `3aaba1a46a`; status: completed.
+- Qwen3-8B, BrowseComp source-order n680, TP=1, 4P:4D, c512,
+  temperature=0; 301.18 s warmup + 1200.01 s measurement.
+- Preserved custom P-to-D late binding/staging and disabled only D-to-P parent
+  reuse. Result: Decode 1938.839 token/s, Prefill 43009.000 token/s,
+  0.95665 agents/s, zero failures.
+- All 4090 formal-window finished D generations were terminally released;
+  D-to-P Direct/Host events were zero. P-to-D remained active and correct.
+- Compared with the 5148.410 token/s full method, Decode fell 62.34% while
+  Prefill/agent rose from 14719 to 44890 tokens, exposing P as the bottleneck.
+- Full details: `docs/agentic_pd_experiments/20260909-pure-recompute-c512.md`.
