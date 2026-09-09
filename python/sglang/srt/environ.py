@@ -317,6 +317,11 @@ class Envs:
     # still follow the ordinary Host path. The production default is off.
     SGLANG_AGENTIC_KV_FAST_DIRECT_FAILURE_RECOMPUTE = EnvBool(False)
     SGLANG_AGENTIC_KV_SLOW_CONGESTION_RECOMPUTE = EnvBool(False)
+    # Ablation only: keep the custom P->D late-binding/staging pipeline, but
+    # never preserve a finished Decode generation for the next Prefill turn.
+    # The request harness also omits parent-generation metadata, making every
+    # later turn an intentional full-Prefill request.
+    SGLANG_AGENTIC_KV_DISABLE_D2P_REUSE = EnvBool(False)
     SGLANG_AGENTIC_KV_DIRECT_BOOTSTRAP_PORT = EnvInt(0)
     SGLANG_AGENTIC_KV_DIRECT_HANDSHAKE_TIMEOUT = EnvFloat(2.0)
     SGLANG_AGENTIC_KV_HOST_TRANSITION_GRACE = EnvFloat(8.0)

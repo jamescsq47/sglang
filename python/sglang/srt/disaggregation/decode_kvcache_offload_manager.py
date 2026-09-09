@@ -343,6 +343,9 @@ class DecodeKVCacheOffloadManager:
         self.agentic_fast_direct_failure_recompute = bool(
             envs.SGLANG_AGENTIC_KV_FAST_DIRECT_FAILURE_RECOMPUTE.get()
         )
+        self.agentic_disable_d2p_reuse = bool(
+            envs.SGLANG_AGENTIC_KV_DISABLE_D2P_REUSE.get()
+        )
         self.agentic_early_claim_store = None
         self.agentic_tp_direct_abort_mailbox = None
         # One deadline starts when the tool result arrives and covers both P
@@ -1481,6 +1484,18 @@ class DecodeKVCacheOffloadManager:
         """
 
         if not req.finished():
+            return False
+        if getattr(self, "agentic_disable_d2p_reuse", False):
+            # Pure-recompute ablation: the request-side metadata deliberately
+            # carries no parent generation, so no future turn can reference
+            # this snapshot.  Do not create a Direct offer, Host extent, route,
+            # or retry state. Returning False delegates D_HBM -> TERMINAL to
+            # the ordinary finished-request release path on every TP rank.
+            logger.info(
+                "AgenticKV reverse_reuse_disabled snapshot=%s output_tokens=%d",
+                metadata.current.snapshot_id,
+                len(req.output_ids),
+            )
             return False
         output_kind = metadata.classify_output(req.output_ids, req.tokenizer)
         if output_kind.value == "unknown":
