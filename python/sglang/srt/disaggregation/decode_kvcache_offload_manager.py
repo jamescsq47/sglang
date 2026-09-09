@@ -343,6 +343,11 @@ class DecodeKVCacheOffloadManager:
         self.agentic_fast_direct_failure_recompute = bool(
             envs.SGLANG_AGENTIC_KV_FAST_DIRECT_FAILURE_RECOMPUTE.get()
         )
+        self.agentic_direct_capacity_recompute = bool(
+            envs.SGLANG_AGENTIC_KV_DIRECT_CAPACITY_RECOMPUTE.get()
+        )
+        if self.agentic_direct_capacity_recompute and self.agentic_fast_direct_failure_recompute:
+            raise ValueError("capacity-only and unconditional Direct recompute are mutually exclusive")
         self.agentic_early_claim_store = None
         self.agentic_tp_direct_abort_mailbox = None
         # One deadline starts when the tool result arrives and covers both P
@@ -2968,7 +2973,34 @@ class DecodeKVCacheOffloadManager:
                 # authoritative source until P has inserted and pinned the
                 # received pages in Radix and atomically commits CONSUMED.
 
-            manifest = self._agentic_direct_manifest(candidate, metadata, now)
+            # Receiver metadata is positive evidence that P has claimed.
+            # Refresh once on that observed transition instead of waiting for
+            # the normal 100-ms manifest cache tick; do not add a new poller.
+            receiver_ready = (
+                getattr(self, "agentic_direct_capacity_recompute", False)
+                and not candidate["sent"]
+                and poll == KVPoll.WaitingForInput
+                and not candidate.get("receiver_metadata_seen")
+            )
+            if receiver_ready:
+                candidate["receiver_metadata_seen"] = True
+            manifest = self._agentic_direct_manifest(
+                candidate, metadata, now, force=receiver_ready
+            )
+            if (
+                manifest.state is SnapshotState.FAILED
+                and (getattr(manifest, "failure_reason", None) or "").startswith("direct_workset_capacity_refused ")
+            ):
+                if candidate["sent"]:
+                    logger.error(
+                        "AgenticKV capacity_refusal_after_send snapshot=%s; retaining source",
+                        snapshot_id,
+                    )
+                    continue
+                # This FAILED is P's final allocator refusal, not permission
+                # to free the source. Reuse the durable route-before-release
+                # handshake, including retry and native TP release commands.
+                candidate["fast_direct_recompute_terminalized"] = True
             # Terminalizing the lifecycle and publishing the multi-P Router
             # marker are separate control-plane writes.  Retain D's sole KV
             # copy while retrying the latter; FAILED alone is not permission
