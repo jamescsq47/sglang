@@ -7145,8 +7145,7 @@ class Scheduler(
                     if not decode_req.waiting_for_input:
                         continue
                     if (
-                        p_ready_dir
-                        and decode_req.req.bootstrap_host != FAKE_BOOTSTRAP_HOST
+                        prealloc_queue._requires_p_ready(decode_req)
                         and not os.path.exists(
                             os.path.join(
                                 p_ready_dir,

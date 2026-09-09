@@ -155,6 +155,11 @@ class PrefillBootstrapQueue:
         # source KV stays locked until D observes the ready marker and sends
         # the normal NIXL destination metadata.
         self.p_ready_dir = os.environ.get("SGLANG_PD_P_READY_DIR", "")
+        self.p2d_prebind_ablation = os.environ.get(
+            "SGLANG_PD_ABLATION_P2D_PREBIND", "false"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if self.p2d_prebind_ablation and self.tp_size != 1:
+            raise ValueError("P->D pre-binding ablation currently requires TP=1")
         if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get() and not self.p_ready_dir:
             raise ValueError(
                 "SGLANG_AGENTIC_KV_LIFECYCLE requires SGLANG_PD_P_READY_DIR "
@@ -302,6 +307,11 @@ class PrefillBootstrapQueue:
         """
         req.sampling_params.max_new_tokens = 1
 
+    def _compute_ahead_enabled(self) -> bool:
+        """Whether P may compute before a Decode receiver is preallocated."""
+
+        return bool(self.p_ready_dir and not self.p2d_prebind_ablation)
+
     def pop_bootstrapped(
         self,
         return_failed_reqs: bool = False,
@@ -324,7 +334,7 @@ class PrefillBootstrapQueue:
             else:
                 return [], []
 
-        if self.p_ready_dir:
+        if self._compute_ahead_enabled():
             # Compute-ahead mode: move requests to P's waiting queue without
             # waiting for D destination metadata. Transfer is initialized in
             # process_disagg_prefill_inflight_queue after D sees P-ready.

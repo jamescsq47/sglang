@@ -359,6 +359,11 @@ class DecodePreallocQueue:
             os.environ.get("SGLANG_PD_MAX_TRANSFER_INFLIGHT", default_transfer_inflight)
         )
         self.p_ready_dir = os.environ.get("SGLANG_PD_P_READY_DIR", "")
+        self.p2d_prebind_ablation = os.environ.get(
+            "SGLANG_PD_ABLATION_P2D_PREBIND", "false"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if self.p2d_prebind_ablation and self.tp_size != 1:
+            raise ValueError("P->D pre-binding ablation currently requires TP=1")
         if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get() and not self.p_ready_dir:
             raise ValueError(
                 "SGLANG_AGENTIC_KV_LIFECYCLE requires SGLANG_PD_P_READY_DIR "
@@ -388,6 +393,7 @@ class DecodePreallocQueue:
         self._ensure_retry_interval: float = 1.0  # seconds
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.kv_manager = self._init_kv_manager()
+
         self.p2d_host_load_manager = None
         if os.getenv("SGLANG_AGENTIC_KV_P2D_HOST_STAGING", "0").lower() in {
             "1",
@@ -423,6 +429,15 @@ class DecodePreallocQueue:
                 self.max_total_num_tokens,
                 self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
             )
+
+    def _requires_p_ready(self, decode_req: DecodeRequest) -> bool:
+        """Whether this D request participates in compute-ahead late binding."""
+
+        return bool(
+            self.p_ready_dir
+            and not self.p2d_prebind_ablation
+            and decode_req.req.bootstrap_host != FAKE_BOOTSTRAP_HOST
+        )
 
     def enable_async_progress(self) -> None:
         # Each TP rank owns a distinct KV shard but receives the same logical
@@ -477,7 +492,7 @@ class DecodePreallocQueue:
         if mailbox is None:
             return
         for decode_req in list(self.queue):
-            p_ready = decode_req.req.bootstrap_host == FAKE_BOOTSTRAP_HOST or getattr(
+            p_ready = not self._requires_p_ready(decode_req) or getattr(
                 decode_req, "_async_p_ready", False
             )
             status = (
@@ -1157,10 +1172,7 @@ class DecodePreallocQueue:
                 blocked_req = blocked_req or decode_req
                 continue
 
-            require_p_ready = bool(
-                self.p_ready_dir
-                and decode_req.req.bootstrap_host != FAKE_BOOTSTRAP_HOST
-            )
+            require_p_ready = self._requires_p_ready(decode_req)
             if require_p_ready:
                 if self._async_progress_enabled:
                     if not getattr(decode_req, "_async_p_ready", False):
