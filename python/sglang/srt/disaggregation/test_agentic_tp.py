@@ -8294,6 +8294,47 @@ def test_fast_arrival_and_direct_setup_share_one_deadline(monkeypatch):
     assert staged == [(candidate, manifest)]
 
 
+@pytest.mark.parametrize("arrival_offset", [0.2, 1.5])
+def test_direct_abort_preserves_fast_identity_before_deleting_arrival(arrival_offset):
+    request = RequestGeneration("abort-arrival-race", 1)
+    wall, mono = time.time(), time.monotonic()
+    manifest = SimpleNamespace(
+        request=request, snapshot_id=request.snapshot_id, claim_id="claim",
+        created_at=wall, token_count=1024,
+    )
+    candidate = dict(
+        manifest=manifest, sent=False, created_at=mono,
+        early_claim_next_poll_at=mono + 100,
+    )
+    events = []
+    marker = {"arrived_at": wall + arrival_offset}
+    manager = SimpleNamespace(
+        tp_world_size=1, tp_rank=0, agentic_fast_threshold=1.0,
+        agentic_direct_setup_timeout=1.0, agentic_early_claim_poll_interval=0.01,
+        agentic_early_claim_store=SimpleNamespace(
+            read_arrival=lambda *args, **kwargs: events.append("read") or marker,
+            publish_direct_abort=lambda *args, **kwargs: events.append("abort"),
+        ),
+        _agentic_try_tool_confirmation=lambda _: True,
+        _agentic_release_early_claim=lambda value, reason: (
+            events.append("delete"), marker.clear(), value.pop("fast_arrival_seen", None)
+        ),
+    )
+    manager._agentic_try_early_claim = lambda value, now: (
+        DecodeKVCacheOffloadManager._agentic_try_early_claim(manager, value, now)
+    )
+    assert DecodeKVCacheOffloadManager._agentic_publish_unstarted_direct_abort(
+        manager, candidate, manifest, reason="injected_init_failure"
+    )
+    assert events == ["read", "abort", "delete"]
+    assert (candidate.get("fast_arrival_seen_at") is not None) == (arrival_offset <= 1)
+    assert candidate["direct_abort_tool_confirmed"]
+    assert DecodeKVCacheOffloadManager._agentic_publish_unstarted_direct_abort(
+        manager, candidate, manifest, reason="retry"
+    )
+    assert events == ["read", "abort", "delete"]
+
+
 def test_direct_abort_publish_failure_is_backed_off_and_does_not_send():
     request = RequestGeneration("direct-abort-publish-retry", 1)
     manifest = SimpleNamespace(
@@ -9398,8 +9439,10 @@ def test_force_slow_ablation_stages_immediately_without_direct_wait():
         (1, False, False, True),
     ],
 )
+@pytest.mark.parametrize("returned_claim", [False, True])
 def test_fast_direct_failure_recompute_keeps_slow_tools_on_host(
-    tp_world_size, fast_arrival_seen, expected_recompute, expected_stage
+    tp_world_size, fast_arrival_seen, expected_recompute, expected_stage,
+    returned_claim,
 ):
     snapshot_id = f"request:fast-recompute:{fast_arrival_seen}"
     manifest = SimpleNamespace(
@@ -9426,6 +9469,11 @@ def test_fast_direct_failure_recompute_keeps_slow_tools_on_host(
         ),
     }
     recomputes = []
+    if returned_claim:
+        candidate["claimed_at"] = time.monotonic() - 0.5
+        # Marker cleanup drops the bool but keeps validated arrival time.
+        candidate["fast_arrival_seen"] = False
+        candidate["direct_abort_tool_confirmed"] = True
     staged = []
     releases = []
     cleanups = []
@@ -9483,6 +9531,58 @@ def test_fast_direct_failure_recompute_keeps_slow_tools_on_host(
         assert cleanups == [candidate]
     else:
         assert not releases and not cleanups
+
+
+@pytest.mark.parametrize("sent", [False, True])
+@pytest.mark.parametrize("poll_state", [KVPoll.Success, KVPoll.Failed, KVPoll.Transferring])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_returned_direct_claim_policy_respects_physical_fence(sent, poll_state, enabled):
+    request = RequestGeneration("returned-direct-policy", 1)
+    manifest = SimpleNamespace(
+        request=request, snapshot_id=request.snapshot_id,
+        state=SnapshotState.DIRECT_READY, token_count=1024,
+    )
+    candidate = dict(
+        req=object(), metadata=SimpleNamespace(current=request), manifest=manifest,
+        sender=SimpleNamespace(poll=lambda: poll_state), sent=sent,
+        local_send_complete=False, staging=False, claimed_at=time.monotonic(),
+        created_at=time.monotonic(), fallback_retry_at=0.0,
+        io_lock=threading.RLock(), fast_arrival_seen_at=time.monotonic(),
+    )
+    events = []
+    manager = SimpleNamespace(
+        tp_world_size=1, tp_rank=0, agentic_relay_worker=None,
+        agentic_fast_threshold=1000.0, agentic_fast_direct_failure_recompute=enabled,
+        agentic_host_staging_client=object(),
+        _agentic_candidate_items=lambda: ((request.snapshot_id, candidate),),
+        _agentic_candidate_is_live_locked=lambda sid, value: value is candidate,
+        _agentic_try_final_confirmation=lambda _: False,
+        _agentic_direct_manifest=lambda *args, **kwargs: manifest,
+        _agentic_try_tool_confirmation=lambda _: True,
+        _agentic_direct_ready_timeout=lambda _: (1000.0, 0.5),
+        _agentic_direct_kv_usage=lambda: 0.5,
+        _agentic_release_early_claim=lambda *args: None,
+        agentic_snapshot_store=SimpleNamespace(
+            fail_direct_offer=lambda *args, **kwargs: (
+                events.append("terminal") or SimpleNamespace(state=SnapshotState.FAILED)
+            )
+        ),
+        _publish_agentic_route=lambda *args, **kwargs: (
+            events.append(kwargs["route"]) or True
+        ),
+        _cleanup_agentic_direct_sender=lambda _: events.append("cleanup"),
+        _retire_candidate_for_release=lambda *args: events.append("release"),
+        _start_agentic_host_staging=lambda value, current: (
+            events.append("slow") or value.update(staging=True) or True
+        ),
+    )
+    DecodeKVCacheOffloadManager._check_agentic_direct_progress(manager, progress_relay=False)
+    if sent and poll_state == KVPoll.Transferring:
+        assert events == []
+    elif enabled:
+        assert events == ["terminal", "recompute", "cleanup", "release"]
+    else:
+        assert events == ["slow", "host_writing"]
 
 
 @pytest.mark.parametrize(

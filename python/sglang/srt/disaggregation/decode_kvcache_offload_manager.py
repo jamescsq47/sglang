@@ -1944,6 +1944,15 @@ class DecodeKVCacheOffloadManager:
         # out-of-tree caller accidentally drives two progress loops.
         candidate["direct_abort_claim_id"] = claim_id
         try:
+            if candidate.get("fast_arrival_seen_at") is None:
+                observe_arrival = getattr(self, "_agentic_try_early_claim", None)
+                if callable(observe_arrival):
+                    # A previous READY poll may have missed arrival just
+                    # before P claimed. Preserve its validated tool time
+                    # before abort cleanup deletes that marker; do not let
+                    # the old polling throttle suppress this final read.
+                    candidate["early_claim_next_poll_at"] = 0.0
+                    observe_arrival(candidate, now)
             candidate["direct_abort_tool_confirmed"] = bool(
                 candidate.get("fast_arrival_seen")
             ) or bool(self._agentic_try_tool_confirmation(candidate))
@@ -3002,13 +3011,21 @@ class DecodeKVCacheOffloadManager:
                 # request-generation into Radix, so it returned lifecycle
                 # ownership after the NIXL fence became terminal.  This is a
                 # failed Direct session, not a fresh offer: retain the D source
-                # and immediately move it to Shared-Host Slow recovery.
+                # and immediately apply the configured failure policy below.
                 should_fallback = True
                 logger.warning(
                     "AgenticKV direct_session_returned snapshot=%s; "
                     "falling back with D source intact",
                     snapshot_id,
                 )
+            elif (
+                manifest.state is SnapshotState.DIRECT_READY
+                and candidate.get("claimed_at") is not None
+            ):
+                # P returned an unstarted claim after its negative-send fence.
+                # Do not restart the tool/deadline clock after marker cleanup;
+                # use the same refreshed lifecycle/CAS as every other failure.
+                should_fallback = True
             if not candidate["sent"] and manifest.state is SnapshotState.DIRECT_LOADING:
                 if candidate["claimed_at"] is None:
                     candidate["claimed_at"] = now
@@ -3300,7 +3317,13 @@ class DecodeKVCacheOffloadManager:
                         "agentic_fast_direct_failure_recompute",
                         False,
                     )
-                    and bool(candidate.get("fast_arrival_seen"))
+                    and (
+                        bool(candidate.get("fast_arrival_seen"))
+                        # Releasing a failed claim removes fast_arrival_seen,
+                        # but preserves this already-validated fast-tool time.
+                        # A generic tool ACK alone is not fast-tool evidence.
+                        or candidate.get("fast_arrival_seen_at") is not None
+                    )
                 ):
                     DecodeKVCacheOffloadManager._try_fast_direct_failure_recompute(
                         self, candidate, manifest, metadata, now
