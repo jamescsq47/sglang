@@ -1,9 +1,13 @@
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+import torch
 
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.mem_cache.common import alloc_for_extend
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefResult,
     IncLockRefResult,
@@ -100,6 +104,96 @@ class TestPrefillAdder(CustomTestCase):
         )
         defaults.update(kwargs)
         return PrefillAdder(**defaults)
+
+    def test_chunked_continuation_keeps_page_aligned_mamba_boundary(self):
+        self.mock_token_allocator.available_size.return_value = 10000
+        self.mock_tree_cache.full_evictable_size.return_value = 0
+        self.mock_tree_cache.supports_mamba.return_value = True
+        req = MagicMock(spec=Req)
+        req.extend_input_len = 130
+        req.prefix_indices = []
+        req.output_ids = []
+        req.sampling_params = SimpleNamespace(max_new_tokens=16, ignore_eos=True)
+        req.retracted_stain = False
+        req.set_extend_input_len.side_effect = lambda value: setattr(
+            req, "extend_input_len", value
+        )
+
+        adder = self.create_adder(
+            self.create_running_batch(), page_size=64, rem_chunk_tokens=100
+        )
+        remaining = adder.add_chunked_req(req)
+
+        self.assertIs(remaining, req)
+        self.assertEqual(req.extend_input_len, 64)
+        self.assertEqual(req.fill_len, len(req.prefix_indices) + 64)
+
+    @staticmethod
+    def _ignore_eos_chunk_req(extend_input_len=130):
+        req = MagicMock()
+        req.extend_input_len = extend_input_len
+        req.prefix_indices = []
+        req.origin_input_ids = list(range(extend_input_len))
+        req.output_ids = []
+        req.sampling_params = SimpleNamespace(max_new_tokens=16, ignore_eos=True)
+        req.retracted_stain = False
+        req.set_extend_input_len.side_effect = lambda value: setattr(
+            req, "extend_input_len", value
+        )
+        return req
+
+    def test_ignore_eos_chunk_alignment_is_mamba_only(self):
+        self.mock_token_allocator.available_size.return_value = 10000
+        self.mock_tree_cache.full_evictable_size.return_value = 0
+
+        self.mock_tree_cache.supports_mamba.return_value = True
+        mamba_adder = self.create_adder(
+            self.create_running_batch(), page_size=64, rem_chunk_tokens=100
+        )
+        mamba_req = self._ignore_eos_chunk_req()
+        mamba_adder.add_one_req_ignore_eos(mamba_req)
+        self.assertEqual(mamba_req.extend_input_len, 64)
+
+        self.mock_tree_cache.supports_mamba.return_value = False
+        dense_adder = self.create_adder(
+            self.create_running_batch(), page_size=64, rem_chunk_tokens=100
+        )
+        dense_req = self._ignore_eos_chunk_req()
+        dense_adder.add_one_req_ignore_eos(dense_req)
+        self.assertEqual(dense_req.extend_input_len, 100)
+
+        swa_adder = self.create_adder(
+            self.create_running_batch(), page_size=64, rem_chunk_tokens=100
+        )
+        swa_adder.is_hybrid_ssm_cache = True
+        swa_adder.is_hybrid_swa = True
+        swa_adder.tree_cache.sliding_window_size = 64
+        swa_adder.token_to_kv_pool_allocator.full_available_size.return_value = 10000
+        swa_adder.token_to_kv_pool_allocator.swa_available_size.return_value = 10000
+        swa_adder.tree_cache.swa_evictable_size.return_value = 0
+        swa_req = self._ignore_eos_chunk_req()
+        swa_adder.add_one_req_ignore_eos(swa_req)
+        self.assertEqual(swa_req.extend_input_len, 100)
+
+    def test_mamba_ignore_eos_subpage_budget_defers_then_recovers(self):
+        self.mock_token_allocator.available_size.return_value = 10000
+        self.mock_tree_cache.full_evictable_size.return_value = 0
+        self.mock_tree_cache.supports_mamba.return_value = True
+        req = self._ignore_eos_chunk_req()
+
+        blocked = self.create_adder(
+            self.create_running_batch(), page_size=64, rem_chunk_tokens=63
+        )
+        self.assertEqual(blocked.add_one_req_ignore_eos(req), AddReqResult.OTHER)
+        self.assertEqual(req.extend_input_len, 130)
+        self.assertEqual(blocked.can_run_list, [])
+
+        resumed = self.create_adder(
+            self.create_running_batch(), page_size=64, rem_chunk_tokens=64
+        )
+        resumed.add_one_req_ignore_eos(req)
+        self.assertEqual(req.extend_input_len, 64)
+        self.assertEqual(resumed.can_run_list, [req])
 
     def test_preempt_success_high_priority_values_first(self):
         params = [
@@ -451,6 +545,117 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(len(adder2.can_run_list), 2)
         self.assertEqual(adder2.rem_chunk_tokens, 0)  # 3 - 3 = 0
         self.assertEqual(result3, AddReqResult.OTHER)
+
+    def test_private_workset_admits_when_global_kv_is_fully_reserved(self):
+        """A restored request must consume its lease, not reserve KV twice."""
+
+        self.mock_token_allocator.available_size.return_value = 0
+        req = self.create_mock_req("restored", priority=0, max_new_tokens=16)
+        req.extend_input_len = 128
+        req.host_hit_length = 0
+        req.prefix_indices = []
+        req.full_untruncated_fill_ids = list(range(128))
+        req.fill_len = 128
+        req.last_node = MagicMock()
+        req.sampling_params.ignore_eos = False
+
+        adder = self.create_adder(
+            self.create_running_batch(),
+            page_size=64,
+            rem_input_tokens=1024,
+            rem_chunk_tokens=1024,
+        )
+        self.assertEqual(
+            adder.add_one_req(req, False, None), AddReqResult.NO_TOKEN
+        )
+        self.assertEqual(adder.can_run_list, [])
+
+        result = adder.add_one_req_with_private_token_credit(
+            req,
+            has_chunked_req=False,
+            truncation_align_size=None,
+            private_token_credit=128,
+        )
+
+        self.assertEqual(adder.can_run_list, [req])
+        # CONTINUE permits another independently preallocated workset to join
+        # this homogeneous batch; ordinary requests cannot borrow this credit.
+        self.assertEqual(result, AddReqResult.CONTINUE)
+        self.assertEqual(adder.rem_total_token_offset, 0)
+        self.assertEqual(adder.cur_rem_token_offset, 0)
+
+    def test_alloc_for_extend_consumes_private_workset_without_allocator(self):
+        lease = SimpleNamespace(
+            snapshot_id="parent:1",
+            remaining_suffix_indices=torch.empty(0, dtype=torch.int64),
+        )
+        broker = MagicMock()
+
+        @contextmanager
+        def transaction(_operations):
+            yield (torch.tensor([10, 11, 12]),)
+
+        broker.consume_suffix_batch_transaction.side_effect = transaction
+        req = SimpleNamespace(
+            prefix_indices=torch.tensor([1, 2]),
+            extend_input_len=3,
+            fill_len=5,
+            full_untruncated_fill_ids=list(range(5)),
+            _agentic_workset_backed=True,
+            _agentic_p_workset_lease=lease,
+            _agentic_p_workset_broker=broker,
+            _agentic_workset_suffix_indices=torch.tensor([10, 11, 12]),
+        )
+        batch = SimpleNamespace(
+            maybe_evict_swa=MagicMock(),
+            reqs=[req],
+            device="cpu",
+            prefix_lens=[2],
+            extend_lens=[3],
+            req_to_token_pool=MagicMock(),
+            tree_cache=SimpleNamespace(page_size=64),
+            seq_lens=torch.tensor([5]),
+            seq_lens_cpu=torch.tensor([5]),
+            extend_num_tokens=3,
+        )
+
+        with (
+            patch(
+                "sglang.srt.mem_cache.common.alloc_req_slots", return_value=[0]
+            ),
+            patch("sglang.srt.mem_cache.common.write_cache_indices") as write_mock,
+            patch(
+                "sglang.srt.mem_cache.common.alloc_paged_token_slots_extend"
+            ) as allocator_mock,
+        ):
+            out_cache_loc, _, _ = alloc_for_extend(batch)
+
+        self.assertEqual(out_cache_loc.tolist(), [10, 11, 12])
+        broker.validate_suffix_batch.assert_called_once()
+        broker.consume_suffix_batch_transaction.assert_called_once()
+        allocator_mock.assert_not_called()
+        write_mock.assert_called_once()
+
+    def test_alloc_for_extend_rejects_mixed_batch_before_any_pool_mutation(self):
+        private = SimpleNamespace(
+            _agentic_workset_backed=True,
+            _agentic_p_workset_lease=MagicMock(),
+            _agentic_p_workset_broker=MagicMock(),
+        )
+        ordinary = SimpleNamespace(_agentic_workset_backed=False)
+        batch = SimpleNamespace(
+            reqs=[private, ordinary],
+            maybe_evict_swa=MagicMock(),
+        )
+
+        with (
+            patch("sglang.srt.mem_cache.common.alloc_req_slots") as alloc_mock,
+            self.assertRaisesRegex(RuntimeError, "must be homogeneous"),
+        ):
+            alloc_for_extend(batch)
+
+        batch.maybe_evict_swa.assert_not_called()
+        alloc_mock.assert_not_called()
 
     def _build_hybrid_swa_chunked_req(
         self,

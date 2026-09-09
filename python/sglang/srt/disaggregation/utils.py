@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import random
+import logging
+import time
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
@@ -14,6 +16,8 @@ import torch.distributed as dist
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_npu
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base.conn import KVArgs, StateType
@@ -86,11 +90,27 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers, server_args) -> N
             decode_req = decode_reqs[i]
             if _is_fake_transfer(decode_req.req, server_args):
                 continue
+            if getattr(decode_req, "metadata_fenced_by_receiver", False) or getattr(
+                decode_req.kv_receiver, "metadata_fenced_by_receiver", False
+            ):
+                continue
             actual_room = metadata_buffers.bootstrap_room[
                 decode_req.metadata_buffer_index, 0
             ].item()
             if actual_room == 0:
                 polls[i] = int(KVPoll.Transferring)
+                if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get():
+                    now = time.monotonic()
+                    if now >= getattr(
+                        decode_req, "_agentic_next_metadata_wait_log", 0.0
+                    ):
+                        decode_req._agentic_next_metadata_wait_log = now + 5.0
+                        logger.info(
+                            "AgenticKV metadata_wait room=%s index=%s actual=%s",
+                            decode_req.req.bootstrap_room,
+                            decode_req.metadata_buffer_index,
+                            actual_room,
+                        )
 
 
 def poll_and_all_reduce(

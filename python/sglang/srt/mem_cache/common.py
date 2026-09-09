@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
@@ -450,6 +451,42 @@ def alloc_for_extend(
         req_pool_indices_device: request pool indices as a device tensor
         req_pool_indices_cpu: request pool indices as a CPU tensor (host mirror)
     """
+    private_flags = [
+        bool(
+            getattr(req, "_agentic_workset_backed", False)
+            and getattr(req, "_agentic_p_workset_lease", None) is not None
+            and getattr(req, "_agentic_p_workset_broker", None) is not None
+        )
+        for req in batch.reqs
+    ]
+    if any(private_flags) and not all(private_flags):
+        # Reject before maybe_evict_swa() or request-slot allocation mutates
+        # any pool.  Scheduler normally keeps these batches homogeneous; this
+        # is the allocator's fail-closed ownership boundary.
+        raise RuntimeError("agentic private-workset Prefill batch must be homogeneous")
+
+    private_broker = None
+    private_operations = ()
+    if private_flags and all(private_flags):
+        brokers = {
+            id(req._agentic_p_workset_broker): req._agentic_p_workset_broker
+            for req in batch.reqs
+        }
+        if len(brokers) != 1:
+            raise RuntimeError("one private-workset Prefill batch must use one broker")
+        private_broker = next(iter(brokers.values()))
+        private_operations = tuple(
+            (
+                req._agentic_p_workset_lease,
+                int(req.extend_input_len),
+                int(req.fill_len) >= len(req.full_untruncated_fill_ids),
+            )
+            for req in batch.reqs
+        )
+        # Validate before any allocation, then validate once more while the
+        # broker lock is held by the transaction below.
+        private_broker.validate_suffix_batch(private_operations)
+
     # free out-of-window swa tokens
     batch.maybe_evict_swa()
 
@@ -461,49 +498,102 @@ def alloc_for_extend(
     prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
     extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
 
-    # Allocate req slots
-    req_pool_indices = alloc_req_slots(
-        batch.req_to_token_pool, batch.reqs, batch.tree_cache
+    preexisting_req_slots = [getattr(req, "req_pool_idx", None) for req in batch.reqs]
+    preexisting_mamba_slots = [
+        getattr(req, "mamba_pool_idx", None) for req in batch.reqs
+    ]
+    transaction = (
+        private_broker.consume_suffix_batch_transaction(private_operations)
+        if private_broker is not None
+        else nullcontext(None)
     )
-    req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
-    req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
+    try:
+        # Keep the private-workset transaction open until ReqToTokenPool owns
+        # the exact suffix mapping.  Exceptions roll back the broker cursor;
+        # newly allocated request slots are returned below.
+        with transaction as private_parts:
+            req_pool_indices = alloc_req_slots(
+                batch.req_to_token_pool, batch.reqs, batch.tree_cache
+            )
+            req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
+            req_pool_indices_device = req_pool_indices_cpu.to(
+                batch.device, non_blocking=True
+            )
 
-    # Allocate KV cache (throws exception on failure)
-    if batch.tree_cache.page_size == 1:
-        out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
-    else:
-        # Paged allocation - build last_loc
-        last_loc = [
-            (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
-            for t in prefix_tensors
-        ]
-        out_cache_loc = alloc_paged_token_slots_extend(
-            tree_cache=batch.tree_cache,
-            prefix_lens=prefix_lens_device,
-            prefix_lens_cpu=prefix_lens_cpu,
-            seq_lens=batch.seq_lens,
-            seq_lens_cpu=batch.seq_lens_cpu,
-            last_loc=torch.cat(last_loc),
-            extend_num_tokens=batch.extend_num_tokens,
-            req_pool_indices=req_pool_indices_device,
-            dsv4_state_lens=_compute_dsv4_state_lens(batch, is_decode=False),
-            batch=batch,
-        )
+            # Allocate KV cache (throws exception on failure).  A restored
+            # agentic workset already owns its complete suffix, so install
+            # those exact indices instead of allocating a second copy.
+            if private_parts is not None:
+                for req, indices in zip(batch.reqs, private_parts):
+                    if int(indices.numel()) != int(req.extend_input_len):
+                        raise RuntimeError(
+                            "agentic private workset returned the wrong suffix "
+                            f"length: snapshot={req._agentic_p_workset_lease.snapshot_id} "
+                            f"got={indices.numel()} expected={req.extend_input_len}"
+                        )
+                out_cache_loc = torch.cat(private_parts)
+            elif batch.tree_cache.page_size == 1:
+                out_cache_loc = alloc_token_slots(
+                    batch.tree_cache, batch.extend_num_tokens
+                )
+            else:
+                # Paged allocation - build last_loc
+                last_loc = [
+                    (
+                        t[-1:]
+                        if len(t) > 0
+                        else torch.tensor([-1], device=batch.device)
+                    )
+                    for t in prefix_tensors
+                ]
+                out_cache_loc = alloc_paged_token_slots_extend(
+                    tree_cache=batch.tree_cache,
+                    prefix_lens=prefix_lens_device,
+                    prefix_lens_cpu=prefix_lens_cpu,
+                    seq_lens=batch.seq_lens,
+                    seq_lens_cpu=batch.seq_lens_cpu,
+                    last_loc=torch.cat(last_loc),
+                    extend_num_tokens=batch.extend_num_tokens,
+                    req_pool_indices=req_pool_indices_device,
+                    dsv4_state_lens=_compute_dsv4_state_lens(
+                        batch, is_decode=False
+                    ),
+                    batch=batch,
+                )
 
-    # Write to req_to_token_pool
-    write_cache_indices(
-        out_cache_loc,
-        req_pool_indices_device,
-        req_pool_indices_cpu,
-        prefix_lens_device,
-        prefix_lens_cpu,
-        batch.seq_lens,
-        batch.seq_lens_cpu,
-        extend_lens_device,
-        extend_lens_cpu,
-        prefix_tensors,
-        batch.req_to_token_pool,
-    )
+            # This mapping is the transaction's ownership commit point.
+            write_cache_indices(
+                out_cache_loc,
+                req_pool_indices_device,
+                req_pool_indices_cpu,
+                prefix_lens_device,
+                prefix_lens_cpu,
+                batch.seq_lens,
+                batch.seq_lens_cpu,
+                extend_lens_device,
+                extend_lens_cpu,
+                prefix_tensors,
+                batch.req_to_token_pool,
+            )
+    except Exception:
+        for req, old_slot, old_mamba_slot in zip(
+            batch.reqs, preexisting_req_slots, preexisting_mamba_slots
+        ):
+            if old_slot is None and getattr(req, "req_pool_idx", None) is not None:
+                if (
+                    isinstance(batch.req_to_token_pool, HybridReqToTokenPool)
+                    and old_mamba_slot is None
+                    and getattr(req, "mamba_pool_idx", None) is not None
+                ):
+                    batch.req_to_token_pool.free_mamba_cache(req)
+                batch.req_to_token_pool.free(req)
+        raise
+
+    if private_broker is not None:
+        for req in batch.reqs:
+            req._agentic_workset_suffix_indices = (
+                req._agentic_p_workset_lease.remaining_suffix_indices
+            )
 
     # DSV4-NPU hook: write c4/c128/swa per-req tables from the stashed bundle.
     # No-op on non-DSV4 paths (out_cache_loc_dsv4 stays None there).

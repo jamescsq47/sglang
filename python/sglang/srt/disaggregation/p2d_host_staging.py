@@ -32,6 +32,13 @@ from sglang.srt.disaggregation.agentic_host_staging import (
     SharedMHAHostSnapshot,
 )
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.agentic_hybrid_snapshot import (
+    HybridSnapshotLayout,
+    SharedMambaHostSnapshot,
+)
+from sglang.srt.disaggregation.agentic_hybrid_transfer import (
+    p2d_mamba_source_indices,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -262,6 +269,135 @@ class _RegisteredP2DHostSnapshot:
         self._closed = True
 
 
+class _RegisteredP2DHybridHostSnapshot:
+    """Registered P->D snapshot containing Attention plus two Mamba slots."""
+
+    def __init__(
+        self,
+        *,
+        arena,
+        offset: int,
+        allocation_bytes: int,
+        token_count: int,
+        byte_size: int,
+        device_pool,
+    ):
+        self.arena = arena
+        self.path = arena.path
+        self.offset = int(offset)
+        self.allocation_bytes = int(allocation_bytes)
+        self.token_count = int(token_count)
+        self.device_pool = device_pool
+        self.layout = HybridSnapshotLayout.from_pools(
+            token_count,
+            device_pool.full_kv_pool,
+            device_pool.mamba_pool,
+            state_slots=2,
+        )
+        if int(byte_size) != self.layout.total_bytes:
+            raise ValueError("registered hybrid P->D snapshot byte size mismatch")
+        self.byte_size = int(byte_size)
+        self.attention = _RegisteredP2DHostSnapshot(
+            arena=arena,
+            offset=offset,
+            allocation_bytes=allocation_bytes,
+            token_count=token_count,
+            byte_size=self.layout.attention_bytes,
+            device_pool=device_pool.full_kv_pool,
+        )
+        self.mamba = SharedMambaHostSnapshot(
+            path=self.path,
+            mamba_pool=device_pool.mamba_pool,
+            byte_size=self.layout.state_bytes,
+            file_offset=self.offset + self.layout.state_offset,
+            state_slots=2,
+        )
+        self._closed = False
+
+    def materialize(self):
+        return self
+
+    def start_backup_range_from_device(self, *args, **kwargs):
+        return self.attention.start_backup_range_from_device(*args, **kwargs)
+
+    def commit_backup_range_from_bounce(self, *args, **kwargs):
+        return self.attention.commit_backup_range_from_bounce(*args, **kwargs)
+
+    @property
+    def _last_d2h_start_event(self):
+        return self.attention._last_d2h_start_event
+
+    def start_backup_state_from_device(
+        self, source_indices, stream, launch_fence=None
+    ):
+        return self.mamba.start_backup_from_device(
+            source_indices, stream, launch_fence=launch_fence
+        )
+
+    def commit_backup_state_from_bounce(self, refs):
+        return self.mamba.commit_backup_from_bounce(refs)
+
+    def mark_populated(self):
+        self.attention.mark_populated()
+
+    def close(self, *, unlink: bool = False):
+        del unlink
+        if self._closed:
+            return
+        self.attention.close(unlink=False)
+        self.mamba.close()
+        self._closed = True
+
+
+class _OpenedP2DHybridHostSnapshot:
+    """D-side view of a complete registered hybrid Host extent."""
+
+    def __init__(self, *, path, token_count, byte_size, file_offset, device_pool):
+        self.layout = HybridSnapshotLayout.from_pools(
+            token_count,
+            device_pool.full_kv_pool,
+            device_pool.mamba_pool,
+            state_slots=2,
+        )
+        if int(byte_size) != self.layout.total_bytes:
+            raise ValueError("opened hybrid P->D snapshot byte size mismatch")
+        self.byte_size = int(byte_size)
+        self.attention = SharedMHAHostSnapshot(
+            path=path,
+            token_count=token_count,
+            device_pool=device_pool.full_kv_pool,
+            byte_size=self.layout.attention_bytes,
+            create=False,
+            file_offset=file_offset,
+        )
+        self.mamba = SharedMambaHostSnapshot(
+            path=path,
+            mamba_pool=device_pool.mamba_pool,
+            byte_size=self.layout.state_bytes,
+            file_offset=int(file_offset) + self.layout.state_offset,
+            state_slots=2,
+        )
+        self._closed = False
+
+    def start_load_range_to_device(self, *args, **kwargs):
+        return self.attention.start_load_range_to_device(*args, **kwargs)
+
+    def start_load_state_to_device(
+        self, destination_indices, stream, launch_fence=None
+    ):
+        return self.mamba.start_load_to_device(
+            destination_indices, stream, launch_fence=launch_fence
+        )
+
+    def close(self, *, unlink=False):
+        del unlink
+        if self._closed:
+            return
+        self.attention.close(unlink=False)
+        self.mamba.close()
+        self._closed = True
+
+
 class _RegisteredP2DHostArena:
     """One pre-registered tmpfs arena with request-level suballocation.
 
@@ -288,9 +424,7 @@ class _RegisteredP2DHostArena:
         fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
         try:
             os.ftruncate(fd, self.capacity_bytes)
-            self.mapping = mmap.mmap(
-                fd, self.capacity_bytes, access=mmap.ACCESS_WRITE
-            )
+            self.mapping = mmap.mmap(fd, self.capacity_bytes, access=mmap.ACCESS_WRITE)
         finally:
             os.close(fd)
         try:
@@ -318,7 +452,7 @@ class _RegisteredP2DHostArena:
         self.used_bytes = 0
         self._lock = threading.Lock()
         self._free: list[tuple[int, int]] = [(0, self.capacity_bytes)]
-        self._active: dict[int, tuple[_RegisteredP2DHostSnapshot, int, int]] = {}
+        self._active: dict[int, tuple[Any, int, int]] = {}
         self._closed = False
 
     @classmethod
@@ -352,12 +486,15 @@ class _RegisteredP2DHostArena:
             _, offset, index = min(candidates)
             free_offset, free_length = self._free.pop(index)
             if free_length > requested:
-                self._free.append(
-                    (free_offset + requested, free_length - requested)
-                )
+                self._free.append((free_offset + requested, free_length - requested))
                 self._free.sort()
             try:
-                snapshot = _RegisteredP2DHostSnapshot(
+                snapshot_class = (
+                    _RegisteredP2DHybridHostSnapshot
+                    if hasattr(device_pool, "mamba_pool")
+                    else _RegisteredP2DHostSnapshot
+                )
+                snapshot = snapshot_class(
                     arena=self,
                     offset=offset,
                     allocation_bytes=requested,
@@ -452,6 +589,8 @@ class AgenticPToDHostStagingManager:
         self.numa_node = int(numa_node)
         self.tp_rank = int(tp_rank)
         self.tp_size = int(tp_size)
+        self.attention_pool = getattr(device_pool, "full_kv_pool", device_pool)
+        self.is_hybrid = hasattr(device_pool, "mamba_pool")
         self.hard_watermark = float(hard_watermark)
         self.owner = (
             f"p2d-p:{os.getpid()}"
@@ -474,10 +613,8 @@ class AgenticPToDHostStagingManager:
         )
         self._worker_resources = [
             (
-                torch.cuda.Stream(
-                    device=torch.cuda.current_device(), priority=0
-                ),
-                LayerFirstD2HStaging(self.device_pool, self.chunk_tokens),
+                torch.cuda.Stream(device=torch.cuda.current_device(), priority=0),
+                LayerFirstD2HStaging(self.attention_pool, self.chunk_tokens),
             )
             for _ in range(self.worker_count)
         ]
@@ -540,13 +677,23 @@ class AgenticPToDHostStagingManager:
         )
 
     def _byte_size(self, token_count: int) -> int:
+        is_hybrid = getattr(self, "is_hybrid", hasattr(self.device_pool, "mamba_pool"))
+        if is_hybrid:
+            return HybridSnapshotLayout.from_pools(
+                token_count,
+                self.device_pool.full_kv_pool,
+                self.device_pool.mamba_pool,
+                state_slots=2,
+            ).total_bytes
         return (
             2
             * int(token_count)
-            * int(self.device_pool.layer_num)
-            * int(self.device_pool.head_num)
-            * int(self.device_pool.head_dim)
-            * int(self.device_pool.store_dtype.itemsize)
+            * int(getattr(self, "attention_pool", self.device_pool).layer_num)
+            * int(getattr(self, "attention_pool", self.device_pool).head_num)
+            * int(getattr(self, "attention_pool", self.device_pool).head_dim)
+            * int(
+                getattr(self, "attention_pool", self.device_pool).store_dtype.itemsize
+            )
         )
 
     def _targets_this_p(self, entry: dict[str, Any]) -> bool:
@@ -680,6 +827,12 @@ class AgenticPToDHostStagingManager:
                     torch.cuda.current_stream(device=source_indices.device)
                 )
             prefill_metadata = _prefill_metadata(req)
+            is_hybrid = getattr(
+                self, "is_hybrid", hasattr(self.device_pool, "mamba_pool")
+            )
+            state_source_indices = (
+                p2d_mamba_source_indices(req, self.page_size)[0] if is_hybrid else None
+            )
             with self._lock:
                 # Cancellation, capacity reservation, the ledger claim and
                 # active registration form one ownership transaction.  The
@@ -711,6 +864,15 @@ class AgenticPToDHostStagingManager:
                         "arena_numa_node": self.numa_node,
                         "prefill_metadata": prefill_metadata,
                         "tp_rank": self.tp_rank,
+                        "cache_components": (
+                            ["attention", "mamba"] if is_hybrid else ["attention"]
+                        ),
+                        "state_slots": 2 if is_hybrid else 0,
+                        "state_checkpoint_tokens": (
+                            token_count // self.page_size * self.page_size
+                            if is_hybrid
+                            else None
+                        ),
                     }
                     prepared = self.ledger.prepare_p2d_write_rank(
                         snapshot_id,
@@ -729,6 +891,7 @@ class AgenticPToDHostStagingManager:
                     record = {
                         "source_indices": source_indices,
                         "source_ready_event": source_ready_event,
+                        "state_source_indices": state_source_indices,
                         "token_count": token_count,
                         "byte_size": byte_size,
                         "prefill_metadata": prefill_metadata,
@@ -794,9 +957,7 @@ class AgenticPToDHostStagingManager:
                     record.get("snapshot")
                     if record is not None
                     else (
-                        prepared.get("snapshot")
-                        if prepared is not None
-                        else snapshot
+                        prepared.get("snapshot") if prepared is not None else snapshot
                     )
                 )
                 if owned_snapshot is not None:
@@ -1026,6 +1187,16 @@ class AgenticPToDHostStagingManager:
                     )
                     event.synchronize()
                     launch_fence = None
+                if hasattr(snapshot, "start_backup_state_from_device"):
+                    launch_fence = H2DLaunchFence(event=torch.cuda.Event())
+                    state_event, state_refs = snapshot.start_backup_state_from_device(
+                        record["state_source_indices"],
+                        stream,
+                        launch_fence=launch_fence,
+                    )
+                    state_event.synchronize()
+                    snapshot.commit_backup_state_from_bounce(state_refs)
+                    launch_fence = None
                 # Only a completely written extent may enter the reusable
                 # arena pool.  A failed partial D2H is unlinked on release.
                 snapshot.mark_populated()
@@ -1095,9 +1266,7 @@ class AgenticPToDHostStagingManager:
                     record["source_ready_event"] = None
             self._cleanup_consumed()
 
-    def _finish_d2h_success(
-        self, snapshot_id: str, record: dict[str, Any]
-    ) -> None:
+    def _finish_d2h_success(self, snapshot_id: str, record: dict[str, Any]) -> None:
         elapsed = time.monotonic() - float(record["started_at"])
         with self._lock:
             self._group_pending.pop(snapshot_id, None)
@@ -1187,6 +1356,8 @@ class AgenticPToDHostLoadManager:
         self.numa_node = int(numa_node)
         self.tp_rank = int(tp_rank)
         self.tp_size = int(tp_size)
+        self.attention_pool = getattr(device_pool, "full_kv_pool", device_pool)
+        self.is_hybrid = hasattr(device_pool, "mamba_pool")
         self.chunk_tokens = max(
             self.page_size,
             int(os.getenv("SGLANG_AGENTIC_KV_P2D_H2D_CHUNK_TOKENS", "1024")),
@@ -1200,11 +1371,9 @@ class AgenticPToDHostLoadManager:
         )
         self._worker_resources = [
             (
-                torch.cuda.Stream(
-                    device=torch.cuda.current_device(), priority=0
-                ),
-                LayerFirstD2HStaging(self.device_pool, self.chunk_tokens),
-                PinnedMHAHostBounce(self.device_pool, self.chunk_tokens),
+                torch.cuda.Stream(device=torch.cuda.current_device(), priority=0),
+                LayerFirstD2HStaging(self.attention_pool, self.chunk_tokens),
+                PinnedMHAHostBounce(self.attention_pool, self.chunk_tokens),
             )
             for _ in range(self.worker_count)
         ]
@@ -1284,7 +1453,12 @@ class AgenticPToDHostLoadManager:
             )
         self._group_wakeup.set()
 
-    def submit(self, receiver: "AgenticPToDHostReceiver", device_indices) -> None:
+    def submit(
+        self,
+        receiver: "AgenticPToDHostReceiver",
+        device_indices,
+        state_destination_indices=None,
+    ) -> None:
         with receiver._state_lock:
             if receiver._submitted:
                 return
@@ -1333,6 +1507,19 @@ class AgenticPToDHostLoadManager:
                 raise RuntimeError("P->D Host grant has no Arena NUMA node")
             if int(grant["token_count"]) != len(device_indices):
                 raise RuntimeError("P->D Host destination token count mismatch")
+            is_hybrid_snapshot = "mamba" in grant.get("cache_components", [])
+            if is_hybrid_snapshot:
+                if state_destination_indices is None:
+                    raise RuntimeError("hybrid P->D Host load has no Mamba destination")
+                state_destination_indices = torch.as_tensor(
+                    state_destination_indices, dtype=torch.int64
+                ).reshape(-1)
+                if state_destination_indices.numel() != int(
+                    grant.get("state_slots", 0)
+                ):
+                    raise RuntimeError("hybrid P->D Host state slot count mismatch")
+            elif state_destination_indices is not None:
+                raise RuntimeError("dense P->D Host load received Mamba destinations")
             owner = entry.get("p_owner")
             if not self.ledger.begin_host_load_rank(
                 receiver.snapshot_id,
@@ -1346,7 +1533,7 @@ class AgenticPToDHostLoadManager:
             receiver._grant = grant
             receiver._owner = owner
             receiver._cross_numa = arena_numa_node != self.numa_node
-            self._work.put((receiver, device_indices))
+            self._work.put((receiver, device_indices, state_destination_indices))
 
     def _worker(
         self,
@@ -1359,7 +1546,7 @@ class AgenticPToDHostLoadManager:
             work = self._work.get()
             if work is None:
                 break
-            receiver, device_indices = work
+            receiver, device_indices, state_destination_indices = work
             started_at = time.monotonic()
             snapshot = None
             launch_fence = None
@@ -1372,13 +1559,23 @@ class AgenticPToDHostLoadManager:
                 ):
                     raise RuntimeError("P->D Host peer load aborted before H2D")
                 grant = receiver._grant
-                snapshot = SharedMHAHostSnapshot(
-                    path=str(grant["arena_path"]),
-                    token_count=int(grant["token_count"]),
-                    device_pool=self.device_pool,
-                    byte_size=int(grant["byte_size"]),
-                    create=False,
-                    file_offset=int(grant.get("arena_offset", 0)),
+                snapshot = (
+                    _OpenedP2DHybridHostSnapshot(
+                        path=str(grant["arena_path"]),
+                        token_count=int(grant["token_count"]),
+                        device_pool=self.device_pool,
+                        byte_size=int(grant["byte_size"]),
+                        file_offset=int(grant.get("arena_offset", 0)),
+                    )
+                    if "mamba" in grant.get("cache_components", [])
+                    else SharedMHAHostSnapshot(
+                        path=str(grant["arena_path"]),
+                        token_count=int(grant["token_count"]),
+                        device_pool=self.device_pool,
+                        byte_size=int(grant["byte_size"]),
+                        create=False,
+                        file_offset=int(grant.get("arena_offset", 0)),
+                    )
                 )
                 for start in range(0, len(device_indices), self.chunk_tokens):
                     end = min(start + self.chunk_tokens, len(device_indices))
@@ -1404,6 +1601,16 @@ class AgenticPToDHostLoadManager:
                         raise RuntimeError(
                             "P->D Host peer load aborted after H2D fence"
                         )
+                if hasattr(snapshot, "start_load_state_to_device"):
+                    launch_fence = H2DLaunchFence(event=torch.cuda.Event())
+                    state_event, state_refs = snapshot.start_load_state_to_device(
+                        state_destination_indices,
+                        stream,
+                        launch_fence=launch_fence,
+                    )
+                    state_event.synchronize()
+                    del state_refs
+                    launch_fence = None
                 if not self.ledger.complete_host_load_rank(
                     receiver.snapshot_id,
                     receiver._owner,
@@ -1507,11 +1714,7 @@ class AgenticPToDHostLoadManager:
             int(completion["byte_size"]) / max(elapsed, 1e-9) / (1024**3),
             self.decode_domain,
             self.numa_node,
-            int(
-                (getattr(receiver, "_grant", None) or {}).get(
-                    "arena_numa_node", -1
-                )
-            ),
+            int((getattr(receiver, "_grant", None) or {}).get("arena_numa_node", -1)),
             bool(getattr(receiver, "_cross_numa", False)),
             int(completion["worker_id"]),
         )
@@ -1564,6 +1767,10 @@ class AgenticPToDHostReceiver:
     """Small receiver adapter consumed by DecodeTransferQueue."""
 
     require_staging = False
+    # The P-side metadata is committed atomically in the Host snapshot grant
+    # and consumed by commit_req().  Unlike NIXL, this receiver does not use a
+    # row in Decode's MetadataBuffers.
+    metadata_fenced_by_receiver = True
 
     def __init__(self, manager: AgenticPToDHostLoadManager, snapshot_id: str):
         self.manager = manager
@@ -1607,8 +1814,8 @@ class AgenticPToDHostReceiver:
     def init(self, _prefill_dp_rank: int) -> None:
         return
 
-    def bind(self, device_indices) -> None:
-        self.manager.submit(self, device_indices)
+    def bind(self, device_indices, state_destination_indices=None) -> None:
+        self.manager.submit(self, device_indices, state_destination_indices)
 
     def poll(self):
         with self._state_lock:

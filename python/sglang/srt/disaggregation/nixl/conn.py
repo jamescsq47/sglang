@@ -3,12 +3,14 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import os
+import queue as thread_queue
 import struct
 import threading
 import time
 import uuid
 from collections import defaultdict
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -216,6 +218,9 @@ class TransferStatus:
     received_state_per_pp: Set[int] = dataclasses.field(default_factory=set)
     # Whether state data is expected (set based on state_type).
     expects_state: bool = False
+    # Control-plane failure is diagnostic only for agentic transfers.  It may
+    # not authorize page reuse while a late remote WRITE can still arrive.
+    is_failure: bool = False
 
     def is_done(self):
         if self.num_pp_ranks_expected is None or not self.received_aux:
@@ -235,6 +240,9 @@ class TransferStatus:
                 return False
         return True
 
+    def is_data_complete(self) -> bool:
+        return self.is_done()
+
 
 class NixlKVManager(CommonKVManager):
     def __init__(
@@ -246,7 +254,7 @@ class NixlKVManager(CommonKVManager):
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         try:
-            from nixl._api import nixl_agent, nixl_agent_config
+            from nixl._api import nixl_agent, nixl_agent_config, nixl_thread_sync_t
         except ImportError as e:
             raise ImportError(
                 "Please install NIXL by following the instructions at "
@@ -267,7 +275,16 @@ class NixlKVManager(CommonKVManager):
                 "SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS must be a JSON object "
                 "with string keys and string values"
             )
-        agent_config = nixl_agent_config(backends=[], num_threads=num_threads)
+        # Agentic PD progresses P->D and D->P transfers from independent
+        # background workers.  Ask NIXL to serialize metadata mutations while
+        # still allowing concurrent readers; the default NONE mode is only
+        # safe when one thread owns the agent.
+        agent_config = nixl_agent_config(
+            backends=[],
+            num_threads=num_threads,
+            sync_mode=nixl_thread_sync_t.NIXL_THREAD_SYNC_RW,
+        )
+        self.thread_sync_rw_enabled = True
         self.agent = nixl_agent(str(uuid.uuid4()), agent_config)
         if num_threads > 0:
             # TODO: Remove this once NIXL passes thread parameters from
@@ -286,7 +303,11 @@ class NixlKVManager(CommonKVManager):
                 f"NIXL backend '{backend}' not found. Available: {available_plugins}. "
                 f"Please install the required NIXL plugin or choose from: {available_plugins}"
             )
-        logger.info(f"NIXL KVManager initialized with backend: {backend}")
+        logger.info(
+            "NIXL KVManager initialized with backend=%s thread_sync_rw=%s",
+            backend,
+            self.thread_sync_rw_enabled,
+        )
 
         self.register_buffer_to_engine()
 
@@ -309,6 +330,9 @@ class NixlKVManager(CommonKVManager):
                 FastQueue() for _ in range(transfer_queue_size)
             ]
             self.exceptions: Dict[int, Exception] = {}
+            self._failed_fence_queue = thread_queue.Queue()
+            self._failed_fence_rooms: Set[int] = set()
+            self._failed_fence_lock = threading.Lock()
             # Mirror mooncake: one staging buffer per worker queue, all
             # built before workers spawn so each worker owns a private
             # buffer (no cross-worker contention on the staging ring).
@@ -326,6 +350,10 @@ class NixlKVManager(CommonKVManager):
                     args=(queue, staging_buffer),
                     daemon=True,
                 ).start()
+            threading.Thread(
+                target=self._failed_transfer_fence_worker,
+                daemon=True,
+            ).start()
             self._start_bootstrap_thread()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.transfer_statuses: Dict[int, TransferStatus] = defaultdict(
@@ -671,6 +699,8 @@ class NixlKVManager(CommonKVManager):
         )
 
     def _prepare_payload_xfer(self, peer_info: KVArgsRegisterInfo):
+        if getattr(self, "disable_prepped_kv", False):
+            return
         if self.is_mla_backend or peer_info.decode_tp_size == self.attn_tp_size:
             # Safe to use prefill's kv_item_lens for the dst dlist stride:
             # equal_tp guarantees identical heads-per-rank (same item_len);
@@ -690,6 +720,54 @@ class NixlKVManager(CommonKVManager):
         else:
             self._init_hetero_tp_prep_handle(peer_info.agent_name, peer_info)
 
+    def _publish_fenced_transfer_failure(self, room: int, error: BaseException) -> None:
+        self.exceptions[room] = error
+        self.record_failure(room, str(error))
+        self.update_status(room, KVPoll.Failed)
+
+    def _failed_transfer_fence_worker(self) -> None:
+        """Fence partial posts without consuming a data-plane worker.
+
+        An unqueryable NIXL handle quarantines only its request generation.
+        Other rooms on the same transfer queue continue to make progress.
+        """
+
+        pending = []
+        while True:
+            try:
+                item = self._failed_fence_queue.get(
+                    block=not pending, timeout=0.01 if not pending else None
+                )
+                pending.append(item)
+            except thread_queue.Empty:
+                pass
+            while True:
+                try:
+                    pending.append(self._failed_fence_queue.get_nowait())
+                except thread_queue.Empty:
+                    break
+            pending = self._poll_failed_fences_once(pending)
+            if pending:
+                time.sleep(0.001)
+
+    def _poll_failed_fences_once(self, pending):
+        """Advance every quarantined attempt once; never head-of-line block."""
+
+        retained = []
+        for room, handles, error in pending:
+            try:
+                states = [self.agent.check_xfer_state(h) for h in handles]
+            except Exception:
+                retained.append((room, handles, error))
+                continue
+            if not all(state in ("DONE", "ERR") for state in states):
+                retained.append((room, handles, error))
+                continue
+            self._publish_fenced_transfer_failure(room, error)
+            with self._failed_fence_lock:
+                self._failed_fence_rooms.discard(room)
+        return retained
+
     def transfer_worker(self, queue: FastQueue, staging_buffer=None):
         # Per-worker staging strategy: lazy-created on first chunk so we
         # see kv_buffer_tensors (set by ModelRunner after engine init).
@@ -700,7 +778,20 @@ class NixlKVManager(CommonKVManager):
             kv_chunk: TransferKVChunk = queue.get()
             room = kv_chunk.room
             handles: List[Any] = []
+
+            def register_handle(handle) -> None:
+                # Identity comparison avoids relying on opaque NIXL handle
+                # equality while making retries/idempotent wrappers harmless.
+                if handle is not None and not any(h is handle for h in handles):
+                    handles.append(handle)
+
             try:
+                with self._failed_fence_lock:
+                    if room in self._failed_fence_rooms:
+                        # This generation already has a partially posted DMA.
+                        # Discard later queued chunks; its sender observes
+                        # Transferring until the independent fence completes.
+                        continue
                 if self.check_status(room) == KVPoll.Failed:
                     continue
 
@@ -779,6 +870,7 @@ class NixlKVManager(CommonKVManager):
                                 req,
                                 dst_info,
                                 queue,
+                                handle_sink=register_handle,
                             )
                             if deferred:
                                 # Chunk re-enqueued; stop processing remaining
@@ -802,6 +894,7 @@ class NixlKVManager(CommonKVManager):
                                     chunked_dst_kv_indice,
                                     dst_info.gpu_id,
                                     notif,
+                                    handle_sink=register_handle,
                                 )
                             else:
                                 kv_xfer_handle = self.send_kvcache_slice(
@@ -809,9 +902,10 @@ class NixlKVManager(CommonKVManager):
                                     kv_chunk.prefill_kv_indices,
                                     chunked_dst_kv_indice,
                                     notif,
+                                    handle_sink=register_handle,
                                 )
 
-                        handles.append(kv_xfer_handle)
+                        register_handle(kv_xfer_handle)
 
                     if kv_chunk.is_last_chunk:
                         dst_info = self.decode_kv_args_table[req.agent_name]
@@ -827,10 +921,10 @@ class NixlKVManager(CommonKVManager):
                                 decode_tp_rank=dst_info.decode_tp_rank,
                                 dst_state_item_lens=dst_info.dst_state_item_lens,
                                 dst_state_dim_per_tensor=dst_info.dst_state_dim_per_tensor,
+                                handle_sink=register_handle,
                             )
-                            handles.extend(
-                                h for h in state_xfer_handles if h is not None
-                            )
+                            for state_handle in state_xfer_handles:
+                                register_handle(state_handle)
 
                         if kv_chunk.prefill_aux_index is None:
                             raise RuntimeError("Missing aux index for last chunk")
@@ -849,8 +943,9 @@ class NixlKVManager(CommonKVManager):
                             dst_info.dst_aux_ptrs,
                             req.dst_aux_index,
                             aux_notif,
+                            handle_sink=register_handle,
                         )
-                        handles.append(aux_xfer_handle)
+                        register_handle(aux_xfer_handle)
 
                 if staging_deferred:
                     # Chunk has been re-enqueued; do not advance status.
@@ -881,16 +976,22 @@ class NixlKVManager(CommonKVManager):
                     self.update_status(room, KVPoll.Transferring)
             except Exception as e:
                 # Catch all exceptions to prevent silently killing this
-                # worker thread, but still propagate via failure_exception().
+                # worker thread.  An initialized handle is registered before
+                # every post.  Transfer the attempt to the independent fence
+                # poller so only this room is quarantined while later rooms
+                # continue on this worker.
                 if isinstance(e, _NIXL_TRANSPORT_ERRORS):
                     logger.warning(f"NIXL transport error for room {room}: {e}")
                 else:
                     logger.exception(
                         f"Unexpected transfer worker error for room {room}"
                     )
-                self.exceptions[room] = e
-                self.record_failure(room, str(e))
-                self.update_status(room, KVPoll.Failed)
+                if handles:
+                    with self._failed_fence_lock:
+                        self._failed_fence_rooms.add(room)
+                    self._failed_fence_queue.put((room, tuple(handles), e))
+                else:
+                    self._publish_fenced_transfer_failure(room, e)
 
     def register_buffer_to_engine(self):
         kv_addrs = []
@@ -941,6 +1042,27 @@ class NixlKVManager(CommonKVManager):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prepare_payload_xfer(decode_kv_args)
 
+    def _post_transfer(
+        self,
+        xfer_handle,
+        handle_sink: Optional[Callable[[object], None]],
+        failure_message: str,
+    ):
+        """Publish handle ownership before the non-atomic NIXL post call.
+
+        ``agent.transfer`` may submit work and then raise.  Once the handle is
+        initialized, the caller must therefore retain it until a physical
+        DONE/ERR fence is observed.  Recording it first turns partial launch
+        into a pollable attempt instead of an untracked DMA.
+        """
+
+        if handle_sink is not None:
+            handle_sink(xfer_handle)
+        state = self.agent.transfer(xfer_handle)
+        if state == "ERR":
+            raise RuntimeError(failure_message)
+        return xfer_handle
+
     def _send_kvcache_generic(
         self,
         peer_name: str,
@@ -951,15 +1073,42 @@ class NixlKVManager(CommonKVManager):
         dst_data_indices: npt.NDArray[np.int32],
         dst_gpu_id: int,
         notif: str,
+        handle_sink: Optional[Callable[[object], None]] = None,
     ):
         """Generic KV cache transfer supporting both MHA and MLA architectures.
         Used by both send_kvcache and maybe_send_extra."""
+        debug_agentic = os.getenv("SGLANG_AGENTIC_KV_DEBUG_DIGEST", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         # Prepped path (KV only; state transfers use the non-prepped path below).
-        if (
-            src_data_ptrs is self.kv_args.kv_data_ptrs
+        reverse_explicit = bool(getattr(self, "disable_prepped_kv", False))
+        use_prepped = (
+            not reverse_explicit
+            and src_data_ptrs is self.kv_args.kv_data_ptrs
             and "" in self.prep_handles
             and peer_name in self.prep_handles
-        ):
+        )
+        if debug_agentic and reverse_explicit and src_data_ptrs is self.kv_args.kv_data_ptrs:
+            logger.info(
+                "AgenticKV nixl_attention_xfer path=%s disable_prepped=%s "
+                "peer=%s src_gpu=%s dst_gpu=%s pages=%d "
+                "src_first=%s dst_first=%s item_len=%s src_indices=%s dst_indices=%s",
+                "prepped" if use_prepped else "explicit",
+                reverse_explicit,
+                peer_name,
+                self.kv_args.gpu_id,
+                dst_gpu_id,
+                len(prefill_data_indices),
+                None if len(prefill_data_indices) == 0 else int(prefill_data_indices[0]),
+                None if len(dst_data_indices) == 0 else int(dst_data_indices[0]),
+                None if not item_lens else int(item_lens[0]),
+                np.asarray(prefill_data_indices, dtype=np.int32).tolist(),
+                np.asarray(dst_data_indices, dtype=np.int32).tolist(),
+            )
+        if use_prepped:
             src_prep = self.prep_handles[""]
             dst_prep = self.prep_handles[peer_name]
             info = self.decode_kv_args_table[peer_name]
@@ -985,10 +1134,11 @@ class NixlKVManager(CommonKVManager):
             )
             if not xfer_handle:
                 raise Exception("KVSender failed to create prepped transfer")
-            state = self.agent.transfer(xfer_handle)
-            if state == "ERR":
-                raise Exception("KVSender failed to post prepped transfer")
-            return xfer_handle
+            return self._post_transfer(
+                xfer_handle,
+                handle_sink,
+                "KVSender failed to post prepped transfer",
+            )
 
         # Non-prepped path: used for state transfers (SWA/NSA) via maybe_send_extra.
         # Convert pointer lists to np.uint64 arrays up front.
@@ -1091,10 +1241,9 @@ class NixlKVManager(CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
-        state = self.agent.transfer(xfer_handle)
-        if state == "ERR":
-            raise Exception("KVSender failed to post transfer")
-        return xfer_handle
+        return self._post_transfer(
+            xfer_handle, handle_sink, "KVSender failed to post transfer"
+        )
 
     def send_kvcache(
         self,
@@ -1104,6 +1253,7 @@ class NixlKVManager(CommonKVManager):
         dst_kv_indices: npt.NDArray[np.int32],
         dst_gpu_id: int,
         notif: str,
+        handle_sink: Optional[Callable[[object], None]] = None,
     ):
         return self._send_kvcache_generic(
             peer_name=peer_name,
@@ -1114,6 +1264,7 @@ class NixlKVManager(CommonKVManager):
             dst_data_indices=dst_kv_indices,
             dst_gpu_id=dst_gpu_id,
             notif=notif,
+            handle_sink=handle_sink,
         )
 
     def send_kvcache_slice(
@@ -1122,6 +1273,7 @@ class NixlKVManager(CommonKVManager):
         prefill_kv_indices: npt.NDArray[np.int32],
         dst_kv_indices: npt.NDArray[np.int32],
         notif: str,
+        handle_sink: Optional[Callable[[object], None]] = None,
     ):
         # Prepped path: src dlist is shared per decode_tp_size; dst is per peer.
         assert self.prep_handle_slice_src is not None
@@ -1157,10 +1309,11 @@ class NixlKVManager(CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create prepped slice transfer")
-        state = self.agent.transfer(xfer_handle)
-        if state == "ERR":
-            raise Exception("KVSender failed to post prepped slice transfer")
-        return xfer_handle
+        return self._post_transfer(
+            xfer_handle,
+            handle_sink,
+            "KVSender failed to post prepped slice transfer",
+        )
 
     def send_kvcache_staged(
         self,
@@ -1174,6 +1327,7 @@ class NixlKVManager(CommonKVManager):
         dst_kv_item_len: int,
         notif: str,
         staging_buffer=None,
+        handle_sink: Optional[Callable[[object], None]] = None,
     ):
         """Transfer KV cache via staging buffers (gather -> bulk RDMA -> scatter on decode)."""
         from sglang.srt.disaggregation.common.staging_buffer import (
@@ -1269,10 +1423,11 @@ class NixlKVManager(CommonKVManager):
                 f"(src=0x{staging_buffer.get_ptr():x}, dst=0x{dst_write_ptr:x}, "
                 f"size={per_rank_bytes})"
             )
-        state = self.agent.transfer(xfer_handle)
-        if state == "ERR":
-            raise RuntimeError("[Staging] NIXL bulk transfer failed to post")
-        return xfer_handle
+        return self._post_transfer(
+            xfer_handle,
+            handle_sink,
+            "[Staging] NIXL bulk transfer failed to post",
+        )
 
     def _try_create_staging_strategy(self, staging_buffer):
         """Create a per-worker PrefillStagingStrategy bound to ``staging_buffer``.
@@ -1297,6 +1452,7 @@ class NixlKVManager(CommonKVManager):
         req: TransferInfo,
         dst_info: KVArgsRegisterInfo,
         queue: FastQueue,
+        handle_sink: Optional[Callable[[object], None]] = None,
     ):
         """Attempt staging transfer for one chunk. Returns (xfer_handle, deferred).
 
@@ -1351,6 +1507,7 @@ class NixlKVManager(CommonKVManager):
             dst_info.dst_kv_item_len,
             notif_tag,
             staging_buffer=staging_strategy.staging_buffer,
+            handle_sink=handle_sink,
         )
         return (handle, False)
 
@@ -1361,6 +1518,7 @@ class NixlKVManager(CommonKVManager):
         dst_aux_ptrs: list[int],
         dst_aux_index: int,
         notif: str,
+        handle_sink: Optional[Callable[[object], None]] = None,
     ):
         src_addrs = []
         dst_addrs = []
@@ -1387,10 +1545,9 @@ class NixlKVManager(CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
-        state = self.agent.transfer(xfer_handle)
-        if state == "ERR":
-            raise Exception("KVSender failed to post transfer")
-        return xfer_handle
+        return self._post_transfer(
+            xfer_handle, handle_sink, "KVSender failed to post aux transfer"
+        )
 
     def _send_mamba_state(
         self,
@@ -1402,12 +1559,14 @@ class NixlKVManager(CommonKVManager):
         dst_state_indices: List[int],
         dst_gpu_id: int,
         notif: str,
+        handle_sink: Optional[Callable[[object], None]] = None,
     ):
         """Transfer Mamba states via RDMA."""
-        assert len(prefill_state_indices) == 1, "Mamba should have single state index"
         assert len(dst_state_indices) == len(
             prefill_state_indices
         ), "State indices count mismatch between Prefill and Decode"
+        if len(prefill_state_indices) == 0:
+            raise ValueError("Mamba transfer requires at least one state index")
 
         src_addrs = []
         dst_addrs = []
@@ -1416,10 +1575,11 @@ class NixlKVManager(CommonKVManager):
             length = src_state_item_lens[i]
             if length == 0 or src_state_data_ptrs[i] == 0 or dst_state_ptr == 0:
                 continue
-            src_addr = src_state_data_ptrs[i] + length * int(prefill_state_indices[0])
-            dst_addr = dst_state_ptr + length * int(dst_state_indices[0])
-            src_addrs.append((src_addr, length, self.kv_args.gpu_id))
-            dst_addrs.append((dst_addr, length, dst_gpu_id))
+            for src_index, dst_index in zip(prefill_state_indices, dst_state_indices):
+                src_addr = src_state_data_ptrs[i] + length * int(src_index)
+                dst_addr = dst_state_ptr + length * int(dst_index)
+                src_addrs.append((src_addr, length, self.kv_args.gpu_id))
+                dst_addrs.append((dst_addr, length, dst_gpu_id))
 
         src_descs = self.agent.get_xfer_descs(src_addrs, "VRAM")
         dst_descs = self.agent.get_xfer_descs(dst_addrs, "VRAM")
@@ -1433,10 +1593,9 @@ class NixlKVManager(CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("Failed to create Mamba state transfer")
-        state = self.agent.transfer(xfer_handle)
-        if state == "ERR":
-            raise Exception("Failed to post Mamba state transfer")
-        return xfer_handle
+        return self._post_transfer(
+            xfer_handle, handle_sink, "Failed to post Mamba state transfer"
+        )
 
     def _send_mamba_state_slice(
         self,
@@ -1453,6 +1612,7 @@ class NixlKVManager(CommonKVManager):
         notif: str,
         decode_tp_size: int,
         decode_tp_rank: int,
+        handle_sink: Optional[Callable[[object], None]] = None,
     ):
         """Transfer Mamba states with TP slice support via RDMA.
 
@@ -1465,7 +1625,11 @@ class NixlKVManager(CommonKVManager):
             f"Prefill attn_tp_size={self.attn_tp_size}, "
             f"Decode attn_tp_size={decode_tp_size}."
         )
-        assert len(prefill_state_indices) == 1, "Mamba should have single state index"
+        assert len(dst_state_indices) == len(
+            prefill_state_indices
+        ), "State indices count mismatch between Prefill and Decode"
+        if len(prefill_state_indices) == 0:
+            raise ValueError("Mamba transfer requires at least one state index")
 
         if not src_state_dim_per_tensor or not dst_state_dim_per_tensor:
             return self._send_mamba_state(
@@ -1477,6 +1641,7 @@ class NixlKVManager(CommonKVManager):
                 dst_state_indices,
                 dst_gpu_id,
                 notif,
+                handle_sink,
             )
 
         local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
@@ -1511,18 +1676,17 @@ class NixlKVManager(CommonKVManager):
             dst_dim_offset = dst_dim_start * dst_bytes_per_dim
             bytes_to_send = num_dims_to_send * src_bytes_per_dim
 
-            src_addr = (
-                src_state_data_ptrs[i]
-                + src_item_len * int(prefill_state_indices[0])
-                + src_dim_offset
-            )
-            dst_addr = (
-                dst_state_ptr
-                + dst_item_len * int(dst_state_indices[0])
-                + dst_dim_offset
-            )
-            src_addrs.append((src_addr, bytes_to_send, self.kv_args.gpu_id))
-            dst_addrs.append((dst_addr, bytes_to_send, dst_gpu_id))
+            for src_index, dst_index in zip(prefill_state_indices, dst_state_indices):
+                src_addr = (
+                    src_state_data_ptrs[i]
+                    + src_item_len * int(src_index)
+                    + src_dim_offset
+                )
+                dst_addr = (
+                    dst_state_ptr + dst_item_len * int(dst_index) + dst_dim_offset
+                )
+                src_addrs.append((src_addr, bytes_to_send, self.kv_args.gpu_id))
+                dst_addrs.append((dst_addr, bytes_to_send, dst_gpu_id))
 
         src_descs = self.agent.get_xfer_descs(src_addrs, "VRAM")
         dst_descs = self.agent.get_xfer_descs(dst_addrs, "VRAM")
@@ -1536,10 +1700,11 @@ class NixlKVManager(CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("Failed to create Mamba state slice transfer")
-        state = self.agent.transfer(xfer_handle)
-        if state == "ERR":
-            raise Exception("Failed to post Mamba state slice transfer")
-        return xfer_handle
+        return self._post_transfer(
+            xfer_handle,
+            handle_sink,
+            "Failed to post Mamba state slice transfer",
+        )
 
     def maybe_send_extra(
         self,
@@ -1553,6 +1718,7 @@ class NixlKVManager(CommonKVManager):
         decode_tp_rank: int = 0,
         dst_state_item_lens: List[List[int]] | None = None,
         dst_state_dim_per_tensor: List[List[int]] | None = None,
+        handle_sink: Optional[Callable[[object], None]] = None,
     ):
         """Send state per hybrid component, dispatching by state_type[i]."""
         state_types = getattr(self.kv_args, "state_types", []) or []
@@ -1600,6 +1766,7 @@ class NixlKVManager(CommonKVManager):
                         comp_notif,
                         decode_tp_size,
                         decode_tp_rank,
+                        handle_sink,
                     )
                 else:
                     h = self._send_mamba_state(
@@ -1611,6 +1778,7 @@ class NixlKVManager(CommonKVManager):
                         dst_indices,
                         dst_gpu_id,
                         comp_notif,
+                        handle_sink,
                     )
             elif st in (StateType.SWA, StateType.DSA, StateType.SWA_RING):
                 if not self.is_mla_backend and self.attn_tp_size != decode_tp_size:
@@ -1631,6 +1799,7 @@ class NixlKVManager(CommonKVManager):
                     dst_data_indices=np.array(dst_indices, dtype=np.int32),
                     dst_gpu_id=dst_gpu_id,
                     notif=comp_notif,
+                    handle_sink=handle_sink,
                 )
             else:
                 raise RuntimeError(
@@ -1899,13 +2068,16 @@ class NixlKVSender(CommonKVSender):
         self._send_failed = False
         self._send_error: Optional[Exception] = None
         self._transfer_start_time: Optional[float] = None
+        self.launch_failed = False
+        self.launch_exception: Optional[BaseException] = None
+        self.xfer_handles: List[Any] = []
 
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
     ):
-        if self._send_failed:
+        if getattr(self, "_send_failed", False):
             return
 
         kv_indices, index_slice, is_last_chunk, should_skip = (
@@ -1914,7 +2086,7 @@ class NixlKVSender(CommonKVSender):
         if should_skip:
             return
 
-        if self._transfer_start_time is None and (
+        if getattr(self, "_transfer_start_time", None) is None and (
             len(kv_indices) > 0 or state_indices is not None
         ):
             self._transfer_start_time = time.perf_counter()
@@ -1933,9 +2105,55 @@ class NixlKVSender(CommonKVSender):
         if is_last_chunk:
             self.has_sent = True
 
+    def fence_failed_launch(self, error: BaseException) -> KVPoll:
+        """Convert a partial send exception into a physically fenced attempt.
+
+        Handles are registered before every NIXL post, so an exception can no
+        longer hide an already-live DMA.  The sender remains nonterminal until
+        all registered handles report DONE/ERR.  If NIXL cannot report their
+        state, polling remains nonterminal and the source pages are quarantined
+        for the process lifetime rather than recycled unsafely.
+        """
+
+        self.launch_failed = True
+        self.launch_exception = error
+        self.has_sent = True
+        self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
+        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        return self.poll()
+
+    def _physical_handle_states(self) -> Optional[list[str]]:
+        states = []
+        for handle in self.xfer_handles:
+            try:
+                states.append(self.kv_mgr.agent.check_xfer_state(handle))
+            except Exception:
+                logger.exception(
+                    "Unable to fence NIXL sender handle room=%s; quarantining source KV",
+                    self.bootstrap_room,
+                )
+                return None
+        return states
+
     def poll(self) -> KVPoll:
-        if self._send_failed:
+        if getattr(self, "_send_failed", False):
             return KVPoll.Failed  # type: ignore
+        handles = getattr(self, "xfer_handles", ())
+        if handles or getattr(self, "launch_failed", False):
+            states = self._physical_handle_states()
+            if states is None:
+                return KVPoll.Transferring  # type: ignore
+            terminal = all(state in ("DONE", "ERR") for state in states)
+            if getattr(self, "launch_failed", False):
+                return KVPoll.Failed if terminal else KVPoll.Transferring  # type: ignore
+            if terminal and all(state == "DONE" for state in states):
+                return KVPoll.Success  # type: ignore
+            if terminal:
+                self.launch_exception = RuntimeError(
+                    "NIXL KVSender transfer encountered an error"
+                )
+                return KVPoll.Failed  # type: ignore
+            return KVPoll.Transferring  # type: ignore
         status = self.kv_mgr.check_status(self.bootstrap_room)
         if (
             status == KVPoll.Success
@@ -2034,6 +2252,13 @@ class NixlKVReceiver(CommonKVReceiver):
                 else b""
             )
             with lock:
+                # Connection setup cannot expose destination addresses.  Set
+                # the DMA fence immediately before the first actual publish:
+                # after this point even a send exception may have delivered
+                # bytes and therefore requires transport quarantine.
+                if not self.started_transfer:
+                    self.started_transfer = True
+                    self.init_time = time.time()
                 sock.send_multipart(
                     [
                         GUARD,
@@ -2056,10 +2281,12 @@ class NixlKVReceiver(CommonKVReceiver):
         if state_indices:
             self.kv_mgr.transfer_statuses[self.bootstrap_room].expects_state = True
 
-        self.started_transfer = True
-        self.init_time = time.time()
-
-    def poll(self) -> KVPoll:
+    def poll(
+        self,
+        *,
+        update_transport: bool = True,
+        enforce_waiting_timeout: bool = True,
+    ) -> KVPoll:
         if self.conclude_state is not None:
             return self.conclude_state
         status = self.kv_mgr.check_status(self.bootstrap_room)
@@ -2073,7 +2300,8 @@ class NixlKVReceiver(CommonKVReceiver):
         if timeout_result is not None:
             return timeout_result
 
-        self.kv_mgr.update_transfer_status()
+        if update_transport:
+            self.kv_mgr.update_transfer_status()
         if self.kv_mgr.check_transfer_done(self.bootstrap_room):  # type: ignore
             self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
                 self.bootstrap_room
@@ -2081,7 +2309,84 @@ class NixlKVReceiver(CommonKVReceiver):
             self.conclude_state = KVPoll.Success
             del self.kv_mgr.transfer_statuses[self.bootstrap_room]
             return self.conclude_state  # type: ignore
+        if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get():
+            now = time.monotonic()
+            if now >= getattr(self, "_agentic_next_wait_log", 0.0):
+                self._agentic_next_wait_log = now + 5.0
+                transfer = self.kv_mgr.transfer_statuses.get(self.bootstrap_room)
+                if transfer is not None:
+                    logger.info(
+                        "AgenticKV nixl_receive_wait room=%s aux=%s "
+                        "state=%s/%s kv=%s expected=%s",
+                        self.bootstrap_room,
+                        transfer.received_aux,
+                        sorted(transfer.received_state_per_pp),
+                        transfer.num_pp_ranks_expected,
+                        {
+                            rank: sorted(chunks)
+                            for rank, chunks in transfer.received_kvs_per_pp.items()
+                        },
+                        dict(transfer.expected_kvs_per_pp),
+                    )
         return KVPoll.WaitingForInput  # type: ignore
+
+    def poll_agentic(self, *, update_transport: bool = True) -> KVPoll:
+        """Poll using only physical transfer completion as a page-reuse fence.
+
+        Agentic Direct pages are ordinary allocator pages.  A local timeout
+        or heartbeat failure cannot prove that a remote NIXL WRITE has
+        stopped, so neither may convert the receive into a releasable Failed
+        state.  Without a transport cancel-and-fence API, incomplete rooms
+        stay quarantined until all expected remote-write notifications arrive
+        or the engine process tears down its allocator.
+        """
+
+        if self.conclude_state is KVPoll.Success:
+            return KVPoll.Success
+        if not self.started_transfer:
+            return self.poll(
+                update_transport=update_transport,
+                enforce_waiting_timeout=False,
+            )
+        if update_transport:
+            self.kv_mgr.update_transfer_status()
+        transfer = self.kv_mgr.transfer_statuses.get(self.bootstrap_room)
+        if transfer is None or not transfer.is_data_complete():
+            return KVPoll.WaitingForInput
+        self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
+            self.bootstrap_room
+        )
+        self.conclude_state = KVPoll.Success
+        del self.kv_mgr.transfer_statuses[self.bootstrap_room]
+        return KVPoll.Success
+
+    @classmethod
+    def poll_many(cls, receivers: list["NixlKVReceiver"]) -> list[KVPoll]:
+        """Poll receivers sharing one manager with one notification drain.
+
+        ``update_transfer_status`` drains notifications for every room owned by
+        the manager. Calling it once per request makes a long transfer queue do
+        the same global transport work repeatedly and creates head-of-line
+        stalls. Decode groups only receivers from one queue/manager here.
+        """
+
+        if not receivers:
+            return []
+        manager = receivers[0].kv_mgr
+        if any(receiver.kv_mgr is not manager for receiver in receivers):
+            return [receiver.poll() for receiver in receivers]
+        manager.update_transfer_status()
+        return [receiver.poll(update_transport=False) for receiver in receivers]
+
+    @classmethod
+    def poll_many_agentic(cls, receivers: list["NixlKVReceiver"]) -> list[KVPoll]:
+        if not receivers:
+            return []
+        manager = receivers[0].kv_mgr
+        if any(receiver.kv_mgr is not manager for receiver in receivers):
+            return [receiver.poll_agentic() for receiver in receivers]
+        manager.update_transfer_status()
+        return [receiver.poll_agentic(update_transport=False) for receiver in receivers]
 
     def _register_kv_args(self):
         for bootstrap_info in self.bootstrap_infos:

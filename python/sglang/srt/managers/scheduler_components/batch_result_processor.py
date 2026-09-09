@@ -835,11 +835,28 @@ class SchedulerBatchResultProcessor:
         # for mamba_lazy_post_decode_at_boundary inside.
         self._mamba_prefix_cache_update(req, batch, result, i)
 
-        if (
-            self.server_args.disaggregation_decode_enable_offload_kvcache
-            and not req.finished()
-        ):
-            self.decode_offload_manager.offload_kv_cache(req)
+        # Agentic request-generation snapshots deliberately run with native
+        # Decode HiCache/Mooncake offload disabled: their custom manager owns
+        # complete-snapshot Direct/Shared-Arena lifecycle instead.  Scheduler
+        # initialization still installs that manager, so completion dispatch
+        # must follow manager ownership rather than only the native CLI flag.
+        # Untagged/baseline serving keeps the original flag-only behavior.
+        manager = self.decode_offload_manager
+        custom_params = getattr(req.sampling_params, "custom_params", None) or {}
+        agentic_snapshot_owned = bool(
+            manager is not None
+            and getattr(manager, "agentic_enabled", False)
+            and "agentic_request_id" in custom_params
+        )
+        native_incremental_offload = bool(
+            manager is not None
+            and self.server_args.disaggregation_decode_enable_offload_kvcache
+            and not agentic_snapshot_owned
+        )
+        decode_offload_enabled = native_incremental_offload or agentic_snapshot_owned
+
+        if native_incremental_offload and not req.finished():
+            manager.offload_kv_cache(req)
 
         if req.finished():
             # delete feature to save memory
@@ -848,10 +865,10 @@ class SchedulerBatchResultProcessor:
             self._maybe_collect_routed_experts(req)
             self._maybe_collect_indexer_topk(req)
 
-            if self.server_args.disaggregation_decode_enable_offload_kvcache:
+            if decode_offload_enabled:
                 # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
-                if not self.decode_offload_manager.offload_kv_cache(req):
-                    self.decode_offload_manager.finalize_release_on_finish(req)
+                if not manager.offload_kv_cache(req):
+                    manager.finalize_release_on_finish(req)
             else:
                 if self.server_args.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
@@ -894,7 +911,10 @@ class SchedulerBatchResultProcessor:
         Lazy: keep the same index (prealloc handles the swap) and run
         post-decode cleanup to free the temporary second slot.
         """
-        if req.mamba_ping_pong_track_buffer is None:
+        if (
+            req.mamba_ping_pong_track_buffer is None
+            or getattr(req, "_agentic_mamba_frozen_prompt_tokens", None) is not None
+        ):
             return
 
         lazy = get_global_server_args().enable_mamba_extra_buffer_lazy()

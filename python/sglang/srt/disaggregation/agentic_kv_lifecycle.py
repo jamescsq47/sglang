@@ -44,9 +44,7 @@ def _decode_envelope_component(value: str, *, max_bytes: int) -> bytes:
     if not value or len(value) > max_bytes * 2:
         raise ValueError("invalid agentic envelope component size")
     padding = "=" * (-len(value) % 4)
-    decoded = base64.b64decode(
-        value + padding, altchars=b"-_", validate=True
-    )
+    decoded = base64.b64decode(value + padding, altchars=b"-_", validate=True)
     if len(decoded) > max_bytes:
         raise ValueError("agentic envelope component is too large")
     return decoded
@@ -64,9 +62,7 @@ def _discard_shared_ledger_snapshot(snapshot_id: str) -> None:
 
     path = os.getenv("SGLANG_AGENTIC_KV_LEDGER_PATH", "")
     directory = os.path.dirname(path)
-    if not path or (
-        directory != "/dev/shm" and not directory.startswith("/dev/shm/")
-    ):
+    if not path or (directory != "/dev/shm" and not directory.startswith("/dev/shm/")):
         return
     try:
         fd = os.open(path, os.O_RDWR)
@@ -95,9 +91,7 @@ def _discard_shared_ledger_snapshot(snapshot_id: str) -> None:
                     removed = True
                 if removed:
                     file_obj.seek(0)
-                    json.dump(
-                        ledger, file_obj, separators=(",", ":"), sort_keys=True
-                    )
+                    json.dump(ledger, file_obj, separators=(",", ":"), sort_keys=True)
                     file_obj.truncate()
                     file_obj.flush()
                     os.fsync(file_obj.fileno())
@@ -122,9 +116,9 @@ def unpack_agentic_extra_key(extra_key: Any) -> Optional[tuple[str, dict[str, An
     encoded = extra_key[len(EXTRA_KEY_ENVELOPE_PREFIX) :]
     try:
         stable_raw, params_raw = encoded.split(":", 1)
-        stable_key = _decode_envelope_component(
-            stable_raw, max_bytes=4096
-        ).decode("utf-8")
+        stable_key = _decode_envelope_component(stable_raw, max_bytes=4096).decode(
+            "utf-8"
+        )
         params = json.loads(
             _decode_envelope_component(params_raw, max_bytes=16384).decode("utf-8")
         )
@@ -141,9 +135,7 @@ def unpack_agentic_extra_key(extra_key: Any) -> Optional[tuple[str, dict[str, An
     # Read legacy trajectory-only envelopes so an in-flight request submitted
     # by an older client fails soft during a rolling update.  New clients
     # always emit generation-scoped keys to isolate P cache cleanup races.
-    legacy_key = (
-        f"agentic-v1:{metadata.request_id}" if metadata is not None else None
-    )
+    legacy_key = f"agentic-v1:{metadata.request_id}" if metadata is not None else None
     if metadata is None or stable_key not in {expected_key, legacy_key}:
         raise ValueError("agentic envelope request id mismatch")
     return stable_key, params
@@ -254,9 +246,7 @@ _ALLOWED_TRANSITIONS: Mapping[SnapshotState, frozenset[SnapshotState]] = {
             SnapshotState.FAILED,
         }
     ),
-    SnapshotState.TO_DECODE: frozenset(
-        {SnapshotState.CONSUMED, SnapshotState.FAILED}
-    ),
+    SnapshotState.TO_DECODE: frozenset({SnapshotState.CONSUMED, SnapshotState.FAILED}),
     SnapshotState.DELETE_PENDING: frozenset(
         {SnapshotState.CONSUMED, SnapshotState.EVICTED, SnapshotState.FAILED}
     ),
@@ -409,7 +399,10 @@ class AgenticRequestMetadata:
             ):
                 return AgenticOutputKind.TERMINAL
         for suffix in self.tool_suffix_token_ids:
-            if len(output_ids) >= len(suffix) and tuple(output_ids[-len(suffix) :]) == suffix:
+            if (
+                len(output_ids) >= len(suffix)
+                and tuple(output_ids[-len(suffix) :]) == suffix
+            ):
                 return AgenticOutputKind.TOOL
         return AgenticOutputKind.UNKNOWN
 
@@ -433,21 +426,20 @@ class AgenticRequestMetadata:
         # Accept one suffix as [1, 2] and multiple suffixes as [[1, 2], [3]].
         if raw_suffixes and isinstance(raw_suffixes[0], int):
             raw_suffixes = (raw_suffixes,)
-        suffixes = tuple(tuple(int(token) for token in suffix) for suffix in raw_suffixes)
+        suffixes = tuple(
+            tuple(int(token) for token in suffix) for suffix in raw_suffixes
+        )
         raw_terminal_markers = custom_params.get(CUSTOM_TERMINAL_MARKERS) or ()
         if raw_terminal_markers and isinstance(raw_terminal_markers[0], int):
             raw_terminal_markers = (raw_terminal_markers,)
         terminal_markers = tuple(
-            tuple(int(token) for token in marker)
-            for marker in raw_terminal_markers
+            tuple(int(token) for token in marker) for marker in raw_terminal_markers
         )
         raw_suffix_strings = custom_params.get(CUSTOM_TOOL_SUFFIX_STRINGS) or ()
         if isinstance(raw_suffix_strings, str):
             raw_suffix_strings = (raw_suffix_strings,)
         suffix_strings = tuple(str(marker) for marker in raw_suffix_strings)
-        raw_terminal_strings = (
-            custom_params.get(CUSTOM_TERMINAL_MARKER_STRINGS) or ()
-        )
+        raw_terminal_strings = custom_params.get(CUSTOM_TERMINAL_MARKER_STRINGS) or ()
         if isinstance(raw_terminal_strings, str):
             raw_terminal_strings = (raw_terminal_strings,)
         terminal_strings = tuple(str(marker) for marker in raw_terminal_strings)
@@ -523,13 +515,21 @@ class SnapshotManifest:
             raise ValueError("cache_components must be unique")
         if self.state_byte_size < 0:
             raise ValueError("state_byte_size must be non-negative")
-        if self.state_checkpoint_tokens is not None and self.state_checkpoint_tokens < 0:
+        if (
+            self.state_checkpoint_tokens is not None
+            and self.state_checkpoint_tokens < 0
+        ):
             raise ValueError("state_checkpoint_tokens must be non-negative")
         if "mamba" in self.cache_components:
             if self.state_byte_size <= 0:
                 raise ValueError("Mamba snapshots require a state payload")
             if self.state_checkpoint_tokens is None:
                 raise ValueError("Mamba snapshots require a checkpoint position")
+            if int(self.state_checkpoint_tokens) != int(self.token_count):
+                raise ValueError(
+                    "Mamba state checkpoint must match the Attention prefix: "
+                    f"state={self.state_checkpoint_tokens} attention={self.token_count}"
+                )
         if not self.page_keys and self.state not in {
             SnapshotState.FAILED,
             SnapshotState.FINAL,
@@ -580,7 +580,9 @@ class SnapshotManifest:
                 f"invalid snapshot transition {self.state.value} -> {target.value} "
                 f"for {self.snapshot_id}"
             )
-        return replace(self, state=target, updated_at=time.time() if now is None else now)
+        return replace(
+            self, state=target, updated_at=time.time() if now is None else now
+        )
 
     def eviction_cost(
         self,
@@ -754,9 +756,7 @@ class MooncakeSnapshotStore:
         return True, True
 
     @classmethod
-    def _acquire_local_claim(
-        cls, request: RequestGeneration, claim_id: str
-    ) -> bool:
+    def _acquire_local_claim(cls, request: RequestGeneration, claim_id: str) -> bool:
         acquired, _ = cls._acquire_local_claim_with_ownership(request, claim_id)
         return acquired
 
@@ -872,9 +872,7 @@ class MooncakeSnapshotStore:
         retry_delay = 0.01
         last_code = 0
         for attempt in range(max_attempts):
-            last_code = self.store.upsert(
-                manifest.manifest_key, manifest.to_bytes()
-            )
+            last_code = self.store.upsert(manifest.manifest_key, manifest.to_bytes())
             if last_code == 0:
                 return
             if last_code != -601:
@@ -1144,9 +1142,7 @@ class MooncakeSnapshotStore:
             if not all(path is not None and os.path.exists(path) for path in ack_paths):
                 return manifest
 
-            done_path = self._local_tp_direct_path(
-                manifest.request, claim_id, "done"
-            )
+            done_path = self._local_tp_direct_path(manifest.request, claim_id, "done")
             finalize_path = self._local_tp_direct_path(
                 manifest.request, claim_id, "finalizer"
             )
@@ -1156,9 +1152,7 @@ class MooncakeSnapshotStore:
             if os.path.exists(done_path):
                 current = self.load(manifest.request, require_ready=False)
                 return current if current is not None else received
-            if not self._create_local_marker(
-                finalize_path, str(tp_rank).encode()
-            ):
+            if not self._create_local_marker(finalize_path, str(tp_rank).encode()):
                 return manifest
             try:
                 self._update_claimed_transition(
@@ -1274,9 +1268,7 @@ class MooncakeSnapshotStore:
             raise SnapshotLifecycleError(
                 f"invalid direct claim release for {manifest.snapshot_id}"
             )
-        ready = replace(manifest, claim_id=None).transition(
-            SnapshotState.DIRECT_READY
-        )
+        ready = replace(manifest, claim_id=None).transition(SnapshotState.DIRECT_READY)
         self._update_claimed_transition(
             ready,
             expected_states=(SnapshotState.DIRECT_LOADING,),
@@ -1298,9 +1290,7 @@ class MooncakeSnapshotStore:
             raise SnapshotLifecycleError(
                 f"invalid received direct release for {manifest.snapshot_id}"
             )
-        ready = replace(manifest, claim_id=None).transition(
-            SnapshotState.DIRECT_READY
-        )
+        ready = replace(manifest, claim_id=None).transition(SnapshotState.DIRECT_READY)
         self._update_claimed_transition(
             ready,
             expected_states=(SnapshotState.P_RECEIVED,),
@@ -1338,7 +1328,10 @@ class MooncakeSnapshotStore:
         )
         if not acquired:
             return None
-        if not created_local_claim and self._local_claim_path(manifest.request) is not None:
+        if (
+            not created_local_claim
+            and self._local_claim_path(manifest.request) is not None
+        ):
             # A peer D rank owns the same deterministic fallback group.  Join
             # its request-generation transition instead of treating the
             # already-visible SLOW_FALLBACK state as foreign ownership.
@@ -1399,9 +1392,7 @@ class MooncakeSnapshotStore:
     def _is_fallback_claim(claim_id: Optional[str]) -> bool:
         return bool(claim_id and claim_id.startswith("fallback:"))
 
-    def complete_slow_fallback(
-        self, manifest: SnapshotManifest
-    ) -> SnapshotManifest:
+    def complete_slow_fallback(self, manifest: SnapshotManifest) -> SnapshotManifest:
         """Acknowledge complete Shared-Host→P-GPU recovery.
 
         The P GPU copy is authoritative before this transition.  CONSUMED is
@@ -1448,9 +1439,7 @@ class MooncakeSnapshotStore:
             return None
         return f"{claim_path}.tp-slow.{suffix}"
 
-    def complete_slow_fallback_group(
-        self, request: RequestGeneration
-    ) -> bool:
+    def complete_slow_fallback_group(self, request: RequestGeneration) -> bool:
         """Idempotently finalize one node-local TP Shared-Host recovery.
 
         The caller must first establish, through the Shared-Host ledger, that
@@ -1648,13 +1637,17 @@ class MooncakeSnapshotStore:
 
         manifest = self.load(request, require_ready=False)
         if manifest is None:
-            raise SnapshotLifecycleError(f"missing OFFLOADING manifest {request.snapshot_id}")
+            raise SnapshotLifecycleError(
+                f"missing OFFLOADING manifest {request.snapshot_id}"
+            )
         if manifest.state is not SnapshotState.OFFLOADING:
             raise SnapshotLifecycleError(
                 f"commit_publish requires OFFLOADING, got {manifest.state.value}"
             )
         exists = self.store.batch_is_exist(list(manifest.page_keys))
-        missing = [key for key, result in zip(manifest.page_keys, exists) if result != 1]
+        missing = [
+            key for key, result in zip(manifest.page_keys, exists) if result != 1
+        ]
         if missing:
             raise SnapshotLifecycleError(
                 f"cannot publish incomplete snapshot {manifest.snapshot_id}; "
@@ -1680,9 +1673,7 @@ class MooncakeSnapshotStore:
 
         fallback_claim = self._is_fallback_claim(manifest.claim_id)
         if manifest.state is SnapshotState.OFFLOADING:
-            failed = replace(
-                manifest.transition(SnapshotState.FAILED), claim_id=None
-            )
+            failed = replace(manifest.transition(SnapshotState.FAILED), claim_id=None)
             if fallback_claim:
                 self._update_claimed_transition(
                     failed,
@@ -1772,9 +1763,16 @@ class MooncakeSnapshotStore:
             )
         return observed
 
-    def mark_p_host(self, manifest: SnapshotManifest, claim_id: str) -> SnapshotManifest:
-        if manifest.state is not SnapshotState.P_LOADING or manifest.claim_id != claim_id:
-            raise SnapshotLifecycleError(f"invalid P host ACK for {manifest.snapshot_id}")
+    def mark_p_host(
+        self, manifest: SnapshotManifest, claim_id: str
+    ) -> SnapshotManifest:
+        if (
+            manifest.state is not SnapshotState.P_LOADING
+            or manifest.claim_id != claim_id
+        ):
+            raise SnapshotLifecycleError(
+                f"invalid P host ACK for {manifest.snapshot_id}"
+            )
         updated = manifest.transition(SnapshotState.P_HOST)
         self.update(updated)
         return updated
@@ -1791,24 +1789,28 @@ class MooncakeSnapshotStore:
         the cleanup.
         """
 
-        if manifest.state not in {
-            SnapshotState.P_LOADING,
-            SnapshotState.P_HOST,
-        } or manifest.claim_id != claim_id:
+        if (
+            manifest.state
+            not in {
+                SnapshotState.P_LOADING,
+                SnapshotState.P_HOST,
+            }
+            or manifest.claim_id != claim_id
+        ):
             raise SnapshotLifecycleError(
                 f"invalid P load abandonment for {manifest.snapshot_id}"
             )
-        tombstone = replace(
-            manifest, deletion_target=SnapshotState.EVICTED
-        ).transition(SnapshotState.DELETE_PENDING)
-        self.update(tombstone)
-        return self.delete_snapshot(
-            tombstone, final_state=SnapshotState.EVICTED
+        tombstone = replace(manifest, deletion_target=SnapshotState.EVICTED).transition(
+            SnapshotState.DELETE_PENDING
         )
+        self.update(tombstone)
+        return self.delete_snapshot(tombstone, final_state=SnapshotState.EVICTED)
 
     def mark_p_gpu(self, manifest: SnapshotManifest, claim_id: str) -> SnapshotManifest:
         if manifest.state is not SnapshotState.P_HOST or manifest.claim_id != claim_id:
-            raise SnapshotLifecycleError(f"invalid P GPU ACK for {manifest.snapshot_id}")
+            raise SnapshotLifecycleError(
+                f"invalid P GPU ACK for {manifest.snapshot_id}"
+            )
         updated = manifest.transition(SnapshotState.P_GPU)
         self.update(updated)
         return updated
@@ -1835,9 +1837,7 @@ class MooncakeSnapshotStore:
                 )
 
             if final_state is SnapshotState.EVICTED:
-                claim_code = self.store.put(
-                    manifest.request.claim_key, b"evict"
-                )
+                claim_code = self.store.put(manifest.request.claim_key, b"evict")
                 if claim_code != 0:
                     raise SnapshotNotReadyError(
                         f"snapshot {manifest.snapshot_id} was claimed before eviction"
@@ -1868,9 +1868,7 @@ class MooncakeSnapshotStore:
         # recovery remain lease-safe because they may race a live GET.
         force_remove = final_state is SnapshotState.CONSUMED
         codes = tuple(
-            self.store.batch_remove(
-                list(tombstone.page_keys), force=force_remove
-            )
+            self.store.batch_remove(list(tombstone.page_keys), force=force_remove)
         )
         remaining = tuple(
             key
@@ -1914,9 +1912,7 @@ class MooncakeSnapshotStore:
 
         if manifest.state is SnapshotState.OFFLOADING:
             return self.fail_publish(
-                replace(
-                    manifest, failure_reason="stale_offloading_recovered"
-                )
+                replace(manifest, failure_reason="stale_offloading_recovered")
             )
         if manifest.state in {SnapshotState.P_LOADING, SnapshotState.P_HOST}:
             if not manifest.claim_id:
@@ -1925,17 +1921,13 @@ class MooncakeSnapshotStore:
                 )
             return self.abandon_load(manifest, manifest.claim_id)
         if manifest.state is SnapshotState.P_GPU:
-            return self.delete_snapshot(
-                manifest, final_state=SnapshotState.CONSUMED
-            )
+            return self.delete_snapshot(manifest, final_state=SnapshotState.CONSUMED)
         if manifest.state is SnapshotState.DELETE_PENDING:
             if manifest.deletion_target is None:
                 raise SnapshotLifecycleError(
                     f"stale delete has no target: {manifest.snapshot_id}"
                 )
-            return self.delete_snapshot(
-                manifest, final_state=manifest.deletion_target
-            )
+            return self.delete_snapshot(manifest, final_state=manifest.deletion_target)
         raise SnapshotLifecycleError(
             f"state {manifest.state.value} has no stale recovery action"
         )
@@ -2078,9 +2070,7 @@ class SnapshotEvictionController:
 
     def _reconcile(self) -> None:
         for manifest in self.index.manifests():
-            observed = self.snapshot_store.load(
-                manifest.request, require_ready=False
-            )
+            observed = self.snapshot_store.load(manifest.request, require_ready=False)
             if observed is None or observed.state in {
                 SnapshotState.CONSUMED,
                 SnapshotState.EVICTED,
@@ -2115,8 +2105,7 @@ class SnapshotEvictionController:
                 self.index.discard(snapshot_id)
             else:
                 self.index.upsert(
-                    self.snapshot_store.load(request, require_ready=False)
-                    or observed
+                    self.snapshot_store.load(request, require_ready=False) or observed
                 )
 
     def reserve(self, incoming_bytes: int) -> bool:
@@ -2128,9 +2117,7 @@ class SnapshotEvictionController:
             self._retry_pending_deletes()
             self._reconcile()
             projected = (
-                self.index.resident_byte_size
-                + self._reserved_bytes
-                + incoming_bytes
+                self.index.resident_byte_size + self._reserved_bytes + incoming_bytes
             )
             bytes_to_free = max(0, projected - self.byte_limit)
             if bytes_to_free:
@@ -2158,9 +2145,7 @@ class SnapshotEvictionController:
                     if result.removed:
                         self.index.discard(candidate.snapshot_id)
                     else:
-                        self._pending_deletes[candidate.snapshot_id] = (
-                            candidate.request
-                        )
+                        self._pending_deletes[candidate.snapshot_id] = candidate.request
                         observed = self.snapshot_store.load(
                             candidate.request, require_ready=False
                         )
@@ -2332,9 +2317,7 @@ class SharedSnapshotEvictionController:
                     SnapshotState.FINAL,
                     SnapshotState.FAILED,
                 }:
-                    ledger["residents"][snapshot_id] = self._encode_manifest(
-                        observed
-                    )
+                    ledger["residents"][snapshot_id] = self._encode_manifest(observed)
             except Exception:
                 # Preserve the reservation on metadata-store failure.  It is
                 # safer to temporarily reject work than under-account bytes.
@@ -2364,9 +2347,7 @@ class SharedSnapshotEvictionController:
                 try:
                     result = self.snapshot_store.delete_snapshot(
                         observed,
-                        final_state=(
-                            observed.deletion_target or SnapshotState.EVICTED
-                        ),
+                        final_state=(observed.deletion_target or SnapshotState.EVICTED),
                         update_shared_ledger=False,
                     )
                 except Exception:
@@ -2383,9 +2364,7 @@ class SharedSnapshotEvictionController:
             for item in ledger["reservations"].values()
         )
 
-    def _resident_manifests(
-        self, ledger: Mapping[str, Any]
-    ) -> list[SnapshotManifest]:
+    def _resident_manifests(self, ledger: Mapping[str, Any]) -> list[SnapshotManifest]:
         result = []
         for snapshot_id, encoded in ledger["residents"].items():
             try:
@@ -2424,9 +2403,7 @@ class SharedSnapshotEvictionController:
                 }
             )
             projected = (
-                resident_bytes
-                + self._reservation_bytes(ledger)
-                + incoming_bytes
+                resident_bytes + self._reservation_bytes(ledger) + incoming_bytes
             )
             bytes_to_free = max(0, projected - self.byte_limit)
             if bytes_to_free:
@@ -2521,14 +2498,11 @@ class SharedSnapshotEvictionController:
             # A fast P can consume and delete the snapshot in that window.
             # Recheck while holding the ledger lock: if P already reached a
             # terminal state, do not resurrect stale capacity accounting.
-            observed = self.snapshot_store.load(
-                manifest.request, require_ready=False
-            )
+            observed = self.snapshot_store.load(manifest.request, require_ready=False)
             if manifest.snapshot_id in ledger["terminals"]:
                 ledger["residents"].pop(manifest.snapshot_id, None)
             elif (
-                observed is not None
-                and observed.state is SnapshotState.MOONCAKE_READY
+                observed is not None and observed.state is SnapshotState.MOONCAKE_READY
             ):
                 ledger["residents"][manifest.snapshot_id] = self._encode_manifest(
                     observed

@@ -4379,6 +4379,18 @@ class ServerArgs:
 
     def _handle_mamba_radix_cache(self, model_arch: str):
         if self.disable_radix_cache:
+            if (
+                envs.SGLANG_AGENTIC_KV_LIFECYCLE.get()
+                and self.disaggregation_mode in ("prefill", "decode")
+                and self._support_mamba_cache_extra_buffer(model_arch)
+            ):
+                # Agentic reverse KV needs page-boundary recurrent-state
+                # checkpoints even though Decode does not prefix-match its
+                # local radix tree.  Record the model-qualified override here
+                # while the resolved architecture is available; never enable
+                # Mamba paths for ordinary dense models.
+                self._agentic_force_mamba_extra_buffer = True
+                self._validate_mamba_extra_buffer(model_arch)
             return
 
         self.uses_mamba_radix_cache = True
@@ -6583,6 +6595,14 @@ class ServerArgs:
         )
 
     def enable_mamba_extra_buffer(self) -> bool:
+        # Decode disaggregation normally disables its local radix cache and,
+        # consequently, the stock Mamba tracking buffer.  Agentic reverse-KV
+        # snapshots still require a page-boundary checkpoint on D even when D
+        # does not perform prefix matching.  Keep this override scoped to the
+        # custom lifecycle so baseline SGLang retains its original memory
+        # sizing and cache behavior.
+        if getattr(self, "_agentic_force_mamba_extra_buffer", False):
+            return True
         return (
             self.disable_radix_cache is False
             and self.mamba_radix_cache_strategy in ("extra_buffer", "extra_buffer_lazy")

@@ -622,6 +622,62 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         self.dec_lock_ref(req.last_node)
 
+    def release_request_generation_cache(
+        self,
+        req: Req,
+        *,
+        committed_len: Optional[int] = None,
+        _defer_if_blocked: bool = True,
+        event_prefix: str = "request_generation_release",
+        allow_shared_ancestors: bool = False,
+    ) -> int:
+        """Atomically release Attention and Mamba for an unlocked leaf path."""
+
+        del _defer_if_blocked, event_prefix, allow_shared_ancestors
+        if self.disable or not getattr(req, "extra_key", None):
+            return 0
+        length = int(
+            getattr(req, "kv_committed_len", 0)
+            if committed_len is None
+            else committed_len
+        )
+        token_ids = (req.origin_input_ids + req.output_ids)[:length]
+        key = RadixKey(token_ids, req.extra_key).page_aligned(self.page_size)
+        if not len(key):
+            return 0
+        match = self.match_prefix(MatchPrefixParams(key=key))
+        if len(match.device_indices) != len(key):
+            return 0
+        node = match.last_device_node
+        released = 0
+        while (
+            node is not self.root_node
+            and node.full_lock_ref == 0
+            and node.mamba_lock_ref == 0
+            and not node.children
+            and node.key.extra_key == req.extra_key
+            and node.mamba_value is not None
+        ):
+            parent = node.parent
+            full_released, _, _, _ = self._evict_leaf_node(node, True)
+            released += full_released
+            node = parent
+        return released
+
+    def release_agentic_request_cache(
+        self,
+        req: Req,
+        *,
+        committed_len: Optional[int] = None,
+        _defer_if_blocked: bool = True,
+    ) -> int:
+        return self.release_request_generation_cache(
+            req,
+            committed_len=committed_len,
+            _defer_if_blocked=_defer_if_blocked,
+            event_prefix="p_to_d_release",
+        )
+
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
 

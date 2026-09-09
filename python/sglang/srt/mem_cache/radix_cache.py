@@ -482,6 +482,86 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
 
+    def release_request_generation_cache(
+        self,
+        req: Req,
+        *,
+        committed_len: Optional[int] = None,
+        _defer_if_blocked: bool = True,
+        event_prefix: str = "request_generation_release",
+        allow_shared_ancestors: bool = False,
+    ) -> int:
+        """Free the unlocked leaf path owned by one request generation.
+
+        Agentic request generations carry a trajectory-scoped ``extra_key``
+        on P.  D may deliberately use a shared namespace; in that case locks
+        and branch children retain prefixes still used by another request.
+        The request must have released its ordinary Radix lock first.
+        """
+
+        del _defer_if_blocked, event_prefix, allow_shared_ancestors
+        if self.disable or not getattr(req, "extra_key", None):
+            return 0
+        length = int(
+            getattr(req, "kv_committed_len", 0)
+            if committed_len is None
+            else committed_len
+        )
+        token_ids = (req.origin_input_ids + req.output_ids)[:length]
+        key = RadixKey(token_ids, req.extra_key, is_bigram=self.is_eagle).page_aligned(
+            self.page_size
+        )
+        if not len(key):
+            return 0
+        match = self.match_prefix(MatchPrefixParams(key=key))
+        if len(match.device_indices) != len(key):
+            return 0
+        node = match.last_device_node
+        released = 0
+        direct_credit_pool = getattr(req, "_agentic_direct_credit_pool", None)
+        while (
+            node is not self.root_node
+            and node.lock_ref == 0
+            and not node.children
+            and node.key.extra_key == req.extra_key
+        ):
+            parent = node.parent
+            released += len(node.value)
+            self._record_remove_event(node)
+            if direct_credit_pool is None:
+                self.token_to_kv_pool_allocator.free(node.value)
+            else:
+                direct_credit_pool.reclaim_node_indices(
+                    node.value, self.token_to_kv_pool_allocator
+                )
+            self._delete_leaf(node)
+            node = parent
+        if direct_credit_pool is not None and (
+            node is self.root_node or node.key.extra_key != req.extra_key
+        ):
+            for name in (
+                "_agentic_direct_credit_pool",
+                "_agentic_direct_credit_allocation",
+                "_agentic_direct_parent_token_count",
+            ):
+                if hasattr(req, name):
+                    delattr(req, name)
+        return released
+
+    def release_agentic_request_cache(
+        self,
+        req: Req,
+        *,
+        committed_len: Optional[int] = None,
+        _defer_if_blocked: bool = True,
+    ) -> int:
+        return self.release_request_generation_cache(
+            req,
+            committed_len=committed_len,
+            _defer_if_blocked=_defer_if_blocked,
+            event_prefix="p_to_d_release",
+        )
+
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
         if self.disable:
@@ -616,7 +696,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             if node.parent is None:
                 assert (
                     node is self.root_node
-                ), f"This request holds the node from another tree"
+                ), "This request holds the node from another tree"
             node = node.parent
         return DecLockRefResult(delta=delta)
 

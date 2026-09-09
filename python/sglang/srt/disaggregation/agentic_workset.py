@@ -6,15 +6,14 @@ ported across SGLang releases without copying an older scheduler.
 
 import threading
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Deque, Dict, Optional, Sequence, Tuple
+from typing import Any, Deque, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 
 from sglang.srt.mem_cache.common import kv_to_page_indices
-
-
 
 
 @dataclass
@@ -40,6 +39,8 @@ class AgenticPWorksetLease:
     # currently contributes exactly one MAMBA component (temporal + conv
     # tensors share the same slot index on the wire).
     state_device_indices: Tuple[torch.Tensor, ...] = ()
+    runtime_state_device_indices: Tuple[torch.Tensor, ...] = ()
+    runtime_state_req: Any = None
     parent_bound: bool = False
     state: str = "active"
     suffix_cursor: int = 0
@@ -67,9 +68,29 @@ class AgenticPWorksetLease:
 class AgenticPWorksetLeaseBroker:
     """Thread-safe intent queue with scheduler-owned physical allocation."""
 
-    def __init__(self, page_size: int, *, state_allocators: Sequence = ()):
+    def __init__(
+        self,
+        page_size: int,
+        *,
+        state_allocators: Sequence = (),
+        mamba_req_to_token_pool=None,
+    ):
         self.page_size = int(page_size)
         self._state_allocators = tuple(state_allocators)
+        self._mamba_req_to_token_pool = mamba_req_to_token_pool
+        self._runtime_state_slots = 1
+        if mamba_req_to_token_pool is not None and getattr(
+            mamba_req_to_token_pool, "enable_mamba_extra_buffer", False
+        ):
+            self._runtime_state_slots += (
+                1
+                if getattr(
+                    mamba_req_to_token_pool,
+                    "enable_mamba_extra_buffer_lazy",
+                    False,
+                )
+                else int(mamba_req_to_token_pool.mamba_ping_pong_track_buffer_size)
+            )
         self._intents: Dict[str, Tuple[str, int, int]] = {}
         self._leases: Dict[str, AgenticPWorksetLease] = {}
         self._release_requested: Dict[str, int] = {}
@@ -174,10 +195,7 @@ class AgenticPWorksetLeaseBroker:
                 return False
             if owner is not None and current.owner != owner:
                 return False
-            if (
-                current.state == "active"
-                and any(entry[0] == snapshot_id for entry in self._tp_plan)
-            ):
+            if current.state == "active" and self._tp_plan_epoch >= 0:
                 # The current TP allocation epoch is immutable.  Record the
                 # exact lease terminal now; TP0 omits it from the next epoch,
                 # and every rank releases at the same scheduler-safe boundary.
@@ -193,7 +211,7 @@ class AgenticPWorksetLeaseBroker:
                 if current.io_attempt != io_attempt:
                     return False
                 current.state = "release_pending"
-                if any(entry[0] == snapshot_id for entry in self._tp_plan):
+                if self._tp_plan_epoch >= 0:
                     self._tp_release_pending[snapshot_id] = current.lease_id
                     self._tp_retire_requested.add(snapshot_id)
                 return False
@@ -285,6 +303,10 @@ class AgenticPWorksetLeaseBroker:
                         self._state_allocators, lease.state_device_indices
                     ):
                         state_allocator.free(state_indices)
+                    for state_allocator, state_indices in zip(
+                        self._state_allocators, lease.runtime_state_device_indices
+                    ):
+                        state_allocator.free(state_indices)
                     if self._tp_plan_epoch >= 0:
                         self._tp_retired_in_epoch.add(snapshot_id)
 
@@ -305,6 +327,20 @@ class AgenticPWorksetLeaseBroker:
                     if snapshot_id in planned_ids:
                         continue
                     if lease.state != "active":
+                        # A background I/O terminal can land just after TP0
+                        # froze an epoch which did not contain this lease.
+                        # Once the lease has a persistent group-retirement
+                        # tombstone, omission from that one stale plan is not
+                        # permission to free (or to fail the scheduler).  Keep
+                        # the physical pages quarantined; TP0's next control
+                        # epoch carries the lease plus an authoritative retire
+                        # command, and all ranks release only after every DMA
+                        # fence reports quiesced.
+                        if (
+                            snapshot_id in self._tp_retire_requested
+                            or snapshot_id in self._tp_release_pending
+                        ):
+                            continue
                         raise RuntimeError(
                             "TP workset plan removed a non-cancellable lease "
                             f"{snapshot_id} state={lease.state}"
@@ -315,10 +351,12 @@ class AgenticPWorksetLeaseBroker:
                         self._state_allocators, lease.state_device_indices
                     ):
                         state_allocator.free(state_indices)
+                    for state_allocator, state_indices in zip(
+                        self._state_allocators, lease.runtime_state_device_indices
+                    ):
+                        state_allocator.free(state_indices)
                     self._tp_release_pending.pop(snapshot_id, None)
-                for snapshot_id, cancel_owner in tuple(
-                    self._tp_cancel_pending.items()
-                ):
+                for snapshot_id, cancel_owner in tuple(self._tp_cancel_pending.items()):
                     if snapshot_id not in planned_ids:
                         pending = self._intents.get(snapshot_id)
                         if pending is not None and (
@@ -418,17 +456,28 @@ class AgenticPWorksetLeaseBroker:
                         break
                     continue
                 state_device_indices = []
+                runtime_state_device_indices = []
                 for state_allocator in self._state_allocators:
                     state_indices = state_allocator.alloc(1)
-                    if state_indices is None:
+                    runtime_indices = state_allocator.alloc(self._runtime_state_slots)
+                    if state_indices is None or runtime_indices is None:
+                        if state_indices is not None:
+                            state_allocator.free(state_indices)
+                        if runtime_indices is not None:
+                            state_allocator.free(runtime_indices)
                         for rollback_allocator, rollback_indices in zip(
                             self._state_allocators, state_device_indices
+                        ):
+                            rollback_allocator.free(rollback_indices)
+                        for rollback_allocator, rollback_indices in zip(
+                            self._state_allocators, runtime_state_device_indices
                         ):
                             rollback_allocator.free(rollback_indices)
                         allocator.free(device_indices)
                         device_indices = None
                         break
                     state_device_indices.append(state_indices)
+                    runtime_state_device_indices.append(runtime_indices)
                 if device_indices is None:
                     self._allocation_failures += 1
                     if allocation_plan is not None:
@@ -437,7 +486,7 @@ class AgenticPWorksetLeaseBroker:
                 parent_indices = device_indices[:parent_allocated]
                 page_indices = kv_to_page_indices(
                     parent_indices.cpu().numpy(), self.page_size
-                )
+                ).astype(np.int32, copy=False)
                 self._leases[snapshot_id] = AgenticPWorksetLease(
                     snapshot_id=snapshot_id,
                     lease_id=self._next_lease_id,
@@ -449,6 +498,7 @@ class AgenticPWorksetLeaseBroker:
                     device_indices=device_indices,
                     parent_page_indices=page_indices,
                     state_device_indices=tuple(state_device_indices),
+                    runtime_state_device_indices=tuple(runtime_state_device_indices),
                 )
                 self._next_lease_id += 1
                 self._grants += 1
@@ -481,8 +531,7 @@ class AgenticPWorksetLeaseBroker:
             if epoch == self._tp_plan_epoch:
                 if (
                     normalized == self._tp_plan
-                    and authoritative_retirements
-                    == self._tp_authoritative_retirements
+                    and authoritative_retirements == self._tp_authoritative_retirements
                 ):
                     return
                 raise RuntimeError(
@@ -580,9 +629,7 @@ class AgenticPWorksetLeaseBroker:
                 parent_tokens,
                 prompt_tokens,
             ) in self._intents.items():
-                if (
-                    snapshot_id not in seen
-                ):
+                if snapshot_id not in seen:
                     plan.append(
                         (
                             snapshot_id,
@@ -596,9 +643,7 @@ class AgenticPWorksetLeaseBroker:
                 epoch,
                 frozen,
                 retiring_ids=(
-                    self.tp_retire_candidates
-                    if retiring_ids is None
-                    else retiring_ids
+                    self.tp_retire_candidates if retiring_ids is None else retiring_ids
                 ),
             )
             return frozen
@@ -673,6 +718,91 @@ class AgenticPWorksetLeaseBroker:
             self._grant_events.clear()
             return events
 
+    def attach_runtime_state_for_bind(
+        self, snapshot_id: str, req, lease: AgenticPWorksetLease
+    ) -> None:
+        """Attach pre-reserved active/tracking slots before native Mamba COW."""
+
+        with self._lock:
+            current = self._leases.get(snapshot_id)
+            if current is None or current.lease_id != lease.lease_id:
+                raise RuntimeError(f"workset lease disappeared for {snapshot_id}")
+            if current.state != "binding" or not current.parent_bound:
+                raise RuntimeError(
+                    f"cannot attach runtime state from {current.state} workset"
+                )
+            if not current.runtime_state_device_indices:
+                return
+            if current.runtime_state_req is not None:
+                if current.runtime_state_req is req:
+                    return
+                raise RuntimeError("runtime Mamba reservation has another owner")
+            if getattr(req, "mamba_pool_idx", None) is not None:
+                raise RuntimeError("request already owns active Mamba state")
+            if len(current.runtime_state_device_indices) != 1:
+                raise RuntimeError("V1 supports exactly one Mamba state component")
+            reserved = current.runtime_state_device_indices[0]
+            req.mamba_pool_idx = reserved[0]
+            req.mamba_needs_clear = False
+            pool = self._mamba_req_to_token_pool
+            if pool is not None and getattr(pool, "enable_mamba_extra_buffer", False):
+                buffer_size = int(pool.mamba_ping_pong_track_buffer_size)
+                buffer = torch.full(
+                    (buffer_size,),
+                    -1,
+                    dtype=reserved.dtype,
+                    device=reserved.device,
+                )
+                ping_pong = reserved[1:]
+                if ping_pong.numel() > buffer_size:
+                    raise RuntimeError("too many reserved Mamba tracking slots")
+                buffer[: ping_pong.numel()] = ping_pong
+                req.mamba_ping_pong_track_buffer = buffer
+                req.mamba_next_track_idx = 0
+            current.runtime_state_req = req
+
+    def stage_runtime_checkpoint_cow_for_bind(
+        self, snapshot_id: str, req, lease: AgenticPWorksetLease
+    ) -> None:
+        """COW the restored parent into active and its retained track slot.
+
+        Native Radix matching populates ``mamba_cow_src_index`` for the active
+        slot only.  A short tool-result suffix may not cross another tracking
+        boundary, so P must also retain the exact received parent checkpoint
+        in the ping-pong slot selected by ``get_mamba_ping_pong_keep_idx``.
+        The actual copies remain deferred to the model forward stream.
+        """
+
+        with self._lock:
+            current = self._leases.get(snapshot_id)
+            if current is None or current.lease_id != lease.lease_id:
+                raise RuntimeError(f"workset lease disappeared for {snapshot_id}")
+            if current.runtime_state_req is not req:
+                raise RuntimeError("runtime Mamba reservation is not attached")
+            source = getattr(req, "mamba_cow_src_index", None)
+            if source is None:
+                raise RuntimeError("Radix match did not provide a Mamba checkpoint")
+            destinations = [torch.as_tensor(req.mamba_pool_idx).reshape(1)]
+            pool = self._mamba_req_to_token_pool
+            buffer = getattr(req, "mamba_ping_pong_track_buffer", None)
+            if (
+                pool is not None
+                and getattr(pool, "enable_mamba_extra_buffer", False)
+                and buffer is not None
+                and buffer.numel()
+            ):
+                keep_index = int(pool.get_mamba_ping_pong_keep_idx(req))
+                checkpoint_destination = buffer[keep_index].reshape(1)
+                if int(checkpoint_destination.item()) < 0:
+                    raise RuntimeError("reserved Mamba checkpoint slot is invalid")
+                destinations.append(checkpoint_destination)
+            destination = torch.cat(destinations)
+            source = torch.as_tensor(source, device=destination.device).reshape(-1)
+            if source.numel() != 1:
+                raise RuntimeError("Radix match returned multiple Mamba checkpoints")
+            req.mamba_cow_src_index = source.repeat(destination.numel())
+            req._agentic_mamba_cow_dst_indices = destination
+
     def handoff_to_req(
         self, snapshot_id: str, req, lease: AgenticPWorksetLease
     ) -> None:
@@ -704,16 +834,15 @@ class AgenticPWorksetLeaseBroker:
                     f"workset prompt changed for {snapshot_id}: "
                     f"reserved={current.prompt_tokens} actual={actual_prompt_tokens}"
                 )
-            if len(current.state_device_indices) > 1:
-                raise RuntimeError(
-                    "agentic workset currently supports one Mamba state component"
-                )
-            if current.state_device_indices and getattr(
-                req, "mamba_pool_idx", None
-            ) is not None:
-                raise RuntimeError(
-                    f"request already owns Mamba state for {snapshot_id}"
-                )
+            if current.state_device_indices:
+                raise RuntimeError("Radix checkpoint ownership was not committed")
+            if current.runtime_state_device_indices:
+                if current.runtime_state_req is not req:
+                    raise RuntimeError("runtime Mamba reservation was not attached")
+                if getattr(req, "mamba_pool_idx", None) is None:
+                    raise RuntimeError("attached request lost active Mamba state")
+                current.runtime_state_device_indices = ()
+                current.runtime_state_req = None
             current.state = "handed"
             self._intents.pop(snapshot_id, None)
             # This marker is the scheduler-visible ownership contract.  The
@@ -724,9 +853,7 @@ class AgenticPWorksetLeaseBroker:
             req._agentic_p_workset_lease = current
             req._agentic_p_workset_broker = self
             req._agentic_workset_suffix_indices = current.remaining_suffix_indices
-            if current.state_device_indices:
-                req.mamba_pool_idx = current.state_device_indices[0][0]
-                req.mamba_needs_clear = False
+            if getattr(req, "mamba_pool_idx", None) is not None:
                 # The reverse snapshot represents the complete parent at this
                 # request-generation boundary.  Any page/chunk tail that the
                 # native cache cannot bind is recomputed by normal Prefill.
@@ -747,13 +874,29 @@ class AgenticPWorksetLeaseBroker:
         so the broker drops the lease without freeing that padding.
         """
 
-        extend_tokens = int(extend_tokens)
-        if extend_tokens < 0:
-            raise ValueError("extend_tokens must be non-negative")
-        with self._lock:
+        with self.consume_suffix_batch_transaction(
+            ((lease, extend_tokens, final_prompt_chunk),)
+        ) as parts:
+            return parts[0]
+
+    def _validate_suffix_batch_locked(self, operations):
+        plans = []
+        seen = set()
+        for lease, extend_tokens, final_prompt_chunk in operations:
+            extend_tokens = int(extend_tokens)
+            final_prompt_chunk = bool(final_prompt_chunk)
+            if extend_tokens < 0:
+                raise ValueError("extend_tokens must be non-negative")
+            if lease.snapshot_id in seen:
+                raise RuntimeError(
+                    f"duplicate workset in one Prefill batch: {lease.snapshot_id}"
+                )
+            seen.add(lease.snapshot_id)
             current = self._leases.get(lease.snapshot_id)
             if current is None or current.lease_id != lease.lease_id:
-                raise RuntimeError(f"workset lease disappeared for {lease.snapshot_id}")
+                raise RuntimeError(
+                    f"workset lease disappeared for {lease.snapshot_id}"
+                )
             if current.state != "handed":
                 raise RuntimeError(
                     f"workset lease is {current.state} for {lease.snapshot_id}"
@@ -780,14 +923,73 @@ class AgenticPWorksetLeaseBroker:
                 raise RuntimeError(
                     "non-final chunked Prefill must end on a KV page boundary"
                 )
-            indices = current.suffix_indices[start:end]
-            current.suffix_cursor = end
-            if final_prompt_chunk or end == physical_suffix_tokens:
-                current.state = "consumed"
-                self._leases.pop(lease.snapshot_id, None)
-                if self._tp_plan_epoch >= 0:
-                    self._tp_handoff_committed.add(lease.snapshot_id)
-            return indices
+            plans.append(
+                (
+                    current,
+                    start,
+                    end,
+                    final_prompt_chunk,
+                    physical_suffix_tokens,
+                )
+            )
+        return plans
+
+    def validate_suffix_batch(self, operations):
+        """Preflight a batch without changing cursor or ownership."""
+
+        operations = tuple(operations)
+        with self._lock:
+            plans = self._validate_suffix_batch_locked(operations)
+            return tuple(
+                (
+                    current.snapshot_id,
+                    current.lease_id,
+                    start,
+                    end,
+                    final_prompt_chunk,
+                    physical_suffix_tokens,
+                )
+                for (
+                    current,
+                    start,
+                    end,
+                    final_prompt_chunk,
+                    physical_suffix_tokens,
+                ) in plans
+            )
+
+    @contextmanager
+    def consume_suffix_batch_transaction(self, operations):
+        """Atomically validate and commit suffix ownership for one batch.
+
+        The broker lock remains held while the caller installs the returned
+        indices in ReqToTokenPool.  An exception before that installation
+        leaves every cursor and lease unchanged; normal exit commits all
+        requests together, so the Nth invalid request cannot orphan the first
+        N-1 worksets.
+        """
+
+        operations = tuple(operations)
+        with self._lock:
+            plans = self._validate_suffix_batch_locked(operations)
+            parts = tuple(
+                current.suffix_indices[start:end]
+                for current, start, end, _, _ in plans
+            )
+            yield parts
+            for (
+                current,
+                _,
+                end,
+                final_prompt_chunk,
+                physical_suffix_tokens,
+            ) in plans:
+                current.suffix_cursor = end
+                if final_prompt_chunk or end == physical_suffix_tokens:
+                    current.state = "consumed"
+                    self._leases.pop(current.snapshot_id, None)
+                    if self._tp_plan_epoch >= 0:
+                        self._tp_handoff_committed.add(current.snapshot_id)
 
     def commit_tp_handoff(self, snapshot_id: str) -> bool:
         """Finish a TP-wide broker-to-Req ownership transfer.
@@ -844,6 +1046,26 @@ class AgenticPWorksetLeaseBroker:
             if current is None or current.lease_id != lease.lease_id:
                 return False
             if current.state != "active":
+                return False
+            if self._tp_plan_epoch >= 0 and not any(
+                planned_snapshot == snapshot_id
+                and planned_owner == current.owner
+                and int(planned_parent) == int(current.parent_tokens)
+                and int(planned_prompt) == int(current.prompt_tokens)
+                for (
+                    planned_snapshot,
+                    planned_owner,
+                    planned_parent,
+                    planned_prompt,
+                ) in self._tp_plan
+            ):
+                # The current native TP epoch has already frozen an omission
+                # of this still-active lease.  Let service() retire it and a
+                # later all-rank epoch recreate it; pinning it now would turn
+                # ordinary pre-I/O reconciliation into a non-cancellable TP
+                # split.  Once a lease is present in the frozen plan, moving
+                # it to io_reserved makes every subsequently prepared plan
+                # retain the same exact physical owner.
                 return False
             current.state = "io_reserved"
             current.io_attempt = str(attempt)
@@ -906,7 +1128,14 @@ class AgenticPWorksetLeaseBroker:
                 return True
             if current.state == "release_pending":
                 current.io_attempt = None
-                if snapshot_id in self._tp_retire_requested:
+                if self._tp_plan_epoch >= 0:
+                    # TP pages are one logical allocation across all ranks.
+                    # Even if the I/O terminal races with an epoch that has
+                    # already omitted this snapshot, local quiescence may not
+                    # turn into a rank-local allocator free.  Materialize a
+                    # persistent tombstone and wait for the group retire
+                    # handshake instead.
+                    self._tp_retire_requested.add(snapshot_id)
                     current.state = "retire_ready"
                     self._tp_release_pending[snapshot_id] = current.lease_id
                 else:
@@ -916,8 +1145,25 @@ class AgenticPWorksetLeaseBroker:
             return False
 
     def commit_parent_bound(
-        self, snapshot_id: str, lease: AgenticPWorksetLease
+        self,
+        snapshot_id: str,
+        lease: AgenticPWorksetLease,
+        *,
+        state_donated_to_radix: bool = False,
+        state_duplicate: bool = False,
     ) -> None:
+        """Commit the restored parent and settle hybrid-state ownership.
+
+        A received Mamba checkpoint is inserted into the Radix tree before
+        this boundary.  If the insert created a new checkpoint, ownership is
+        donated to Radix.  If an identical checkpoint already existed, the
+        just-received slot is returned to its allocator.  In either case the
+        workset must no longer hand that same physical slot to the live Req;
+        the subsequent native prefix match allocates/COWs an active state.
+        """
+
+        if state_donated_to_radix and state_duplicate:
+            raise ValueError("Mamba state cannot be donated and duplicate")
         with self._lock:
             current = self._leases.get(snapshot_id)
             if current is None or current.lease_id != lease.lease_id:
@@ -926,6 +1172,17 @@ class AgenticPWorksetLeaseBroker:
                 raise RuntimeError(
                     f"cannot bind {current.state} workset lease for {snapshot_id}"
                 )
+            if current.state_device_indices:
+                if not (state_donated_to_radix or state_duplicate):
+                    raise RuntimeError(
+                        "hybrid parent bind did not settle Mamba state ownership"
+                    )
+                if state_duplicate:
+                    for state_allocator, state_indices in zip(
+                        self._state_allocators, current.state_device_indices
+                    ):
+                        state_allocator.free(state_indices)
+                current.state_device_indices = ()
             current.parent_bound = True
 
     def abort_bind(
@@ -943,6 +1200,15 @@ class AgenticPWorksetLeaseBroker:
                 return False
             if current.state != "binding":
                 return False
+            attached_req = current.runtime_state_req
+            if attached_req is not None:
+                attached_req.mamba_pool_idx = None
+                attached_req.mamba_ping_pong_track_buffer = None
+                attached_req.mamba_next_track_idx = None
+                attached_req.mamba_cow_src_index = None
+                if hasattr(attached_req, "_agentic_mamba_cow_dst_indices"):
+                    delattr(attached_req, "_agentic_mamba_cow_dst_indices")
+                current.runtime_state_req = None
             if self._tp_plan_epoch >= 0:
                 # A bind failure is a TP-group retirement.  It must be
                 # broadcast and committed at one scheduler-safe boundary;
@@ -1017,6 +1283,35 @@ class AgenticPWorksetLeaseBroker:
     def owner_is_superseded(self, snapshot_id: str, *, owner: str) -> bool:
         with self._lock:
             return (snapshot_id, owner) in self._superseded_owners
+
+    def owner_is_physically_quiesced(self, snapshot_id: str, *, owner: str) -> bool:
+        """Whether an owner has no intent, frozen plan, or allocated pages.
+
+        ``supersede_unstarted`` may only schedule a TP-wide retirement.  Host
+        admission uses this stronger predicate to wait until the scheduler has
+        actually serviced that retirement; a ``releasing`` lease still owns
+        physical HBM and is therefore not quiescent.
+        """
+
+        with self._lock:
+            pending = self._intents.get(snapshot_id)
+            if pending is not None and pending[0] == owner:
+                return False
+            lease = self._leases.get(snapshot_id)
+            if lease is not None and lease.owner == owner:
+                return False
+            return not any(
+                planned_snapshot == snapshot_id and planned_owner == owner
+                for planned_snapshot, planned_owner, _parent, _prompt in self._tp_plan
+            )
+
+    def owner_quiescence_epoch(self, snapshot_id: str, *, owner: str) -> Optional[int]:
+        """Return the installed TP epoch only while ``owner`` is quiescent."""
+
+        with self._lock:
+            if not self.owner_is_physically_quiesced(snapshot_id, owner=owner):
+                return None
+            return int(self._tp_plan_epoch)
 
     @property
     def tp_retire_candidates(self) -> tuple[str, ...]:
@@ -1097,10 +1392,13 @@ class AgenticPWorksetLeaseBroker:
                 tokens[lease.state] = tokens.get(lease.state, 0) + int(
                     lease.allocated_tokens
                 )
-            return ",".join(
-                f"{state}:{counts[state]}/{tokens[state]}"
-                for state in sorted(counts)
-            ) or "empty"
+            return (
+                ",".join(
+                    f"{state}:{counts[state]}/{tokens[state]}"
+                    for state in sorted(counts)
+                )
+                or "empty"
+            )
 
     @property
     def active_lease_summary(self) -> str:
@@ -1113,6 +1411,24 @@ class AgenticPWorksetLeaseBroker:
                 if lease.state == "active"
             ]
             return ";".join(active) or "empty"
+
+    def eviction_blocker(self, snapshot_id: str) -> Optional[str]:
+        """Describe live ownership that makes Host eviction illegal.
+
+        This is copied from the validated ``pd`` lifecycle.  Pending intents
+        own no physical pages and releasing/consumed leases are already past
+        the physical ownership boundary; every other lease state protects the
+        complete attention+Mamba workset from Host eviction.
+        """
+
+        with self._lock:
+            lease = self._leases.get(snapshot_id)
+            if lease is None or lease.state in {"releasing", "consumed"}:
+                return None
+            return (
+                f"id={lease.lease_id} owner={lease.owner} "
+                f"state={lease.state} tokens={lease.allocated_tokens}"
+            )
 
     @property
     def unaccounted_tokens(self) -> int:

@@ -401,8 +401,13 @@ class Envs:
     # Experimental request-generation KV lifecycle for multi-turn PD serving.
     # Every switch defaults off, preserving stock SGLang behavior.
     SGLANG_AGENTIC_KV_LIFECYCLE = EnvBool(False)
+    # Opt-in hybrid snapshot at the stable prompt prefix, not Decode's tail.
+    SGLANG_AGENTIC_KV_MAMBA_PROMPT_CHECKPOINT = EnvBool(False)
     SGLANG_AGENTIC_KV_CUSTOM_STORAGE_ONLY = EnvBool(False)
     SGLANG_AGENTIC_KV_FAST_TOOL_THRESHOLD = EnvFloat(0.2)
+    # Ablation only: keep request-generation Shared Host recovery enabled
+    # while bypassing D->P Direct admission. Kept identical to ``pd``.
+    SGLANG_AGENTIC_KV_FORCE_SLOW_PATH = EnvBool(False)
     SGLANG_AGENTIC_KV_DIRECT_BOOTSTRAP_PORT = EnvInt(0)
     SGLANG_AGENTIC_KV_DIRECT_HANDSHAKE_TIMEOUT = EnvFloat(2.0)
     SGLANG_AGENTIC_KV_HOST_TRANSITION_GRACE = EnvFloat(8.0)

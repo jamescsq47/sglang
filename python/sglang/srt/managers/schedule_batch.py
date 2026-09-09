@@ -1153,6 +1153,21 @@ class Req(ReqDllmMixin):
         # avoiding an O(context) copy per prefill-batch build.
         token_ids_to_match = self.full_untruncated_fill_ids
         key_limit: Optional[int] = self._compute_max_prefix_len(input_len)
+        if (
+            tree_cache is not None
+            and tree_cache.supports_mamba()
+            and envs.SGLANG_AGENTIC_KV_MAMBA_PROMPT_CHECKPOINT.get()
+            and envs.SGLANG_AGENTIC_KV_LIFECYCLE.get()
+            and get_global_server_args().disaggregation_mode == "prefill"
+        ):
+            from sglang.srt.disaggregation.agentic_hybrid_transfer import (
+                p2d_mamba_checkpoint_tokens,
+            )
+
+            key_limit = min(
+                key_limit,
+                p2d_mamba_checkpoint_tokens(self, tree_cache.page_size),
+            )
 
         # Disable prefix caching when embed overrides are present: same token IDs
         # with different override vectors must not share cached KV values.
@@ -1440,6 +1455,11 @@ class Req(ReqDllmMixin):
         # Increment retraction count before resetting other state. We should not reset this
         # since we are tracking the total number of retractions for each request.
         self.retraction_count += 1
+        if getattr(self, "_agentic_mamba_frozen_prompt_tokens", None) is not None:
+            # Native retraction saves only active state, not the immutable
+            # imported checkpoint. Decode can resume, but reverse must publish
+            # explicit RECOMPUTE_REQUIRED unless a new P->D import replaces it.
+            self._agentic_mamba_frozen_prompt_valid = False
 
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
         self.routed_experts = None
@@ -2283,7 +2303,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # to force the math calculation to retrieve the correct mamba state from h.
             return i + 1
 
+        stable_target = None
+        if (
+            envs.SGLANG_AGENTIC_KV_MAMBA_PROMPT_CHECKPOINT.get()
+            and envs.SGLANG_AGENTIC_KV_LIFECYCLE.get()
+            and get_global_server_args().disaggregation_mode == "prefill"
+        ):
+            from sglang.srt.disaggregation.agentic_hybrid_transfer import (
+                p2d_mamba_checkpoint_tokens,
+            )
+
+            stable_target = p2d_mamba_checkpoint_tokens(
+                req, self.token_to_kv_pool_allocator.page_size
+            )
         mask = req.extend_input_len >= mamba_cache_chunk_size
+        if stable_target is not None and len(req.prefix_indices) >= stable_target:
+            # The exact stable checkpoint is already protected in last_node.
+            # A one-page suffix still needs normal Forward, not a newer track
+            # event that would replace that checkpoint with the wrong state.
+            mask = False
         track_index = req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
         mamba_track_seqlen = -1
         if mask:
@@ -2327,7 +2365,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         req.mamba_next_track_idx
                     )
                 )
-            if req.mamba_branching_seqlen is not None:
+            # Native Mamba prefix caching uses the single tracking slot for an
+            # Attention-only radix branching point when one is present.  A
+            # complete agentic P->D snapshot instead needs that slot to match
+            # the latest page-aligned Attention prefix of this request.  V1
+            # agentic snapshots are request-private, so prefer the request-tail
+            # checkpoint only while that lifecycle is enabled; keep native
+            # branching behavior unchanged everywhere else.
+            if (
+                req.mamba_branching_seqlen is not None
+                and not envs.SGLANG_AGENTIC_KV_LIFECYCLE.get()
+            ):
                 # track branching point in this forward if the branching point
                 # is within the current extend batch.
                 branching_seqlen_aligned_mask = (
@@ -2343,6 +2391,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # See _force_track_h() for more details.
                     mamba_track_seqlen = _force_track_h(req.mamba_branching_seqlen)
                     mamba_track_seqlen_aligned = req.mamba_branching_seqlen
+            if stable_target is not None:
+                target = stable_target
+                start = len(req.prefix_indices)
+                end = start + req.extend_input_len
+                if start < target < end:
+                    mamba_track_seqlen = _force_track_h(target)
+                    mamba_track_seqlen_aligned = target
             req.mamba_last_track_seqlen = mamba_track_seqlen_aligned
 
         return _MambaRadixCacheV2TrackEntry(
@@ -2358,9 +2413,35 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         clear_tensors = []
         for req in reqs:
             if req.mamba_cow_src_index is not None:
-                cow_src_tensors.append(req.mamba_cow_src_index)
-                cow_dst_tensors.append(req.mamba_pool_idx.unsqueeze(0))
+                agentic_destinations = getattr(
+                    req, "_agentic_mamba_cow_dst_indices", None
+                )
+                cow_sources = req.mamba_cow_src_index.reshape(-1)
+                cow_destinations = (
+                    req.mamba_pool_idx.unsqueeze(0)
+                    if agentic_destinations is None
+                    else agentic_destinations.reshape(-1)
+                )
+                if agentic_destinations is not None:
+                    # Agentic restore initializes both the active slot and a
+                    # retained page-boundary checkpoint from one received
+                    # parent.  Native queue admission may rematch the same
+                    # parent after staging and overwrite mamba_cow_src_index
+                    # with its ordinary single-source tensor.  Re-expand that
+                    # one source here so batched restore keeps source and
+                    # destination cardinalities equal.
+                    if cow_sources.numel() == 1 and cow_destinations.numel() > 1:
+                        cow_sources = cow_sources.repeat(cow_destinations.numel())
+                    elif cow_sources.numel() != cow_destinations.numel():
+                        raise RuntimeError(
+                            "agentic Mamba COW source/destination count mismatch: "
+                            f"{cow_sources.numel()} != {cow_destinations.numel()}"
+                        )
+                cow_src_tensors.append(cow_sources)
+                cow_dst_tensors.append(cow_destinations)
                 req.mamba_cow_src_index = None
+                if hasattr(req, "_agentic_mamba_cow_dst_indices"):
+                    delattr(req, "_agentic_mamba_cow_dst_indices")
                 req.mamba_needs_clear = False
             elif req.mamba_needs_clear:
                 clear_tensors.append(req.mamba_pool_idx.unsqueeze(0))
@@ -2675,8 +2756,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 set_mamba_track_indices_from_reqs(self)
 
             # async H2D
+            track_mask_cpu = self.seq_lens_cpu % mamba_track_interval == 0
+            if envs.SGLANG_AGENTIC_KV_MAMBA_PROMPT_CHECKPOINT.get():
+                # Never overwrite D's imported stable checkpoint. Active
+                # recurrent state continues to update normally in Forward.
+                track_mask_cpu &= torch.tensor(
+                    [getattr(req, "_agentic_mamba_frozen_prompt_tokens", None) is None
+                     for req in self.reqs], dtype=torch.bool,
+                )
             self.mamba_track_mask = (
-                (self.seq_lens_cpu % mamba_track_interval == 0)
+                track_mask_cpu
                 .pin_memory()
                 .to(device=self.device, non_blocking=True)
             )

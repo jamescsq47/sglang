@@ -153,14 +153,23 @@ class ModelRunnerKVCacheMixin:
             and server_args.max_running_requests is not None
         ):
             # Use explicitly set max_running_requests when radix cache is disabled
-            server_args.max_mamba_cache_size = server_args.max_running_requests // (
+            max_reqs_per_worker = server_args.max_running_requests // (
                 server_args.dp_size if server_args.enable_dp_attention else 1
             )
+            ratio = self._calculate_mamba_ratio()
+            decode_extra_slots = (
+                server_args.disaggregation_decode_extra_slots
+                if server_args.disaggregation_mode == "decode"
+                else 0
+            )
+            server_args.max_mamba_cache_size = (
+                max_reqs_per_worker + decode_extra_slots
+            ) * ratio
             # Reserve intermediate memory based on capped max_num_reqs
             if has_spec_dec:
                 intermediate_size = (
                     config.mamba2_cache_params.mamba_cache_per_req
-                    * server_args.max_mamba_cache_size
+                    * max_reqs_per_worker
                     * server_args.speculative_num_draft_tokens
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
@@ -272,8 +281,22 @@ class ModelRunnerKVCacheMixin:
         return kv_cache_dim
 
     def _calculate_mamba_ratio(self: ModelRunner) -> int:
+        # Stock decode disaggregation disables radix caching and therefore
+        # normally needs only the active recurrent-state slot.  The agentic
+        # lifecycle still needs page-boundary checkpoints for D->P snapshots,
+        # so its extra slots must be included in memory profiling.
         if self.server_args.disable_radix_cache:
-            return 1
+            if not (
+                envs.SGLANG_AGENTIC_KV_LIFECYCLE.get()
+                and self.server_args.enable_mamba_extra_buffer()
+            ):
+                return 1
+            # With local radix disabled there is no additional cached-prefix
+            # reserve: one active slot plus the request's tracking slots is
+            # the complete physical requirement.
+            if self.server_args.disable_overlap_schedule:
+                return 2
+            return 2 if self.server_args.enable_mamba_extra_buffer_lazy() else 3
 
         additional_ratio = 0
         if self.server_args.enable_mamba_extra_buffer():
@@ -995,8 +1018,11 @@ class ModelRunnerKVCacheMixin:
 
         if self.mambaish_config is not None:
             ratio = self._calculate_mamba_ratio()
+            mamba_req_capacity = self.server_args.max_mamba_cache_size // ratio
+            if self.server_args.disaggregation_mode == "decode":
+                mamba_req_capacity -= self.server_args.disaggregation_decode_extra_slots
             max_num_reqs = min(
-                max_num_reqs, self.server_args.max_mamba_cache_size // ratio
+                max_num_reqs, mamba_req_capacity
             )
 
             if max_num_reqs <= 0:

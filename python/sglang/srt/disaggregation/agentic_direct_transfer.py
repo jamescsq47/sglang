@@ -92,6 +92,33 @@ def debug_kv_digest(kv_pool, token_indices) -> str | None:
     return digest.hexdigest()
 
 
+def debug_kv_page_digests(kv_pool, token_indices) -> str | None:
+    """Return compact per-page Attention digests for explicit-path diagnosis."""
+
+    if os.getenv("SGLANG_AGENTIC_KV_DEBUG_PAGE_DIGEST", "0").lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return None
+    page_size = int(getattr(kv_pool, "page_size", 1) or 1)
+    if hasattr(kv_pool, "full_kv_pool"):
+        kv_pool = kv_pool.full_kv_pool
+    indices = torch.as_tensor(
+        token_indices, dtype=torch.long, device=kv_pool.k_buffer[0].device
+    )
+    pages = []
+    for start in range(0, int(indices.numel()), page_size):
+        page_indices = indices[start : start + page_size]
+        digest = hashlib.sha256()
+        for tensor in kv_pool.k_buffer + kv_pool.v_buffer:
+            data = tensor.index_select(0, page_indices).contiguous().view(torch.uint8)
+            digest.update(data.cpu().numpy().tobytes())
+        pages.append(digest.hexdigest()[:16])
+    return ",".join(pages)
+
+
 def _make_kv_args(
     *,
     transfer_backend: TransferBackend,
@@ -229,6 +256,20 @@ def create_agentic_direct_runtime(
         direct_args,
         is_mla_backend(kv_pool),
     )
+    # The role-reversed D->P plane uses allocator pages whose source and
+    # destination pools are registered by independently constructed managers.
+    # NIXL's stock prepped dlist cache assumes the ordinary P->D manager
+    # lifecycle and currently maps these reverse Attention page slots to the
+    # wrong descriptors.  Mamba state already uses explicit-address transfers;
+    # use the same correctness-preserving path for reverse Attention without
+    # changing the normal P->D data plane.
+    manager.disable_prepped_kv = True
+    # A bootstrap registration can race manager construction.  Sending also
+    # gates on disable_prepped_kv, while clearing here prevents stale reverse
+    # descriptors from retaining unnecessary NIXL resources.
+    manager.prep_handles.clear()
+    manager.prep_handles_slice_dst.clear()
+    manager.prep_handle_slice_src = None
     bootstrap_addr = None
     if role is DisaggregationMode.PREFILL:
         # Registration is HTTP and all TP scheduler processes start

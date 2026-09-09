@@ -62,6 +62,8 @@ class SchedulerRequestReceiver:
     stream_output: Callable[..., None]
     get_last_forward_mode: Callable[[], Any]
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
+    prepare_tp_control: Optional[Callable[[], Any]] = None
+    consume_tp_control: Optional[Callable[[List[Any]], List[Any]]] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -86,7 +88,22 @@ class SchedulerRequestReceiver:
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
 
+        # Agentic PD uses the existing native TP request broadcast as its
+        # logical control plane.  Rank 0 snapshots the shared-mailbox state
+        # immediately before that collective; every physical rank then
+        # consumes the exact same admission/terminal command before ordinary
+        # request processing.  Keeping this hook inside the receiver avoids a
+        # second collective and prevents rank-local filesystem timing from
+        # choosing different KV owners.
+        if recv_reqs is not None and self.prepare_tp_control is not None:
+            control = self.prepare_tp_control()
+            if control is not None:
+                recv_reqs.append(control)
+
         recv_reqs = self._broadcast_reqs_across_ranks(recv_reqs)
+
+        if self.consume_tp_control is not None:
+            recv_reqs = self.consume_tp_control(recv_reqs)
 
         recv_reqs = self._apply_mm_receiver(recv_reqs)
 

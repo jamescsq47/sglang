@@ -720,7 +720,23 @@ class PrefillAdder:
                 _rem_tokens = self.rem_chunk_tokens
 
         truncated = req.extend_input_len > _rem_tokens
-        req.set_extend_input_len(min(req.extend_input_len, _rem_tokens))
+        chunk_tokens = min(req.extend_input_len, _rem_tokens)
+        if (
+            truncated
+            and self.page_size > 1
+            and self.is_hybrid_ssm_cache
+            and not self.is_hybrid_swa
+        ):
+            # A continuation may share the Prefill token budget with other
+            # requests.  Keep every non-final boundary page aligned, just as
+            # add_one_req does.  This is required by Mamba Cache V2: once an
+            # unaligned active recurrent state is extended in place, the
+            # intervening page checkpoint cannot be reconstructed from the
+            # Attention pages alone.
+            chunk_tokens = chunk_tokens // self.page_size * self.page_size
+            if chunk_tokens <= 0:
+                return req
+        req.set_extend_input_len(chunk_tokens)
         req.fill_len = len(req.prefix_indices) + req.extend_input_len
         self.can_run_list.append(req)
         self._update_prefill_budget(
@@ -843,8 +859,19 @@ class PrefillAdder:
             if self.rem_chunk_tokens <= 0:
                 return AddReqResult.OTHER
 
-            # Chunked prefill
+            # Chunked prefill.  Hybrid recurrent state is checkpointed at
+            # page-aligned boundaries.  Leaving an arbitrary tail here can
+            # make the following (short) final chunk unable to produce the
+            # floor(prompt/page) Mamba checkpoint: Attention has advanced
+            # past the boundary while the only retained recurrent state is
+            # from an older page.  The ordinary add_one_req path below
+            # already applies this alignment; keep the ignore-eos path
+            # consistent with it.
             trunc_len = self.rem_chunk_tokens
+            if self.is_hybrid_ssm_cache and not self.is_hybrid_swa:
+                trunc_len = trunc_len // self.page_size * self.page_size
+                if trunc_len <= 0:
+                    return AddReqResult.OTHER
 
             req.set_extend_input_len(trunc_len)
             assert len(req.prefix_indices) == 0
@@ -1021,6 +1048,66 @@ class PrefillAdder:
                 )
 
         return self.budget_state()
+
+    def add_one_req_with_private_token_credit(
+        self,
+        req: Req,
+        has_chunked_req: bool,
+        truncation_align_size: Optional[int],
+        *,
+        private_token_credit: int,
+    ):
+        """Admit a request using only its already allocated private KV pages.
+
+        Agentic reverse-KV recovery reserves the complete parent+suffix
+        workset before H2D starts.  Those suffix pages are therefore absent
+        from the allocator's global ``available_size`` and ordinary admission
+        would count them a second time, eventually deadlocking at zero global
+        free pages.  Expose the exact request-private suffix as a temporary
+        credit, while preventing unused credit from becoming spendable by a
+        later request in the same batch.
+        """
+
+        # add_one_req() deliberately reserves max_new + one page beyond the
+        # prompt allocation.  A Prefill worker backed by a complete private
+        # workset does not allocate either here: it consumes the preallocated
+        # prompt suffix and hands the result to Decode.  Include those
+        # conservative admission-only terms (plus one because the ordinary
+        # check rejects equality) so a workset can make progress even when
+        # global free pages are exactly zero.
+        credit = max(0, int(private_token_credit))
+        credit += min(
+            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+            CLIP_MAX_NEW_TOKENS,
+        )
+        credit += self.page_size + 1
+        old_total_offset = self.rem_total_token_offset
+        old_cur_offset = self.cur_rem_token_offset
+        old_can_run = len(self.can_run_list)
+        self.rem_total_token_offset -= credit
+        self.cur_rem_token_offset -= credit
+        try:
+            result = self.add_one_req(
+                req,
+                has_chunked_req=has_chunked_req,
+                truncation_align_size=truncation_align_size,
+            )
+        except Exception:
+            self.rem_total_token_offset = old_total_offset
+            self.cur_rem_token_offset = old_cur_offset
+            raise
+        if len(self.can_run_list) == old_can_run:
+            self.rem_total_token_offset = old_total_offset
+            self.cur_rem_token_offset = old_cur_offset
+        else:
+            # The request may consume less than the page-rounded private
+            # suffix in this chunk.  That remainder belongs to this request,
+            # not to the shared admission budget.
+            self.rem_total_token_offset = max(
+                old_total_offset, self.rem_total_token_offset
+            )
+            self.cur_rem_token_offset = max(old_cur_offset, self.cur_rem_token_offset)
+        return result
 
     def preempt_to_schedule(self, req: Req, server_args: ServerArgs) -> bool:
         """

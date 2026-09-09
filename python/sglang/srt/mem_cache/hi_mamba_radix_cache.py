@@ -186,6 +186,56 @@ class HiMambaRadixCache(MambaRadixCache):
 
         super().__init__(params=params)
 
+    def release_request_generation_cache(
+        self,
+        req,
+        *,
+        committed_len: Optional[int] = None,
+        _defer_if_blocked: bool = True,
+        event_prefix: str = "request_generation_release",
+        allow_shared_ancestors: bool = False,
+    ) -> int:
+        """Release one unlocked hybrid generation from both GPU and Host."""
+
+        del _defer_if_blocked, event_prefix, allow_shared_ancestors
+        if self.disable or not getattr(req, "extra_key", None):
+            return 0
+        length = int(
+            getattr(req, "kv_committed_len", 0)
+            if committed_len is None
+            else committed_len
+        )
+        token_ids = (req.origin_input_ids + req.output_ids)[:length]
+        key = RadixKey(token_ids, req.extra_key).page_aligned(self.page_size)
+        if not len(key):
+            return 0
+        match = self.match_prefix(MatchPrefixParams(key=key))
+        if len(match.device_indices) != len(key):
+            return 0
+        node = match.last_device_node
+        released = 0
+        while (
+            node is not self.root_node
+            and node.full_lock_ref == 0
+            and node.mamba_lock_ref == 0
+            and node.host_ref_counter == 0
+            and node.host_mamba_ref_counter == 0
+            and not node.children
+            and node.key.extra_key == req.extra_key
+        ):
+            parent = node.parent
+            node_tokens = len(node.key)
+            if node.evicted:
+                self._evict_host_leaf(node)
+            elif node.backuped:
+                self._evict_to_host(node)
+                self._evict_host_leaf(node)
+            else:
+                self._evict_regular(node)
+            released += node_tokens
+            node = parent
+        return released
+
     def reset(self) -> None:
         TreeNode.counter = 0
         self._flush_pending_storage_backups_before_reset()
