@@ -3311,12 +3311,22 @@ class DecodeKVCacheOffloadManager:
                 # atomically from D-owned DIRECT_READY to recompute and free D
                 # HBM; do not consume Shared-Host capacity. Candidates whose
                 # tool missed the fast window retain the production Slow path.
-                if (
-                    getattr(
-                        self,
-                        "agentic_fast_direct_failure_recompute",
-                        False,
+                recompute_enabled = getattr(self, "agentic_fast_direct_failure_recompute", False)
+                if os.getenv("SGLANG_AGENTIC_KV_SLOW_CONGESTION_RECOMPUTE", "0").lower() in {"1", "true"}:
+                    from sglang.srt.disaggregation.agentic_slow_congestion import SlowCongestionReader
+                    reader = getattr(self, "_slow_congestion_reader", None)
+                    if reader is None:
+                        reader = self._slow_congestion_reader = SlowCongestionReader(
+                            os.getenv("SGLANG_AGENTIC_KV_PREFILL_LOAD_PATH", "")
+                        )
+                    recompute_enabled = reader.congested()
+                    logger.info(
+                        "AgenticKV slow_congestion_decision snapshot=%s congested=%s q=%s",
+                        snapshot_id, recompute_enabled,
+                        None if reader.sample is None else reader.sample.get("q"),
                     )
+                if (
+                    recompute_enabled
                     and (
                         bool(candidate.get("fast_arrival_seen"))
                         # Releasing a failed claim removes fast_arrival_seen,

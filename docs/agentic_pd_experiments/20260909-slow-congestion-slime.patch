@@ -1,0 +1,324 @@
+diff --git a/examples/pd/docs/AGENTIC_PD_DESIGN_INVARIANTS.md b/examples/pd/docs/AGENTIC_PD_DESIGN_INVARIANTS.md
+index 19058e4..ed084a9 100644
+--- a/examples/pd/docs/AGENTIC_PD_DESIGN_INVARIANTS.md
++++ b/examples/pd/docs/AGENTIC_PD_DESIGN_INVARIANTS.md
+@@ -10,23 +10,69 @@
+ 
+ 传统推理引擎通常把工具调用视为当前请求已经结束并释放 KV；工具返回后，再把完整历史作为新请求重新 Prefill。这会浪费大量算力，尤其是在工具调用较多时。控制并发数或预测工具时间只能缓解问题：许多工具等待时间不可预测（例如用户交互），限制并发也会降低吞吐。
+ 
+-### 当前新方法定义（2026-09-08）
+-
+-当前新方法采用 **D→P 快慢路径 + Direct 失败显式重算**：
++### 当前试验（2026-09-09，全局Slow恢复拥堵反馈）
++
++仅决定快工具Direct失败后的出口，不修改任何physical ownership/fence/workset/TP协议。
++开关 `SGLANG_AGENTIC_KV_SLOW_CONGESTION_RECOMPUTE` 默认关闭；开启时覆盖固定重算策略。
++Router按正在处理的下一轮后台dispatch记录parent generation引用，dispatch取消/结束退出、重复请求引用计数，
++客户端断开但singleflight后台仍继续时仍计入真实恢复工作，
++跨P重路由不新增generation。复用原有Host容量账本读取/遍历，不增加逐snapshot文件或RPC查询。
++Q=工具已返回且Host durable，尚未进入H2D worker的唯一snapshot数量。
++HOST_READY和H2D_LOADING的pinned/leased都计入；任一TP rank到io_inflight/handed后不计，
++恢复失败退回Host时可重新计入。io_inflight包含H2D的CPU提交准备，不宣称CUDA DMA已开始；
++这样沿用已有阶段写入，不为拥堵统计增加传输路径上的账本提交。
++每秒采样；默认high=4×全局逻辑H2D lanes、low=1×lanes。c512 4P×2lane即32/8。
++连续两次Q>=high进入拥堵，Q<=low退出，中间保留原模式。
++模式随现有P压力快照发布；D后台最多每秒读取一次，缺失/超过3秒陈旧时保守Slow。
++工具未返回始终Slow；快工具Direct失败后：正常Slow、拥堵显式重算。
++重算仍需P退还claim、DMA fence终态、原子FAILED和重算路由持久化后才释放D。
++这些是启动试验阈值，不是已验证最优值；仍用c512、300+1200正式验收。
++
++### 上一轮试验（2026-09-09，所有快工具 Direct 失败均重算）
++
++在下述4888恢复基线上，仅扩大失败出口：工具超过1秒仍走Slow；快工具Direct失败，
++无论是否曾claim，都显式完整重算。已经claim的请求必须先完成现有DMA/接收取消fence，
++P将manifest退还DIRECT_READY，再由D原子转FAILED、持久化recompute路由，最后释放D源KV。
++快工具身份复用现有已验证的fast_arrival_seen_at，不新增容量采样/控制RPC。
++该节覆盖下文历史容量判定说明。不开启原生HiCache/Mooncake，不改Forward/TP调度。
++验收为同配置c512、300秒预热+1200秒正式测试；须CPU回归和独立审核GO后启动。
++
++### 恢复基线（2026-09-09，用户要求恢复4888组）
++
++用户明确撤回本轮容量判定与异步页索引试验，恢复试验前的运行逻辑。
++本节覆盖下文保留的容量判定试验说明：工具超过1秒走Slow；快工具尝试Direct，
++未建链超时按原有分支显式重算，已claim后的接收/建链失败仍经fence转Slow。
++不要求真实容量不足证据才重算，不把“未claim”声称为“没有内存”。
++P→D继续先Prefill后分配D，D暂时不能接收则使用Shared Host Arena；原生HiCache/Mooncake关闭。
++恢复 `SGLANG_AGENTIC_KV_FAST_DIRECT_FAILURE_RECOMPUTE=true`，工具/建链阈值各1秒。
++本轮新增容量开关、拒绝证据发布和异步页索引代码撤回，失败实验记录保留。
++历史恢复经独立核对：D manager与4888组记录的SHA256 `178d20e410e400537850f3f90ae83ebe33f7de78c080916fc770bba5c6eb55ce` 一致；scheduler/environ/Direct传输/NIXL连接文件亦与历史补丁一致。
++保留后来添加的“无D→P Host时仍可预热P→D Host”启动兼容性修复，它不改变本次双向Host配置；不宣称整个仓库逐字节回到历史版本。匹配旧策略的CPU回归272项通过，未跑GPU。
++旧组实测吞吐4888.225 token/s，统一口径Direct成功率92.37%；恢复代码不等于已经重新测出该吞吐。
++不重新运行GPU实验；后续若再修改或运行，仍须遵守生命周期与独立审核门禁。
++
++### 已撤回的容量判定试验（历史设计，不是当前运行策略）
++
++当前新方法采用 **D→P 快慢路径 + 明确完整 workset 容量不足时重算**：
+ 
+ - 工具等待阈值默认 1 秒；1 秒内工具未返回的 snapshot 进入 D→P Slow。
+ - 工具在 1 秒内返回时尝试 D→P Direct；从工具返回开始，Direct admission、
+   receiver 建立与传输启动共享一个 1 秒 deadline。
+-- deadline 内未成功建立 Direct 的 snapshot 不再转 Slow，而是原子切换为
+-  `RECOMPUTE_REQUIRED`，由 P 在下一轮完整重算。重算路由持久化后，D 才能释放
+-  对应 parent KV。
+-- 因而 Slow 只承接慢工具，Direct 建立失败只触发显式重算。两类原因必须分别
+-  计数，不能把重算记成 KV 丢失或 Slow fallback。
+-
+-该选择来自对齐显存配置下的 BrowseComp/Qwen3-8B/c512 消融：相对于所有
+-Direct 失败都转 Slow，利用 P 侧剩余算力做少量重算取得了更高 Decode 吞吐。
+-它是当前默认设计，但其他模型、数据集、并发和 P:D 配比下的旧结果均需按此语义
+-重跑，不能直接沿用旧“Direct 失败→Slow”结果。
++- 对快工具，只有 P 原生分配边界明确确认完整 workset 不足、且原子关闭了从未
++  获得 grant 的本次 Direct 申请，才允许显式完整重算；不是用“没有 claim”推断没有内存。
++- 已获 grant 后建链失败、控制处理超时、没有可靠容量拒绝证据时，均转 Slow。
++  工具超时同样走 Slow。任何已提交 DMA 仍须先通过原有物理 fence。
++- 容量拒绝沿用已有 manifest/CAS 和 D 轮询；重算路由持久化后，D 才释放 parent KV。
++- 分别统计慢工具、快工具建链失败转 Slow、容量拒绝重算。快请求 Direct 成功率的
++  分母必须包括快工具转 Slow，不能只统计 Direct 与重算。
++
++旧 c512 的 4,888.225 token/s 组混合了 424 次重算和 125 次快工具转 Slow，
++仅可作为历史性能参考，不能声称它已实现上述统一判定。其正式窗口快请求 Direct
++成功率是 6649/(6649+424+125)=92.37%。
++
++本轮修正通过 `SGLANG_AGENTIC_KV_DIRECT_CAPACITY_RECOMPUTE=true` 显式启用，
++与原有“所有建链失败都重算”的消融开关互斥。容量拒绝和异步页索引准备先限定 TP=1；
++TP>1 的既有配置与组调度不改动，不能将本轮 TP=1 验收自动外推到 TP>1。
+ 
+ ## 1. KV cache 的管理单位
+ 
+@@ -73,14 +119,14 @@ Decode 完成一轮后，需要准备把该 request-generation 的完整 parent
+ #### 快路径
+ 
+ - 如果工具在阈值内返回，且 P 可以为完整下一轮 workset 分配空间，则使用 NVLink/NIXL 直接把 parent KV 从 D HBM 传到 P HBM。
+-- 从工具返回时刻开始，P admission、Direct receiver 建立与传输启动共用同一个 Direct deadline，默认 1 秒；P claim 不得重新开始一个新的 deadline。deadline 内尚未成功启动 Direct 时立即进入显式重算，而不是转 Slow。已经提交给传输层的 DMA 必须先按物理 fence 收敛，不能在仍可能访问源页时强行切换所有权。
++- 从工具返回时刻开始，P admission、Direct receiver 建立与传输启动共用同一个 Direct deadline，默认 1 秒；P claim 不得重新开始一个新的 deadline。尚未成功启动 Direct 时，没有可靠容量拒绝证据就转 Slow；已经获得 workset 的建链失败同样转 Slow。已经提交给传输层的 DMA 必须先按物理 fence 收敛，不能在仍可能访问源页时强行切换所有权。
+ - 完整 workset 包括 parent KV 和新增 tool-result Prompt 所需 KV 空间；不能只接收 parent，随后因没有 suffix 空间而死锁。
+ - P Router 只使用 KV 容量做选择：在能容纳完整 workset 的候选中选择剩余 KV tokens 最大的 P。剩余量必须扣除尚未反映到物理采样中的 Direct/Slow reservation，以避免多个并发 snapshot 选择同一个过期容量；不再把请求队列、Host Arena 压力或加权综合分数用于 D→P 选 P。
+ - Direct 成功后，P 对该 snapshot 取得所有权，D 立即释放对应 HBM KV。
+ 
+ #### 慢路径
+ 
+-- 如果工具在 1 秒阈值内没有返回，则进入慢路径。Direct 建立失败不再进入这条路径；一个慢工具或失败的 Direct 都不得阻塞后续 Direct。
++- 如果工具在 1 秒阈值内没有返回，则进入慢路径。快工具建链失败且未获得可靠容量拒绝证据也进入 Slow；一个慢工具或失败的 Direct 都不得阻塞后续 Direct。
+ - Slow 使用两阶段独立路由。进入 Slow 时只比较各 D→P Shared Host Arena 的可用字节数（容量减去已用空间和尚未反映到物理账本的 Host reservation），选择 Host 剩余空间最大的 Arena；此时不按 P HBM 压力选计算节点。
+ - D 通过 PCIe 将完整 snapshot offload 到选中的 D→P Shared Host Arena；tool 执行与 KV offload 并行。Host Arena 的物理落点不绑定后续 Prefill P；同机 P 可以通过 ledger 中的 `arena_path + offset` 读取该完整 extent。
+ - Host snapshot durable 后，D 必须立即释放对应 HBM KV，不能等待工具结束，也不能等待 P 有空间。
+@@ -88,16 +134,19 @@ Decode 完成一轮后，需要准备把该 request-generation 的完整 parent
+ - Host→P load 完成、P 已取得完整 snapshot 后，立即释放 Shared Host Arena 中该 snapshot 的空间。
+ - Decode 节点继续使用 SGLang Radix Cache 共享前缀，但 request-generation 的传输和释放必须保持完整、引用安全。
+ 
+-#### Direct 失败重算
++#### Direct 容量拒绝重算
+ 
+-- 工具在阈值内返回、但 Direct 在统一 1 秒 deadline 内没有成功启动时，D 将
+-  snapshot 原子标记为 `RECOMPUTE_REQUIRED`，并发布持久化的完整重算路由。
++- 工具在阈值内返回时，P 分配器在现有安全边界比较实际可用页（扣除 native chunk
++  已承诺的 suffix）与分别向上取整的 parent + suffix。明确不足时，原子关闭并
++  tombstone 从未获 grant 的 Direct owner；后台通过既有 claim-safe CAS 发布
++  `direct_workset_capacity_refused`，D 再发布持久化的完整重算路由。
++- 一个 generation 曾经获得 grant 后，即使该 grant 后来因建链失败而释放，也不能
++  再据此发布容量拒绝。过期 Router 采样、lane 满、未调度、未知 allocator 错误均不构成证据。
+ - 只有重算路由已经可见、且任何可能访问旧源页的 DMA 已经通过 fence 收敛后，
+   D 才释放 parent KV；不得留下 `DIRECT_READY`、旧 claim 或无人持有的 snapshot。
+ - 下一轮在所选 P 上按完整 Prompt 重新 Prefill。该额外 Prefill、触发次数和
+   Direct 失败原因必须单独统计。
+-- 这是有意识地用 P 侧剩余算力换取更低 Host 恢复压力，不属于父 KV
+-  correctness failure。
++- 这是有明确原因的重算，不属于父 KV correctness failure；是否带来吞吐收益须实测。
+ 
+ #### P Router
+ 
+@@ -105,8 +154,8 @@ Decode 完成一轮后，需要准备把该 request-generation 的完整 parent
+ - D→P Slow 的 D2H 落点只根据 Shared Host Arena 剩余字节选择；Host durable 后的 H2D/Prefill 落点再独立根据 P 的剩余 KV tokens 选择。不得把 Host 剩余量与 P HBM 剩余量合成为加权 pressure score，也不得因为 Host 落在某个 P 管理的 Arena 就把恢复计算固定到该 P。
+ - 选择 P 时必须同时考虑 parent KV 和新增 tool-result tokens 的完整 workset，防止 P 被 parent KV 塞满后无法 Prefill。
+ - TP 场景由逻辑 TP rank 0 做一次组级决策并广播；所有 rank 必须选择同一个逻辑 P 组。
+-- 若 Direct 失败，TP=1 与 TP>1 都进入相同的组级显式重算语义；不得再迁移到
+-  Slow，也不得因重路由造成 snapshot 丢失或多重所有权。
++- Direct 失败只有取得可靠容量拒绝证据才进入重算，否则进入 Slow。TP 不得以某个
++  rank 的局部拒绝代替组级证据，也不得因重路由造成 snapshot 丢失或多重所有权。
+ 
+ ### 2.3 Prefill 调度
+ 
+@@ -135,8 +184,8 @@ Direct 与 Slow 必须有独立 I/O 队列，并与计算进度解耦。
+ 
+ ### D 侧
+ 
+-- D→P Direct、Slow 与重算发布完全解耦。Direct 失败后立即发布显式重算，不能
+-  转入 Slow，也不能阻塞后续 Direct；慢工具仍可独立进入 Slow。
++- D→P Direct、Slow 与重算发布完全解耦。容量拒绝发布显式重算，其他 Direct 失败
++  转入 Slow；二者均不能阻塞后续 Direct，慢工具仍可独立进入 Slow。
+ - Slow 不做全量 candidate 扫描：每个 D rank 维护 sticky active window，并用 round-robin progress budget 推进。配置上限默认 active window=8、每轮 budget=8，但物理上限按 DMA group 数裁剪；默认 4 个 DMA group，因此同时只让 4 个 snapshot 取得 D2H pipeline，窗口外 snapshot 继续由 D HBM 完整持有，不会取得部分 Host ownership。一次 progress visit 对一个 snapshot 最多推进一个物理阶段，不能把整个 snapshot 的 chunk 全部排入 CUDA 队列。
+ - D→P D2H 使用独立低优先级 CUDA stream。传输 worker 从进程内有界 registered-window cache 取得最终 request extent 所覆盖的窗口，并在后台生成一次 CPU token-index mirror；CUDA 13 `cuMemcpyBatchAsync` 把相邻 allocator tokens 合并为 page/run 后批量提交 `HBM→registered final extent`，不再启动占用 SM 的 gather kernel。完成 event 同时是该 chunk 的物理完成与 Host durable fence，不再有 CPU commit memcpy。默认 batch 为 4096 tokens；窗口默认 8 GiB、通用 cache 默认 64 GiB。全局路由下一个进程可能访问 4 个 P domain，正式 Qwen3-8B 4P:4D 配置因此使用 1280 GiB 上限（`4 * (256+64) GiB`）；首次发现 arena 时只启动后台预注册线程，线程逐个 8 GiB 窗口 acquire/release，不能在传输 progress 线程内同步注册完整个 256 GiB arena。只能淘汰 refcount=0 的窗口，snapshot close 先释放窗口引用，不能逐请求 unregister。注册或 batch API 在任何 CUDA 提交前不可用时，才安全回退到原 gather→pinned-bounce/CPU-commit 路径。每条 lane、每个 snapshot 同时最多一个在途 CUDA batch；正式配置只使用两条经 Forward 隔离测试验证的 lane。
+ - Host durable 或 Direct 成功后，及时删除 D 上该 request-generation 的 KV，不做无必要的保守保留。
+diff --git a/examples/pd/late_binding_router.py b/examples/pd/late_binding_router.py
+index b6c0583..09cdd68 100644
+--- a/examples/pd/late_binding_router.py
++++ b/examples/pd/late_binding_router.py
+@@ -411,6 +411,14 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
+         self._d2p_host_ledger = (
+             SharedHostStagingLedger(staging_path) if staging_path else None
+         )
++        self._slow_congestion = None
++        if os.getenv("SGLANG_AGENTIC_KV_SLOW_CONGESTION_RECOMPUTE", "0").lower() in {"1", "true"}:
++            from sglang.srt.disaggregation.agentic_slow_congestion import SlowRecoveryCongestion
++            lanes = max(1, _env_int("SGLANG_AGENTIC_KV_P_H2D_MAX_INFLIGHT", 2)) * len(self.prefill_urls)
++            self._slow_congestion = SlowRecoveryCongestion(
++                _env_int("SGLANG_AGENTIC_KV_SLOW_CONGESTION_HIGH", 4 * lanes),
++                _env_int("SGLANG_AGENTIC_KV_SLOW_CONGESTION_LOW", lanes),
++            )
+         # One logical request-generation may outlive an HTTP client's timeout.
+         # Keep the actual P->D dispatch detached from that client and let every
+         # retry await the same task.  Without this fence, a retry can select a
+@@ -774,11 +782,14 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
+         temporary.write_bytes(orjson.dumps(payload))
+         os.replace(temporary, path)
+ 
+-    def _prefill_arena_bytes(self) -> list[int]:
++    def _prefill_arena_bytes(self, recovery_parents=None):
+         used = [0] * len(self.prefill_urls)
+         ledger = self._d2p_host_ledger
+         if ledger is None:
+-            return used
++            return used if recovery_parents is None else (used, 0)
++        q = 0
++        if recovery_parents is not None:
++            from sglang.srt.disaggregation.agentic_slow_congestion import waiting_for_recovery
+         live_states = {
+             HostStageState.HOST_RESERVED.value,
+             HostStageState.HOST_WRITING.value,
+@@ -795,13 +806,17 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
+         # not.  Add the former only when this environment exposes it.
+         if _HOST_STAGE_EVICTING is not None:
+             live_states.add(_HOST_STAGE_EVICTING.value)
+-        for entry in ledger.snapshot_entries().values():
++        for snapshot_id, entry in ledger.snapshot_entries().items():
++            # Same existing ledger read/iteration, unique generation IDs;
++            # never sum per-P caches or scan arrival marker directories.
++            if recovery_parents is not None and snapshot_id in recovery_parents:
++                q += int(waiting_for_recovery(entry))
+             if entry.get("state") not in live_states:
+                 continue
+             domain = int(entry.get("arena_domain", -1))
+             if 0 <= domain < len(used):
+                 used[domain] += int(entry.get("byte_size", 0))
+-        return used
++        return used if recovery_parents is None else (used, q)
+ 
+     def _p2d_pressure_by_domain(
+         self, ledger_entries: Optional[dict[str, dict[str, Any]]] = None
+@@ -920,7 +935,13 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
+                     ),
+                     return_exceptions=True,
+                 )
+-                arena_used = await asyncio.to_thread(self._prefill_arena_bytes)
++                policy = getattr(self, "_slow_congestion", None)
++                if policy is None:
++                    arena_used = await asyncio.to_thread(self._prefill_arena_bytes)
++                else:
++                    arena_used, q = await asyncio.to_thread(
++                        self._prefill_arena_bytes, frozenset(policy.parents)
++                    )
+                 domains = []
+                 for domain, result in enumerate(fetched):
+                     if isinstance(result, BaseException):
+@@ -941,6 +962,12 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
+                     "published_at": time.time(),
+                     "domains": domains,
+                 }
++                if policy is not None:
++                    previous = policy.latest
++                    payload["slow_recovery"] = policy.sample(q)
++                    if policy.latest is not previous:
++                        logger.info("PD_SLOW_CONGESTION q=%d congested=%s high=%d low=%d",
++                                    q, policy.blocked, policy.high, policy.low)
+                 # Publish the sample and its causal epoch together, without an
+                 # intervening await.  A Direct terminal may therefore either
+                 # keep its bridge credit or rely on this physical snapshot,
+@@ -4024,6 +4051,22 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
+                     )
+         except (TypeError, ValueError):
+             metadata = None
++        policy = getattr(self, "_slow_congestion", None)
++        parent_id = metadata.parent.snapshot_id if metadata is not None and metadata.parent is not None else None
++        if policy is not None and parent_id is not None:
++            policy.enter(parent_id)
++        try:
++            return await self._late_dispatch_with_metadata(
++                session, modified_request, prefill_server, endpoint, headers, metadata
++            )
++        finally:
++            if policy is not None and parent_id is not None:
++                policy.leave(parent_id)
++
++    async def _late_dispatch_with_metadata(
++        self, session, modified_request, prefill_server, endpoint, headers, metadata
++    ):
++        rooms = self._rooms(modified_request)
+         parent_turn = metadata is not None and metadata.parent is not None
+         prefill_work: Optional[_PrefillWorkReservation] = None
+         # Preserve the application-visible tool-return time independently of
+diff --git a/examples/pd/tests/test_slow_congestion_router.py b/examples/pd/tests/test_slow_congestion_router.py
+new file mode 100644
+index 0000000..c82f362
+--- /dev/null
++++ b/examples/pd/tests/test_slow_congestion_router.py
+@@ -0,0 +1,60 @@
++import asyncio
++from types import SimpleNamespace
++
++import pytest
++
++from late_binding_router import LateBindingMiniLoadBalancer
++from sglang.srt.disaggregation.agentic_slow_congestion import SlowRecoveryCongestion
++
++
++def test_global_q_reuses_one_ledger_read_excludes_slow_tools_and_domains():
++    router = object.__new__(LateBindingMiniLoadBalancer)
++    router.prefill_urls = ["p0", "p1"]
++    entries = {
++        "fast:0": dict(state="host_ready", arena_domain=0, recovery_domain=1, byte_size=10),
++        "slow-tool:0": dict(state="host_ready", arena_domain=0, byte_size=20),
++        "leased:0": dict(state="h2d_loading", arena_domain=1, byte_size=30,
++                         recovery_claims={"0": {"phase": "leased"}}),
++        "dma:0": dict(state="h2d_loading", arena_domain=1, byte_size=40,
++                      recovery_claims={"0": {"phase": "io_inflight"}}),
++        "evicted:0": dict(state="recompute_required", arena_domain=1, byte_size=50),
++    }
++    reads = []
++    router._d2p_host_ledger = SimpleNamespace(
++        snapshot_entries=lambda: reads.append(1) or entries
++    )
++    parents = frozenset({"fast:0", "leased:0", "dma:0", "evicted:0"})
++    used, q = router._prefill_arena_bytes(parents)
++    assert used == [30, 70]
++    assert q == 2 and len(reads) == 1
++    entries["fast:0"]["recovery_domain"] = 0
++    assert router._prefill_arena_bytes(parents)[1] == 2
++    entries["leased:0"].update(state="host_ready", recovery_claims={})
++    assert router._prefill_arena_bytes(parents)[1] == 2
++    assert router._prefill_arena_bytes() == [30, 70]
++
++
++@pytest.mark.parametrize("cancel", [False, True])
++def test_parent_reference_cleanup_including_early_resolve_failure(cancel):
++    async def scenario():
++        router = object.__new__(LateBindingMiniLoadBalancer)
++        router._slow_congestion = SlowRecoveryCongestion(32, 8)
++        seen = []
++
++        async def dispatch(*args):
++            seen.append(dict(router._slow_congestion.parents))
++            if cancel:
++                raise asyncio.CancelledError()
++            raise RuntimeError("resolve failed before original dispatch try")
++
++        router._late_dispatch_with_metadata = dispatch
++        request = {"bootstrap_room": 1, "sampling_params": {"custom_params": {
++            "agentic_request_id": "agent", "agentic_generation": 1,
++            "agentic_parent_generation": 0,
++        }}}
++        with pytest.raises(asyncio.CancelledError if cancel else RuntimeError):
++            await router._late_dispatch(None, request, "p0", "generate", {})
++        assert seen == [{"agent:0": 1}]
++        assert not router._slow_congestion.parents
++
++    asyncio.run(scenario())

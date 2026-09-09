@@ -9440,9 +9440,10 @@ def test_force_slow_ablation_stages_immediately_without_direct_wait():
     ],
 )
 @pytest.mark.parametrize("returned_claim", [False, True])
+@pytest.mark.parametrize("adaptive_blocked", [False, True])
 def test_fast_direct_failure_recompute_keeps_slow_tools_on_host(
     tp_world_size, fast_arrival_seen, expected_recompute, expected_stage,
-    returned_claim,
+    returned_claim, adaptive_blocked, monkeypatch,
 ):
     snapshot_id = f"request:fast-recompute:{fast_arrival_seen}"
     manifest = SimpleNamespace(
@@ -9520,6 +9521,11 @@ def test_fast_direct_failure_recompute_keeps_slow_tools_on_host(
         ),
     )
 
+    if adaptive_blocked:
+        monkeypatch.setenv("SGLANG_AGENTIC_KV_SLOW_CONGESTION_RECOMPUTE", "true")
+        manager._slow_congestion_reader = SimpleNamespace(
+            congested=lambda: True, sample={"q": 32}
+        )
     DecodeKVCacheOffloadManager._check_agentic_direct_progress(
         manager, progress_relay=False
     )
@@ -9536,7 +9542,8 @@ def test_fast_direct_failure_recompute_keeps_slow_tools_on_host(
 @pytest.mark.parametrize("sent", [False, True])
 @pytest.mark.parametrize("poll_state", [KVPoll.Success, KVPoll.Failed, KVPoll.Transferring])
 @pytest.mark.parametrize("enabled", [False, True])
-def test_returned_direct_claim_policy_respects_physical_fence(sent, poll_state, enabled):
+@pytest.mark.parametrize("adaptive", [None, False, True])
+def test_returned_direct_claim_policy_respects_physical_fence(sent, poll_state, enabled, adaptive, monkeypatch):
     request = RequestGeneration("returned-direct-policy", 1)
     manifest = SimpleNamespace(
         request=request, snapshot_id=request.snapshot_id,
@@ -9576,10 +9583,15 @@ def test_returned_direct_claim_policy_respects_physical_fence(sent, poll_state, 
             events.append("slow") or value.update(staging=True) or True
         ),
     )
+    if adaptive is not None:
+        monkeypatch.setenv("SGLANG_AGENTIC_KV_SLOW_CONGESTION_RECOMPUTE", "true")
+        manager._slow_congestion_reader = SimpleNamespace(
+            congested=lambda: adaptive, sample={"q": 32 if adaptive else 0}
+        )
     DecodeKVCacheOffloadManager._check_agentic_direct_progress(manager, progress_relay=False)
     if sent and poll_state == KVPoll.Transferring:
         assert events == []
-    elif enabled:
+    elif (enabled if adaptive is None else adaptive):
         assert events == ["terminal", "recompute", "cleanup", "release"]
     else:
         assert events == ["slow", "host_writing"]
