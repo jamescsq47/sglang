@@ -224,7 +224,7 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 from sglang.srt.managers.session_controller import SessionController
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.common import release_kv_cache, release_unadmitted_mamba_cow
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
@@ -302,6 +302,9 @@ class AgenticPWorksetLease:
     allocated_tokens: int
     device_indices: torch.Tensor
     parent_page_indices: np.ndarray
+    state_device_indices: Tuple[torch.Tensor, ...] = ()
+    runtime_state_device_indices: Tuple[torch.Tensor, ...] = ()
+    runtime_state_req: Any = None
     parent_bound: bool = False
     state: str = "active"
     suffix_cursor: int = 0
@@ -329,8 +332,15 @@ class AgenticPWorksetLease:
 class AgenticPWorksetLeaseBroker:
     """Thread-safe intent queue with scheduler-owned physical allocation."""
 
-    def __init__(self, page_size: int):
+    def __init__(self, page_size: int, *, state_allocators=(), mamba_req_to_token_pool=None):
         self.page_size = int(page_size)
+        self._state_allocators = tuple(state_allocators)
+        self._mamba_req_to_token_pool = mamba_req_to_token_pool
+        self._runtime_state_slots = 1
+        if mamba_req_to_token_pool is not None and getattr(
+            mamba_req_to_token_pool, "enable_mamba_extra_buffer", False
+        ):
+            self._runtime_state_slots += int(mamba_req_to_token_pool.mamba_ping_pong_track_buffer_size)
         self._intents: Dict[str, Tuple[str, int, int]] = {}
         self._leases: Dict[str, AgenticPWorksetLease] = {}
         self._release_requested: Dict[str, int] = {}
@@ -549,6 +559,14 @@ class AgenticPWorksetLeaseBroker:
             self._release_requested[snapshot_id] = current.lease_id
             return True
 
+    def _release_hybrid_lease_slots(self, lease):
+        for pool, indices in zip(self._state_allocators, lease.state_device_indices):
+            pool.free(indices)
+        for pool, indices in zip(self._state_allocators, lease.runtime_state_device_indices):
+            pool.free(indices)
+        lease.state_device_indices = ()
+        lease.runtime_state_device_indices = ()
+
     def service(
         self,
         allocator,
@@ -582,6 +600,7 @@ class AgenticPWorksetLeaseBroker:
                         if lease.parent_bound
                         else lease.device_indices
                     )
+                    self._release_hybrid_lease_slots(lease)
                     if self._tp_plan_epoch >= 0:
                         self._tp_retired_in_epoch.add(snapshot_id)
 
@@ -608,6 +627,7 @@ class AgenticPWorksetLeaseBroker:
                         )
                     self._leases.pop(snapshot_id, None)
                     allocator.free(lease.device_indices)
+                    self._release_hybrid_lease_slots(lease)
                     self._tp_release_pending.pop(snapshot_id, None)
                 for snapshot_id, cancel_owner in tuple(
                     self._tp_cancel_pending.items()
@@ -710,6 +730,30 @@ class AgenticPWorksetLeaseBroker:
                     if allocation_plan is not None:
                         break
                     continue
+                state_device_indices = []
+                runtime_state_device_indices = []
+                for state_allocator in self._state_allocators:
+                    state_indices = state_allocator.alloc(1)
+                    runtime_indices = state_allocator.alloc(self._runtime_state_slots)
+                    if state_indices is None or runtime_indices is None:
+                        if state_indices is not None:
+                            state_allocator.free(state_indices)
+                        if runtime_indices is not None:
+                            state_allocator.free(runtime_indices)
+                        for pool, indices in zip(self._state_allocators, state_device_indices):
+                            pool.free(indices)
+                        for pool, indices in zip(self._state_allocators, runtime_state_device_indices):
+                            pool.free(indices)
+                        allocator.free(device_indices)
+                        device_indices = None
+                        break
+                    state_device_indices.append(state_indices)
+                    runtime_state_device_indices.append(runtime_indices)
+                if device_indices is None:
+                    self._allocation_failures += 1
+                    if allocation_plan is not None:
+                        break
+                    continue
                 parent_indices = device_indices[:parent_allocated]
                 page_indices = kv_to_page_indices(
                     parent_indices.cpu().numpy(), self.page_size
@@ -724,6 +768,8 @@ class AgenticPWorksetLeaseBroker:
                     allocated_tokens=allocated_tokens,
                     device_indices=device_indices,
                     parent_page_indices=page_indices,
+                    state_device_indices=tuple(state_device_indices),
+                    runtime_state_device_indices=tuple(runtime_state_device_indices),
                 )
                 self._next_lease_id += 1
                 self._grants += 1
@@ -948,6 +994,49 @@ class AgenticPWorksetLeaseBroker:
             self._grant_events.clear()
             return events
 
+    def attach_runtime_state_for_bind(
+        self, snapshot_id: str, req, lease: AgenticPWorksetLease
+    ) -> None:
+        """Attach pre-reserved active/tracking slots before native Mamba COW."""
+
+        with self._lock:
+            current = self._leases.get(snapshot_id)
+            if current is None or current.lease_id != lease.lease_id:
+                raise RuntimeError(f"workset lease disappeared for {snapshot_id}")
+            if current.state != "binding" or not current.parent_bound:
+                raise RuntimeError(
+                    f"cannot attach runtime state from {current.state} workset"
+                )
+            if not current.runtime_state_device_indices:
+                return
+            if current.runtime_state_req is not None:
+                if current.runtime_state_req is req:
+                    return
+                raise RuntimeError("runtime Mamba reservation has another owner")
+            if getattr(req, "mamba_pool_idx", None) is not None:
+                raise RuntimeError("request already owns active Mamba state")
+            if len(current.runtime_state_device_indices) != 1:
+                raise RuntimeError("V1 supports exactly one Mamba state component")
+            reserved = current.runtime_state_device_indices[0]
+            req.mamba_pool_idx = reserved[0]
+            req.mamba_needs_clear = False
+            pool = self._mamba_req_to_token_pool
+            if pool is not None and getattr(pool, "enable_mamba_extra_buffer", False):
+                buffer_size = int(pool.mamba_ping_pong_track_buffer_size)
+                buffer = torch.full(
+                    (buffer_size,),
+                    -1,
+                    dtype=reserved.dtype,
+                    device=reserved.device,
+                )
+                ping_pong = reserved[1:]
+                if ping_pong.numel() > buffer_size:
+                    raise RuntimeError("too many reserved Mamba tracking slots")
+                buffer[: ping_pong.numel()] = ping_pong
+                req.mamba_ping_pong_track_buffer = buffer
+                req.mamba_next_track_idx = 0
+            current.runtime_state_req = req
+
     def handoff_to_req(
         self, snapshot_id: str, req, lease: AgenticPWorksetLease
     ) -> None:
@@ -979,6 +1068,13 @@ class AgenticPWorksetLeaseBroker:
                     f"workset prompt changed for {snapshot_id}: "
                     f"reserved={current.prompt_tokens} actual={actual_prompt_tokens}"
                 )
+            if current.state_device_indices:
+                raise RuntimeError("Radix checkpoint ownership was not committed")
+            if current.runtime_state_device_indices:
+                if current.runtime_state_req is not req or req.mamba_pool_idx is None:
+                    raise RuntimeError("runtime Mamba reservation was not attached")
+                current.runtime_state_device_indices = ()
+                current.runtime_state_req = None
             current.state = "handed"
             self._intents.pop(snapshot_id, None)
             # This marker is the scheduler-visible ownership contract.  The
@@ -989,6 +1085,9 @@ class AgenticPWorksetLeaseBroker:
             req._agentic_p_workset_lease = current
             req._agentic_p_workset_broker = self
             req._agentic_workset_suffix_indices = current.remaining_suffix_indices
+            if getattr(req, "mamba_pool_idx", None) is not None:
+                req._agentic_mamba_runtime_reserved = True
+                req.mamba_last_track_seqlen = current.parent_tokens
 
     def consume_suffix(
         self,
@@ -1174,8 +1273,11 @@ class AgenticPWorksetLeaseBroker:
             return False
 
     def commit_parent_bound(
-        self, snapshot_id: str, lease: AgenticPWorksetLease
+        self, snapshot_id: str, lease: AgenticPWorksetLease, *,
+        state_donated_to_radix: bool = False, state_duplicate: bool = False,
     ) -> None:
+        if state_donated_to_radix and state_duplicate:
+            raise ValueError("Mamba state cannot be both donated and duplicate")
         with self._lock:
             current = self._leases.get(snapshot_id)
             if current is None or current.lease_id != lease.lease_id:
@@ -1184,6 +1286,13 @@ class AgenticPWorksetLeaseBroker:
                 raise RuntimeError(
                     f"cannot bind {current.state} workset lease for {snapshot_id}"
                 )
+            if current.state_device_indices:
+                if not (state_donated_to_radix or state_duplicate):
+                    raise RuntimeError("hybrid parent bind did not settle state ownership")
+                if state_duplicate:
+                    for pool, indices in zip(self._state_allocators, current.state_device_indices):
+                        pool.free(indices)
+                current.state_device_indices = ()
             current.parent_bound = True
 
     def abort_bind(
@@ -1201,6 +1310,15 @@ class AgenticPWorksetLeaseBroker:
                 return False
             if current.state != "binding":
                 return False
+            attached_req = current.runtime_state_req
+            if attached_req is not None:
+                attached_req.mamba_pool_idx = None
+                attached_req.mamba_ping_pong_track_buffer = None
+                attached_req.mamba_next_track_idx = None
+                attached_req.mamba_cow_src_index = None
+                if hasattr(attached_req, "_agentic_mamba_cow_dst_indices"):
+                    delattr(attached_req, "_agentic_mamba_cow_dst_indices")
+                current.runtime_state_req = None
             if self._tp_plan_epoch >= 0:
                 # A bind failure is a TP-group retirement.  It must be
                 # broadcast and committed at one scheduler-safe boundary;
@@ -2117,8 +2235,11 @@ class Scheduler(
         # Direct and Slow restore share the ordinary P KV pool.  Background
         # workers publish intents; only the scheduler services physical page
         # allocation and release, preserving allocator/Radix ownership rules.
+        hybrid_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
         self.agentic_p_workset_broker = AgenticPWorksetLeaseBroker(
-            self.server_args.page_size
+            self.server_args.page_size,
+            state_allocators=((hybrid_pool,) if hybrid_pool is not None else ()),
+            mamba_req_to_token_pool=(self.req_to_token_pool if hybrid_pool is not None else None),
         )
         # TP rank 0 owns one ordered set of Direct admissions.  A dedicated
         # tmpfs mailbox grants the same request-generation to every rank's
@@ -3801,7 +3922,11 @@ class Scheduler(
                 self.agentic_p_workset_broker.mark_io_inflight(
                     request.snapshot_id, workset_lease, claim_id
                 )
-                receiver.send_metadata(workset_lease.parent_page_indices, aux_index=0)
+                if workset_lease.state_device_indices:
+                    from sglang.srt.disaggregation.agentic_hybrid_transfer import submit_reverse_receive
+                    submit_reverse_receive(receiver, workset_lease, ("mamba",))
+                else:
+                    receiver.send_metadata(workset_lease.parent_page_indices, aux_index=0)
         except Exception as exc:
             transport_may_write = bool(
                 receiver is not None
@@ -5591,6 +5716,10 @@ class Scheduler(
                 restored_digest,
             )
 
+        if entry.workset_lease.state_device_indices:
+            from sglang.srt.disaggregation.agentic_hybrid_transfer import log_mamba_digest
+            log_mamba_digest(self.req_to_token_pool, entry.workset_lease.state_device_indices,
+                             phase="d2p_direct_received", snapshot_id=request.snapshot_id)
         parent_tokens = req.origin_input_ids[: entry.manifest.token_count]
         if (
             len(parent_tokens) != entry.manifest.token_count
@@ -5658,6 +5787,8 @@ class Scheduler(
                 InsertParams(
                     key=RadixKey(parent_tokens, req.extra_key),
                     value=entry.device_indices,
+                    mamba_value=(entry.workset_lease.state_device_indices[0].clone()
+                                 if entry.workset_lease.state_device_indices else None),
                     priority=getattr(req, "priority", 0) or 0,
                 )
             )
@@ -5687,8 +5818,14 @@ class Scheduler(
                 entry, req, reason="radix_insert_failed"
             )
         self.agentic_p_workset_broker.commit_parent_bound(
-            request.snapshot_id, entry.workset_lease
+            request.snapshot_id, entry.workset_lease,
+            state_donated_to_radix=(bool(entry.workset_lease.state_device_indices) and not result.mamba_exist),
+            state_duplicate=(bool(entry.workset_lease.state_device_indices) and result.mamba_exist),
         )
+        if entry.workset_lease.runtime_state_device_indices:
+            self.agentic_p_workset_broker.attach_runtime_state_for_bind(
+                request.snapshot_id, req, entry.workset_lease
+            )
         # insert() makes the restored parent visible to the Radix LRU.  Pin the
         # exact request-generation before returning to the queue.  Native
         # Prefill acquires its ordinary request lock first and only then drops
@@ -5790,7 +5927,9 @@ class Scheduler(
             # A trajectory-unique extra_key normally makes this zero.  Keep
             # duplicate-prefix handling correct with ordinary allocator pages.
             entry.existing_tokens = 0
-            self.token_to_kv_pool_allocator.free(entry.device_indices[:existing_tokens])
+            # MambaRadixCache.insert already frees duplicate Attention pages.
+            if not self.tree_cache.supports_mamba():
+                self.token_to_kv_pool_allocator.free(entry.device_indices[:existing_tokens])
         if admit:
             self.agentic_p_workset_broker.handoff_to_req(
                 request.snapshot_id, req, entry.workset_lease
@@ -6051,7 +6190,11 @@ class Scheduler(
             self.agentic_p_workset_broker.mark_io_inflight(
                 manifest.snapshot_id, workset_lease, claim_id
             )
-            receiver.send_metadata(workset_lease.parent_page_indices, aux_index=0)
+            if workset_lease.state_device_indices:
+                from sglang.srt.disaggregation.agentic_hybrid_transfer import submit_reverse_receive
+                submit_reverse_receive(receiver, workset_lease, ("mamba",))
+            else:
+                receiver.send_metadata(workset_lease.parent_page_indices, aux_index=0)
         except Exception as exc:
             transport_may_write = bool(
                 receiver is not None
@@ -6359,13 +6502,21 @@ class Scheduler(
                     InsertParams(
                         key=RadixKey(keys, req.extra_key),
                         value=device_indices,
+                        mamba_value=(workset_lease.state_device_indices[0].clone()
+                                     if workset_lease.state_device_indices else None),
                         priority=getattr(req, "priority", 0) or 0,
                     )
                 )
                 inserted = True
                 self.agentic_p_workset_broker.commit_parent_bound(
-                    manifest.snapshot_id, workset_lease
+                    manifest.snapshot_id, workset_lease,
+                    state_donated_to_radix=(bool(workset_lease.state_device_indices) and not result.mamba_exist),
+                    state_duplicate=(bool(workset_lease.state_device_indices) and result.mamba_exist),
                 )
+                if workset_lease.runtime_state_device_indices:
+                    self.agentic_p_workset_broker.attach_runtime_state_for_bind(
+                        manifest.snapshot_id, req, workset_lease
+                    )
             except Exception:
                 self.agentic_p_workset_broker.abort_bind(
                     manifest.snapshot_id,
@@ -6380,7 +6531,7 @@ class Scheduler(
                     req, reason="radix_insert_failed"
                 )
                 return True
-            if result.prefix_len:
+            if result.prefix_len and not self.tree_cache.supports_mamba():
                 self.token_to_kv_pool_allocator.free(
                     device_indices[: result.prefix_len]
                 )
@@ -9206,11 +9357,8 @@ class Scheduler(
                     else:
                         self.running_batch.batch_is_full = True
                 # revert matched mamba idx to avoid memory leak, if req is not added
-                if not added and req.mamba_pool_idx is not None:
-                    self.tree_cache.req_to_token_pool.mamba_pool.free(
-                        req.mamba_pool_idx.unsqueeze(-1)
-                    )
-                    req.mamba_pool_idx = None
+                if not added:
+                    release_unadmitted_mamba_cow(req, self.tree_cache)
                 break
 
         # Update waiting queue

@@ -164,9 +164,11 @@ class SchedulerRuntimeCheckerMixin:
             mamba_evictable_size,
         ) = self._get_mamba_token_info()
         session_held = self._session_held_tokens()
+        staging_reserved = self._agentic_reserved_tokens()
+        state_owned = self._agentic_owned_mamba_slots()
         memory_leak = (
-            full_num_used != self.tree_cache.full_protected_size() + session_held
-            or mamba_num_used != self.tree_cache.mamba_protected_size()
+            full_num_used != self.tree_cache.full_protected_size() + session_held + staging_reserved
+            or mamba_num_used != self.tree_cache.mamba_protected_size() + sum(state_owned.values())
         )
         if memory_leak:
             free_full_pages = set(
@@ -186,7 +188,7 @@ class SchedulerRuntimeCheckerMixin:
             cached_mamba_pages = set(
                 self.tree_cache.all_mamba_values_flatten().tolist()
             )
-            expected_mamba_pages = set(range(self.req_to_token_pool.mamba_pool.size))
+            expected_mamba_pages = set(range(1, self.req_to_token_pool.mamba_pool.size + 1))
             leaked_mamba_pages = (
                 expected_mamba_pages - free_mamba_pages - cached_mamba_pages
             )
@@ -199,7 +201,43 @@ class SchedulerRuntimeCheckerMixin:
                 f"{full_available_size=}, {full_evictable_size=}, {self.token_to_kv_pool_allocator.size=}, {self.tree_cache.full_protected_size()=}\n"
                 f"{mamba_available_size=}, {mamba_evictable_size=}, {self.req_to_token_pool.mamba_pool.size=}, {self.tree_cache.mamba_protected_size()=}\n"
             )
+        token_msg += f"{staging_reserved=}, agentic_mamba_owned={state_owned}\n"
         return memory_leak, token_msg
+
+    def _agentic_owned_mamba_slots(self: Scheduler):
+        """Count physical state owners not represented by Radix protection."""
+        counts = {"broker": 0, "unpooled_req": 0, "detached_decode": 0}
+        broker = getattr(self, "agentic_p_workset_broker", None)
+        if broker is not None:
+            with broker._lock:
+                for lease in broker._leases.values():
+                    counts["broker"] += sum(int(x.numel()) for x in
+                        (*lease.state_device_indices, *lease.runtime_state_device_indices))
+        seen = set()
+
+        def count_req(req, group):
+            if req is None or id(req) in seen:
+                return
+            seen.add(id(req))
+            buffer = getattr(req, "mamba_ping_pong_track_buffer", None)
+            active = int(getattr(req, "mamba_pool_idx", None) is not None)
+            if not active and not getattr(req, "_agentic_mamba_runtime_reserved", False):
+                return  # Native D cleanup may leave a non-owning buffer view.
+            counts[group] += active + (int(buffer.numel()) if buffer is not None else 0)
+
+        for req in getattr(self, "waiting_queue", ()):
+            if getattr(req, "req_pool_idx", None) is None and getattr(req, "_agentic_mamba_runtime_reserved", False):
+                count_req(req, "unpooled_req")
+        offload = getattr(self, "decode_offload_manager", None)
+        if offload is not None:
+            from sglang.srt.disaggregation.decode_kvcache_offload_manager import DecodeKVCacheOffloadManager
+            candidates, pending = DecodeKVCacheOffloadManager._agentic_detached_ownership_items(offload)
+            for _, item in pending:
+                count_req(item[0], "detached_decode")
+            for _, candidate in candidates:
+                if not candidate.get("retired"):
+                    count_req(candidate.get("req"), "detached_decode")
+        return counts
 
     def _check_radix_cache_memory(self: Scheduler):
         _, _, available_size, evictable_size = self._get_token_info()
@@ -402,6 +440,12 @@ class SchedulerRuntimeCheckerMixin:
         if self.enable_hisparse and self.hisparse_coordinator.has_ongoing_staging():
             return
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get() and self.is_hybrid_ssm:
+                broker = getattr(self, "agentic_p_workset_broker", None)
+                if broker is not None:
+                    with broker._lock:
+                        if broker._leases:
+                            return  # Bound/in-flight worksets are not idle.
             if len(self.disagg_prefill_inflight_queue) > 0 or len(
                 getattr(self, "agentic_kv_waiting_queue", ())
             ) > 0:
@@ -423,6 +467,16 @@ class SchedulerRuntimeCheckerMixin:
                 )
             )
             if self.decode_offload_manager is not None:
+                if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get() and self.is_hybrid_ssm:
+                    from sglang.srt.disaggregation.decode_kvcache_offload_manager import DecodeKVCacheOffloadManager
+                    candidates, pending = DecodeKVCacheOffloadManager._agentic_detached_ownership_items(
+                        self.decode_offload_manager
+                    )
+                    # TP completion retains Radix locks until group release.
+                    # Its ownership ledger is authoritative even when the
+                    # native pending-token counter is zero. This is not idle.
+                    if candidates or pending:
+                        return
                 queue_size += len(self.decode_offload_manager.ongoing_offload)
                 # A fast D->P offer intentionally retains the finished D KV
                 # until P has reserved HBM and the NIXL transfer completes.

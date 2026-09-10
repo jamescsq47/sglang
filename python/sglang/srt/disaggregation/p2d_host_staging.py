@@ -114,6 +114,19 @@ def _prefill_metadata(req) -> dict[str, Any]:
 
 
 class _RegisteredP2DHostSnapshot:
+    def __new__(cls, *, arena, offset, allocation_bytes, token_count, byte_size, device_pool):
+        if hasattr(device_pool, "mamba_pool"):
+            from sglang.srt.disaggregation.agentic_hybrid_dma import RegisteredHybridHostSnapshot
+            snapshot = RegisteredHybridHostSnapshot(
+                path=arena.path, token_count=token_count, device_pool=device_pool,
+                byte_size=byte_size, file_offset=offset, create=False, state_slots=2,
+            )
+            snapshot.arena = arena
+            snapshot.offset = offset
+            snapshot.allocation_bytes = allocation_bytes
+            return snapshot
+        return super().__new__(cls)
+
     """One logical snapshot view inside a process-lifetime registered arena."""
 
     def __init__(
@@ -620,6 +633,12 @@ class AgenticPToDHostStagingManager:
         )
 
     def _byte_size(self, token_count: int) -> int:
+        if hasattr(self.device_pool, "mamba_pool"):
+            from sglang.srt.disaggregation.agentic_hybrid_snapshot import HybridSnapshotLayout
+            return HybridSnapshotLayout.from_pools(
+                token_count, self.device_pool.full_kv_pool, self.device_pool.mamba_pool,
+                state_slots=2,
+            ).total_bytes
         return (
             2
             * int(token_count)
@@ -781,6 +800,9 @@ class AgenticPToDHostStagingManager:
                     snapshot = self.arena.create(
                         snapshot_id, token_count, self.device_pool, byte_size
                     )
+                    if hasattr(self.device_pool, "mamba_pool"):
+                        from sglang.srt.disaggregation.agentic_hybrid_transfer import p2d_mamba_source_indices
+                        snapshot.set_state_indices(p2d_mamba_source_indices(req, self.page_size)[0])
                     grant = {
                         "kind": "shared_host_extent",
                         "arena_path": snapshot.path,
@@ -1571,14 +1593,23 @@ class AgenticPToDHostLoadManager:
                 ):
                     raise RuntimeError("P->D Host peer load aborted before H2D")
                 grant = receiver._grant
-                snapshot = SharedMHAHostSnapshot(
-                    path=str(grant["arena_path"]),
-                    token_count=int(grant["token_count"]),
-                    device_pool=self.device_pool,
-                    byte_size=int(grant["byte_size"]),
-                    create=False,
-                    file_offset=int(grant.get("arena_offset", 0)),
-                )
+                if hasattr(self.device_pool, "mamba_pool"):
+                    from sglang.srt.disaggregation.agentic_hybrid_dma import RegisteredHybridHostSnapshot
+                    snapshot = RegisteredHybridHostSnapshot(
+                        path=str(grant["arena_path"]), token_count=int(grant["token_count"]),
+                        device_pool=self.device_pool, byte_size=int(grant["byte_size"]),
+                        create=False, file_offset=int(grant.get("arena_offset", 0)), state_slots=2,
+                    )
+                    snapshot.set_state_indices(receiver.state_indices)
+                else:
+                    snapshot = SharedMHAHostSnapshot(
+                        path=str(grant["arena_path"]),
+                        token_count=int(grant["token_count"]),
+                        device_pool=self.device_pool,
+                        byte_size=int(grant["byte_size"]),
+                        create=False,
+                        file_offset=int(grant.get("arena_offset", 0)),
+                    )
                 device_indices_host = None
                 if _cuda_driver_batch_memcpy() is not None:
                     try:

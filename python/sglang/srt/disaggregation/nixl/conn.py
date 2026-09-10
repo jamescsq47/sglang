@@ -707,7 +707,8 @@ class NixlKVManager(CommonKVManager):
         handle_sink: Optional[Callable[[object], None]] = None,
     ):
         """Transfer Mamba states via RDMA."""
-        assert len(prefill_state_indices) == 1, "Mamba should have single state index"
+        if len(prefill_state_indices) not in (1, 2):
+            raise ValueError("Mamba transfer needs active and optionally checkpoint slots")
         assert len(dst_state_indices) == len(
             prefill_state_indices
         ), "State indices count mismatch between Prefill and Decode"
@@ -720,12 +721,13 @@ class NixlKVManager(CommonKVManager):
 
         for i, dst_state_ptr in enumerate(dst_state_data_ptrs):
             length = prefill_state_item_lens[i]
-            src_addr = prefill_state_data_ptrs[i] + length * int(
-                prefill_state_indices[0]
-            )
-            dst_addr = dst_state_ptr + length * int(dst_state_indices[0])
-            src_addrs.append((src_addr, length, self.kv_args.gpu_id))
-            dst_addrs.append((dst_addr, length, dst_gpu_id))
+            for source_index, destination_index in zip(
+                prefill_state_indices, dst_state_indices
+            ):
+                src_addr = prefill_state_data_ptrs[i] + length * int(source_index)
+                dst_addr = dst_state_ptr + length * int(destination_index)
+                src_addrs.append((src_addr, length, self.kv_args.gpu_id))
+                dst_addrs.append((dst_addr, length, dst_gpu_id))
 
         src_descs = self.agent.get_xfer_descs(src_addrs, "VRAM")
         dst_descs = self.agent.get_xfer_descs(dst_addrs, "VRAM")

@@ -3303,6 +3303,7 @@ class LayerFirstD2HStaging:
     """Small reusable HBM gather buffer feeding contiguous PCIe D2H DMA."""
 
     def __init__(self, device_pool, token_capacity: int):
+        device_pool = getattr(device_pool, "full_kv_pool", device_pool)
         self.token_capacity = max(1, int(token_capacity))
         self.layer_num = int(device_pool.layer_num)
         self.head_num = int(device_pool.head_num)
@@ -3837,6 +3838,12 @@ def start_registered_host_arena_startup_prewarm(
 
 
 class SharedMHAHostSnapshot:
+    def __new__(cls, *args, **kwargs):
+        if cls is SharedMHAHostSnapshot and hasattr(kwargs.get("device_pool"), "mamba_pool"):
+            from sglang.srt.disaggregation.agentic_hybrid_dma import RegisteredHybridHostSnapshot
+            return RegisteredHybridHostSnapshot(*args, **kwargs)
+        return super().__new__(cls)
+
     """One request-generation extent mapped by both P and its owning D.
 
     The hot on-disk shape is layer-first and snapshot-local:
@@ -4538,6 +4545,7 @@ class PinnedMHAHostBounce:
     """Process-lifetime pinned Host chunk reused by every slow snapshot."""
 
     def __init__(self, device_pool, token_capacity: int):
+        device_pool = getattr(device_pool, "full_kv_pool", device_pool)
         self.token_capacity = int(token_capacity)
         if self.token_capacity <= 0:
             raise ValueError("pinned Host bounce capacity must be positive")
@@ -4599,6 +4607,7 @@ class LazySharedMHAHostSnapshot:
             raise ValueError("shared Host extent offset must be mmap-aligned")
         self.requires_prefault = bool(create)
         self._materialized = None
+        self._pending_state_indices = None
         self._closed = False
         self._lock = threading.Lock()
         flags = os.O_RDWR | (os.O_CREAT | os.O_EXCL if create else 0)
@@ -4668,19 +4677,61 @@ class LazySharedMHAHostSnapshot:
             del anchor
             mapping.close()
 
+    def set_state_indices(self, indices):
+        """Freeze CPU state metadata without mapping/registering the extent."""
+        if not hasattr(self.device_pool, "mamba_pool"):
+            raise ValueError("state indices require a hybrid KV pool")
+        if torch.is_tensor(indices) and indices.device.type != "cpu":
+            raise ValueError("lazy state indices must already be on CPU")
+        values = tuple(int(value) for value in np.asarray(indices).reshape(-1))
+        if len(values) not in (1, 2) or min(values) < 0:
+            raise ValueError("hybrid snapshot requires one or two valid state slots")
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("cannot configure a released Host extent")
+            if self._pending_state_indices is not None and self._pending_state_indices != values:
+                raise ValueError("snapshot state indices are immutable")
+            if self._materialized is not None:
+                if self._materialized.state_slots != len(values):
+                    raise ValueError("cannot change a materialized hybrid layout")
+                self._materialized.set_state_indices(values)
+            self._pending_state_indices = values
+
+    def reset_state_indices_after_quiesce(self):
+        """Reset a failed H2D attempt, without releasing its durable extent."""
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("cannot reset a released Host extent")
+            if self._pending_state_indices is not None and len(self._pending_state_indices) != 1:
+                raise RuntimeError("P2D source state binding cannot be reset")
+            if self._materialized is not None:
+                self._materialized.reset_state_indices_after_quiesce()
+            self._pending_state_indices = None
+
     def materialize(self):
         with self._lock:
             if self._closed:
                 raise RuntimeError("cannot materialize a released Host extent")
             if self._materialized is None:
-                self._materialized = SharedMHAHostSnapshot(
+                state_args = {}
+                if self._pending_state_indices is not None:
+                    state_args["state_slots"] = len(self._pending_state_indices)
+                inner = SharedMHAHostSnapshot(
                     path=self.path,
                     token_count=self.token_count,
                     device_pool=self.device_pool,
                     byte_size=self.byte_size,
                     create=False,
                     file_offset=self.file_offset,
+                    **state_args,
                 )
+                try:
+                    if self._pending_state_indices is not None:
+                        inner.set_state_indices(self._pending_state_indices)
+                except BaseException:
+                    inner.close(unlink=False)
+                    raise
+                self._materialized = inner
             return self
 
     def mark_populated(self) -> None:
@@ -6730,11 +6781,27 @@ class AgenticPHostStagingManager:
         ):
             load.pop(key, None)
 
+    @staticmethod
+    def _configure_hybrid_h2d_state(load: dict[str, Any]) -> None:
+        """Configure the immutable destination once, on the H2D worker."""
+        state_indices = getattr(load["workset_lease"], "state_device_indices", ())
+        if not state_indices or load.get("hybrid_state_configured"):
+            return
+        snapshot = load["record"]["snapshot"]
+        # The lease allocator returns GPU indices. Lazy arena metadata must
+        # remain CPU-only; mirror here, never in scheduler admission. This is
+        # the same worker-side conversion used for Attention page indices.
+        indices = _device_indices_to_host(state_indices[0])
+        snapshot.materialize()
+        snapshot.set_state_indices(indices)
+        load["hybrid_state_configured"] = True
+
     def _start_h2d_chunk(self, load: dict[str, Any]) -> bool:
         """Launch one asynchronously prefetched H2D chunk."""
 
         record = load["record"]
         device_indices = load["device_indices"]
+        AgenticPHostStagingManager._configure_hybrid_h2d_state(load)
         lane = AgenticPHostStagingManager._h2d_lane_resources(
             self, int(load.get("h2d_lane_id", 0))
         )
@@ -7043,9 +7110,14 @@ class AgenticPHostStagingManager:
                 )
             AgenticPHostStagingManager._release_h2d_lane(self, snapshot_id)
             return True
+        # No prefetch or composite DMA can still access the old destination.
+        # Keep Host bytes for the group retry but discard the old lease's
+        # recurrent-slot binding before publishing this record as ready again.
         with self._get_state_lock():
             if self.loads.get(rid) is not load:
                 return True
+            if getattr(workset_lease, "state_device_indices", ()):
+                load["record"]["snapshot"].reset_state_indices_after_quiesce()
             self.loads.pop(rid, None)
             if not load.get("device_released"):
                 self.workset_broker.request_release(
@@ -7770,18 +7842,28 @@ class AgenticPHostStagingManager:
 
                 radix_key = RadixKey(keys, req.extra_key)
                 if not load.get("radix_bound"):
+                    if workset_lease.state_device_indices:
+                        from sglang.srt.disaggregation.agentic_hybrid_transfer import log_mamba_digest
+                        log_mamba_digest(self.tree_cache.req_to_token_pool, workset_lease.state_device_indices,
+                                         phase="d2p_host_received", snapshot_id=snapshot_id)
                     result = self.tree_cache.insert(
                         InsertParams(
                             key=radix_key,
                             value=device_indices,
+                            mamba_value=(workset_lease.state_device_indices[0].clone()
+                                         if workset_lease.state_device_indices else None),
                             priority=getattr(req, "priority", 0) or 0,
                         )
                     )
                     inserted = True
                     self.workset_broker.commit_parent_bound(
-                        snapshot_id, workset_lease
+                        snapshot_id, workset_lease,
+                        state_donated_to_radix=(bool(workset_lease.state_device_indices) and not result.mamba_exist),
+                        state_duplicate=(bool(workset_lease.state_device_indices) and result.mamba_exist),
                     )
-                    if result.prefix_len:
+                    if workset_lease.runtime_state_device_indices:
+                        self.workset_broker.attach_runtime_state_for_bind(snapshot_id, req, workset_lease)
+                    if result.prefix_len and not self.tree_cache.supports_mamba():
                         self.token_allocator.free(
                             device_indices[: result.prefix_len]
                         )
@@ -8976,6 +9058,8 @@ class AgenticDHostStagingClient:
             create=False,
             file_offset=int(grant.get("arena_offset", 0)),
         )
+        if hasattr(self.device_pool, "mamba_pool"):
+            snapshot.set_state_indices(candidate["source_state_indices"])
         write = candidate["arena_write"] = {
             "snapshot": snapshot,
             "chunks": {},

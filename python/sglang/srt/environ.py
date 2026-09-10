@@ -303,6 +303,7 @@ class Envs:
     # Experimental request-generation KV lifecycle for multi-turn PD serving.
     # Defaults are intentionally off so stock SGLang baseline behavior is unchanged.
     SGLANG_AGENTIC_KV_LIFECYCLE = EnvBool(False)
+    SGLANG_AGENTIC_KV_MAMBA_PROMPT_CHECKPOINT = EnvBool(False)
     # Keep HiCache's Host pool and storage backend available as infrastructure
     # for the request-generation Direct/Shared-Arena lifecycle, while disabling
     # generic Radix write-back, storage prefetch, and ordinary Decode offload.

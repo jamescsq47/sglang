@@ -633,6 +633,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
                     )
             self.mamba_pool.free(mamba_ping_pong_track_buffer_to_free)
 
+        if getattr(req, "_agentic_mamba_runtime_reserved", False):
+            # Native release has either freed each tracking slot or donated
+            # its retained checkpoint to Radix. Req owns neither afterwards.
+            req.mamba_ping_pong_track_buffer = None
+            req._agentic_mamba_runtime_reserved = False
+
     def clear(self):
         logger.info("Reset HybridReqToTokenPool")
         super().clear()

@@ -11075,6 +11075,7 @@ def test_tp1_direct_finalize_failure_retries_without_unpin_or_double_free():
         agentic_early_direct_poll_lock=nullcontext(),
         agentic_early_direct_receives={request.snapshot_id: entry},
         agentic_early_direct_terminal={},
+        tree_cache=SimpleNamespace(supports_mamba=lambda: False),
         _agentic_snapshot_store=lambda: store,
     )
     owner._agentic_finalize_early_direct_bind = lambda *args, **kwargs: (

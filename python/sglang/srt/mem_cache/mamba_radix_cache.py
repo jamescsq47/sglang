@@ -602,6 +602,69 @@ class MambaRadixCache(BasePrefixCache):
 
         self.dec_lock_ref(req.last_node)
 
+    def release_request_generation_cache(
+        self,
+        req: Req,
+        *,
+        committed_len: Optional[int] = None,
+        _defer_if_blocked: bool = True,
+        event_prefix: str = "request_generation_release",
+        allow_shared_ancestors: bool = False,
+    ) -> int:
+        """Atomically release Attention and Mamba for an unlocked leaf path."""
+
+        del _defer_if_blocked, event_prefix, allow_shared_ancestors
+        if self.disable or not getattr(req, "extra_key", None):
+            return 0
+        length = int(
+            getattr(req, "kv_committed_len", 0)
+            if committed_len is None
+            else committed_len
+        )
+        token_ids = (req.origin_input_ids + req.output_ids)[:length]
+        key = RadixKey(token_ids[:len(token_ids) // self.page_size * self.page_size], req.extra_key)
+        if not len(key):
+            return 0
+        match = self.match_prefix(MatchPrefixParams(key=key))
+        # cache_finished_req(is_insert=False) already freed the new suffix.
+        # The remaining cached prefix can therefore be shorter than committed.
+        node = match.last_device_node
+        released = 0
+        while (
+            node is not self.root_node
+            and node.full_lock_ref == 0
+            and node.mamba_lock_ref == 0
+            and not node.children
+            and node.key.extra_key == req.extra_key
+        ):
+            if node.mamba_value is None:
+                parent = node.parent
+                self.token_to_kv_pool_allocator.free(node.value)
+                released += len(node.value)
+                self.full_lru_list.remove_node(node)
+                self._delete_tombstone_leaf(node)
+                node = parent
+            else:
+                full_released, _, last_deleted, _ = self._evict_leaf_node(node, True)
+                released += full_released
+                # Native eviction may also delete tombstone ancestors.
+                node = last_deleted.parent
+        return released
+
+    def release_agentic_request_cache(
+        self,
+        req: Req,
+        *,
+        committed_len: Optional[int] = None,
+        _defer_if_blocked: bool = True,
+    ) -> int:
+        return self.release_request_generation_cache(
+            req,
+            committed_len=committed_len,
+            _defer_if_blocked=_defer_if_blocked,
+            event_prefix="p_to_d_release",
+        )
+
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
 
@@ -1063,6 +1126,13 @@ class MambaRadixCache(BasePrefixCache):
             else:
                 src_index = last_node.mamba_value
                 dst_index = req.mamba_pool_idx.unsqueeze(0)
+                if getattr(req, "_agentic_mamba_runtime_reserved", False):
+                    keep = self.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                        req.mamba_next_track_idx
+                    )
+                    checkpoint = req.mamba_ping_pong_track_buffer[keep].reshape(1)
+                    dst_index = torch.cat((dst_index, checkpoint))
+                    src_index = src_index.repeat(2)
                 self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
 
         value = value[:best_value_len]

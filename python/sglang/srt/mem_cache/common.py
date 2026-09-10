@@ -552,6 +552,13 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     return out_cache_loc
 
 
+def release_unadmitted_mamba_cow(req: Req, tree_cache: BasePrefixCache):
+    """Return temporary Radix COW, never a handed-off request's runtime."""
+    if req.mamba_pool_idx is not None and not getattr(req, "_agentic_mamba_runtime_reserved", False):
+        tree_cache.req_to_token_pool.mamba_pool.free(req.mamba_pool_idx.unsqueeze(-1))
+        req.mamba_pool_idx = None
+
+
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
     # MambaRadixCache may alloc mamba state before alloc KV cache
     if req.req_pool_idx is None:
@@ -564,6 +571,14 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
                 req.mamba_pool_idx.unsqueeze(-1)
             )
             req.mamba_pool_idx = None
+        # Handed runtime has no req-index mapping yet. Even if another cleanup
+        # already returned active, the tracking slots still need one owner.
+        if getattr(req, "_agentic_mamba_runtime_reserved", False):
+            buffer = getattr(req, "mamba_ping_pong_track_buffer", None)
+            if buffer is not None:
+                tree_cache.req_to_token_pool.mamba_pool.free(buffer[buffer >= 0])
+                req.mamba_ping_pong_track_buffer = None
+            req._agentic_mamba_runtime_reserved = False
         return
 
     if req.last_node is None:
@@ -580,6 +595,8 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.req_pool_idx, :allocated_len
         ]
         tree_cache.token_to_kv_pool_allocator.free(kv_indices)
+        if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and req.mamba_pool_idx is not None:
+            tree_cache.req_to_token_pool.free_mamba_cache(req)
         tree_cache.req_to_token_pool.free(req)
         return
 

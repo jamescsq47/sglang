@@ -88,8 +88,25 @@ class SchedulerOutputProcessorMixin:
             req.time_stats.set_decode_prebuilt_finish_time()
             req.check_finished()
             if req.finished():
-                req.time_stats.set_quick_finish_time()
-                release_kv_cache(req, self.tree_cache)
+                if (
+                    envs.SGLANG_AGENTIC_KV_LIFECYCLE.get()
+                    and getattr(req, "mamba_pool_idx", None) is not None
+                    and self.decode_offload_manager is not None
+                    and "agentic_request_id" in (req.sampling_params.custom_params or {})
+                ):
+                    # A first sampled stop token has no Decode Forward/KV.
+                    # The imported Prompt checkpoint is still a valid parent;
+                    # use the same complete-snapshot manager as normal Decode.
+                    response_ready = True
+                    if self.decode_offload_manager.offload_kv_cache(req):
+                        response_ready = not self.decode_offload_manager.is_response_pending(req.rid)
+                    else:
+                        self.decode_offload_manager.finalize_release_on_finish(req)
+                    if response_ready:
+                        req.time_stats.set_quick_finish_time()
+                else:
+                    req.time_stats.set_quick_finish_time()
+                    release_kv_cache(req, self.tree_cache)
 
         # Note: Logprobs should be handled on the prefill engine.
         self.stream_output(batch.reqs, batch.return_logprob)
@@ -578,6 +595,8 @@ class SchedulerOutputProcessorMixin:
         result: GenerationBatchResult,
         i: int,
     ) -> None:
+        if getattr(req, "_agentic_mamba_frozen_prompt_valid", False):
+            return
         seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
         if req.mamba_ping_pong_track_buffer is not None:
             mamba_track_interval = get_global_server_args().mamba_track_interval

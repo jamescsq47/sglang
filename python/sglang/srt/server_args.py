@@ -2144,6 +2144,13 @@ class ServerArgs:
             self.disable_radix_cache = True
             return
 
+        if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get() and self.disaggregation_mode != "null":
+            if not self.enable_mamba_extra_buffer() or self.disable_radix_cache:
+                raise ValueError("agentic Mamba return requires extra_buffer and Radix cache")
+            if self.page_size != 64 or self.mamba_track_interval != 64:
+                raise ValueError("agentic Mamba return currently requires page64 and track_interval64")
+            if self.speculative_algorithm:
+                raise ValueError("agentic Mamba return does not support speculation")
         if not support_mamba_cache_extra_buffer:
             assert (
                 not self.enable_mamba_extra_buffer()

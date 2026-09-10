@@ -1531,6 +1531,15 @@ class DecodeKVCacheOffloadManager:
         if aligned_len == 0:
             self._publish_agentic_failure(metadata, "empty_aligned_snapshot")
             return False
+        if getattr(req, "mamba_pool_idx", None) is not None:
+            from sglang.srt.disaggregation.agentic_hybrid_transfer import snapshot_token_count_for_req
+            try:
+                aligned_len = snapshot_token_count_for_req(req, len(all_tokens), ("mamba",), self.page_size)
+                if aligned_len <= 0:
+                    raise RuntimeError("empty hybrid checkpoint")
+            except RuntimeError as exc:
+                self._publish_agentic_failure(metadata, f"mamba_checkpoint_unavailable:{exc}")
+                return False
         all_tokens = all_tokens[:aligned_len]
         producer_store = getattr(self, "agentic_early_claim_store", None)
         producer_id = None
@@ -1708,6 +1717,15 @@ class DecodeKVCacheOffloadManager:
                     )
                     candidate["source_token_indices"] = frozen_token_indices
                     candidate["source_page_indices"] = frozen_page_indices
+                    if getattr(getattr(self.agentic_direct_runtime.manager, "kv_args", None), "state_type", "none") == "mamba":
+                        from sglang.srt.disaggregation.agentic_hybrid_transfer import state_indices_for_req
+                        candidate["source_state_indices"] = state_indices_for_req(
+                            req, ("mamba",), checkpoint_tokens=manifest.token_count,
+                            page_size=self.page_size,
+                        )[0]
+                    if candidate.get("source_state_indices") is not None:
+                        from sglang.srt.disaggregation.agentic_hybrid_transfer import log_mamba_digest
+                        log_mamba_digest(self.req_to_token_pool, [candidate["source_state_indices"]], phase="d2p_source", snapshot_id=manifest.snapshot_id)
                     candidate["sender"] = sender
                     candidate["local_prepared"] = True
                     if source_digest is not None:
@@ -2278,6 +2296,11 @@ class DecodeKVCacheOffloadManager:
             for value in self.agentic_direct_runtime.manager.kv_args.kv_item_lens
         )
         rank_byte_size = bytes_per_page * len(source_pages)
+        if candidate.get("source_state_indices") is not None:
+            from sglang.srt.disaggregation.agentic_hybrid_transfer import complete_snapshot_bytes
+            rank_byte_size = complete_snapshot_bytes(
+                self.agentic_direct_runtime.manager.kv_args, candidate["manifest"].token_count
+            )
         if rank_byte_size <= 0:
             raise RuntimeError(
                 "D->P Slow Host staging requires a positive rank-local "
@@ -3107,7 +3130,10 @@ class DecodeKVCacheOffloadManager:
                         # a false "unstarted" abort and late-DMA page reuse.
                         candidate["sent"] = True
                         try:
-                            candidate["sender"].send(page_indices)
+                            if candidate.get("source_state_indices") is not None:
+                                candidate["sender"].send(page_indices, state_indices=candidate["source_state_indices"])
+                            else:
+                                candidate["sender"].send(page_indices)
                         except Exception as error:
                             fence_failed_launch = getattr(
                                 candidate["sender"],
@@ -3644,7 +3670,10 @@ class DecodeKVCacheOffloadManager:
                     # treat it as submitted until the sender proves otherwise.
                     candidate["sent"] = True
                     try:
-                        sender.send(page_indices)
+                        if candidate.get("source_state_indices") is not None:
+                            sender.send(page_indices, state_indices=candidate["source_state_indices"])
+                        else:
+                            sender.send(page_indices)
                     except Exception as error:
                         fence = getattr(sender, "fence_failed_launch", None)
                         try:
@@ -3817,6 +3846,8 @@ class DecodeKVCacheOffloadManager:
             ]
             self.token_to_kv_pool_allocator.free(overalloc_indices)
 
+        if getattr(req, "mamba_pool_idx", None) is not None:
+            self.req_to_token_pool.free_mamba_cache(req)
         self.req_to_token_pool.free(req)
         self.tree_cache.protected_size_ -= len(req.prefix_indices)
         if req.rid in self.offloaded_state:

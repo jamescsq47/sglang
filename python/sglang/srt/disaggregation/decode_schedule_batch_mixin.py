@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
@@ -27,9 +28,23 @@ def cache_pd_decode_committed_req(tree_cache, req) -> None:
     """
 
     fill_ids = req.fill_ids
+    # MambaRadix forks (does not donate) the request's checkpoint into Radix,
+    # then clears its tracking length for ordinary Prefill bookkeeping. D must
+    # retain this imported checkpoint when Decode ends before the next page.
+    tracked = getattr(req, "mamba_last_track_seqlen", None)
+    preserve_track = (
+        envs.SGLANG_AGENTIC_KV_LIFECYCLE.get()
+        and getattr(req, "mamba_pool_idx", None) is not None
+        and tracked is not None
+    )
+    if preserve_track:
+        assert 0 < tracked <= int(req.kv_committed_len)
+        assert tracked % tree_cache.page_size == 0
     req.fill_ids = fill_ids[: int(req.kv_committed_len)]
     try:
         tree_cache.cache_unfinished_req(req)
+        if preserve_track:
+            req.mamba_last_track_seqlen = tracked
     finally:
         req.fill_ids = fill_ids
 

@@ -263,7 +263,11 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_memory_saver = enable_memory_saver
-        if mamba_size is not None:
+        if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get() and enable_mamba_extra_buffer:
+            if mamba_size is None:
+                raise ValueError("agentic Mamba PD requires a memory-budgeted Mamba pool size")
+            effective_mamba_size = mamba_size
+        elif mamba_size is not None:
             effective_mamba_size = min(mamba_size, size + pre_alloc_size)
             if mamba_size > size + pre_alloc_size:
                 logger.warning(
@@ -653,6 +657,11 @@ class DecodePreallocQueue:
             destination_indices = self.req_to_token_pool.req_to_token[
                 decode_req.req.req_pool_idx, :origin_input_len
             ]
+            if isinstance(self.token_to_kv_pool, HybridLinearKVPool):
+                from sglang.srt.disaggregation.agentic_hybrid_transfer import p2d_mamba_destination_indices
+                decode_req.kv_receiver.state_indices = p2d_mamba_destination_indices(
+                    decode_req.req, self.req_to_token_pool, page_size
+                )[0]
             decode_req.kv_receiver.bind(destination_indices)
             ready_path = getattr(decode_req, "_async_p_ready_path", None)
             self._consume_p_ready_marker(ready_path)
@@ -670,13 +679,17 @@ class DecodePreallocQueue:
             kv_indices = kv_indices_full.cpu().numpy()
 
         if isinstance(self.token_to_kv_pool, HybridLinearKVPool):
-            state_indices = [
-                self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                    decode_req.req.req_pool_idx
+            if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get():
+                from sglang.srt.disaggregation.agentic_hybrid_transfer import p2d_mamba_destination_indices
+                state_indices = p2d_mamba_destination_indices(
+                    decode_req.req, self.req_to_token_pool, page_size
+                )[0]
+            else:
+                state_indices = [
+                    self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                        decode_req.req.req_pool_idx
+                    ].cpu().numpy()
                 ]
-                .cpu()
-                .numpy()
-            ]
         elif isinstance(self.token_to_kv_pool, SWAKVPool):
             seq_len = len(decode_req.req.origin_input_ids)
             window_size = self.scheduler.sliding_window_size
@@ -1236,6 +1249,18 @@ class DecodePreallocQueue:
                 blocked_required_tokens = required_tokens_for_request
                 break
 
+            if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get() and isinstance(self.token_to_kv_pool, HybridLinearKVPool):
+                state_pool = self.req_to_token_pool.mamba_pool
+                needed_slots = (int(decode_req.req.mamba_pool_idx is None)
+                                + (self.req_to_token_pool.mamba_ping_pong_track_buffer_size
+                                   if decode_req.req.mamba_ping_pong_track_buffer is None else 0))
+                if state_pool.available_size() < needed_slots:
+                    from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+                    self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=needed_slots - state_pool.available_size()))
+                if state_pool.available_size() < needed_slots:
+                    blocked_reason = "mamba_slots"
+                    blocked_req = decode_req
+                    break
             allocatable_tokens -= required_tokens_for_request
             dst_kv_indices = self._pre_alloc(decode_req.req)
 
@@ -1280,14 +1305,17 @@ class DecodePreallocQueue:
 
             # Prepare extra pool indices for hybrid models
             if isinstance(self.token_to_kv_pool, HybridLinearKVPool):
-                # Mamba hybrid model: single mamba state index
-                state_indices = [
-                    self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                        decode_req.req.req_pool_idx
+                if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get():
+                    from sglang.srt.disaggregation.agentic_hybrid_transfer import p2d_mamba_destination_indices
+                    state_indices = p2d_mamba_destination_indices(
+                        decode_req.req, self.req_to_token_pool, page_size
+                    )[0]
+                else:
+                    state_indices = [
+                        self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                            decode_req.req.req_pool_idx
+                        ].cpu().numpy()
                     ]
-                    .cpu()
-                    .numpy()
-                ]
             elif isinstance(self.token_to_kv_pool, SWAKVPool):
                 # SWA hybrid model: send decode-side SWA window indices
                 seq_len = len(decode_req.req.origin_input_ids)
@@ -1331,6 +1359,8 @@ class DecodePreallocQueue:
                 destination_indices = self.req_to_token_pool.req_to_token[
                     decode_req.req.req_pool_idx, :origin_input_len
                 ]
+                if isinstance(self.token_to_kv_pool, HybridLinearKVPool):
+                    decode_req.kv_receiver.state_indices = state_indices
                 decode_req.kv_receiver.bind(destination_indices)
             else:
                 page_indices = kv_to_page_indices(kv_indices, page_size)
@@ -1423,7 +1453,11 @@ class DecodePreallocQueue:
         # suffixes then remain as *evictable* LRU pages.  Treat those pages as
         # admission capacity, otherwise preallocation stalls while most of the
         # pool is immediately reclaimable.
-        evictable_size = self.tree_cache.evictable_size()
+        evictable_size = (
+            self.tree_cache.full_evictable_size()
+            if self.tree_cache.supports_mamba()
+            else self.tree_cache.evictable_size()
+        )
         if isinstance(evictable_size, int):
             available_size += evictable_size
         allocatable_tokens = available_size - max(
@@ -2137,7 +2171,19 @@ class SchedulerDisaggregationDecodeMixin:
             if i < num_not_used_batch:
                 can_run_list.append(req)
                 prepare_pd_decode_radix_key(self, req)
-                req.init_next_round_input(self.tree_cache)
+                # The full active recurrent state was already imported from P.
+                # Radix may share Attention pages but must not rewind that state.
+                if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get() and getattr(req, "mamba_pool_idx", None) is not None:
+                    if os.getenv("SGLANG_AGENTIC_KV_DEBUG_DIGEST", "0").lower() in {"1", "true", "yes", "on"}:
+                        from sglang.srt.disaggregation.agentic_hybrid_transfer import log_mamba_digest
+                        keep = self.req_to_token_pool.get_mamba_ping_pong_other_idx(req.mamba_next_track_idx)
+                        indices = [[int(req.mamba_pool_idx), int(req.mamba_ping_pong_track_buffer[keep])]]
+                        custom = req.sampling_params.custom_params or {}
+                        log_mamba_digest(self.req_to_token_pool, indices, phase="p2d_received",
+                                         snapshot_id=f"{custom.get('agentic_request_id')}:{custom.get('agentic_generation')}")
+                    req.init_next_round_input(self.tree_cache, cow_mamba=False)
+                else:
+                    req.init_next_round_input(self.tree_cache)
                 # P->D still transfers one complete request snapshot into
                 # request-private destination pages.  Dedup happens only
                 # after DMA success, so transport remains all-or-nothing.

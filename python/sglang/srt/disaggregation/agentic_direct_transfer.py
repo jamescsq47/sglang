@@ -53,6 +53,9 @@ class AgenticDirectRuntime:
             tuple(int(value) for value in getattr(args, "kv_item_lens", ())),
             len(getattr(args, "kv_data_ptrs", ())),
         )
+        if getattr(args, "state_type", "none") == "mamba":
+            fields += ("mamba", tuple(args.state_item_lens),
+                       tuple(args.state_dim_per_tensor))
         return hashlib.sha256(repr(fields).encode("ascii")).hexdigest()[:24]
 
 
@@ -66,6 +69,7 @@ def debug_kv_digest(kv_pool, token_indices) -> str | None:
         "on",
     }:
         return None
+    kv_pool = getattr(kv_pool, "full_kv_pool", kv_pool)
     indices = torch.as_tensor(
         token_indices, dtype=torch.long, device=kv_pool.k_buffer[0].device
     )
@@ -118,6 +122,14 @@ def _make_kv_args(
     kv_args.state_item_lens = []
     kv_args.state_dim_per_tensor = []
     kv_args.state_type = "none"
+    # Keep the dense wire/layout unchanged. Hybrid reverse transfers additionally
+    # register the recurrent pool; state slots use the native flat-index ABI.
+    if hasattr(kv_pool, "mamba_pool"):
+        (kv_args.state_data_ptrs, kv_args.state_data_lens,
+         kv_args.state_item_lens) = kv_pool.get_state_buf_infos()
+        kv_args.state_dim_per_tensor = kv_pool.get_state_dim_per_tensor()
+        kv_args.state_type = "mamba"
+        kv_args.state_types = ("mamba",)
     kv_args.ib_device = server_args.disaggregation_ib_device
     kv_args.ib_traffic_class = getattr(
         server_args, "disaggregation_ib_traffic_class", ""

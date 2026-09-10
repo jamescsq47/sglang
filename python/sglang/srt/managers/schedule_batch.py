@@ -1201,6 +1201,8 @@ class Req(ReqDllmMixin):
         self.temp_input_top_logprobs_idx = None
         self.extend_logprob_start_len = 0
         self.is_chunked = 0
+        if hasattr(self, "_agentic_mamba_frozen_prompt_valid"):
+            self._agentic_mamba_frozen_prompt_valid = False
         self.mamba_pool_idx = None
         self.mamba_ping_pong_track_buffer = None
         self.mamba_next_track_idx = None
@@ -1803,6 +1805,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # to force the math calculation to retrieve the correct mamba state from h.
             return i + 1
 
+        if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get() and get_global_server_args().disaggregation_mode == "prefill":
+            from sglang.srt.disaggregation.agentic_hybrid_transfer import p2d_mamba_checkpoint_tokens
+            page_size = self.token_to_kv_pool_allocator.page_size
+            start = len(req.prefix_indices)
+            end = start + req.extend_input_len
+            target = min(p2d_mamba_checkpoint_tokens(req, page_size), end // page_size * page_size)
+            mask = target > start and req.extend_input_len >= FLA_CHUNK_SIZE
+            mamba_track_mask_cpu.append(mask)
+            mamba_track_indices_cpu.append(req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item())
+            mamba_track_seqlens_cpu.append((target if target == end else target + 1) if mask else -1)
+            if mask:
+                req.mamba_last_track_seqlen = target
+                req.mamba_next_track_idx = self.req_to_token_pool.get_mamba_ping_pong_other_idx(req.mamba_next_track_idx)
+            return
         mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
         mask = req.extend_input_len >= mamba_cache_chunk_size
         mamba_track_mask_cpu.append(mask)
@@ -2167,7 +2183,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             # async H2D
             self.mamba_track_mask = (
-                (self.seq_lens_cpu % get_global_server_args().mamba_track_interval == 0)
+                ((self.seq_lens_cpu % get_global_server_args().mamba_track_interval == 0)
+                 & torch.tensor([not getattr(r, "_agentic_mamba_frozen_prompt_valid", False) for r in self.reqs], dtype=torch.bool))
                 .pin_memory()
                 .to(device=self.device, non_blocking=True)
             )

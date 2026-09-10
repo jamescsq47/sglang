@@ -1198,13 +1198,13 @@ class SchedulerDisaggregationPrefillMixin:
         state_indices = None
         kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
         if isinstance(kv_pool, HybridLinearKVPool):
-            state_indices = [
-                self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                    req.req_pool_idx
+            if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get():
+                from sglang.srt.disaggregation.agentic_hybrid_transfer import p2d_mamba_source_indices
+                state_indices = p2d_mamba_source_indices(req, page_size)[0]
+            else:
+                state_indices = [
+                    self.req_to_token_pool.req_index_to_mamba_index_mapping[req.req_pool_idx].cpu().numpy()
                 ]
-                .cpu()
-                .numpy()
-            ]
         elif isinstance(kv_pool, SWAKVPool):
             window_start = max(0, end_idx - self.sliding_window_size)
             window_start = (window_start // page_size) * page_size
@@ -1635,7 +1635,15 @@ class SchedulerDisaggregationPrefillMixin:
 
                 # There is no output_ids for prefill
                 req.output_ids.append(next_token_id)
+                tracked = getattr(req, "mamba_last_track_seqlen", None)
                 self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
+                if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get() and getattr(req, "mamba_pool_idx", None) is not None:
+                    from sglang.srt.disaggregation.agentic_hybrid_transfer import freeze_p2d_mamba_checkpoint_after_cache
+                    freeze_p2d_mamba_checkpoint_after_cache(req, tracked, self.server_args.page_size)
+                    from sglang.srt.disaggregation.agentic_hybrid_transfer import log_mamba_digest, p2d_mamba_source_indices
+                    custom = req.sampling_params.custom_params or {}
+                    log_mamba_digest(self.req_to_token_pool, p2d_mamba_source_indices(req, self.server_args.page_size),
+                                     phase="p2d_source", snapshot_id=f"{custom.get('agentic_request_id')}:{custom.get('agentic_generation')}")
                 self.disagg_prefill_inflight_queue.append(req)
                 p2d_host = getattr(self, "agentic_p2d_host_staging_manager", None)
                 if p2d_host is not None:
@@ -2217,14 +2225,15 @@ class SchedulerDisaggregationPrefillMixin:
             if isinstance(
                 self.token_to_kv_pool_allocator.get_kvcache(), HybridLinearKVPool
             ):
-                # Mamba hybrid model: send single mamba state index
-                state_indices = [
-                    self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                        req.req_pool_idx
+                if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get():
+                    from sglang.srt.disaggregation.agentic_hybrid_transfer import p2d_mamba_source_indices
+                    state_indices = p2d_mamba_source_indices(req, page_size)[0]
+                else:
+                    state_indices = [
+                        self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                            req.req_pool_idx
+                        ].cpu().numpy()
                     ]
-                    .cpu()
-                    .numpy()
-                ]
             elif isinstance(self.token_to_kv_pool_allocator.get_kvcache(), SWAKVPool):
                 # SWA hybrid model: send last window KV indices
                 seq_len = len(req.fill_ids)
