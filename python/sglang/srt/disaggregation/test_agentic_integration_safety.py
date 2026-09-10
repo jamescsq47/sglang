@@ -81,6 +81,38 @@ def test_assigned_unclaimed_host_snapshot_cannot_be_evicted(ledger_dir, domain):
     assert entry["recovery_domain"] == domain
 
 
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+def test_static_local_recovery_claim_with_domain(ledger_dir, tp_size):
+    request = RequestGeneration("static-local-recovery", 1)
+    ledger = _ready_ledger(ledger_dir, request, tp_size=tp_size, arena_domain=0)
+    sid = request.snapshot_id
+    before = ledger.get(sid)
+    for owner, domain in [("foreign", 0), ("host", 1)]:
+        assert not ledger.claim_d2p_recovery_rank(
+            sid, owner, tp_rank=0, tp_size=tp_size,
+            claim_id="child", recovery_domain=domain,
+        )
+        assert ledger.get(sid) == before
+    for rank in range(tp_size):
+        for _ in range(2):
+            assert ledger.claim_d2p_recovery_rank(
+                sid, "host", tp_rank=rank, tp_size=tp_size,
+                claim_id="child", recovery_domain=0,
+            )
+        assert not ledger.begin_host_eviction(
+            sid, "host", tp_size=tp_size, reason="pressure"
+        )
+    entry = ledger.get(sid)
+    assert entry["recovery_domain"] == 0
+    assert entry["recovery_owner"] == "host"
+    assert len(entry["recovery_claims"]) == tp_size
+    assert entry["state"] == HostStageState.H2D_LOADING.value
+    assert not ledger.claim_d2p_recovery_rank(
+        sid, "host", tp_rank=0, tp_size=tp_size,
+        claim_id="other-child", recovery_domain=0,
+    )
+
+
 @pytest.mark.parametrize("claimed", [False, True])
 def test_expired_assignment_allows_eviction_only_before_recovery_claim(
     ledger_dir, claimed

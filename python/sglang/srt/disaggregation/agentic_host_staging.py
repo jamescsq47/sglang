@@ -2627,10 +2627,20 @@ class SharedHostStagingLedger:
             ):
                 return False, False
             selected_domain = current.get("recovery_domain")
-            if recovery_domain is not None and (
-                selected_domain is None
-                or int(selected_domain) != int(recovery_domain)
-            ):
+            if selected_domain is None:
+                # Static single-P routing has no Router assignment.  Only
+                # the physical Host owner may claim that unassigned record;
+                # commit its domain together with the pin, under this CAS.
+                if current.get("p_owner") != owner:
+                    return False, False
+                arena_domain = current.get("arena_domain")
+                if (
+                    recovery_domain is not None
+                    and arena_domain is not None
+                    and int(arena_domain) != int(recovery_domain)
+                ):
+                    return False, False
+            elif recovery_domain is None or int(selected_domain) != int(recovery_domain):
                 return False, False
             recovery_owner = current.get("recovery_owner")
             if recovery_owner not in {None, owner}:
@@ -2651,6 +2661,8 @@ class SharedHostStagingLedger:
             }
             current["recovery_claim_id"] = claim_id
             current["recovery_owner"] = owner
+            if recovery_domain is not None:
+                current["recovery_domain"] = int(recovery_domain)
             current["recovery_claims"] = claims
             current["state"] = HostStageState.H2D_LOADING.value
             if changed:
