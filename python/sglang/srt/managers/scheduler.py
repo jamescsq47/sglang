@@ -486,12 +486,14 @@ class AgenticPWorksetLeaseBroker:
             if owner is not None and current.owner != owner:
                 return False
             if (
-                current.state == "active"
+                current.state in {"active", "retire_ready"}
                 and any(entry[0] == snapshot_id for entry in self._tp_plan)
             ):
                 # The current TP allocation epoch is immutable.  Record the
-                # exact lease terminal now; TP0 omits it from the next epoch,
-                # and every rank releases at the same scheduler-safe boundary.
+                # exact lease terminal now; only all-rank retirement permits
+                # TP0 to omit it and release at a scheduler-safe boundary.
+                # retire_ready is local quiescence, not group permission: a
+                # repeated receiver cleanup must not turn it into a local free.
                 # Releasing eagerly here would let the still-frozen plan
                 # recreate the snapshot with a new lease id.
                 self._tp_release_pending[snapshot_id] = current.lease_id
@@ -1432,10 +1434,14 @@ class AgenticPWorksetLeaseBroker:
             return False
         return lease.state in {"active", "retire_ready", "releasing"}
 
-    def tp_retire_ready(self, snapshot_id: str) -> bool:
+    def tp_retire_ready(
+        self, snapshot_id: str, *, lease_id: Optional[int] = None
+    ) -> bool:
         with self._lock:
             lease = self._leases.get(snapshot_id)
-            return lease is None or lease.state in {
+            return lease is None or (
+                lease_id is not None and lease.lease_id != lease_id
+            ) or lease.state in {
                 "active",
                 "retire_ready",
                 "releasing",
@@ -5409,7 +5415,7 @@ class Scheduler(
 
         The first phase only publishes receipt -1 so every native scheduler
         rolls back its local Radix/pin/workset.  The second phase runs after
-        the mailbox proves all ranks acknowledged status 6; only then may TP0
+        the separate rollback ACK proves every rank quiescent; only then may TP0
         return P_RECEIVED to D and publish terminal receipt -2.
         """
 
@@ -5527,7 +5533,7 @@ class Scheduler(
                 if snapshot_id in getattr(
                     self, "agentic_tp_direct_local_rolled_back", ()
                 ):
-                    mailbox.publish_local_progress(snapshot_id, 6)
+                    mailbox.publish_local_rollback_complete(snapshot_id)
                 elif snapshot_id in getattr(
                     self, "agentic_tp_direct_local_failed", ()
                 ):
@@ -5547,15 +5553,11 @@ class Scheduler(
                 if snapshot_id not in self.agentic_tp_direct_admission_active:
                     continue
             entry = receives.get(snapshot_id)
-            group_status = mailbox.group_status(snapshot_id)
-            if group_status is None:
-                continue
-            group_status = int(group_status)
             receipt = mailbox.receipt(snapshot_id)
             if receipt is not None and int(receipt) < 0:
                 if int(receipt) <= -2:
                     continue
-                if group_status >= 6:
+                if mailbox.rollback_group_complete(snapshot_id):
                     Scheduler._agentic_abort_tp_direct_grant(
                         self,
                         active_item[0],
@@ -5564,6 +5566,10 @@ class Scheduler(
                         rolled_back=True,
                     )
                 continue
+            group_status = mailbox.group_status(snapshot_id)
+            if group_status is None:
+                continue
+            group_status = int(group_status)
             if group_status < 0:
                 Scheduler._agentic_abort_tp_direct_grant(
                     self,
@@ -7114,7 +7120,10 @@ class Scheduler(
                 ):
                     local_status = 5
                     break
-            mailbox.publish_local_progress(snapshot_id, local_status)
+            if local_status == 6:
+                mailbox.publish_local_rollback_complete(snapshot_id)
+            else:
+                mailbox.publish_local_progress(snapshot_id, local_status)
         if self.tp_rank == 0:
             self.agentic_tp_direct_group_status = {
                 snapshot_id: int(status)
@@ -7849,6 +7858,13 @@ class Scheduler(
                         self.agentic_p_workset_broker.request_release(
                             snapshot_id, active_item[4]
                         )
+                        if not self.agentic_p_workset_broker.tp_retire_ready(
+                            snapshot_id, lease_id=active_item[4].lease_id
+                        ):
+                            # A start can own the transport lease before its
+                            # receiver is visible.  Keep the group claim until
+                            # that exact attempt reaches its physical fence.
+                            continue
                     rolled_back = getattr(
                         self, "agentic_tp_direct_local_rolled_back", None
                     )
@@ -7858,7 +7874,7 @@ class Scheduler(
                     rolled_back.add(snapshot_id)
                     mailbox = getattr(self, "agentic_tp_direct_mailbox", None)
                     if mailbox is not None:
-                        mailbox.publish_local_progress(snapshot_id, 6)
+                        mailbox.publish_local_rollback_complete(snapshot_id)
                     # TP0 returns P_RECEIVED ownership only after every rank
                     # has published this rollback ACK.  Keep the command
                     # active until the background worker publishes receipt -2.
@@ -7875,8 +7891,10 @@ class Scheduler(
                     mailbox = getattr(self, "agentic_tp_direct_mailbox", None)
                     if mailbox is not None:
                         mailbox.clear_local(snapshot_id)
+                        mailbox.clear_local_rollback(snapshot_id)
                         if self.tp_rank == 0:
                             mailbox.clear_group(snapshot_id)
+                            mailbox.clear_group_rollback(snapshot_id)
                 continue
             request = RequestGeneration(
                 str(command["request_id"]), int(command["generation"])

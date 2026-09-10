@@ -18,13 +18,96 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     AgenticRequestMetadata,
     DecodeKVCacheOffloadManager,
 )
-from sglang.srt.managers.scheduler import AgenticPWorksetLeaseBroker
+from sglang.srt.managers.scheduler import AgenticPWorksetLeaseBroker, Scheduler
+from sglang.srt.disaggregation.agentic_tp_control import TPGroupMailbox
+from sglang.srt.disaggregation.agentic_kv_lifecycle import SnapshotState
+from sglang.srt.disaggregation.utils import DisaggregationMode
 
 
 @pytest.fixture
 def ledger_dir():
     with tempfile.TemporaryDirectory(prefix="agentic-safety-", dir="/dev/shm") as path:
         yield Path(path)
+
+
+@pytest.mark.parametrize("tp_size", [2, 4])
+def test_four_failed_direct_slots_return_after_all_rank_rollback(ledger_dir, tp_size):
+    requests = [RequestGeneration(f"abort-slot-{i}", 0) for i in range(4)]
+    store = SimpleNamespace(load=lambda *_a, **_kw: SimpleNamespace(state=SnapshotState.DIRECT_READY))
+    owners = []
+    for rank in range(tp_size):
+        mailbox = TPGroupMailbox("rollback-test", tp_rank=rank, tp_size=tp_size, directory=str(ledger_dir))
+        owners.append(SimpleNamespace(
+            tp_size=tp_size, tp_rank=rank,
+            disaggregation_mode=DisaggregationMode.PREFILL,
+            _AGENTIC_TP_CONTROL_KEY=Scheduler._AGENTIC_TP_CONTROL_KEY,
+            agentic_tp_direct_mailbox=mailbox,
+            agentic_early_direct_poll_lock=threading.RLock(),
+            agentic_tp_direct_admission_active={r.snapshot_id: (r, 0.0, None, 128, None) for r in requests},
+            agentic_tp_direct_group_status={}, agentic_early_direct_receives={},
+            agentic_tp_direct_local_failed={r.snapshot_id for r in requests},
+            agentic_tp_direct_local_admitted=set(), agentic_tp_direct_local_rolled_back=set(),
+            agentic_p_workset_broker=SimpleNamespace(
+                install_tp_plan=lambda *_a, **_kw: None,
+                cancel_unstarted=lambda *_a, **_kw: None,
+            ),
+            agentic_host_staging_manager=None,
+        ))
+        for request in requests:
+            mailbox.publish_local_progress(request.snapshot_id, -1)
+            if rank == 0:
+                mailbox.publish_receipt(request.snapshot_id, -1)
+        assert Scheduler._agentic_early_direct_slots_used(owners[-1]) == 4
+
+    def control(action):
+        return {
+            Scheduler._AGENTIC_TP_CONTROL_KEY: True,
+            "workset_plan_epoch": 1, "workset_allocation_plan": [],
+            "direct_commands": [{"snapshot": r.snapshot_id, "action": action} for r in requests],
+        }
+
+    # Abort races a background start after begin_io_attempt but before the
+    # receiver becomes visible.  No rank may acknowledge this unfinished DMA.
+    owner = owners[0]
+    broker = AgenticPWorksetLeaseBroker(page_size=4)
+    broker.install_tp_plan = lambda *_a, **_kw: None
+    owner.agentic_p_workset_broker = broker
+    request = requests[0]
+    lease = SimpleNamespace(lease_id="invisible-start", owner="direct", state="active", io_attempt=None)
+    broker._leases[request.snapshot_id] = lease
+    owner.agentic_tp_direct_admission_active[request.snapshot_id] = (request, 0.0, None, 128, lease)
+    assert broker.begin_io_attempt(request.snapshot_id, lease, "attempt")
+    for state in ("io_reserved", "io_inflight", "release_pending"):
+        lease.state = state
+        Scheduler._agentic_tp_consume_admission_control(owner, [control("abort")])
+        assert request.snapshot_id not in owner.agentic_tp_direct_local_rolled_back
+        assert not owner.agentic_tp_direct_mailbox.rollback_group_complete(request.snapshot_id)
+    # Physical quiescence permits the ordinary rollback protocol to finish.
+    lease.state = "retire_ready"
+    assert broker.tp_retire_ready(request.snapshot_id, lease_id=lease.lease_id)
+    # A later unrelated lease cannot make an old exact-lease ACK wait forever.
+    assert broker.tp_retire_ready(request.snapshot_id, lease_id="already-retired")
+
+    for rank, owner in enumerate(owners):
+        Scheduler._agentic_tp_consume_admission_control(owner, [control("abort")])
+        # Retry ACK and late ordinary failure must not erase rollback evidence.
+        Scheduler._agentic_commit_tp_direct_groups(owner, store)
+        for request in requests:
+            owner.agentic_tp_direct_mailbox.publish_local_progress(request.snapshot_id, -1)
+        Scheduler._agentic_commit_tp_direct_groups(owners[0], store)
+        expected = -2 if rank == tp_size - 1 else -1
+        for request in requests:
+            assert owners[0].agentic_tp_direct_mailbox.receipt(request.snapshot_id) == expected
+            assert owner.agentic_tp_direct_mailbox.local_status(request.snapshot_id) == -1
+
+    for owner in owners:
+        Scheduler._agentic_tp_consume_admission_control(owner, [control("clear")])
+        assert Scheduler._agentic_early_direct_slots_used(owner) == 0
+    for request in requests:
+        assert not owners[0].agentic_tp_direct_mailbox.rollback_group_complete(request.snapshot_id)
+    next_request = RequestGeneration("next-direct", 0)
+    owners[0].agentic_tp_direct_admission_active[next_request.snapshot_id] = (next_request, 0.0, None, 128, None)
+    assert Scheduler._agentic_early_direct_slots_used(owners[0]) == 1
 
 
 def _ready_ledger(ledger_dir, request, **fields):

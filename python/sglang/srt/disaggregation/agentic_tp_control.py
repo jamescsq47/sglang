@@ -187,6 +187,23 @@ class TPGroupMailbox:
     def receipt(self, key: object) -> Optional[int]:
         return self._read(self._receipt_path(key))
 
+    def publish_local_rollback_complete(self, key: object) -> None:
+        """ACK physical rollback independently of sticky transfer failure.
+
+        Only the Direct cleanup owner calls this after its DMA fence and
+        local rollback.  It must never turn a failed transfer into success.
+        """
+        self.publish_local_progress(("direct-rollback", key), 1)
+
+    def rollback_group_complete(self, key: object) -> bool:
+        return self.group_status(("direct-rollback", key)) == 1
+
+    def clear_local_rollback(self, key: object) -> None:
+        self.clear_local(("direct-rollback", key))
+
+    def clear_group_rollback(self, key: object) -> None:
+        self.clear_group(("direct-rollback", key))
+
     def clear_local(self, key: object) -> None:
         path = self._rank_path(key, self.tp_rank)
         with self._cache_lock:

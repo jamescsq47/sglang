@@ -1,3 +1,20 @@
+# pd_mamba：Qwen3 + Qwen3.5 融合版 / Unified Agentic PD
+
+本分支自 2026-09-10 起发布基于 `sglang-h100-integration` 当前 Agentic PD
+流水线的融合实现：保留 Qwen3 路径，额外支持 Qwen3.5 的 Attention KV +
+Mamba conv/temporal state 一体化传输与跨轮回传，并包含 TP 回滚/释放修复。
+它替代旧 `pd_mamba` 分支的实现；旧提交 `6252e0fc9c` 仍保留在 Git 历史中。
+这是当前 PD 基线上的移植，不是对旧分支较新上游 SGLang 版本的整体升级。
+
+**验证范围：**此前 Qwen3-8B 输出一致性、Qwen3.5-9B TP1/TP2 多轮 Direct/Host
+回传检查通过；本次 TP 补丁通过 491 项 CPU 回归及独立审核，尚未重跑 GPU。
+不代表所有 Qwen3/Qwen3.5 型号、TP 配置或满载吞吐均已验证。
+
+完整架构、依赖环境、复现步骤和限制见 [融合与验证记录](QWEN35_CURRENT_PD_PORT.md)。
+请使用隔离源码 overlay，不要覆盖正在进行其他实验的 baseline 环境。
+
+---
+
 <div align="center" id="sglangtop">
 <img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="logo" width="400" margin="10px"></img>
 

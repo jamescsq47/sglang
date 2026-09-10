@@ -1334,7 +1334,9 @@ def test_tp_workset_epoch_does_not_resurrect_io_terminal_release():
     assert broker.prepare_tp_plan(3) == ()
 
 
-def test_tp_workset_group_retire_waits_for_staggered_rank_fences():
+@pytest.mark.parametrize("tp_size", [2, 4])
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_tp_workset_group_retire_waits_for_staggered_rank_fences(tp_size, hybrid):
     class Allocator:
         def __init__(self):
             self.available = 8
@@ -1351,20 +1353,31 @@ def test_tp_workset_group_retire_waits_for_staggered_rank_fences():
         def free(self, indices):
             self.available += int(indices.numel())
 
-    ranks = [AgenticPWorksetLeaseBroker(page_size=4) for _ in range(2)]
+    state_allocators = [Allocator() for _ in range(tp_size)]
+    ranks = [AgenticPWorksetLeaseBroker(
+        page_size=4,
+        state_allocators=(state,) if hybrid else (),
+        mamba_req_to_token_pool=SimpleNamespace(
+            enable_mamba_extra_buffer=True, mamba_ping_pong_track_buffer_size=2,
+        ) if hybrid else None,
+    ) for state in state_allocators]
     owner = ranks[0].direct_owner("stagger:0")
     ranks[0].request("stagger:0", 4, 8, owner=owner)
     plan1 = ranks[0].prepare_tp_plan(1)
-    ranks[1].install_tp_plan(1, plan1)
-    allocators = [Allocator(), Allocator()]
+    for broker in ranks[1:]:
+        broker.install_tp_plan(1, plan1)
+    allocators = [Allocator() for _ in ranks]
     for broker, allocator in zip(ranks, allocators):
         broker.service(allocator)
         lease = broker.get("stagger:0", owner=owner)
         assert broker.begin_io_attempt("stagger:0", lease, "attempt")
         broker.mark_io_inflight("stagger:0", lease, "attempt")
 
+    assert all(state.available == (4 if hybrid else 8) for state in state_allocators)
+
     plan2 = ranks[0].prepare_tp_plan(2)
-    ranks[1].install_tp_plan(2, plan2)
+    for broker in ranks[1:]:
+        broker.install_tp_plan(2, plan2)
     leases = [broker.get("stagger:0", owner=owner) for broker in ranks]
     for broker, lease in zip(ranks, leases):
         assert not broker.request_release(
@@ -1378,18 +1391,35 @@ def test_tp_workset_group_retire_waits_for_staggered_rank_fences():
     assert ranks[0].tp_retire_ready("stagger:0")
     assert not ranks[1].tp_retire_ready("stagger:0")
     assert not ranks[1].commit_tp_retire("stagger:0")
+    # Receiver cleanup retries release after the local fence.  This must not
+    # turn retire_ready into a local free while another rank is still in DMA.
+    for epoch in (3, 4):
+        assert ranks[0].request_release("stagger:0", leases[0])
+        plan, retiring, _ = ranks[0].prepare_tp_control(epoch)
+        for broker in ranks[1:]:
+            broker.install_tp_plan(epoch, plan, retiring_ids=retiring)
+        for broker, allocator in zip(ranks, allocators):
+            broker.service(allocator)
+            assert allocator.available == 0
+        assert leases[0].state == "retire_ready"
+        assert all(lease.state == "release_pending" for lease in leases[1:])
+        # Attention pages and Mamba checkpoint/runtime slots share the same
+        # all-rank retirement barrier, including repeated local cleanup.
+        assert all(state.available == (4 if hybrid else 8) for state in state_allocators)
     for broker, allocator in zip(ranks, allocators):
         broker.service(allocator)
         assert broker.get("stagger:0", owner=owner) is not None
 
-    assert ranks[1].mark_io_quiesced("stagger:0", leases[1], "attempt")
+    for broker, lease in zip(ranks[1:], leases[1:]):
+        assert broker.mark_io_quiesced("stagger:0", lease, "attempt")
     assert all(broker.tp_retire_ready("stagger:0") for broker in ranks)
     assert all(broker.commit_tp_retire("stagger:0") for broker in ranks)
     for broker, allocator in zip(ranks, allocators):
         broker.service(allocator)
         assert broker.get("stagger:0") is None
         assert allocator.available == 8
-    assert ranks[0].prepare_tp_plan(3) == ()
+    assert ranks[0].prepare_tp_plan(5) == ()
+    assert all(state.available == 8 for state in state_allocators)
 
 
 def test_tp_workset_epoch_rejects_stale_and_shape_mismatch():

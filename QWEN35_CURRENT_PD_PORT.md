@@ -185,6 +185,54 @@ its inherited metadata limitation is not removed by this port.
 
 ## Reproduce compatibility checks
 
+### TP rollback patch sync (2026-09-10)
+
+Merged the uncommitted TP fixes from `sglang-h100-integration` at base
+`921fbd46ab`, without modifying that worktree or any installed environment.
+The static Host recovery claim patch was already present in `d38015245f`,
+so it was not applied twice. New production changes are confined to
+`agentic_tp_control.py` and `managers/scheduler.py`:
+
+- Direct transfer failure remains sticky, while an independent all-rank
+  rollback ACK records physical quiescence. A late failure cannot erase the
+  rollback ACK and strand the four Direct admission slots.
+- Repeated cleanup of a locally `retire_ready` TP lease must not release its
+  resources before the other ranks finish. All-rank retirement remains the
+  only authority for freeing the workset.
+- Abort checks the exact lease's I/O state even when the background receiver
+  is not yet visible. It cannot acknowledge rollback while that attempt is
+  reserved, in flight, or pending release. A replaced lease does not block an
+  already-retired attempt's ACK.
+
+Ownership mapping: this affects failed D→P Direct handoff rollback, not normal
+P→D delivery or routing. The source retains the composite Attention+Mamba
+snapshot until destination rollback fences settle across all TP ranks. Then
+existing ownership return/fallback is allowed. Success, Host durability,
+timeouts, congestion policy and shutdown entry points are unchanged. No new
+deadline, credit pool, reservation policy or fallback was introduced.
+
+Copied the donor TP2/TP4 failure/slot-recovery tests and added dense/hybrid
+parameterization to staggered-rank retirement: Attention pages and all four
+Mamba checkpoint/runtime slots stay allocated during repeated early-rank
+cleanup, then return after group retirement. All `test_agentic*.py` CPU tests
+pass: **491 passed**, with two dependency deprecation warnings. The focused
+suite before the extra hybrid case also passed (404 tests). `git diff --check`
+passes. This sync has **not** rerun GPU multi-turn or full-load experiments;
+the earlier GPU results above apply to the pre-sync revision.
+
+Eight-criterion scope: (1) rollback preserves composite ownership; (2–4)
+normal Direct/Host release paths unchanged; (5) no Forward-thread I/O added;
+(6) exact-lease fence plus independent all-rank rollback barrier strengthened;
+(7) hybrid payload/checkpoint code unchanged and hybrid retirement regression
+passes; (8) CPU tests pass, independent review recorded separately below.
+
+Independent `audit_tp_patch_merge` review: **GO for code merge / CPU validation**.
+The reviewer verified donor/target production added/removed lines match exactly,
+rollback ACK cannot override sticky failure, exact-lease rollback waits for
+quiescence, and Mamba slots share the all-rank free barrier. No new GPU or
+performance acceptance is implied. Test log:
+`validation/results/tp-rollback-sync-20260910/cpu-tests.log`.
+
 Do not install this tree into a shared environment. Launch it via the isolated
 overlay; the installed dependencies still come from `pd`:
 
