@@ -3824,6 +3824,11 @@ class Scheduler(
                 self.token_to_kv_pool_allocator,
                 reserve_tokens=reserve_tokens,
             )
+            # This wrapper is used by BOTH ordinary and disaggregated Prefill
+            # safe boundaries. PD never calls get_next_batch_to_run().
+            manager = getattr(self, "agentic_host_staging_manager", None)
+            if manager is not None and getattr(manager, "h2d_decoupled", False):
+                self._agentic_progress_granted_slow()
 
     def _agentic_start_early_direct_receive(
         self,
@@ -7025,7 +7030,51 @@ class Scheduler(
         host_staging = getattr(self, "agentic_host_staging_manager", None)
         if host_staging is not None and req.rid in host_staging.loads:
             return "slow"
+        if host_staging is not None and getattr(host_staging, "h2d_decoupled", False):
+            metadata = AgenticRequestMetadata.from_req(req)
+            parent = None if metadata is None else metadata.parent
+            if parent is not None and parent.snapshot_id in host_staging.h2d_selected_snapshots():
+                # A prestart workset intent already owns its physical lane.
+                # It must progress even when NEW-I/O admission has no slots.
+                return "slow"
         return None
+
+    def _agentic_progress_granted_slow(self) -> None:
+        """Consume bounded existing Slow grants at the allocator-safe boundary.
+
+        No new request selection, class priority, allocator thread or TP phase:
+        just start already-selected grants and bind completed worksets without
+        forcing an unrelated Forward between grant and H2D start.
+        """
+        manager = getattr(self, "agentic_host_staging_manager", None)
+        if manager is None or not getattr(manager, "h2d_decoupled", False):
+            return
+        selected = manager.h2d_selected_snapshots()
+        if not selected:
+            return
+        remaining = []
+        for req, arrived_at in self.agentic_kv_waiting_queue:
+            metadata = AgenticRequestMetadata.from_req(req)
+            parent = None if metadata is None else metadata.parent
+            if parent is None or parent.snapshot_id not in selected:
+                remaining.append((req, arrived_at))
+                continue
+            try:
+                deferred = manager.gate_request(req, parent)
+            except (SnapshotNotReadyError, SnapshotLifecycleError):
+                # Same recoverable lifecycle races as the ordinary admission
+                # loop: keep this exact waiter/ownership and progress others.
+                remaining.append((req, arrived_at))
+                continue
+            if deferred is not False:
+                remaining.append((req, arrived_at))
+                continue
+            # This workset is fully bound/handed, not a fresh compute admission
+            # that can remain behind unallocated waiters and fill Mamba slots.
+            req._agentic_kv_wait_enqueued = False
+            self._agentic_publish_p_scheduled(req)
+            self._add_request_to_queue(req)
+        self.agentic_kv_waiting_queue = remaining
 
     def _agentic_bind_completed_waiters(self) -> None:
         """Bind completed Direct ingress independently of Prefill admission.
@@ -8329,6 +8378,10 @@ class Scheduler(
         # receive from an earlier scheduler iteration consumes the slot.
         active_direct = sum(self._agentic_io_kind(req) == "direct" for req, _ in active)
         active_slow = sum(self._agentic_io_kind(req) == "slow" for req, _ in active)
+        if host_staging is not None and getattr(host_staging, "h2d_decoupled", False):
+            # A completed load still owns a workset, but no longer owns a DMA
+            # lane. Counting it as in-flight would undo transport decoupling.
+            active_slow = host_staging.h2d_physical_occupancy()
         direct_starts_left = max(0, direct_io_cap - active_direct)
         slow_starts_left = max(0, slow_io_cap - active_slow)
         for req, started_at in selected:

@@ -5100,6 +5100,18 @@ class AgenticPHostStagingManager:
         self.max_h2d_inflight = max(
             1, int(os.getenv("SGLANG_AGENTIC_KV_P_H2D_MAX_INFLIGHT", "4"))
         )
+        from sglang.srt.disaggregation.agentic_hybrid_transfer import request_owned_mamba_enabled
+        self.h2d_decoupled = bool(
+            os.getenv("SGLANG_AGENTIC_KV_P_H2D_DECOUPLED", "0").lower()
+            in {"1", "true"}
+            and self.tp_size == 1
+            and tree_cache.supports_mamba()
+            and request_owned_mamba_enabled()
+        )
+        # One bounded stage may await scheduler binding while the other is
+        # preparing/copying. This does not reserve a separate HBM pool: every
+        # item must still obtain the original complete hybrid workset lease.
+        self._h2d_resident_reservations: set[str] = set()
         self.h2d_chunk_tokens = max(
             1, int(os.getenv("SGLANG_AGENTIC_KV_P_H2D_CHUNK_TOKENS", "1024"))
         )
@@ -6630,10 +6642,18 @@ class AgenticPHostStagingManager:
             if existing is not None:
                 return int(existing)
             lane_count = max(1, int(getattr(self, "max_h2d_inflight", 1)))
+            resident = getattr(self, "_h2d_resident_reservations", None)
+            if getattr(self, "h2d_decoupled", False):
+                if resident is None:
+                    resident = self._h2d_resident_reservations = set()
+                if snapshot_id not in resident and len(resident) >= 2 * lane_count:
+                    return None
             occupied = set(int(value) for value in reservations.values())
             for lane_id in range(lane_count):
                 if lane_id not in occupied:
                     reservations[snapshot_id] = lane_id
+                    if getattr(self, "h2d_decoupled", False):
+                        resident.add(snapshot_id)
                     return lane_id
             return None
 
@@ -6644,6 +6664,40 @@ class AgenticPHostStagingManager:
             reservations = getattr(self, "_h2d_lane_reservations", None)
             if reservations is not None:
                 reservations.pop(snapshot_id, None)
+            resident = getattr(self, "_h2d_resident_reservations", None)
+            if resident is not None:
+                resident.discard(snapshot_id)
+
+    def _release_quiesced_h2d_lane(self, load: dict[str, Any]) -> None:
+        """Recycle transport resources, NOT the Host copy or destination lease."""
+
+        if not getattr(self, "h2d_decoupled", False):
+            return
+        if not (load.get("h2d_copy_complete") and load.get("io_quiesced")):
+            return
+        if (load.get("event") is not None or load.get("copy_refs") is not None
+                or load.get("prefetch_future") is not None):
+            return
+        snapshot_id = load["request_generation"].snapshot_id
+        with self._get_state_lock():
+            if self.loads.get(load.get("rid")) is not load:
+                return
+            if load.get("transport_lane_released"):
+                return
+            self._h2d_lane_reservations.pop(snapshot_id, None)
+            load["transport_lane_released"] = True
+            load["copy_done_at"] = time.monotonic()
+        # No Host/lease/CAS mutation here. The bounded resident credit stays
+        # until the existing handoff/cancel path calls _release_h2d_lane().
+        self._control_wakeup.set()
+
+    def h2d_physical_occupancy(self) -> int:
+        with self._get_state_lock():
+            return len(self._h2d_lane_reservations)
+
+    def h2d_selected_snapshots(self) -> set[str]:
+        with self._get_state_lock():
+            return set(self._h2d_resident_reservations)
 
     def _find_h2d_load(
         self, snapshot_id: str, *, rid: Optional[str] = None
@@ -7378,6 +7432,7 @@ class AgenticPHostStagingManager:
                     )
                 load["io_quiesced"] = True
                 load["h2d_copy_complete"] = True
+                AgenticPHostStagingManager._release_quiesced_h2d_lane(self, load)
                 self._publish_d2p_hbm_ready(load)
                 # H2D completion is not an ownership boundary. Keep the Host
                 # extent until the scheduler binds and pins this workset.
@@ -8055,6 +8110,17 @@ class AgenticPHostStagingManager:
                 return True
             if not self._release_completed_h2d_host(load):
                 return True
+            if getattr(self, "h2d_decoupled", False):
+                now = time.monotonic()
+                logger.info(
+                    "AgenticKV h2d_stage_timing snapshot=%s "
+                    "selected_to_grant_ms=%.3f io_to_fence_ms=%.3f "
+                    "fence_to_handoff_ms=%.3f ts=%.6f",
+                    snapshot_id,
+                    1000 * (load["wall_started_at"] - record.get("selected_at", load["wall_started_at"])),
+                    1000 * (load.get("copy_done_at", now) - load["wall_started_at"]),
+                    1000 * (now - load.get("copy_done_at", now)), time.time(),
+                )
             with self._get_state_lock():
                 if self.loads.get(req.rid) is load:
                     self.loads.pop(req.rid, None)
@@ -8149,6 +8215,7 @@ class AgenticPHostStagingManager:
             )
             if h2d_lane_id is None:
                 return True
+            record.setdefault("selected_at", time.monotonic())
             if getattr(record["snapshot"], "_materialized", record["snapshot"]) is None:
                 # Materialization now only mmaps the pageable tmpfs extent;
                 # the process-lifetime bounce was pinned during manager init.
@@ -8326,6 +8393,7 @@ class AgenticPHostStagingManager:
             ]
             record["loading"] = "h2d_prepared"
             self.loads[req.rid] = {
+                "rid": req.rid,
                 "record": record,
                 "request_generation": request_generation,
                 "device_indices": device_indices,
