@@ -224,9 +224,15 @@ class SchedulerRuntimeCheckerMixin:
             if not active and not getattr(req, "_agentic_mamba_runtime_reserved", False):
                 return  # Native D cleanup may leave a non-owning buffer view.
             counts[group] += active + (int(buffer.numel()) if buffer is not None else 0)
+            checkpoint = getattr(req, "_agentic_mamba_prefill_checkpoint", None)
+            if checkpoint is not None:
+                counts[group] += int(checkpoint.numel())
 
         for req in getattr(self, "waiting_queue", ()):
-            if getattr(req, "req_pool_idx", None) is None and getattr(req, "_agentic_mamba_runtime_reserved", False):
+            if getattr(req, "req_pool_idx", None) is None and (
+                getattr(req, "_agentic_mamba_runtime_reserved", False)
+                or getattr(req, "_agentic_prefill_mamba_admitted", False)
+            ):
                 count_req(req, "unpooled_req")
         offload = getattr(self, "decode_offload_manager", None)
         if offload is not None:

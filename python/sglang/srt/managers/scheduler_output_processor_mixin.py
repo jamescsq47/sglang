@@ -595,7 +595,8 @@ class SchedulerOutputProcessorMixin:
         result: GenerationBatchResult,
         i: int,
     ) -> None:
-        if getattr(req, "_agentic_mamba_frozen_prompt_valid", False):
+        from sglang.srt.disaggregation.agentic_hybrid_transfer import frozen_mamba_checkpoint
+        if frozen_mamba_checkpoint(req):
             return
         seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
         if req.mamba_ping_pong_track_buffer is not None:

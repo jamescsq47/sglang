@@ -649,7 +649,24 @@ class MambaRadixCache(BasePrefixCache):
                 released += full_released
                 # Native eviction may also delete tombstone ancestors.
                 node = last_deleted.parent
+        MambaRadixCache._release_unowned_mamba_checkpoints(self)
         return released
+
+    def _release_unowned_mamba_checkpoints(self) -> int:
+        """Drop obsolete state only at scheduler-owned, post-handoff points.
+
+        The latest P checkpoint is pinned by the request's native Radix lock;
+        D's imported checkpoint is request-owned outside this LRU. Other users'
+        locks remain authoritative. Internal tombstones retain shared Attention
+        KV; unreferenced leaf payloads use native cleanup, never a raw free.
+        Do not call this from dec_lock_ref: temporary COW unlocks are not an
+        ownership handoff and the caller may still need the matched node.
+        """
+        from sglang.srt.disaggregation.agentic_hybrid_transfer import request_owned_mamba_enabled
+        if not request_owned_mamba_enabled() or self.disable:
+            return 0
+        count = self.mamba_evictable_size()
+        return self.evict_mamba(count) if count else 0
 
     def release_agentic_request_cache(
         self,
@@ -723,7 +740,10 @@ class MambaRadixCache(BasePrefixCache):
                 req.req_pool_idx
             ).unsqueeze(-1)
         # radix tree mamba value is forked from req space
-        mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(mamba_value)
+        from sglang.srt.disaggregation.agentic_mamba_prefill import fork_prefill_checkpoint
+        mamba_value_forked = fork_prefill_checkpoint(
+            req, self.req_to_token_pool.mamba_pool, mamba_value
+        )
 
         # if alloc mamba cache failed, do evict and alloc again
         if mamba_value_forked is None:
@@ -780,6 +800,15 @@ class MambaRadixCache(BasePrefixCache):
         req.cache_protected_len = len(new_indices)
         req.mamba_last_track_seqlen = None
         req.last_node = new_last_node
+        # The replacement checkpoint is inserted and locked before retiring
+        # old checkpoints. No in-flight/current owner is evictable here.
+        self._release_unowned_mamba_checkpoints()
+
+        if (chunked and getattr(req, "_agentic_prefill_mamba_admitted", False)
+                and getattr(req, "_agentic_mamba_prefill_checkpoint", None) is None):
+            # Recycle the just-retired chunk checkpoint before another input
+            # workset can take it. No in-flight or shared state is evicted.
+            req._agentic_mamba_prefill_checkpoint = self.req_to_token_pool.mamba_pool.alloc(1)
 
     def pretty_print(self) -> None:
         self._print_helper(self.root_node, 0)

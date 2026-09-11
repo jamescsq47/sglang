@@ -332,7 +332,8 @@ class AgenticPWorksetLease:
 class AgenticPWorksetLeaseBroker:
     """Thread-safe intent queue with scheduler-owned physical allocation."""
 
-    def __init__(self, page_size: int, *, state_allocators=(), mamba_req_to_token_pool=None):
+    def __init__(self, page_size: int, *, state_allocators=(), mamba_req_to_token_pool=None,
+                 reserve_mamba_checkpoint=False):
         self.page_size = int(page_size)
         self._state_allocators = tuple(state_allocators)
         self._mamba_req_to_token_pool = mamba_req_to_token_pool
@@ -341,6 +342,8 @@ class AgenticPWorksetLeaseBroker:
             mamba_req_to_token_pool, "enable_mamba_extra_buffer", False
         ):
             self._runtime_state_slots += int(mamba_req_to_token_pool.mamba_ping_pong_track_buffer_size)
+        self._reserve_mamba_checkpoint = bool(reserve_mamba_checkpoint)
+        self._runtime_state_slots += int(self._reserve_mamba_checkpoint)
         self._intents: Dict[str, Tuple[str, int, int]] = {}
         self._leases: Dict[str, AgenticPWorksetLease] = {}
         self._release_requested: Dict[str, int] = {}
@@ -1031,12 +1034,14 @@ class AgenticPWorksetLeaseBroker:
                     dtype=reserved.dtype,
                     device=reserved.device,
                 )
-                ping_pong = reserved[1:]
+                ping_pong = reserved[1:-1] if self._reserve_mamba_checkpoint else reserved[1:]
                 if ping_pong.numel() > buffer_size:
                     raise RuntimeError("too many reserved Mamba tracking slots")
                 buffer[: ping_pong.numel()] = ping_pong
                 req.mamba_ping_pong_track_buffer = buffer
                 req.mamba_next_track_idx = 0
+            if self._reserve_mamba_checkpoint:
+                req._agentic_mamba_prefill_checkpoint = reserved[-1:]
             current.runtime_state_req = req
 
     def handoff_to_req(
@@ -1318,6 +1323,7 @@ class AgenticPWorksetLeaseBroker:
                 attached_req.mamba_ping_pong_track_buffer = None
                 attached_req.mamba_next_track_idx = None
                 attached_req.mamba_cow_src_index = None
+                attached_req._agentic_mamba_prefill_checkpoint = None
                 if hasattr(attached_req, "_agentic_mamba_cow_dst_indices"):
                     delattr(attached_req, "_agentic_mamba_cow_dst_indices")
                 current.runtime_state_req = None
@@ -2242,10 +2248,14 @@ class Scheduler(
         # workers publish intents; only the scheduler services physical page
         # allocation and release, preserving allocator/Radix ownership rules.
         hybrid_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
+        from sglang.srt.disaggregation.agentic_mamba_prefill import prefill_state_admission_enabled
+        self._agentic_mamba_prefill_admission = prefill_state_admission_enabled(
+            self.server_args, self.req_to_token_pool)
         self.agentic_p_workset_broker = AgenticPWorksetLeaseBroker(
             self.server_args.page_size,
             state_allocators=((hybrid_pool,) if hybrid_pool is not None else ()),
             mamba_req_to_token_pool=(self.req_to_token_pool if hybrid_pool is not None else None),
+            reserve_mamba_checkpoint=self._agentic_mamba_prefill_admission,
         )
         # TP rank 0 owns one ordered set of Direct admissions.  A dedicated
         # tmpfs mailbox grants the same request-generation to every rank's
@@ -8139,7 +8149,8 @@ class Scheduler(
     def _drain_agentic_kv_waiting_queue(self) -> None:
         """Progress active KV I/O and admit pending work in arrival order.
 
-        A request in this queue owns metadata only.  Each scheduler iteration
+        Unadmitted requests own metadata only, but a completed receive may
+        already have handed its workset to a waiter. Each scheduler iteration
         first polls already-started transfers. New Direct, Slow, and initial
         requests then share one arrival-ordered compute-admission queue; their
         I/O engines and credits remain independent. A small admission batch
@@ -8227,11 +8238,30 @@ class Scheduler(
             logger.exception("Invalid agentic KV admission setting")
             raise
 
+        def owns_resident_mamba_workset(req):
+            # TP1's completion sweep can commit ownership before this bounded
+            # metadata scan reaches the waiter. Such a request already holds
+            # parent + suffix KV and all runtime Mamba slots; it needs no new
+            # I/O admission. Leaving it behind older unallocated waiters can
+            # deadlock the state pool. Do not apply rank-local readiness to TP
+            # (which uses the group commands below), or change Qwen3 policy.
+            lease = getattr(req, "_agentic_p_workset_lease", None)
+            return bool(
+                getattr(self, "tp_size", 1) == 1
+                and getattr(req, "_agentic_kv_gate_complete", False)
+                and getattr(req, "_agentic_workset_backed", False)
+                and getattr(req, "_agentic_mamba_runtime_reserved", False)
+                and getattr(lease, "state", None) == "handed"
+            )
+
         active = []
+        resident = []
         inactive = []
         for entry in self.agentic_kv_waiting_queue:
             req = entry[0]
-            if self._agentic_io_active(req):
+            if owns_resident_mamba_workset(req):
+                resident.append(entry)
+            elif self._agentic_io_active(req):
                 active.append(entry)
             else:
                 inactive.append(entry)
@@ -8284,7 +8314,11 @@ class Scheduler(
                 return
         else:
             inactive_by_arrival = sorted(inactive, key=lambda entry: entry[1])
-            selected = active + inactive_by_arrival[:scan_limit]
+            selected = (
+                sorted(resident, key=lambda entry: entry[1])
+                + active
+                + inactive_by_arrival[:scan_limit]
+            )
             untouched = inactive_by_arrival[scan_limit:]
         still_waiting = []
         new_io_started = 0
@@ -8300,7 +8334,12 @@ class Scheduler(
         for req, started_at in selected:
             previous_kind = self._agentic_io_kind(req)
             was_active = previous_kind is not None
-            if not was_active and newly_admitted >= admission_batch:
+            resident_workset = owns_resident_mamba_workset(req)
+            if (
+                not was_active
+                and not resident_workset
+                and newly_admitted >= admission_batch
+            ):
                 still_waiting.append((req, started_at))
                 continue
             queue_class = self._agentic_queue_class(req)
@@ -8326,7 +8365,8 @@ class Scheduler(
                 if deferred:
                     still_waiting.append((req, started_at))
                 else:
-                    newly_admitted += 1
+                    if not resident_workset:
+                        newly_admitted += 1
                     req._agentic_kv_wait_enqueued = False
                     self._agentic_publish_p_scheduled(req)
                     direct_tokens = getattr(req, "_agentic_kv_direct_hit_tokens", 0)
@@ -8382,7 +8422,8 @@ class Scheduler(
                 # this request metadata-only and retry; the timeout is the
                 # explicit recompute fallback boundary.
                 still_waiting.append((req, started_at))
-        # Put unscanned entries first so the next bounded pass starts there.
+        # Keep unscanned metadata waiters; the next pass applies native arrival
+        # order again. Resident Mamba worksets must not depend on this rotation.
         self.agentic_kv_waiting_queue = untouched + still_waiting
 
     def _prioritize_agentic_prefill_ready(self) -> None:
@@ -9255,6 +9296,14 @@ class Scheduler(
                     len(self.disagg_prefill_inflight_queue),
                 )
                 return None
+            if getattr(self, "_agentic_mamba_prefill_admission", False):
+                from sglang.srt.disaggregation.agentic_mamba_prefill import reserve_prefill_state
+                reservation = reserve_prefill_state(
+                    self.chunked_req, self.req_to_token_pool, self.tree_cache
+                )
+                if reservation is None:
+                    return None
+                reservation.finish(True)
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
@@ -9308,6 +9357,25 @@ class Scheduler(
                 if pop_failed is not None and pop_failed(req.rid):
                     self._agentic_abandon_load(req)
 
+            # Req slots and Attention tokens do not imply Mamba capacity.
+            # Physically reserve runtime + output checkpoint before COW, so
+            # both this batch and the overlapped previous output remain safe.
+            state_reservation = None
+            if getattr(self, "_agentic_mamba_prefill_admission", False):
+                from sglang.srt.disaggregation.agentic_mamba_prefill import reserve_prefill_state
+                state_reservation = reserve_prefill_state(
+                    req, self.req_to_token_pool, self.tree_cache,
+                    # First-turn chunking has no old checkpoint to retire
+                    # after its first insertion. Reserve the replacement too.
+                    checkpoint_slots=(2 if (
+                        not getattr(req, "_agentic_workset_backed", False)
+                        and adder.rem_chunk_tokens is not None
+                        and len(req.origin_input_ids) > adder.rem_chunk_tokens
+                    ) else 1),
+                )
+                if state_reservation is None:
+                    # A later resident request may need no additional slots.
+                    continue
             req.init_next_round_input(self.tree_cache)
             p_ready_credit = getattr(self, "_p_ready_compute_credit_tokens", None)
             # Once scheduled, the request's complete matched + new Prompt KV
@@ -9322,6 +9390,8 @@ class Scheduler(
             if p_ready_credit is not None and p_ready_protected_tokens > p_ready_credit:
                 # Do not let a large head-of-line prompt prevent smaller work
                 # later in the queue from using the available credit.
+                if state_reservation is not None:
+                    state_reservation.finish(False)
                 continue
             if (
                 getattr(req, "_agentic_kv_direct_hit_tokens", 0)
@@ -9357,6 +9427,8 @@ class Scheduler(
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+            if state_reservation is not None:
+                state_reservation.finish(len(adder.can_run_list) > can_run_before)
             if p_ready_credit is not None and len(adder.can_run_list) > can_run_before:
                 p_ready_credit -= p_ready_protected_tokens
                 self._p_ready_compute_credit_tokens = p_ready_credit

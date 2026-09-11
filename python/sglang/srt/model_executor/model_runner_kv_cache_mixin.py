@@ -371,6 +371,13 @@ class ModelRunnerKVCacheMixin:
         return full_tokens, full_tokens, swa_tokens
 
     def _calculate_mamba_ratio(self: ModelRunner) -> int:
+        from sglang.srt.disaggregation.agentic_hybrid_transfer import request_owned_mamba_enabled
+        if request_owned_mamba_enabled() and self.server_args.disaggregation_mode == "decode":
+            # Active + private frozen checkpoint + its locked Radix copy.
+            # The Radix copy can be shared, but persists during Decode; it is
+            # not merely transient headroom. P keeps native scratch
+            # budgeting because chunked Prefill still rotates its work buffers.
+            return 3
         if self.server_args.disable_radix_cache:
             return 1
 

@@ -1229,13 +1229,28 @@ class Req(ReqDllmMixin):
         token_indices = req_to_token_pool.req_to_token[
             self.req_pool_idx, : self.seqlen - 1
         ]
-        self.kv_cache_cpu = token_to_kv_pool_allocator.get_cpu_copy(token_indices)
+        from sglang.srt.disaggregation.agentic_hybrid_transfer import offload_request_mamba
+        state_backup = offload_request_mamba(self, req_to_token_pool)
+        if state_backup is not None:
+            full_pool = token_to_kv_pool_allocator.get_kvcache().full_kv_pool
+            self.kv_cache_cpu = full_pool.get_cpu_copy(token_indices)
+            self._agentic_retracted_mamba = state_backup
+        else:
+            self.kv_cache_cpu = token_to_kv_pool_allocator.get_cpu_copy(token_indices)
 
     def load_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
             self.req_pool_idx, : self.seqlen - 1
         ]
-        token_to_kv_pool_allocator.load_cpu_copy(self.kv_cache_cpu, token_indices)
+        backup = getattr(self, "_agentic_retracted_mamba", None)
+        if backup is not None:
+            from sglang.srt.disaggregation.agentic_hybrid_transfer import restore_request_mamba
+            full_pool = token_to_kv_pool_allocator.get_kvcache().full_kv_pool
+            full_pool.load_cpu_copy(self.kv_cache_cpu, token_indices)
+            restore_request_mamba(self, req_to_token_pool, backup)
+            del self._agentic_retracted_mamba
+        else:
+            token_to_kv_pool_allocator.load_cpu_copy(self.kv_cache_cpu, token_indices)
         del self.kv_cache_cpu
 
     def log_time_stats(self):
@@ -2182,9 +2197,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
 
             # async H2D
+            from sglang.srt.disaggregation.agentic_hybrid_transfer import frozen_mamba_checkpoint
             self.mamba_track_mask = (
                 ((self.seq_lens_cpu % get_global_server_args().mamba_track_interval == 0)
-                 & torch.tensor([not getattr(r, "_agentic_mamba_frozen_prompt_valid", False) for r in self.reqs], dtype=torch.bool))
+                 & torch.tensor([not frozen_mamba_checkpoint(r) for r in self.reqs], dtype=torch.bool))
                 .pin_memory()
                 .to(device=self.device, non_blocking=True)
             )

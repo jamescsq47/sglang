@@ -130,6 +130,12 @@ PD_CORRECTNESS_CAPTURE_LABEL="${PD_CORRECTNESS_CAPTURE_LABEL:-pd-capture}"
 PD_SERVE_ONLY="${PD_SERVE_ONLY:-0}"
 PD_DETERMINISTIC_INFERENCE="${PD_DETERMINISTIC_INFERENCE:-0}"
 PD_SERVER_RANDOM_SEED="${PD_SERVER_RANDOM_SEED:-2026}"
+for nccl_base in "${PD_PREFILL_NCCL_PORT_BASE:-}" "${PD_DECODE_NCCL_PORT_BASE:-}"; do
+  if [[ -n "${nccl_base}" ]] && { [[ ! "${nccl_base}" =~ ^[1-9][0-9]*$ ]] || (( nccl_base > 65000 )); }; then
+    echo "Invalid explicit NCCL port base: ${nccl_base}" >&2
+    exit 2
+  fi
+done
 MAMBA_TRACK_INTERVAL="${MAMBA_TRACK_INTERVAL:-}"
 # Keep reverse NIXL listeners out of Linux's usual ephemeral range.
 # The legacy offset remains available when explicitly supplied.
@@ -181,6 +187,9 @@ if [[ "${PD_DETERMINISTIC_INFERENCE}" == "1" ]]; then
 fi
 if [[ -n "${MAMBA_TRACK_INTERVAL}" ]]; then
   mamba_args+=(--mamba-track-interval "${MAMBA_TRACK_INTERVAL}")
+fi
+if [[ -n "${MAMBA_FULL_MEMORY_RATIO:-}" ]]; then
+  mamba_args+=(--mamba-full-memory-ratio "${MAMBA_FULL_MEMORY_RATIO}")
 fi
 if [[ -n "${MODEL_REASONING_PARSER}" ]]; then
   model_parser_args+=(--reasoning-parser "${MODEL_REASONING_PARSER}")
@@ -664,8 +673,23 @@ if [[ "${PD_SKIP_SEARCH}" != "1" && "${SEARCH_START_AFTER_MODELS}" != "true" ]];
 fi
 
 prefill_numa_vectors=()
+wait_prefill_model_ready() {
+  local index="$1"
+  # Non-generative readiness: /health on P would wait for a D consumer.
+  wait_http "prefill-${index}" "http://127.0.0.1:${prefill_ports[$index]}/model_info" "${prefill_pids[$index]}"
+  if grep -Eq 'Server error:.*address already in use|error while attempting to bind.*address already in use' \
+      "${RUN_DIR}/logs/prefill-${index}.log"; then
+    echo "prefill-${index} KV bootstrap listener failed; see ${RUN_DIR}/logs/prefill-${index}.log" >&2
+    exit 1
+  fi
+}
+
 prefill_pids=()
 for index in "${!prefill_gpu_groups[@]}"; do
+  prefill_nccl_args=()
+  if [[ -n "${PD_PREFILL_NCCL_PORT_BASE:-}" ]]; then
+    prefill_nccl_args=(--nccl-port "$((PD_PREFILL_NCCL_PORT_BASE + index))")
+  fi
   prefill_group="${prefill_gpu_groups[$index]}"
   IFS=',' read -r -a prefill_group_gpus <<<"${prefill_group}"
   prefill_group_numas=()
@@ -697,6 +721,7 @@ for index in "${!prefill_gpu_groups[@]}"; do
     python -m sglang.launch_server \
       --model-path "${MODEL_PATH}" --host 0.0.0.0 --port "${prefill_ports[$index]}" \
       --tp-size "${PREFILL_TP_SIZE}" --numa-node "${prefill_group_numas[@]}" \
+      "${prefill_nccl_args[@]}" \
       --context-length "${MAX_CONTEXT_LENGTH}" --page-size "${PD_PAGE_SIZE}" \
       --mem-fraction-static "${MEM_FRACTION_STATIC}" --enable-metrics \
       --skip-server-warmup \
@@ -714,27 +739,23 @@ for index in "${!prefill_gpu_groups[@]}"; do
   prefill_pid="$!"
   prefill_pids+=("${prefill_pid}")
   pids+=("${prefill_pid}")
-  # A disaggregated P's /health probe performs a real Prefill and waits for a
-  # Decode consumer.  During bootstrap no D or Router exists yet, so using it
-  # here serializes startup behind an impossible transfer.  /model_info proves
-  # the HTTP/model process is ready without creating a P-ready generation.
-  wait_http "prefill-${index}" "http://127.0.0.1:${prefill_ports[$index]}/model_info" "${prefill_pids[$index]}"
-  # The HTTP server can become healthy even when its auxiliary KV bootstrap
-  # listener failed to bind.  That produces a deceptive half-alive P: every
-  # later P->D handshake retries forever behind the first FIFO generation.
-  # Treat any listener bind failure during startup as fatal.
-  if grep -Eq 'Server error:.*address already in use|error while attempting to bind.*address already in use' \
-      "${RUN_DIR}/logs/prefill-${index}.log"; then
-    echo "prefill-${index} KV bootstrap listener failed; see ${RUN_DIR}/logs/prefill-${index}.log" >&2
-    exit 1
+  if [[ "${PD_PARALLEL_BOOTSTRAP:-0}" != 1 ]]; then
+    wait_prefill_model_ready "${index}"
   fi
 done
+if [[ "${PD_PARALLEL_BOOTSTRAP:-0}" == 1 ]]; then
+  for index in "${!prefill_pids[@]}"; do wait_prefill_model_ready "${index}"; done
+fi
 
 prefill_numa_domains="$(IFS=';'; echo "${prefill_numa_vectors[*]}")"
 export SGLANG_AGENTIC_KV_PREFILL_TP_NUMA_DOMAINS="${prefill_numa_domains}"
 
 decode_pids=()
 for index in "${!decode_gpu_groups[@]}"; do
+  decode_nccl_args=()
+  if [[ -n "${PD_DECODE_NCCL_PORT_BASE:-}" ]]; then
+    decode_nccl_args=(--nccl-port "$((PD_DECODE_NCCL_PORT_BASE + index))")
+  fi
   decode_group="${decode_gpu_groups[$index]}"
   IFS=',' read -r -a decode_group_gpus <<<"${decode_group}"
   decode_group_numas=()
@@ -775,6 +796,7 @@ for index in "${!decode_gpu_groups[@]}"; do
       --model-path "${MODEL_PATH}" \
       --host 0.0.0.0 --port "${decode_ports[$index]}" \
       --tp-size "${DECODE_TP_SIZE}" --numa-node "${decode_group_numas[@]}" \
+      "${decode_nccl_args[@]}" \
       --context-length "${MAX_CONTEXT_LENGTH}" \
       --page-size "${PD_PAGE_SIZE}" \
       --mem-fraction-static "${decode_mem_fraction_statics[$index]}" \
@@ -793,8 +815,15 @@ for index in "${!decode_gpu_groups[@]}"; do
   # Keep model bootstrap non-generative for the same reason as Prefill.  The
   # Router health check below validates the complete P/D serving topology once
   # every worker is present.
-  wait_http "decode-${index}" "http://127.0.0.1:${decode_ports[$index]}/model_info" "${decode_pids[$index]}"
+  if [[ "${PD_PARALLEL_BOOTSTRAP:-0}" != 1 ]]; then
+    wait_http "decode-${index}" "http://127.0.0.1:${decode_ports[$index]}/model_info" "${decode_pids[$index]}"
+  fi
 done
+if [[ "${PD_PARALLEL_BOOTSTRAP:-0}" == 1 ]]; then
+  for index in "${!decode_pids[@]}"; do
+    wait_http "decode-${index}" "http://127.0.0.1:${decode_ports[$index]}/model_info" "${decode_pids[$index]}"
+  done
+fi
 
 wait_registered_host_prewarm
 

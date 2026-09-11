@@ -35,6 +35,7 @@ import torch
 
 from sglang.srt.disaggregation.agentic_early_claim import (
     AgenticDirectoryChangeWatcher,
+    AgenticEarlyClaimStore,
 )
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.agentic_kv_lifecycle import (
@@ -42,6 +43,7 @@ from sglang.srt.disaggregation.agentic_kv_lifecycle import (
     SharedSnapshotEvictionController,
     SnapshotManifest,
     SnapshotState,
+    RequestGeneration,
     page_namespace,
 )
 from sglang.srt.disaggregation.utils import kv_to_page_indices
@@ -856,8 +858,8 @@ class HostStageState(str, Enum):
     RETRY_PENDING = "retry_pending"
     # Request-generation eviction is a two-phase group operation.  The Host
     # snapshot remains authoritative in EVICTING until every TP rank has
-    # released its local shard.  Only RECOMPUTE_REQUIRED means no physical
-    # Host copy remains and the child may safely run a full Prefill.
+    # released its local shard. Pressure eviction then permits recomputation;
+    # application-final reclamation instead commits CONSUMED (no next turn).
     EVICTING = "evicting"
     RECOMPUTE_REQUIRED = "recompute_required"
     SPILLING = "spilling"
@@ -3090,6 +3092,7 @@ class SharedHostStagingLedger:
         *,
         tp_size: int,
         reason: str,
+        terminal_on_release: bool = False,
     ) -> bool:
         """Atomically claim one complete HOST_READY generation for eviction.
 
@@ -3112,7 +3115,7 @@ class SharedHostStagingLedger:
                 HostStageState.EVICTING.value,
                 HostStageState.RECOMPUTE_REQUIRED.value,
             }:
-                return True, False
+                return bool(current.get("terminal_on_release", False)) == terminal_on_release, False
             if state != HostStageState.HOST_READY.value:
                 return False, False
             # Recovery assignment is the ownership fence before the selected
@@ -3139,6 +3142,8 @@ class SharedHostStagingLedger:
             current["eviction_acks"] = []
             current["eviction_reason"] = str(reason)[:256]
             current["eviction_started_at"] = time.time()
+            if terminal_on_release:
+                current["terminal_on_release"] = True
             current["updated_at"] = time.time()
             return True, True
 
@@ -3152,7 +3157,7 @@ class SharedHostStagingLedger:
         tp_rank: int,
         tp_size: int,
     ) -> bool:
-        """ACK one released Host shard and publish group recomputation.
+        """ACK a released Host shard; commit recompute or application terminal.
 
         There is deliberately no timeout that converts a partially ACKed TP
         eviction into recomputation.  If one TP rank dies, the model/NCCL
@@ -3169,7 +3174,10 @@ class SharedHostStagingLedger:
                 or int(current.get("tp_size", 1)) != int(tp_size)
             ):
                 return False, False
-            if current.get("state") == HostStageState.RECOMPUTE_REQUIRED.value:
+            if current.get("state") == HostStageState.RECOMPUTE_REQUIRED.value or (
+                current.get("state") == HostStageState.CONSUMED.value
+                and current.get("terminal_on_release")
+            ):
                 return True, False
             if current.get("state") != HostStageState.EVICTING.value:
                 return False, False
@@ -3180,7 +3188,11 @@ class SharedHostStagingLedger:
             acknowledgements.add(int(tp_rank))
             current["eviction_acks"] = sorted(acknowledgements)
             if len(acknowledgements) == int(tp_size):
-                current["state"] = HostStageState.RECOMPUTE_REQUIRED.value
+                current["state"] = (
+                    HostStageState.CONSUMED.value
+                    if current.get("terminal_on_release")
+                    else HostStageState.RECOMPUTE_REQUIRED.value
+                )
                 current["evicted_at"] = time.time()
                 current["reason"] = current.get(
                     "eviction_reason", "shared_host_pressure_eviction"
@@ -6063,12 +6075,15 @@ class AgenticPHostStagingManager:
                 )
                 return False
             self._host_eviction_local_released.add(snapshot_id)
-            self._host_eviction_count += 1
-            self._host_eviction_tokens += token_count
-            self._host_eviction_bytes += byte_size
+            terminal = bool(entry.get("terminal_on_release"))
+            if not terminal:
+                self._host_eviction_count += 1
+                self._host_eviction_tokens += token_count
+                self._host_eviction_bytes += byte_size
             logger.warning(
-                "AgenticKV shared_host_evict_release snapshot=%s tokens=%d "
+                "AgenticKV %s snapshot=%s tokens=%d "
                 "bytes=%d tp_rank=%d/%d reason=%s",
+                "shared_host_final_release" if terminal else "shared_host_evict_release",
                 snapshot_id,
                 token_count,
                 byte_size,
@@ -6084,9 +6099,69 @@ class AgenticPHostStagingManager:
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
         )
-        if acknowledged:
+        if acknowledged and not entry.get("terminal_on_release"):
             self._notify_scheduler("recompute_required", snapshot_id)
         return acknowledged
+
+    def _progress_final_host_cleanup(self, entries) -> None:
+        """Reap late application finals on the existing background resync.
+
+        HOST_READY is already D2H-fenced. The eviction CAS also excludes every
+        recovery claim/assignment, so a final marker alone never cancels DMA.
+        All Host ranks ACK physical release before publishing CONSUMED; this
+        is terminal reclamation, not pressure eviction or recomputation.
+        """
+        if self.tp_rank != 0 or getattr(self, "storage_spill_enabled", False):
+            return
+        store = getattr(self, "_final_host_claim_store", None)
+        if store is None:
+            directory = os.getenv("SGLANG_AGENTIC_KV_EARLY_CLAIM_DIR", "")
+            if not directory:
+                ready = os.getenv("SGLANG_PD_P_READY_DIR", "")
+                if not ready:
+                    return
+                directory = os.path.join(ready, "early-claims")
+            store = self._final_host_claim_store = AgenticEarlyClaimStore(directory)
+        candidates = [
+            (sid, entry) for sid, entry in entries.items()
+            if entry.get("p_owner") == self.owner
+            and entry.get("state") == HostStageState.HOST_READY.value
+        ]
+        if not candidates:
+            return
+        # Bounded marker reads; no directory scan on Forward or each I/O tick.
+        start = getattr(self, "_final_host_cursor", 0) % len(candidates)
+        count = min(128, len(candidates))
+        self._final_host_cursor = (start + count) % len(candidates)
+        for i in range(count):
+            snapshot_id, entry = candidates[(start + i) % len(candidates)]
+            try:
+                request_id, generation = snapshot_id.rsplit(":", 1)
+                request = RequestGeneration(request_id, int(generation))
+            except (ValueError, TypeError):
+                logger.error("Invalid Host generation for final cleanup: %s", snapshot_id)
+                continue
+            marker = store.read_final(
+                # Host offer may be queued after the application final ACK.
+                # The generation/tool start, not Host publication, is the fence.
+                request, not_before=float(entry.get("tool_started_at", entry.get("created_at", 0))),
+                max_age_seconds=float("inf"),
+            )
+            if not marker or marker.get("kind") != "final":
+                continue
+            broker = getattr(self, "workset_broker", None)
+            if broker is not None and broker.eviction_blocker(snapshot_id) is not None:
+                continue
+            if not self.ledger.begin_host_eviction(
+                snapshot_id, self.owner, tp_size=self.tp_size,
+                reason="application_final", terminal_on_release=True,
+            ):
+                continue
+            if broker is not None and broker.eviction_blocker(snapshot_id) is not None:
+                raise RuntimeError(f"final Host snapshot retains live workset: {snapshot_id}")
+            current = self.ledger.get(snapshot_id)
+            if current is not None:
+                self._release_evicted_host_rank(snapshot_id, current)
 
     def _progress_host_evictions(
         self, ledger_entries=None, *, snapshot_ids=None
@@ -6105,6 +6180,8 @@ class AgenticPHostStagingManager:
             state = entry.get("state")
             if state == HostStageState.EVICTING.value:
                 self._release_evicted_host_rank(snapshot_id, entry)
+            elif state == HostStageState.CONSUMED.value and entry.get("terminal_on_release"):
+                self._host_eviction_local_released.discard(snapshot_id)
             elif state == HostStageState.RECOMPUTE_REQUIRED.value:
                 # Idempotent cleanup after a final ACK/event race.  Normally
                 # the local record was already released in EVICTING.
@@ -6346,6 +6423,7 @@ class AgenticPHostStagingManager:
         if full_snapshot is not None:
             self._poll_active(self._ledger_entries_cache)
             self._poll_aborting(self._ledger_entries_cache)
+            self._progress_final_host_cleanup(self._ledger_entries_cache)
             self._release_consumed_owned_host(self._ledger_entries_cache)
             self._progress_host_evictions(self._ledger_entries_cache)
             self._maybe_evict_shared_host()

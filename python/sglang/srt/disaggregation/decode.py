@@ -260,7 +260,13 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             pre_alloc_size=pre_alloc_size,
         )
 
-        self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
+        from sglang.srt.disaggregation.agentic_hybrid_transfer import request_owned_mamba_enabled
+        # Stable-prompt mode never rotates Decode checkpoints: the imported
+        # state remains immutable until the existing D->P/Host fence retires it.
+        # Keep an independent active state, but no unused second tracking slot.
+        self.mamba_ping_pong_track_buffer_size = (
+            1 if request_owned_mamba_enabled() else (2 if enable_overlap_schedule else 1)
+        )
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_memory_saver = enable_memory_saver
         if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get() and enable_mamba_extra_buffer:
@@ -944,6 +950,15 @@ class DecodePreallocQueue:
             if required_tokens_for_request > allocatable_tokens:
                 break
 
+            from sglang.srt.disaggregation.agentic_hybrid_transfer import request_owned_mamba_enabled
+            if request_owned_mamba_enabled() and getattr(req, "_agentic_retracted_mamba", None) is not None:
+                needed = 1 + self.req_to_token_pool.mamba_ping_pong_track_buffer_size
+                state_pool = self.req_to_token_pool.mamba_pool
+                if state_pool.available_size() < needed:
+                    from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+                    self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=needed-state_pool.available_size()))
+                if state_pool.available_size() < needed:
+                    break
             resumed_reqs.append(req)
             indices_to_remove.add(i)
             req.is_retracted = False

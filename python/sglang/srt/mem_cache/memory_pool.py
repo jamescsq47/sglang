@@ -595,6 +595,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def free_mamba_cache(
         self, req: "Req", mamba_ping_pong_track_buffer_to_keep: Optional[int] = None
     ):
+        if getattr(req, "_agentic_mamba_prefill_checkpoint", None) is not None:
+            from sglang.srt.disaggregation.agentic_mamba_prefill import release_prefill_checkpoint
+            release_prefill_checkpoint(req, self.mamba_pool)
         mamba_index = req.mamba_pool_idx
         assert mamba_index is not None, "double free? mamba_index is None"
         self.mamba_pool.free(mamba_index.unsqueeze(0))
@@ -633,11 +636,13 @@ class HybridReqToTokenPool(ReqToTokenPool):
                     )
             self.mamba_pool.free(mamba_ping_pong_track_buffer_to_free)
 
-        if getattr(req, "_agentic_mamba_runtime_reserved", False):
+        if (getattr(req, "_agentic_mamba_runtime_reserved", False)
+                or getattr(req, "_agentic_prefill_mamba_admitted", False)):
             # Native release has either freed each tracking slot or donated
             # its retained checkpoint to Radix. Req owns neither afterwards.
             req.mamba_ping_pong_track_buffer = None
             req._agentic_mamba_runtime_reserved = False
+            req._agentic_prefill_mamba_admitted = False
 
     def clear(self):
         logger.info("Reset HybridReqToTokenPool")

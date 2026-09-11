@@ -370,11 +370,21 @@ class AgenticRequestMetadata:
         context-dependent BPE merges, constrained decoding, and tokenizer
         changes across datasets.  Token ids remain a cheap compatibility path.
 
-        A response matching neither marker class is ``UNKNOWN``.  This method
-        only recognizes wire markers; the serving caller owns the policy.  In
-        particular, the reverse-KV path treats UNKNOWN as terminal so ordinary
-        answers and malformed/no-tool output never enter Host storage.
+        A response matching neither marker class is ``UNKNOWN``. The serving
+        caller preserves UNKNOWN provisionally until the application decides
+        whether to continue or end the trajectory.
         """
+
+        if os.getenv("SGLANG_AGENTIC_KV_APP_OWNS_TERMINATION", "false").lower() in {
+            "1", "true", "yes", "y",
+        }:
+            # Opt-in for an application with existing tool/final ACKs (e.g.
+            # SWE Miles). A marker inside reasoning or `echo "TASK_COMPLETE"`
+            # is not a submission. Do not duplicate the application's parser,
+            # and do not fall through to substring/token-id terminal matching.
+            # UNKNOWN uses the existing provisional Direct/Host lifecycle;
+            # the final ACK retires it with the existing claim/DMA fences.
+            return AgenticOutputKind.UNKNOWN
 
         if tokenizer is not None and (
             self.tool_suffix_strings or self.terminal_marker_strings

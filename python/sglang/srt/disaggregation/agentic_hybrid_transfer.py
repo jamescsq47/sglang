@@ -26,6 +26,65 @@ def prompt_checkpoint_enabled() -> bool:
     )
 
 
+def request_owned_mamba_enabled() -> bool:
+    return (
+        prompt_checkpoint_enabled()
+        and envs.SGLANG_AGENTIC_KV_CUSTOM_STORAGE_ONLY.get()
+        and envs.SGLANG_AGENTIC_KV_MAMBA_REQUEST_OWNED.get()
+    )
+
+
+def frozen_mamba_checkpoint(req) -> bool:
+    # A retracted generation is invalid until its complete CPU backup has
+    # been restored. Never let a single-slot Decode tracker overwrite it.
+    return bool(getattr(req, "_agentic_mamba_frozen_prompt_valid", False)) or (
+        request_owned_mamba_enabled()
+        and hasattr(req, "_agentic_mamba_frozen_prompt_tokens")
+    )
+
+
+def offload_request_mamba(req, req_pool):
+    """Native retraction backup of BOTH active and immutable states.
+
+    This runs only on the existing synchronous retraction path, not normal
+    Direct/Host I/O. The caller releases GPU slots only after this returns.
+    """
+    if not request_owned_mamba_enabled() or not frozen_mamba_checkpoint(req):
+        return None
+    if not req._agentic_mamba_frozen_prompt_valid:
+        raise RuntimeError("cannot back up an invalid request Mamba checkpoint")
+    keep = req_pool.get_mamba_ping_pong_other_idx(req.mamba_next_track_idx)
+    indices = torch.cat((req.mamba_pool_idx.reshape(1),
+                         req.mamba_ping_pong_track_buffer[keep].reshape(1)))
+    state = req_pool.mamba_pool.mamba_cache
+    # Retraction is selected before the overlapped previous Forward result is
+    # necessarily consumed. CPU copies on this stream alone do not fence writes
+    # to the active state on the Forward stream. Match native KV backup's fence.
+    if state.temporal.is_cuda:
+        torch.cuda.synchronize(state.temporal.device)
+    return (
+        [x.index_select(1, indices).cpu().clone() for x in state.conv],
+        state.temporal.index_select(1, indices).cpu().clone(),
+        int(req._agentic_mamba_frozen_prompt_tokens),
+    )
+
+
+def restore_request_mamba(req, req_pool, backup):
+    conv, temporal, boundary = backup
+    keep = req_pool.get_mamba_ping_pong_other_idx(req.mamba_next_track_idx)
+    indices = torch.cat((req.mamba_pool_idx.reshape(1),
+                         req.mamba_ping_pong_track_buffer[keep].reshape(1)))
+    state = req_pool.mamba_pool.mamba_cache
+    for dst, src in zip(state.conv, conv, strict=True):
+        dst.index_copy_(1, indices, src.to(dst.device))
+    state.temporal.index_copy_(1, indices, temporal.to(state.temporal.device))
+    if state.temporal.is_cuda:
+        torch.cuda.current_stream(state.temporal.device).synchronize()
+    req._agentic_mamba_frozen_prompt_tokens = boundary
+    req.mamba_last_track_seqlen = boundary if boundary else None
+    req._agentic_mamba_frozen_prompt_valid = True
+
+
 def p2d_mamba_checkpoint_tokens(req, page_size: int) -> int:
     """Select a conservative prompt checkpoint without rewriting any input.
 
@@ -104,6 +163,8 @@ def validate_agentic_mamba_tracking(kv_args, server_args) -> None:
 
     if StateType.MAMBA not in (getattr(kv_args, "state_types", ()) or ()):
         return
+    if envs.SGLANG_AGENTIC_KV_MAMBA_REQUEST_OWNED.get() and not request_owned_mamba_enabled():
+        raise ValueError("request-owned Mamba requires lifecycle, stable prompt checkpoints and custom storage")
     page_size = int(getattr(kv_args, "page_size", 1) or 1)
     interval = int(getattr(server_args, "mamba_track_interval", 0) or 0)
     if interval != page_size:
@@ -276,7 +337,7 @@ def freeze_p2d_mamba_checkpoint_after_cache(
 ) -> None:
     """Pin the post-``cache_unfinished`` Radix checkpoint for P->D.
 
-    Native Mamba caching donates the ping-pong checkpoint to Radix and clears
+    Native Mamba caching copies the ping-pong checkpoint into Radix and clears
     ``mamba_last_track_seqlen``.  The request's locked ``last_node`` is then
     the authoritative physical owner until P->D completion.  Freeze that
     index and its logical boundary instead of reading the replacement,
@@ -288,7 +349,8 @@ def freeze_p2d_mamba_checkpoint_after_cache(
         req._agentic_p2d_mamba_checkpoint_index = None
         req._agentic_p2d_mamba_checkpoint_tokens = None
         return
-    if tracked_tokens is None or int(tracked_tokens) != expected:
+    retained_checkpoint = tracked_tokens is None and prompt_checkpoint_enabled()
+    if not retained_checkpoint and (tracked_tokens is None or int(tracked_tokens) != expected):
         raise RuntimeError(
             "Prefill did not produce the expected page Mamba checkpoint: "
             f"tracked={tracked_tokens} expected={expected} "
@@ -307,6 +369,22 @@ def freeze_p2d_mamba_checkpoint_after_cache(
     value = None if node is None else getattr(node, "mamba_value", None)
     if value is None or torch.as_tensor(value).numel() != 1:
         raise RuntimeError("cached Prefill prefix has no unique Mamba checkpoint")
+    if retained_checkpoint:
+        # The previous chunk may have copied the target checkpoint into Radix.
+        # A final short suffix produces no new checkpoint and native caching
+        # clears mamba_last_track_seqlen. Only the still-locked EXACT boundary
+        # is valid; never substitute an older or unlocked cached state.
+        if getattr(node, "mamba_lock_ref", 0) <= 0 or getattr(node, "full_lock_ref", 0) <= 0:
+            raise RuntimeError("retained Prefill checkpoint is not locked")
+        boundary = 0
+        cursor = node
+        while cursor is not None and getattr(cursor, "parent", None) is not None:
+            boundary += len(cursor.key)
+            if boundary > expected:
+                break
+            cursor = cursor.parent
+        if boundary != expected:
+            raise RuntimeError("retained Prefill checkpoint has the wrong Radix boundary")
     req._agentic_p2d_mamba_checkpoint_index = int(torch.as_tensor(value).item())
     req._agentic_p2d_mamba_checkpoint_tokens = expected
 

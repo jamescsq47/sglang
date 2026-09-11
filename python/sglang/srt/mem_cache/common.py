@@ -309,6 +309,11 @@ def alloc_req_slots(
             else MAMBA_STATE_PER_REQ_NO_CACHE
         )
         mamba_state_needed = num_reqs * factor
+        if any(getattr(req, "_agentic_prefill_mamba_admitted", False)
+               or getattr(req, "_agentic_mamba_runtime_reserved", False)
+               for req in reqs):
+            from sglang.srt.disaggregation.agentic_mamba_prefill import missing_runtime_slots
+            mamba_state_needed = sum(missing_runtime_slots(req, req_to_token_pool) for req in reqs)
         if mamba_available_size < mamba_state_needed:
             if tree_cache is not None and tree_cache.supports_mamba():
                 mamba_num = max(0, mamba_state_needed - mamba_available_size)
@@ -560,6 +565,9 @@ def release_unadmitted_mamba_cow(req: Req, tree_cache: BasePrefixCache):
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
+    if getattr(req, "_agentic_mamba_prefill_checkpoint", None) is not None:
+        from sglang.srt.disaggregation.agentic_mamba_prefill import release_prefill_checkpoint
+        release_prefill_checkpoint(req, tree_cache.req_to_token_pool.mamba_pool)
     # MambaRadixCache may alloc mamba state before alloc KV cache
     if req.req_pool_idx is None:
         # Cleanup can race with an abort/transport-failure notification in
@@ -573,12 +581,14 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.mamba_pool_idx = None
         # Handed runtime has no req-index mapping yet. Even if another cleanup
         # already returned active, the tracking slots still need one owner.
-        if getattr(req, "_agentic_mamba_runtime_reserved", False):
+        if (getattr(req, "_agentic_mamba_runtime_reserved", False)
+                or getattr(req, "_agentic_prefill_mamba_admitted", False)):
             buffer = getattr(req, "mamba_ping_pong_track_buffer", None)
             if buffer is not None:
                 tree_cache.req_to_token_pool.mamba_pool.free(buffer[buffer >= 0])
                 req.mamba_ping_pong_track_buffer = None
             req._agentic_mamba_runtime_reserved = False
+            req._agentic_prefill_mamba_admitted = False
         return
 
     if req.last_node is None:

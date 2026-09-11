@@ -304,6 +304,8 @@ class Envs:
     # Defaults are intentionally off so stock SGLang baseline behavior is unchanged.
     SGLANG_AGENTIC_KV_LIFECYCLE = EnvBool(False)
     SGLANG_AGENTIC_KV_MAMBA_PROMPT_CHECKPOINT = EnvBool(False)
+    # Request-owned stable checkpoints; never enable for a native baseline.
+    SGLANG_AGENTIC_KV_MAMBA_REQUEST_OWNED = EnvBool(False)
     # Keep HiCache's Host pool and storage backend available as infrastructure
     # for the request-generation Direct/Shared-Arena lifecycle, while disabling
     # generic Radix write-back, storage prefetch, and ordinary Decode offload.
@@ -318,6 +320,8 @@ class Envs:
     # still follow the ordinary Host path. The production default is off.
     SGLANG_AGENTIC_KV_FAST_DIRECT_FAILURE_RECOMPUTE = EnvBool(False)
     SGLANG_AGENTIC_KV_SLOW_CONGESTION_RECOMPUTE = EnvBool(False)
+    # Requires an application publishing the existing tool/final ACKs.
+    SGLANG_AGENTIC_KV_APP_OWNS_TERMINATION = EnvBool(False)
     # Ablation only: keep the custom P->D late-binding/staging pipeline, but
     # never preserve a finished Decode generation for the next Prefill turn.
     # The request harness also omits parent-generation metadata, making every
