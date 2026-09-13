@@ -6555,10 +6555,74 @@ class AgenticPHostStagingManager:
         self._poll_once()
 
     def snapshot_ready(self, request_generation) -> bool:
-        """Return whether P already owns a readable Host snapshot."""
+        """Discover readable Host metadata before TP selects a restore.
+
+        A foreign arena's local mapping is created only by gate_request after
+        selection. Requiring that mapping here can starve TP discovery. Inspect
+        only the async ledger cache; the selected path still revalidates the
+        route and claims every shard before allocating or starting any I/O.
+        """
 
         with self._get_state_lock():
-            return request_generation.snapshot_id in self.host_ready
+            if request_generation.snapshot_id in self.host_ready:
+                entry = getattr(self, "_ledger_entries_cache", {}).get(
+                    request_generation.snapshot_id
+                )
+                if (
+                    int(getattr(self, "tp_size", 1)) > 1
+                    and entry is not None
+                    and entry.get("recovery_domain") is not None
+                    and not self._recovery_targets_this_manager(entry)
+                ):
+                    return False
+                return True
+        tp_size = int(getattr(self, "tp_size", 1))
+        if tp_size <= 1:
+            return False
+        entry = getattr(self, "_ledger_entries_cache", {}).get(
+            request_generation.snapshot_id
+        )
+        if (
+            entry is None
+            or entry.get("state") != HostStageState.HOST_READY.value
+            or entry.get("p_owner") in {None, self.owner}
+            or entry.get("recovery_domain") is None
+            or not self._recovery_targets_this_manager(entry)
+            or int(entry.get("tp_size", 1)) != tp_size
+            or entry.get("recovery_owner") not in {None, self.owner}
+        ):
+            return False
+        grants = entry.get("rank_grants", {})
+        return set(grants) == {str(rank) for rank in range(tp_size)}
+
+    def tp_host_control_quiescent(self, snapshot_id: str, rid: str) -> bool:
+        """Read-only fence check for a cancelled P-group Host command.
+
+        This retires no physical resource or ledger entry. Background abort
+        workers and the ordinary TP workset retirement protocol do that work.
+        """
+
+        with self._get_state_lock():
+            if self._find_h2d_load(snapshot_id, rid=rid)[1] is not None:
+                return False
+            for name in (
+                "aborting", "_pending_host_abort_requests",
+                "_prestart_recovery_aborts", "_h2d_lane_reservations",
+                "_h2d_resident_reservations",
+            ):
+                if snapshot_id in getattr(self, name, ()):
+                    return False
+            record = self.host_ready.get(snapshot_id)
+            if record is not None and record.get("loading"):
+                return False
+        broker = self.workset_broker
+        return not any(
+            broker.owner_has_unretired_work(snapshot_id, owner=owner)
+            for owner in (
+                broker.slow_owner(snapshot_id, rid),
+                broker.direct_owner(snapshot_id),
+            )
+        )
 
     def _recovery_targets_this_manager(self, entry: dict[str, Any]) -> bool:
         domain = entry.get("recovery_domain")

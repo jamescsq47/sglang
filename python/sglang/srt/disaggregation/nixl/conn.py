@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import dataclasses
+import faulthandler
 import logging
+import os
 import struct
 import threading
 import time
@@ -30,6 +32,18 @@ from sglang.srt.server_args import ServerArgs
 logger = logging.getLogger(__name__)
 
 GUARD = "NixlMsgGuard".encode("ascii")
+
+
+def _enable_diagnostic_stack_timer():
+    # Opt-in diagnostic only. The C watchdog can print Python thread stacks
+    # even while a native transport call holds the GIL. It does not terminate
+    # the process, cancel transfers or alter ownership/fences.
+    seconds = int(os.getenv("SGLANG_NIXL_DIAGNOSTIC_STACK_SECONDS", "0"))
+    if seconds:
+        if seconds < 30:
+            raise ValueError("NIXL diagnostic stack interval must be >=30 seconds")
+        faulthandler.dump_traceback_later(seconds, repeat=True, exit=False)
+        logger.warning("NIXL diagnostic thread stacks enabled interval_s=%d", seconds)
 
 
 @dataclasses.dataclass
@@ -171,6 +185,7 @@ class NixlKVManager(CommonKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        _enable_diagnostic_stack_timer()
         try:
             from nixl._api import nixl_agent, nixl_agent_config
         except ImportError as e:
@@ -965,7 +980,15 @@ class NixlKVManager(CommonKVManager):
                     logger.debug(f"{room=} is bootstrapped")
                     self.update_status(room, KVPoll.WaitingForInput)
 
-        threading.Thread(target=bootstrap_thread).start()
+        if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get():
+            from sglang.srt.disaggregation.agentic_cuda_worker import run_rank_bound_worker
+
+            threading.Thread(
+                target=run_rank_bound_worker,
+                args=(self.kv_args.gpu_id, bootstrap_thread),
+            ).start()
+        else:
+            threading.Thread(target=bootstrap_thread).start()
 
 
 class NixlKVSender(CommonKVSender):
@@ -1045,10 +1068,16 @@ class NixlKVSender(CommonKVSender):
             try:
                 states.append(self.kv_mgr.agent.check_xfer_state(handle))
             except Exception:
-                logger.exception(
-                    "Unable to fence NIXL sender handle room=%s; quarantining source KV",
-                    self.bootstrap_room,
-                )
+                # A poisoned native handle can fail every sub-millisecond
+                # progress poll. Log once per sender, not once per poll: log
+                # floods must not starve unrelated rank/control progress.
+                # Keep polling the physical fence; silence is NOT completion.
+                if not getattr(self, "_unreadable_fence_reported", False):
+                    self._unreadable_fence_reported = True
+                    logger.exception(
+                        "Unable to fence NIXL sender handle room=%s; quarantining source KV",
+                        self.bootstrap_room,
+                    )
                 return None
         return states
 

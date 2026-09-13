@@ -2290,6 +2290,7 @@ class Scheduler(
         self.agentic_tp_host_active_since_by_snapshot: Dict[str, float] = {}
         self.agentic_tp_host_group_statuses: Dict[str, int] = {}
         self.agentic_tp_host_local_admitted: set[str] = set()
+        self.agentic_tp_host_cancelled_requests: Dict[str, str] = {}
         self.agentic_tp_workset_retire_active: set[str] = set()
         self.agentic_tp_workset_retire_visible: set[str] = set()
         self.agentic_tp_workset_retire_group_statuses: Dict[str, int] = {}
@@ -2307,7 +2308,13 @@ class Scheduler(
             self.agentic_tp_direct_abort_mailbox = TPGroupMailbox(
                 "d2p-direct-abort-p", **common
             )
-            self.agentic_tp_host_mailbox = TPGroupMailbox("d2p-host", **common)
+            # Host recovery reports are internal to the selected P group.
+            # A redirected request can still have cancellation progress on
+            # the old P; it must not overwrite/clear the new P's rank reports.
+            self.agentic_tp_host_mailbox = TPGroupMailbox(
+                "d2p-host:" + os.getenv("SGLANG_AGENTIC_KV_PREFILL_DOMAIN", "0"),
+                **common,
+            )
             self.agentic_tp_workset_retire_mailbox = TPGroupMailbox(
                 "p-workset-retire", **common
             )
@@ -2828,8 +2835,11 @@ class Scheduler(
                 # only binds completed pages into Radix. This prevents a slow
                 # transport operation from delaying the next GPU forward.
                 if self.agentic_early_claim_store is not None:
+                    from sglang.srt.disaggregation.agentic_cuda_worker import run_rank_bound_worker
+
                     self.agentic_early_direct_progress_thread = threading.Thread(
-                        target=self._agentic_early_direct_progress_worker,
+                        target=run_rank_bound_worker,
+                        args=(self.gpu_id, self._agentic_early_direct_progress_worker),
                         name=f"agentic-p-direct-{os.getpid()}",
                         daemon=True,
                     )
@@ -6750,6 +6760,14 @@ class Scheduler(
         if metadata is None or metadata.parent is None:
             req._agentic_kv_gate_complete = True
             return False
+        if (
+            getattr(self, "tp_size", 1) > 1
+            and metadata.parent.snapshot_id
+            in getattr(self, "agentic_tp_host_cancelled_requests", {})
+        ):
+            # A new HTTP attempt must not start I/O under the old attempt's
+            # cancellation command. All-rank CLEAR removes this tombstone.
+            return True
         # A terminal application ACK is authoritative even when D deliberately
         # skipped snapshot publication.  A later repair/retry request must
         # recompute immediately instead of waiting the generic snapshot-ready
@@ -7209,6 +7227,23 @@ class Scheduler(
             if request is None:
                 mailbox.publish_local(snapshot_id, local_status)
                 continue
+            cancelled_rid = getattr(
+                self, "agentic_tp_host_cancelled_requests", {}
+            ).get(snapshot_id)
+            if cancelled_rid is not None:
+                # The HTTP waiter has left, but physical abort progress and
+                # allocator retirement still own their original fences. Only
+                # retire the obsolete control command after both have drained.
+                if host_staging.tp_host_control_quiescent(
+                    snapshot_id, cancelled_rid
+                ):
+                    local_status = 4
+                mailbox.publish_local(snapshot_id, local_status)
+                if self.tp_rank == 0:
+                    status = mailbox.group_status(snapshot_id)
+                    if status is not None:
+                        statuses[snapshot_id] = int(status)
+                continue
             if request.snapshot_id in getattr(
                 self, "agentic_tp_host_local_admitted", ()
             ):
@@ -7627,7 +7662,14 @@ class Scheduler(
             group_statuses = self.agentic_tp_host_group_statuses
             for snapshot_id, host_request in tuple(active_host.items()):
                 host_status = int(group_statuses.get(snapshot_id, 0))
-                host_action = self._agentic_tp_host_next_action(host_status)
+                if snapshot_id in getattr(
+                    self, "agentic_tp_host_cancelled_requests", {}
+                ):
+                    # A stale peer status of 1/2/3 is not permission to start
+                    # or commit an attempt that TP0 has already cancelled.
+                    host_action = "clear" if host_status >= 4 else "abort"
+                else:
+                    host_action = self._agentic_tp_host_next_action(host_status)
                 if host_action == "commit":
                     # Every rank has restored its physical shard. TP0 alone
                     # closes the logical slow-path manifest before the group
@@ -8059,13 +8101,23 @@ class Scheduler(
         if not hasattr(self, "agentic_tp_host_group_statuses"):
             self.agentic_tp_host_group_statuses = {}
         host_actions = {}
-        commit_snapshots = set()
+        # Preserve TP0's broadcast order: a bounded admission batch must pick
+        # the same generations on every rank, regardless of Python hash seed.
+        commit_snapshots = []
         mailbox = getattr(self, "agentic_tp_host_mailbox", None)
         for command in host_commands:
             host_snapshot = str(command["snapshot"])
             host_action = command.get("action")
             if host_action == "clear":
                 self.agentic_tp_host_local_admitted.discard(host_snapshot)
+                cancelled_rid = getattr(self, "agentic_tp_host_cancelled_requests", {}).pop(
+                    host_snapshot, None
+                )
+                if cancelled_rid is not None:
+                    logger.info(
+                        "AgenticKV tp_host_cancel_control_retired snapshot=%s rid=%s",
+                        host_snapshot, cancelled_rid,
+                    )
                 active_host.pop(host_snapshot, None)
                 active_since.pop(host_snapshot, None)
                 self.agentic_tp_host_group_statuses.pop(host_snapshot, None)
@@ -8084,7 +8136,8 @@ class Scheduler(
             active_since.setdefault(host_snapshot, time.monotonic())
             host_actions[host_snapshot] = host_action
             if host_action == "commit":
-                commit_snapshots.add(host_snapshot)
+                if host_snapshot not in commit_snapshots:
+                    commit_snapshots.append(host_snapshot)
         self._agentic_tp_host_actions = host_actions
         self.agentic_tp_host_command_visible = bool(host_actions)
         visible_host = list(host_actions)
@@ -8105,9 +8158,9 @@ class Scheduler(
         self._agentic_tp_host_action = (
             None if first_host is None else host_actions[first_host]
         )
-        self._agentic_tp_host_commit_snapshots = commit_snapshots
+        self._agentic_tp_host_commit_snapshots = tuple(commit_snapshots)
         self._agentic_tp_host_commit_snapshot = (
-            None if not commit_snapshots else next(iter(commit_snapshots))
+            None if not commit_snapshots else commit_snapshots[0]
         )
         host_staging = getattr(self, "agentic_host_staging_manager", None)
         if host_staging is not None:
@@ -8710,6 +8763,15 @@ class Scheduler(
             and metadata.parent is not None
         ):
             host_staging.abort_request(req.rid, metadata.parent)
+            if (
+                getattr(self, "tp_size", 1) > 1
+                and metadata.parent.snapshot_id
+                in getattr(self, "agentic_tp_host_active_requests", {})
+            ):
+                cancelled = getattr(self, "agentic_tp_host_cancelled_requests", None)
+                if cancelled is None:
+                    cancelled = self.agentic_tp_host_cancelled_requests = {}
+                cancelled.setdefault(metadata.parent.snapshot_id, req.rid)
 
         snapshot_store = getattr(req, "_agentic_kv_snapshot_store", None)
         manifest = getattr(req, "_agentic_kv_manifest", None)

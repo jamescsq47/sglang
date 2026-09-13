@@ -173,6 +173,16 @@ fi
 prefill_hicache_args=()
 decode_hicache_args=()
 deterministic_args=()
+backend_args=()
+if [[ -n "${PD_ATTENTION_BACKEND:-}" ]]; then
+  backend_args+=(--attention-backend "${PD_ATTENTION_BACKEND}")
+fi
+if [[ -n "${PD_SAMPLING_BACKEND:-}" ]]; then
+  backend_args+=(--sampling-backend "${PD_SAMPLING_BACKEND}")
+fi
+if [[ "${PD_DETERMINISTIC_INFERENCE}" != 1 && -n "${PD_SERVER_RANDOM_SEED:-}" ]]; then
+  backend_args+=(--random-seed "${PD_SERVER_RANDOM_SEED}")
+fi
 mamba_args=()
 if [[ "${MODEL_PATH}" == *"Qwen3.5"* ]]; then
   mamba_args+=(--mamba-scheduler-strategy extra_buffer)
@@ -700,6 +710,14 @@ for index in "${!prefill_gpu_groups[@]}"; do
   prefill_numa_vectors+=("${prefill_numa_csv}")
   prefill_numa="${prefill_group_numas[0]}"
   prefill_launch=(setsid)
+  # Diagnostic opt-in: record child exits and delivered signals instead of
+  # inferring the first failure from a surviving TP peer's Gloo exception.
+  # Keep the same owned process group and existing ordered cleanup.
+  if [[ "${PD_TRACE_PROCESS_SIGNALS:-0}" == 1 ]]; then
+    command -v strace >/dev/null || { echo 'strace is required for process diagnostics' >&2; exit 2; }
+    prefill_launch+=(strace -ff --seccomp-bpf -ttt -e trace=process,signal,prctl
+      -o "${RUN_DIR}/logs/process-prefill-${index}")
+  fi
   prefill_raw_log_args=()
   if [[ -n "${PD_RAW_REQUEST_LOG_DIR}" ]]; then
     mkdir -p "${PD_RAW_REQUEST_LOG_DIR}/prefill-${index}"
@@ -732,6 +750,7 @@ for index in "${!prefill_gpu_groups[@]}"; do
       "${prefill_raw_log_args[@]}" \
       --uvicorn-access-log-exclude-prefixes /get_load /metrics /health \
       "${deterministic_args[@]}" \
+      "${backend_args[@]}" \
       --disaggregation-mode prefill --disaggregation-transfer-backend nixl \
       --disaggregation-bootstrap-port "${bootstrap_ports[$index]}" \
       "${prefill_hicache_args[@]}" \
@@ -765,6 +784,11 @@ for index in "${!decode_gpu_groups[@]}"; do
   decode_numa_csv="$(IFS=,; echo "${decode_group_numas[*]}")"
   decode_numa="${decode_group_numas[0]}"
   decode_launch=(setsid)
+  if [[ "${PD_TRACE_PROCESS_SIGNALS:-0}" == 1 ]]; then
+    command -v strace >/dev/null || { echo 'strace is required for process diagnostics' >&2; exit 2; }
+    decode_launch+=(strace -ff --seccomp-bpf -ttt -e trace=process,signal,prctl
+      -o "${RUN_DIR}/logs/process-decode-${index}")
+  fi
   decode_raw_log_args=()
   if [[ -n "${PD_RAW_REQUEST_LOG_DIR}" ]]; then
     mkdir -p "${PD_RAW_REQUEST_LOG_DIR}/decode-${index}"
@@ -806,6 +830,7 @@ for index in "${!decode_gpu_groups[@]}"; do
       --enable-metrics --skip-server-warmup \
       --uvicorn-access-log-exclude-prefixes /get_load /metrics /health \
       "${deterministic_args[@]}" \
+      "${backend_args[@]}" \
       --disaggregation-mode decode \
       --disaggregation-transfer-backend nixl \
       "${decode_hicache_args[@]}" \

@@ -503,9 +503,16 @@ class SchedulerDisaggregationPrefillMixin:
         self._prefill_transfer_async_enabled = True
         self._prefill_transfer_threads = []
         for index in range(self._prefill_transfer_consumer_count):
+            target = self._prefill_transfer_consumer_worker
+            args = (index,)
+            if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get():
+                from sglang.srt.disaggregation.agentic_cuda_worker import run_rank_bound_worker
+
+                target = run_rank_bound_worker
+                args = (self.gpu_id, self._prefill_transfer_consumer_worker, index)
             thread = threading.Thread(
-                target=self._prefill_transfer_consumer_worker,
-                args=(index,),
+                target=target,
+                args=args,
                 name=f"sglang-prefill-transfer-{os.getpid()}-{index}",
                 daemon=True,
             )

@@ -8025,9 +8025,12 @@ def test_nixl_sender_partial_launch_keeps_source_owned_until_handle_terminal():
     assert sender.poll() == KVPoll.Failed
 
 
-def test_nixl_sender_unreadable_handle_quarantines_source_pages():
+def test_nixl_sender_unreadable_handle_quarantines_source_pages(caplog):
     class Agent:
+        readable = False
         def check_xfer_state(self, _handle):
+            if self.readable:
+                return "DONE"
             raise RuntimeError("transport status unavailable")
 
     sender = NixlKVSender.__new__(NixlKVSender)
@@ -8040,7 +8043,27 @@ def test_nixl_sender_unreadable_handle_quarantines_source_pages():
     sender.launch_failed = True
     sender.launch_exception = RuntimeError("control failure")
 
-    assert sender.poll() == KVPoll.Transferring
+    for _ in range(100):
+        assert sender.poll() == KVPoll.Transferring
+    assert sum('Unable to fence NIXL sender handle' in r.message for r in caplog.records) == 1
+    assert len(sender.xfer_handles) == 1
+    sender.kv_mgr.agent.readable = True
+    assert sender.poll() == KVPoll.Failed  # now fenced, never false success
+
+
+def test_nixl_diagnostic_timer_opt_in_no_process_exit(monkeypatch):
+    from sglang.srt.disaggregation.nixl import conn
+    calls=[]
+    monkeypatch.setattr(conn.faulthandler, 'dump_traceback_later',
+                        lambda *a, **kw: calls.append((a,kw)))
+    monkeypatch.delenv('SGLANG_NIXL_DIAGNOSTIC_STACK_SECONDS', raising=False)
+    conn._enable_diagnostic_stack_timer()
+    assert calls==[]
+    monkeypatch.setenv('SGLANG_NIXL_DIAGNOSTIC_STACK_SECONDS','120')
+    conn._enable_diagnostic_stack_timer()
+    assert calls==[((120,),dict(repeat=True,exit=False))]
+    monkeypatch.setenv('SGLANG_NIXL_DIAGNOSTIC_STACK_SECONDS','1')
+    with pytest.raises(ValueError): conn._enable_diagnostic_stack_timer()
 
 
 @pytest.mark.parametrize(

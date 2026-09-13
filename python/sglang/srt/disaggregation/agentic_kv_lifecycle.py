@@ -2559,7 +2559,19 @@ def page_namespace(request: RequestGeneration) -> str:
 
 
 def token_ids_digest(token_ids: Sequence[int]) -> str:
-    """Stable compact guard against direct-transfer prompt serialization drift."""
+    """Token-content guard, or an explicit trusted-harness opt-out marker.
+
+    The default SHA-256 behavior is unchanged. All P/D participants must use
+    the same setting: the non-SHA marker fails existing comparisons against
+    a real digest if configurations differ. Request/generation, token count,
+    layout, Mamba checkpoint and physical ownership checks remain independent.
+    This opt-out cannot detect same-length prompt serialization changes.
+    """
+
+    if os.getenv("SGLANG_AGENTIC_KV_TOKEN_CONTENT_HASH", "true").strip().lower() in {
+        "0", "false", "no", "off",
+    }:
+        return "unchecked-token-content-v1"
 
     digest = hashlib.sha256()
     for token_id in token_ids:
