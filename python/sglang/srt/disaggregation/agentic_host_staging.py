@@ -25,9 +25,10 @@ import queue
 import threading
 import time
 from concurrent.futures import Future
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from enum import Enum
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import numpy as np
@@ -5108,6 +5109,19 @@ class AgenticPHostStagingManager:
             and tree_cache.supports_mamba()
             and request_owned_mamba_enabled()
         )
+        # Experimental scheduler-side refill only; no allocator or Radix
+        # mutation moves to an I/O thread. Dense models and TP keep their
+        # existing admission path, including when this variable is inherited.
+        self.h2d_event_progress = self.h2d_decoupled and os.getenv(
+            "SGLANG_AGENTIC_KV_P_HOST_EVENT_PROGRESS", "0"
+        ).lower() in {"1", "true"}
+        self.h2d_async_prepare = self.h2d_event_progress and os.getenv(
+            "SGLANG_AGENTIC_KV_P_HOST_ASYNC_PREPARE", "0"
+        ).lower() in {"1", "true"}
+        # Only the control worker prepares these scheduler-selected requests.
+        # No live Req is shared with that worker; tokens are immutable copies.
+        self._host_prepares: dict[str, dict[str, Any]] = {}
+        self._host_prepare_results: dict[str, tuple] = {}
         # One bounded stage may await scheduler binding while the other is
         # preparing/copying. This does not reserve a separate HBM pool: every
         # item must still obtain the original complete hybrid workset lease.
@@ -5201,6 +5215,7 @@ class AgenticPHostStagingManager:
         self._async_control = os.getenv(
             "SGLANG_AGENTIC_KV_P_ASYNC_CONTROL", "1"
         ).lower() not in {"0", "false", "no", "off"}
+        self.h2d_async_prepare = self.h2d_async_prepare and self._async_control
         self._control_interval = max(
             0.001,
             float(
@@ -6339,6 +6354,7 @@ class AgenticPHostStagingManager:
                 or self.spills
                 or getattr(self, "_pending_host_abort_requests", {})
                 or getattr(self, "_prestart_recovery_aborts", {})
+                or getattr(self, "_host_prepares", {})
                 or pending_grant
             )
 
@@ -6410,6 +6426,7 @@ class AgenticPHostStagingManager:
         self._progress_host_abort_requests()
         self._progress_prestart_aborts()
         self._progress_h2d_loads()
+        self._progress_host_prepares()
         self._progress_spills()
         self._maybe_spill()
         watcher_healthy = bool(
@@ -6677,15 +6694,18 @@ class AgenticPHostStagingManager:
         )
         return record
 
-    def drain_scheduler_events(self) -> tuple[tuple[str, str], ...]:
+    def drain_scheduler_events(
+        self, max_events: Optional[int] = None
+    ) -> tuple[tuple[str, str], ...]:
         """Drain completed control edges without reading the file ledger."""
 
         events = []
-        while True:
+        while max_events is None or len(events) < max_events:
             try:
                 events.append(self._scheduler_events.get_nowait())
             except queue.Empty:
                 return tuple(events)
+        return tuple(events)
 
     def _notify_scheduler(self, kind: str, snapshot_id: str) -> None:
         events = getattr(self, "_scheduler_events", None)
@@ -7673,6 +7693,25 @@ class AgenticPHostStagingManager:
         """Cancel one Slow restore without racing an in-flight H2D."""
 
         snapshot_id = request_generation.snapshot_id
+        # A CPU preparation may still hold the mapping or be publishing a
+        # claim. Let its sole worker finish before the existing abort/fence
+        # path can close Host or release a granted workset. Never wait here.
+        with self._get_state_lock():
+            prepare = getattr(self, "_host_prepares", {}).get(str(rid))
+            if prepare is None:
+                prepare = next(
+                    (
+                        item
+                        for item in getattr(self, "_host_prepares", {}).values()
+                        if item["parent"].snapshot_id == snapshot_id
+                    ),
+                    None,
+                )
+            if prepare is not None:
+                prepare["cancelled"] = True
+                self._control_wakeup.set()
+                return
+            getattr(self, "_host_prepare_results", {}).pop(str(rid), None)
         prestart_abort = False
         with self._get_state_lock():
             pending = getattr(self, "_pending_host_abort_requests", None)
@@ -7820,6 +7859,144 @@ class AgenticPHostStagingManager:
             if hasattr(req, name):
                 delattr(req, name)
 
+    def _queue_host_prepare(self, req, request_generation, *, allow_prepare=True) -> Optional[bool]:
+        """Register an already FIFO-selected restore without filesystem I/O."""
+        sid = request_generation.snapshot_id
+        entry = getattr(self, "_ledger_entries_cache", {}).get(sid)
+        if entry is None:
+            with self._get_state_lock():
+                return True if sid in self.active or sid in self.host_ready or sid in self.aborting else None
+        if entry.get("state") not in {
+            HostStageState.HOST_READY.value, HostStageState.H2D_LOADING.value,
+            HostStageState.FAILED.value, HostStageState.RECOMPUTE_REQUIRED.value,
+        }:
+            return True if entry.get("state") in {
+                HostStageState.HOST_RESERVED.value, HostStageState.HOST_WRITING.value,
+                HostStageState.ABORTING.value, HostStageState.HBM_READY.value,
+                HostStageState.EVICTING.value, HostStageState.SPILLING.value,
+                HostStageState.RETRY_PENDING.value,
+            } else None
+        if not allow_prepare:
+            return True
+        if entry.get("state") in {
+            HostStageState.HOST_READY.value, HostStageState.H2D_LOADING.value,
+        } and not self._recovery_targets_this_manager(entry):
+            return True
+        if self._retire_stale_direct_before_slow(sid):
+            return True
+        with self._get_state_lock():
+            if req.rid in self._host_prepares or req.rid in self.loads:
+                return True
+            # A retry's new rid must not replace an old CPU preparation.
+            if any(x["parent"].snapshot_id == sid for x in self._host_prepares.values()):
+                return True
+            if self._reserve_h2d_lane(sid) is None:
+                return True
+            self._host_prepares[req.rid] = {
+                "view": SimpleNamespace(
+                    rid=str(req.rid), origin_input_ids=tuple(req.origin_input_ids),
+                ),
+                "parent": request_generation,
+                "cancelled": False,
+                "queued_at": time.monotonic(),
+            }
+        self._control_wakeup.set()
+        return True
+
+    def _progress_host_prepares(self) -> None:
+        """Single-writer CPU preparation; allocator and Radix stay scheduler-owned."""
+        if not getattr(self, "h2d_async_prepare", False):
+            return
+        with self._get_state_lock():
+            prepares = tuple(self._host_prepares.items())
+        for rid, prepare in prepares:
+            with self._get_state_lock():
+                if self._host_prepares.get(rid) is not prepare:
+                    continue
+                cancelled = prepare["cancelled"]
+            if cancelled:
+                # Runs on the same thread as preparation: all CPU accesses to
+                # the mapping have quiesced before the old abort path runs.
+                with self._get_state_lock():
+                    self._host_prepares.pop(rid, None)
+                self.abort_request(rid, prepare["parent"])
+                # A foreign-owner CAS refusal can legitimately have no local
+                # abort work. Return only our metadata admission credit when
+                # no load, pending fence/abort or physical lease exists.
+                sid = prepare["parent"].snapshot_id
+                with self._get_state_lock():
+                    if (
+                        self._find_h2d_load(sid)[1] is None
+                        and not any(
+                            item["parent"].snapshot_id == sid
+                            for item in self._host_prepares.values()
+                        )
+                        and sid not in getattr(self, "_pending_host_abort_requests", {})
+                        and sid not in getattr(self, "_prestart_recovery_aborts", {})
+                        and not self.workset_broker.owner_has_unretired_work(
+                            sid, owner=self.workset_broker.slow_owner(sid, rid)
+                        )
+                    ):
+                        self._release_h2d_lane(sid)
+                continue
+            result = True
+            try:
+                with self._get_state_lock():
+                    load = self.loads.get(rid)
+                if load is None:
+                    result = self._prepare_host_restore(
+                        prepare["view"], prepare["parent"],
+                    )
+                    with self._get_state_lock():
+                        load = self.loads.get(rid)
+                elif load.get("ledger_prepare_pending"):
+                    if self._prepare_h2d_load_ledger(load):
+                        load["ledger_prepare_pending"] = False
+                        load["start_allowed"] = True
+                    else:
+                        self._cancel_unstarted_h2d_load(rid, load)
+                        load = None
+                with self._get_state_lock():
+                    if prepare["cancelled"]:
+                        # Do not publish completion or recycle this descriptor
+                        # until its pending abort is handled next cycle.
+                        if load is not None:
+                            load["start_allowed"] = False
+                        self._control_wakeup.set()
+                        continue
+                    started = load is not None and not load.get("ledger_prepare_pending")
+                    if started or result is not True:
+                        self._host_prepares.pop(rid, None)
+                        if not started:
+                            self._host_prepare_results[rid] = (
+                                result, getattr(prepare["view"], "_agentic_kv_fallback", None),
+                            )
+                            self._release_h2d_lane(prepare["parent"].snapshot_id)
+                        else:
+                            load["prepare_queued_at"] = prepare["queued_at"]
+                        self._notify_scheduler("host_prepared", prepare["parent"].snapshot_id)
+                # A CPU prepare cannot monopolize progress of other copies.
+                self._progress_h2d_loads()
+            except Exception:
+                # Preserve exact descriptor/claim/lease for retry or abort;
+                # never reinterpret an I/O exception as permission to recompute.
+                logger.exception("AgenticKV host_prepare_retry snapshot=%s rid=%s",
+                                 prepare["parent"].snapshot_id, rid)
+            finally:
+                # Failed claim/attach may have relinquished its admission
+                # resource. Do not retain an unbounded second waiting queue:
+                # native FIFO admission must select that request again.
+                with self._get_state_lock():
+                    sid = prepare["parent"].snapshot_id
+                    if (
+                        self._host_prepares.get(rid) is prepare
+                        and not prepare["cancelled"]
+                        and rid not in self.loads
+                        and sid not in self._h2d_resident_reservations
+                    ):
+                        self._host_prepares.pop(rid, None)
+                        self._notify_scheduler("host_prepare_retry", sid)
+
     def gate_request(
         self,
         req,
@@ -7840,6 +8017,27 @@ class AgenticPHostStagingManager:
         """
 
         snapshot_id = request_generation.snapshot_id
+        if getattr(self, "h2d_async_prepare", False):
+            with self._get_state_lock():
+                if req.rid in self._host_prepares:
+                    return True
+                prepared_result = self._host_prepare_results.pop(req.rid, None)
+            if prepared_result is not None:
+                result, fallback = prepared_result
+                if result is False:
+                    req._agentic_kv_gate_complete = True
+                    req._agentic_kv_fallback = fallback
+                return result
+            # A metadata-only waiter must not read the filesystem on the
+            # scheduler thread. Known Host work goes to the preparation worker;
+            # None preserves Direct/non-Host discovery in the caller.
+            if (req.rid not in self.loads
+                    and not getattr(req, "_agentic_host_retry_reason", None)
+                    and not getattr(req, "_agentic_host_rank_loaded", False)):
+                return self._queue_host_prepare(
+                    req, request_generation,
+                    allow_prepare=allow_prepare and allow_start,
+                )
         pending_retry_reason = getattr(req, "_agentic_host_retry_reason", None)
         if pending_retry_reason is not None:
             try:
@@ -8193,6 +8391,25 @@ class AgenticPHostStagingManager:
             req._agentic_kv_host_hit_tokens = int(record["offer"]["token_count"])
             return False
 
+        if getattr(self, "h2d_async_prepare", False):
+            return self._queue_host_prepare(
+                req, request_generation,
+                allow_prepare=allow_prepare and allow_start,
+            )
+        return self._prepare_host_restore(
+            req, request_generation, allow_prepare=allow_prepare,
+            allow_start=allow_start,
+        )
+
+    def _prepare_host_restore(
+        self, req, request_generation, *, allow_prepare=True, allow_start=True,
+    ) -> Optional[bool]:
+        """Prepare only: never allocate, bind Radix, or consume an existing load.
+
+        In async mode ``req`` is a worker-private view, not the scheduler Req.
+        Legacy/default execution retains its original terminal flag behavior.
+        """
+        snapshot_id = request_generation.snapshot_id
         with self._get_state_lock():
             record = self.host_ready.get(snapshot_id)
             control_owned = snapshot_id in getattr(
@@ -8263,6 +8480,13 @@ class AgenticPHostStagingManager:
             self, snapshot_id
         ):
             return True
+        if getattr(self, "h2d_async_prepare", False) and getattr(
+            record["snapshot"], "_materialized", record["snapshot"]
+        ) is None:
+            # The descriptor remains owned by this single preparation worker;
+            # cancellation is deferred until it finishes. mmap/open must not
+            # hold the manager lock needed by the Forward scheduler.
+            record["snapshot"].materialize()
         with self._get_state_lock():
             # Re-read under the ownership lock: the background spill worker
             # may have claimed the record after the first discovery read.
@@ -8393,7 +8617,12 @@ class AgenticPHostStagingManager:
         record["recovery_claim_id"] = recovery_claim_id
         record["loading"] = "h2d_reserving"
         prompt_tokens = len(req.origin_input_ids)
-        with self._get_state_lock():
+        # Async preparation is single-writer and its cancellation is queued
+        # back to that same worker. Scheduler gate cannot touch this rid until
+        # the descriptor is retired. Do not hold the shared manager lock over
+        # ledger I/O; retain the original lock scope on the legacy path.
+        with (nullcontext() if getattr(self, "h2d_async_prepare", False)
+              else self._get_state_lock()):
             # Lane ownership and workset intent creation are one atomic
             # admission operation.  An abort may otherwise release/reassign a
             # lane between the Host-record check and broker.request(), leaving
@@ -8406,12 +8635,16 @@ class AgenticPHostStagingManager:
                 if self.host_ready.get(snapshot_id) is record:
                     record["loading"] = False
                 return True
-            self.workset_broker.request(
+            requested = self.workset_broker.request(
                 snapshot_id,
                 int(offer["token_count"]),
                 prompt_tokens,
                 owner=workset_owner,
             )
+            if requested is False:
+                # A retiring/conflicting owner is not a grant. Keep the exact
+                # Host claim and retry; never start from another owner's pages.
+                return True
             workset_lease = self.workset_broker.get(
                 snapshot_id, owner=workset_owner
             )

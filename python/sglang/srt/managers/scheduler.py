@@ -3838,7 +3838,54 @@ class Scheduler(
             # safe boundaries. PD never calls get_next_batch_to_run().
             manager = getattr(self, "agentic_host_staging_manager", None)
             if manager is not None and getattr(manager, "h2d_decoupled", False):
-                self._agentic_progress_granted_slow()
+                event_progress = (
+                    getattr(self, "tp_size", 1) == 1
+                    and getattr(manager, "h2d_event_progress", False)
+                )
+                self._agentic_progress_granted_slow(owned_only=event_progress)
+                if event_progress:
+                    self._agentic_refill_host_events(reserve_tokens=reserve_tokens)
+
+    def _agentic_refill_host_events(self, *, reserve_tokens: int = 0) -> None:
+        """One bounded FIFO refill after completion handoff frees capacity.
+
+        Events are hints, never ownership/fence authority. Use the original
+        admission routine for fresh work (no source-class priority), then
+        service its intents and start selected loads at this SAME allocator
+        boundary. Retain the ordinary level-trigger path for missed/remote
+        events, failed claims and absent HTTP waiters. No wait for DMA here.
+        """
+        manager = getattr(self, "agentic_host_staging_manager", None)
+        if (
+            getattr(self, "tp_size", 1) != 1
+            or manager is None
+            or not getattr(manager, "h2d_decoupled", False)
+            or not getattr(manager, "h2d_event_progress", False)
+        ):
+            return
+        events = manager.drain_scheduler_events(max_events=64)
+        if not events or not self.agentic_kv_waiting_queue:
+            return
+        started = time.monotonic()
+        # The initial completion sweep may just have released the resident
+        # credit. Previously no fresh waiter could use it until another loop.
+        self._drain_agentic_kv_waiting_queue(continue_tick=True)
+        self.agentic_p_workset_broker.service(
+            self.token_to_kv_pool_allocator, reserve_tokens=reserve_tokens
+        )
+        self._agentic_progress_granted_slow(owned_only=True)
+        if not getattr(self, "_agentic_host_event_refill_logged", False):
+            self._agentic_host_event_refill_logged = True
+            logger.info(
+                "AgenticKV host_event_refill_enabled events=%d tp_size=1",
+                len(events),
+            )
+        # DEBUG avoids per-pass production logging on the Forward path.
+        logger.debug(
+            "AgenticKV host_event_refill events=%d elapsed_ms=%.3f waiting=%d",
+            len(events), (time.monotonic() - started) * 1000,
+            len(self.agentic_kv_waiting_queue),
+        )
 
     def _agentic_start_early_direct_receive(
         self,
@@ -7057,7 +7104,7 @@ class Scheduler(
                 return "slow"
         return None
 
-    def _agentic_progress_granted_slow(self) -> None:
+    def _agentic_progress_granted_slow(self, *, owned_only: bool = False) -> None:
         """Consume bounded existing Slow grants at the allocator-safe boundary.
 
         No new request selection, class priority, allocator thread or TP phase:
@@ -7087,6 +7134,18 @@ class Scheduler(
             if deferred is not False:
                 remaining.append((req, arrived_at))
                 continue
+            if owned_only:
+                lease = getattr(req, "_agentic_p_workset_lease", None)
+                if not (
+                    getattr(req, "_agentic_workset_backed", False)
+                    and getattr(req, "_agentic_mamba_runtime_reserved", False)
+                    and getattr(lease, "state", None) == "handed"
+                ):
+                    # False also covers explicit eviction/fallback. That
+                    # metadata-only request must use ordinary FIFO admission,
+                    # not the completion shortcut for an owned workset.
+                    remaining.append((req, arrived_at))
+                    continue
             # This workset is fully bound/handed, not a fresh compute admission
             # that can remain behind unallocated waiters and fill Mamba slots.
             req._agentic_kv_wait_enqueued = False
@@ -8248,7 +8307,7 @@ class Scheduler(
 
         self._drain_agentic_kv_waiting_queue()
 
-    def _drain_agentic_kv_waiting_queue(self) -> None:
+    def _drain_agentic_kv_waiting_queue(self, *, continue_tick: bool = False) -> None:
         """Progress active KV I/O and admit pending work in arrival order.
 
         Unadmitted requests own metadata only, but a completed receive may
@@ -8258,6 +8317,8 @@ class Scheduler(
         I/O engines and credits remain independent. A small admission batch
         amortizes scheduler ticks that contain long Prefill kernels.
         """
+        if not continue_tick:
+            self._agentic_admission_used_this_tick = 0
         # This sweep is intentionally outside admission_batch.  Admission
         # limits Prefill compute; it must not retain a completed workset lease.
         if getattr(self, "tp_size", 1) == 1:
@@ -8320,6 +8381,10 @@ class Scheduler(
             admission_batch = max(
                 1, int(os.environ.get("SGLANG_AGENTIC_KV_ADMISSION_BATCH", "8"))
             )
+            if continue_tick:
+                admission_batch = max(
+                    0, admission_batch - getattr(self, "_agentic_admission_used_this_tick", 0)
+                )
             host_staging = getattr(self, "agentic_host_staging_manager", None)
             default_slow_io_cap = max(
                 1, int(getattr(host_staging, "max_h2d_inflight", 1))
@@ -8531,6 +8596,9 @@ class Scheduler(
         # Keep unscanned metadata waiters; the next pass applies native arrival
         # order again. Resident Mamba worksets must not depend on this rotation.
         self.agentic_kv_waiting_queue = untouched + still_waiting
+        self._agentic_admission_used_this_tick = (
+            getattr(self, "_agentic_admission_used_this_tick", 0) + newly_admitted
+        )
 
     def _prioritize_agentic_prefill_ready(self) -> None:
         """Consume already-owned worksets without KV-source class priority.

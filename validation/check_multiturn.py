@@ -110,6 +110,10 @@ def main():
         response.raise_for_status()
         body = response.json()
         output = [int(token) for token in body["output_ids"]]
+        # APP_OWNS_TERMINATION also applies to reference generations: the
+        # transport cannot infer finality from the stop marker on its own.
+        assert confirm_agentic_generation_final(metadata, 0,
+            p_ready_dir=str(args.run_dir / "ready"))
         record["recompute_reference"] = body
         record["exact_output_match"] = output == record["output_ids"]
         target.write_text(json.dumps(records, ensure_ascii=False, indent=2))
