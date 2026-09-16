@@ -949,7 +949,12 @@ class SharedHostStagingLedger:
             raise ValueError("host staging ledger path is required")
         directory = os.path.dirname(path) or "."
         if directory != "/dev/shm" and not directory.startswith("/dev/shm/"):
-            raise ValueError("host staging ledger must reside in /dev/shm")
+            from sglang.srt.disaggregation.agentic_multinode import load_multinode_config
+            config = load_multinode_config()
+            if config is None or os.path.commonpath([
+                os.path.abspath(directory), config.control_directory
+            ]) != config.control_directory:
+                raise ValueError("host staging ledger must reside in /dev/shm or configured multi-node control root")
         os.makedirs(directory, exist_ok=True)
         self.path = os.path.abspath(path)
         self.event_directory = f"{self.path}.events"
@@ -1303,6 +1308,9 @@ class SharedHostStagingLedger:
                     return dict(current), False
                 if int(current.get("tp_size", 1)) != tp_size:
                     raise ValueError("host-staging TP size changed within snapshot")
+                for field in ("source_host_node", "source_host_engine"):
+                    if current.get(field) != entry.get(field):
+                        raise ValueError("host-staging TP ranks disagree on source node")
                 if (
                     int(current.get("token_count", -1))
                     != int(entry.get("token_count", -2))
@@ -1948,6 +1956,19 @@ class SharedHostStagingLedger:
             previous = rank_grants.get(rank_key)
             if previous is not None and previous != normalized:
                 return None, False
+
+            source_node = normalized.get("remote_host_node")
+            source_engine = normalized.get("remote_host_engine")
+            if source_node:
+                if any(item.get("remote_host_node") != source_node
+                       or item.get("remote_host_engine") != source_engine
+                       for item in prepared.values()):
+                    return None, False
+                if (current.get("source_host_node") not in {None, source_node}
+                    or current.get("source_host_engine") not in {None, source_engine}):
+                    return None, False
+                current["source_host_node"] = source_node
+                current["source_host_engine"] = source_engine
 
             claimed = set(int(value) for value in current.get("claimed_ranks", []))
             claimed.add(int(tp_rank))
@@ -2657,6 +2678,8 @@ class SharedHostStagingLedger:
             if previous is not None and previous.get("claim_id") != claim_id:
                 return False, False
             changed = previous is None
+            if current.get("source_host_node") and recovery_claim_id is None and not claims:
+                current["remote_read_epoch"] = int(current.get("remote_read_epoch", 0)) + 1
             claims[rank_key] = {
                 "claim_id": claim_id,
                 "phase": "pinned",
@@ -3232,6 +3255,44 @@ class SharedHostStagingLedger:
 
         return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
 
+    def set_source_host_pressure_rank(self, snapshot_id, source_engine, *, tp_rank, required_bytes):
+        """Notify the source TP leader that a peer lacks a Host extent."""
+        def callback(entries):
+            current = entries.get(snapshot_id)
+            if (current is None or current.get("source_host_engine") != source_engine
+                    or not 0 <= int(tp_rank) < int(current.get("tp_size", 1))):
+                return False, False
+            ranks = current.setdefault("source_host_pressure_ranks", {})
+            key = str(int(tp_rank))
+            wanted = max(0, int(required_bytes))
+            if int(ranks.get(key, 0)) == wanted:
+                return True, False
+            if wanted:
+                ranks[key] = wanted
+            else:
+                ranks.pop(key, None)
+            current["updated_at"] = time.time()
+            return True, True
+        return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
+
+    def complete_source_host_release_rank(self, snapshot_id, owner, *, tp_rank, tp_size):
+        """Keep remote ledger tombstones until every source shard was freed."""
+        if not 0 <= int(tp_rank) < int(tp_size):
+            raise ValueError("invalid source Host release TP rank")
+        def callback(entries):
+            current = entries.get(snapshot_id)
+            if (current is None or not current.get("source_host_node")
+                or current.get("p_owner") != owner
+                or int(current.get("tp_size", 1)) != int(tp_size)
+                or current.get("state") not in {"consumed", "failed", "rejected", "evicting", "recompute_required"}):
+                return False, False
+            ranks = set(current.get("source_host_released_ranks", []))
+            ranks.add(int(tp_rank))
+            current["source_host_released_ranks"] = sorted(ranks)
+            current["updated_at"] = time.time()
+            return True, True
+        return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
+
     def prune(
         self,
         older_than_seconds: float = 600.0,
@@ -3242,6 +3303,8 @@ class SharedHostStagingLedger:
 
         candidates = self.snapshot_entries(force_refresh=True)
         for snapshot_id, value in candidates.items():
+            if value.get("source_host_node") and len(value.get("source_host_released_ranks", [])) != int(value.get("tp_size", 1)):
+                continue
             doomed = (
                 value.get("state") == HostStageState.CONSUMED.value
                 and float(value.get("updated_at", 0.0)) < consumed_cutoff
@@ -4799,9 +4862,12 @@ class SharedHostSnapshotArena:
         self, directory: str, capacity_bytes: int, *, backend: str = "tmpfs"
     ):
         if not directory.startswith("/dev/shm/"):
-            raise ValueError(
-                "shared Host arena control directory must reside in /dev/shm"
-            )
+            from sglang.srt.disaggregation.agentic_multinode import load_multinode_config
+            config = load_multinode_config()
+            local_root = os.path.abspath(os.getenv("SGLANG_AGENTIC_MULTINODE_LOCAL_ROOT", "/dev/shm/dualpd"))
+            if (config is None or backend != "memfd" or os.path.commonpath([
+                os.path.abspath(directory), local_root]) != local_root):
+                raise ValueError("Host arena requires /dev/shm or multi-node local memfd control directory")
         self.directory = directory.rstrip("/")
         self.backend = str(backend).strip().lower()
         if self.backend not in {"tmpfs", "memfd"}:
@@ -5078,11 +5144,21 @@ class AgenticPHostStagingManager:
             raise ValueError("invalid D Host staging TP rank")
         self.expected_tool_seconds = expected_tool_seconds or {}
         self.eviction_controller = eviction_controller
-        self.arena = SharedHostSnapshotArena(
-            arena_directory,
-            int(arena_capacity_bytes),
-            backend=arena_backend,
+        from sglang.srt.disaggregation.agentic_multinode import load_multinode_config
+        from sglang.srt.disaggregation.agentic_remote_host_engine import create_remote_host_bridge
+        self._multinode_config = load_multinode_config()
+        if self._multinode_config is not None:
+            self.owner = f"p-group:{self._multinode_config.engine_id}"
+        self._remote_host_bridge = create_remote_host_bridge(
+            self.device_pool, self.page_size, self.tp_rank, self.tp_size, "d2p"
         )
+        if self._multinode_config is not None:
+            from sglang.srt.disaggregation.agentic_multinode_d2p import RemoteOnlyArena
+            self.arena = RemoteOnlyArena(arena_directory)
+        else:
+            self.arena = SharedHostSnapshotArena(
+                arena_directory, int(arena_capacity_bytes), backend=arena_backend
+            )
         # Kept for scheduler runtime accounting compatibility.  The new slow
         # path reserves no fixed P-HBM staging slots.
         self.reserved_hbm_bytes = 0
@@ -5346,6 +5422,10 @@ class AgenticPHostStagingManager:
         existing 1P and 2P launch configurations remain compatible.
         """
 
+        if offer.get("source_host_node"):
+            # Multi-node Slow always writes source-D-local CPU memory. A P
+            # process must never allocate or mmap that producer's grant.
+            return False
         tp_rank = int(getattr(self, "tp_rank", 0))
         rank_offer = offer.get("rank_offers", {}).get(str(tp_rank), {})
         offer_numa = rank_offer.get(
@@ -6662,21 +6742,28 @@ class AgenticPHostStagingManager:
             grant = None if not grants else grants[0]
         if grant is None:
             return None
-        snapshot = LazySharedMHAHostSnapshot(
-            path=str(grant["arena_path"]),
-            token_count=int(grant.get("token_count", entry["token_count"])),
-            device_pool=self.device_pool,
-            byte_size=int(grant.get("byte_size", entry["byte_size"])),
-            allocation_bytes=int(grant.get("byte_size", entry["byte_size"])),
-            create=False,
-            file_offset=int(grant.get("arena_offset", 0)),
-        )
+        network_host = bool(grant.get("remote_host_node"))
+        if network_host:
+            if getattr(self, "_remote_host_bridge", None) is None:
+                raise RuntimeError("received remote Host grant without multi-node transport")
+            from sglang.srt.disaggregation.agentic_multinode_d2p import RemoteHostDescriptor
+            snapshot = RemoteHostDescriptor(grant)
+        else:
+            snapshot = LazySharedMHAHostSnapshot(
+                path=str(grant["arena_path"]),
+                token_count=int(grant.get("token_count", entry["token_count"])),
+                device_pool=self.device_pool,
+                byte_size=int(grant.get("byte_size", entry["byte_size"])),
+                allocation_bytes=int(grant.get("byte_size", entry["byte_size"])),
+                create=False, file_offset=int(grant.get("arena_offset", 0)),
+            )
         record = {
             "offer": dict(entry),
             "snapshot": snapshot,
             "loading": False,
             "ready_at": float(entry.get("updated_at", time.time())),
             "remote_host": True,
+            "network_host": network_host,
         }
         with self._get_state_lock():
             previous = self.host_ready.get(snapshot_id)
@@ -6877,6 +6964,9 @@ class AgenticPHostStagingManager:
     def _cancel_unstarted_h2d_load(self, rid: str, load: dict[str, Any]) -> None:
         """Release a prepared lane whose DMA was never published."""
 
+        if (getattr(self, "_remote_host_bridge", None) is not None
+                and load.get("record", {}).get("network_host")):
+            self._fence_unstarted_remote_h2d(load)
         request_generation = load["request_generation"]
         snapshot_id = request_generation.snapshot_id
         lease = load["workset_lease"]
@@ -7018,9 +7108,6 @@ class AgenticPHostStagingManager:
         record = load["record"]
         device_indices = load["device_indices"]
         AgenticPHostStagingManager._configure_hybrid_h2d_state(load)
-        lane = AgenticPHostStagingManager._h2d_lane_resources(
-            self, int(load.get("h2d_lane_id", 0))
-        )
         if not load.get("io_inflight"):
             self.workset_broker.mark_io_inflight(
                 load["request_generation"].snapshot_id,
@@ -7045,6 +7132,26 @@ class AgenticPHostStagingManager:
                     "Slow recovery lost Host ownership before H2D"
                 )
             load["io_inflight"] = True
+        if record.get("network_host"):
+            if load.get("remote_h2d_future") is not None:
+                return False
+            snapshot_id = load["request_generation"].snapshot_id
+            entry = self.ledger.get(snapshot_id)
+            if entry is None or not entry.get("recovery_claim_id"):
+                raise RuntimeError("remote Host read lost group recovery claim")
+            attempt = f"{entry['recovery_claim_id']}:epoch:{entry['remote_read_epoch']}"
+            load["remote_h2d_attempt"] = attempt
+            record["loading"] = "h2d"
+            load["remote_h2d_future"] = self._h2d_host_copy_pool.submit(
+                self._remote_host_bridge.load, snapshot_id,
+                record["snapshot"].grant, device_indices,
+                attempt_id=attempt,
+                cancel_check=lambda: bool(load.get("abort_requested") or load.get("io_error")),
+            )
+            return True
+        lane = AgenticPHostStagingManager._h2d_lane_resources(
+            self, int(load.get("h2d_lane_id", 0))
+        )
         if load.get("prefetch_future") is None:
             AgenticPHostStagingManager._submit_h2d_prefetch(
                 self, load, int(load.get("offset", 0))
@@ -7156,8 +7263,52 @@ class AgenticPHostStagingManager:
         )
         return True
 
+    def _fence_unstarted_remote_h2d(self, load: dict[str, Any]) -> None:
+        """Publish the TP receipt for a rank whose worker never started.
+
+        Caller owns the prepared lane, or successfully cancelled its Future.
+        Without this receipt, peer ranks cannot retire the group read epoch.
+        """
+        snapshot_id = load["request_generation"].snapshot_id
+        attempt = load.get("remote_h2d_attempt")
+        if attempt is None:
+            entry = self.ledger.get(snapshot_id)
+            if entry is None or not entry.get("recovery_claim_id"):
+                raise RuntimeError("remote Host cancellation lost recovery claim")
+            attempt = f"{entry['recovery_claim_id']}:epoch:{entry['remote_read_epoch']}"
+        self._remote_host_bridge.cancel_unstarted(snapshot_id, attempt_id=attempt)
+
     def _discard_failed_h2d_load(self, rid: str, load: dict[str, Any]) -> bool:
         """Quiesce one failed shard and retain Host for a group retry."""
+        if load.get("remote_h2d_unfenced"):
+            return False
+        remote_future = load.get("remote_h2d_future")
+        if (getattr(self, "_remote_host_bridge", None) is not None
+                and load.get("record", {}).get("network_host")) and (
+            remote_future is None or remote_future.cancel()
+        ):
+            try:
+                self._fence_unstarted_remote_h2d(load)
+            except Exception:
+                # No receipt means no all-rank drain proof: retry publication
+                # without releasing this destination workset.
+                logger.exception("Remote D2P unstarted cancellation receipt failed")
+                return False
+        if remote_future is not None:
+            remote_future.cancel()
+            if not remote_future.done():
+                return False
+            try:
+                remote_future.result()
+            except Exception as exc:
+                from sglang.srt.disaggregation.agentic_remote_host_engine import UnfencedRemoteRead
+                if isinstance(exc, UnfencedRemoteRead):
+                    load["remote_h2d_unfenced"] = True
+                    load["dma_quarantined"] = True
+                    return False
+                # Bridge ordinary errors carry a successful NIXL cancellation
+                # fence; existing group retry now owns the destination release.
+            load.pop("remote_h2d_future", None)
         prefetch = load.get("prefetch_future")
         if prefetch is not None:
             prefetch.cancel()
@@ -7478,6 +7629,37 @@ class AgenticPHostStagingManager:
                     continue
             event = load.get("event")
             try:
+                if load["record"].get("network_host"):
+                    future = load.get("remote_h2d_future")
+                    if future is None:
+                        self._start_h2d_chunk(load)
+                        continue
+                    if not future.done():
+                        continue
+                    try:
+                        elapsed = float(future.result())
+                    except Exception as exc:
+                        from sglang.srt.disaggregation.agentic_remote_host_engine import UnfencedRemoteRead
+                        if isinstance(exc, UnfencedRemoteRead):
+                            load["remote_h2d_unfenced"] = True
+                            load["dma_quarantined"] = True
+                            load["io_error"] = exc
+                            logger.error("Remote D2P read has no physical fence; retaining workset snapshot=%s", snapshot_id)
+                            continue
+                        raise
+                    load["host_copy_elapsed_seconds"] += elapsed
+                    # RDMA is not timed by CUDA events. Do not report a fake
+                    # GPU-DMA bandwidth by dividing the bytes by zero ms.
+                    load["gpu_elapsed_ms"] = float("nan")
+                    load["offset"] = len(load["device_indices"])
+                    if not self.workset_broker.mark_io_quiesced(snapshot_id,
+                        load["workset_lease"], load["io_attempt"]):
+                        raise RuntimeError("remote Host read lost workset I/O ownership")
+                    load["io_quiesced"] = True
+                    load["h2d_copy_complete"] = True
+                    AgenticPHostStagingManager._release_quiesced_h2d_lane(self, load)
+                    self._publish_d2p_hbm_ready(load)
+                    continue
                 if event is None:
                     self._start_h2d_chunk(load)
                     continue
@@ -9216,6 +9398,13 @@ class AgenticDHostStagingClient:
         # without increasing the number of concurrent gather/DMA operations
         # that can contend with Decode Forward.
         self.max_active_writes = lane_count
+        from sglang.srt.disaggregation.agentic_multinode import load_multinode_config
+        config = load_multinode_config()
+        self._source_host = None
+        if config is not None:
+            from sglang.srt.disaggregation.agentic_multinode_d2p import SourceLocalD2PArena
+            self._source_host = SourceLocalD2PArena(client=self, config=config)
+            self.relay_enabled = False
 
     def set_target(self, *, prefill_domain: int, arena_numa_node: int) -> None:
         """Apply TP0's route before this rank publishes its shard offer."""
@@ -9272,6 +9461,11 @@ class AgenticDHostStagingClient:
             "tp_size": int(getattr(self, "tp_size", 1)),
             "kv_layout_hash": manifest.kv_layout_hash,
         }
+        source_host = getattr(self, "_source_host", None)
+        if source_host is not None:
+            offer.update(source_host_node=source_host.config.node_id,
+                         source_host_engine=source_host.config.engine_id,
+                         arena_numa_node=self.source_numa_node)
         if self.retain_logical_hashes:
             offer["logical_hashes"] = list(logical_hashes)
         return self.ledger.offer(offer)
@@ -9698,6 +9892,9 @@ class AgenticDHostStagingClient:
                 if entry_snapshot is _LEDGER_ENTRY_UNSET
                 else entry_snapshot
             )
+            source_host = getattr(self, "_source_host", None)
+            if source_host is not None:
+                entry = source_host.ensure_grant(entry)
         if entry is None:
             if not self._cleanup_write(candidate):
                 return "waiting"
@@ -9975,6 +10172,11 @@ class AgenticDHostStagingClient:
             - float(write.get("wall_started_at", time.monotonic())),
         )
         elapsed_ready = time.time()
+        source_host = getattr(self, "_source_host", None)
+        if source_host is not None:
+            # Publish network metadata only after this complete local D2H
+            # shard is fenced. HOST_READY still waits for every TP rank.
+            source_host.export_after_d2h(snapshot_id)
         if not self._cleanup_write(candidate):
             return "waiting"
         if not self.ledger.complete_host_write(

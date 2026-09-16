@@ -6078,6 +6078,9 @@ class ServerArgs:
         return max(FLA_CHUNK_SIZE, self.page_size)
 
     def check_server_args(self):
+        from sglang.srt.disaggregation.agentic_multinode import validate_multinode_runtime
+
+        validate_multinode_runtime(self)
         # Check parallel size constraints
         assert (
             self.tp_size * self.pp_size

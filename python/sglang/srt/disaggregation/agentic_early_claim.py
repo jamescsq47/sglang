@@ -13,6 +13,7 @@ import json
 import os
 import select
 import struct
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -65,6 +66,40 @@ def _inotify_add_watch(fd: int, path: Path, mask: int) -> int:
     return descriptor
 
 
+class _SharedControlPoller:
+    """Bounded background resync for remote writes invisible to inotify.
+
+    This is a metadata-only prototype bridge, not a KV data transport. A
+    filesystem with verified cross-client locking/coherency is mandatory.
+    No poll ever grants capacity or transfers snapshot ownership.
+    """
+
+    def __init__(self, interval: float):
+        self.interval = interval
+        self.next_scan = 0.0
+        self.stopped = threading.Event()
+
+    def due(self, timeout: float | None) -> bool:
+        if self.stopped.is_set():
+            return False
+        remaining = max(0.0, self.next_scan - time.monotonic())
+        wait = remaining if timeout is None else min(remaining, max(0.0, timeout))
+        if self.stopped.wait(wait):
+            return False
+        now = time.monotonic()
+        if now < self.next_scan:
+            return False
+        self.next_scan = now + self.interval
+        return True
+
+
+def _shared_control_poller():
+    from sglang.srt.disaggregation.agentic_multinode import control_poll_interval
+
+    interval = control_poll_interval()
+    return None if interval is None else _SharedControlPoller(interval)
+
+
 class AgenticArrivalWatcher:
     """Event-driven reader for Router arrival markers.
 
@@ -74,9 +109,16 @@ class AgenticArrivalWatcher:
     inotify; a full scan is used again solely after kernel queue overflow.
     """
 
+    _shared_poll = None
+
     def __init__(self, store: "AgenticEarlyClaimStore", max_age_seconds: float):
         self.store = store
         self.max_age_seconds = float(max_age_seconds)
+        self._shared_poll = _shared_control_poller()
+        if self._shared_poll is not None:
+            self._closed = False
+            self._seen_arrivals = {}
+            return
         self.fd = _inotify_init()
         try:
             self.watch_descriptor = _inotify_add_watch(
@@ -100,6 +142,9 @@ class AgenticArrivalWatcher:
         if self._closed:
             return
         self._closed = True
+        if self._shared_poll is not None:
+            self._shared_poll.stopped.set()
+            return
         try:
             self.poller.unregister(self.fd)
         except (KeyError, OSError):
@@ -116,6 +161,15 @@ class AgenticArrivalWatcher:
 
         if self._closed:
             return []
+        if self._shared_poll is not None:
+            if not self._shared_poll.due(timeout_seconds):
+                return []
+            current = self.store.iter_arrivals(max_age_seconds=self.max_age_seconds)
+            seen = {request.snapshot_id: payload for request, payload in current}
+            arrivals = [(request, payload) for request, payload in current
+                        if self._seen_arrivals.get(request.snapshot_id) != payload]
+            self._seen_arrivals = seen
+            return sorted(arrivals, key=lambda item: float(item[1]["arrived_at"]))
         arrivals = self._startup
         self._startup = []
         timeout_ms = max(0, int(float(timeout_seconds) * 1000.0))
@@ -187,8 +241,15 @@ class AgenticFileChangeWatcher:
     backstop; normal progress is edge-triggered by inotify.
     """
 
+    _shared_poll = None
+
     def __init__(self, path: str | Path):
         self.path = Path(path).resolve()
+        self._shared_poll = _shared_control_poller()
+        if self._shared_poll is not None:
+            self._closed = False
+            self.healthy = True
+            return
         self.fd = _inotify_init()
         try:
             self.watch_descriptor = _inotify_add_watch(
@@ -213,6 +274,9 @@ class AgenticFileChangeWatcher:
             return
         self._closed = True
         self.healthy = False
+        if self._shared_poll is not None:
+            self._shared_poll.stopped.set()
+            return
         try:
             self.poller.unregister(self.fd)
         except (KeyError, OSError):
@@ -227,6 +291,9 @@ class AgenticFileChangeWatcher:
 
         if self._closed:
             return False
+        if self._shared_poll is not None:
+            # Treat each tick as invalidation, not an ownership transition.
+            return self._shared_poll.due(timeout_seconds)
         timeout_ms = (
             -1
             if timeout_seconds is None
@@ -290,9 +357,16 @@ class AgenticDirectoryChangeWatcher:
     infrequent authoritative resync.
     """
 
+    _shared_poll = None
+
     def __init__(self, directory: str | Path):
         self.directory = Path(directory).resolve()
         self.directory.mkdir(parents=True, exist_ok=True)
+        self._shared_poll = _shared_control_poller()
+        if self._shared_poll is not None:
+            self._closed = False
+            self.healthy = True
+            return
         self.fd = _inotify_init()
         try:
             self.watch_descriptor = _inotify_add_watch(
@@ -317,6 +391,9 @@ class AgenticDirectoryChangeWatcher:
             return
         self._closed = True
         self.healthy = False
+        if self._shared_poll is not None:
+            self._shared_poll.stopped.set()
+            return
         try:
             self.poller.unregister(self.fd)
         except (KeyError, OSError):
@@ -333,6 +410,10 @@ class AgenticDirectoryChangeWatcher:
 
         if self._closed:
             return (), False
+        if self._shared_poll is not None:
+            # Remote changes cannot be named by local inotify. Request the
+            # existing authoritative resync, on the background control worker.
+            return (), self._shared_poll.due(timeout_seconds)
         timeout_ms = (
             -1
             if timeout_seconds is None

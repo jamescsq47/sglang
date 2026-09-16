@@ -2490,6 +2490,11 @@ class Scheduler(
             configure_gc_logger()
 
     def init_disaggregation(self):
+        from sglang.srt.disaggregation.agentic_multinode import validate_multinode_runtime
+
+        validate_multinode_runtime(
+            self.server_args, self.token_to_kv_pool_allocator.get_kvcache()
+        )
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )

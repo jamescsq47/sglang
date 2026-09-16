@@ -38,6 +38,9 @@ from sglang.srt.disaggregation.agentic_host_staging import (
     _registered_indexed_batch_copy,
 )
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.agentic_remote_host_engine import (
+    create_remote_host_bridge, UnfencedRemoteRead,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -513,11 +516,16 @@ class AgenticPToDHostStagingManager:
         self.tp_rank = int(tp_rank)
         self.tp_size = int(tp_size)
         self.hard_watermark = float(hard_watermark)
+        self._remote_bridge = create_remote_host_bridge(
+            device_pool, page_size, tp_rank, tp_size, "p2d"
+        )
         self.owner = (
             f"p2d-p:{os.getpid()}"
             if self.tp_size == 1
             else f"p2d-p-group:{os.getenv('SGLANG_AGENTIC_KV_ENGINE_ID', 'prefill')}"
         )
+        if self._remote_bridge is not None:
+            self.owner = f"p2d-p-group:{self._remote_bridge.config.engine_id}"
         self.arena_backend = os.getenv(
             "SGLANG_AGENTIC_KV_P2D_HOST_ARENA_BACKEND", "memfd"
         ).strip().lower()
@@ -731,7 +739,7 @@ class AgenticPToDHostStagingManager:
             self._candidates.pop(snapshot_id, None)
             prepared = self._prepared.pop(snapshot_id, None)
             if prepared is not None:
-                self.arena.release(prepared["snapshot"])
+                self._release_unwritten_snapshot(snapshot_id, prepared["snapshot"])
             if local_snapshot is not None:
                 self._results.pop(local_snapshot, None)
             return True
@@ -811,6 +819,9 @@ class AgenticPToDHostStagingManager:
                         "token_count": int(token_count),
                         "prefill_domain": self.prefill_domain,
                         "arena_numa_node": self.numa_node,
+                        **({"remote_host_node": self._remote_bridge.config.node_id,
+                            "remote_host_engine": self._remote_bridge.config.engine_id}
+                           if getattr(self, "_remote_bridge", None) is not None else {}),
                         "prefill_metadata": prefill_metadata,
                         "tp_rank": self.tp_rank,
                     }
@@ -822,7 +833,7 @@ class AgenticPToDHostStagingManager:
                         tp_size=self.tp_size,
                     )
                     if prepared is None:
-                        self.arena.release(snapshot)
+                        self._release_unwritten_snapshot(snapshot_id, snapshot)
                         snapshot = None
                         self.ledger.reject_unclaimed_offer(
                             snapshot_id, reason="p2d_prepare_failed"
@@ -864,7 +875,7 @@ class AgenticPToDHostStagingManager:
                         }
                     ):
                         self._prepared.pop(snapshot_id, None)
-                        self.arena.release(snapshot)
+                        self._release_unwritten_snapshot(snapshot_id, snapshot)
                         snapshot = None
                         if current is not None and current.get("state") == (
                             HostStageState.OFFERED.value
@@ -904,7 +915,7 @@ class AgenticPToDHostStagingManager:
                     )
                 )
                 if owned_snapshot is not None:
-                    self.arena.release(owned_snapshot)
+                    self._release_unwritten_snapshot(snapshot_id, owned_snapshot)
             # Before claim, failure leaves the Router offer intact so native
             # Direct remains a valid correctness path.  After claim, Host owns
             # all TP shards and the generation must fail closed.
@@ -978,7 +989,7 @@ class AgenticPToDHostStagingManager:
                 if ownership == P2D_RELEASE_HOST_OWNED:
                     return False
                 prepared = self._prepared.pop(candidate_id)
-                self.arena.release(prepared["snapshot"])
+                self._release_unwritten_snapshot(candidate_id, prepared["snapshot"])
             else:
                 ownership = self.ledger.arbitrate_p2d_release(
                     candidate_id, tp_size=self.tp_size
@@ -1030,6 +1041,8 @@ class AgenticPToDHostStagingManager:
                 "P->D Host background work still active during shutdown; "
                 "retaining registered arena"
             )
+        elif getattr(self, "_remote_bridge", None) is not None and self._records:
+            logger.warning("P->D remote Host leases remain during shutdown; retaining source arena")
         else:
             with self._lock:
                 prepared = list(self._prepared.values())
@@ -1071,7 +1084,7 @@ class AgenticPToDHostStagingManager:
                         self._candidates.pop(snapshot_id, None)
                         prepared = self._prepared.pop(snapshot_id, None)
                         if prepared is not None:
-                            self.arena.release(prepared["snapshot"])
+                            self._release_unwritten_snapshot(snapshot_id, prepared["snapshot"])
                     continue
                 if entry.get("state") not in {
                     HostStageState.OFFERED.value,
@@ -1214,6 +1227,8 @@ class AgenticPToDHostStagingManager:
                 # Only a completely written extent may enter the reusable
                 # arena pool.  A failed partial D2H is unlinked on release.
                 snapshot.mark_populated()
+                if getattr(self, "_remote_bridge", None) is not None:
+                    self._remote_bridge.export_snapshot(snapshot_id, snapshot)
                 if not self.ledger.complete_p2d_host_write_rank(
                     snapshot_id,
                     self.owner,
@@ -1338,6 +1353,16 @@ class AgenticPToDHostStagingManager:
             self._progress_group_completions_once()
             self._cleanup_consumed()
 
+    def _release_unwritten_snapshot(self, snapshot_id, snapshot) -> None:
+        if getattr(self, "_remote_bridge", None) is None:
+            self.arena.release(snapshot)
+            return
+        # A peer may have committed TP Host ownership before this rank began
+        # its copy. Retain a cleanup carrier so its source-release ACK cannot
+        # be lost when the prepared request is removed by native cancellation.
+        self._records.setdefault(snapshot_id, {"snapshot": snapshot})
+        self._group_wakeup.set()
+
     def _cleanup_consumed(self) -> None:
         with self._lock:
             records = list(self._records.items())
@@ -1356,11 +1381,36 @@ class AgenticPToDHostStagingManager:
                 current = self._records.get(snapshot_id)
                 if current is None:
                     continue
+            # Network registration/metadata may block this background worker,
+            # but must never hold the scheduler-facing staging lock.
+            if getattr(self, "_remote_bridge", None) is not None:
+                try:
+                    released = self._remote_bridge.cleanup_source(snapshot_id, entry)
+                except Exception:
+                    logger.exception("P->D remote Host registration cleanup will retry: %s", snapshot_id)
+                    continue
+                if not released:
+                    continue
+            with self._lock:
+                current = self._records.get(snapshot_id)
+                if current is None:
+                    continue
                 if self.arena.release(current["snapshot"]) is False:
                     # Keep the record as the sole retry carrier.  No source or
                     # destination HBM ownership depends on it after terminal
                     # state, so retrying on the completion worker is safe.
                     continue
+            if getattr(self, "_remote_bridge", None) is not None and entry.get("source_host_node"):
+                try:
+                    released = self.ledger.complete_source_host_release_rank(
+                        snapshot_id, self.owner, tp_rank=self.tp_rank, tp_size=self.tp_size
+                    )
+                except Exception:
+                    logger.exception("P->D remote Host release ACK will retry: %s", snapshot_id)
+                    continue
+                if not released:
+                    continue
+            with self._lock:
                 self._records.pop(snapshot_id, None)
             logger.info(
                 "AgenticKV p2d_host_release snapshot=%s state=%s",
@@ -1387,6 +1437,9 @@ class AgenticPToDHostLoadManager:
         self.device_pool = device_pool
         self.page_size = int(page_size)
         self.decode_domain = int(decode_domain)
+        self._remote_bridge = create_remote_host_bridge(
+            device_pool, page_size, tp_rank, tp_size, "p2d"
+        )
         self.numa_node = int(numa_node)
         self.tp_rank = int(tp_rank)
         self.tp_size = int(tp_size)
@@ -1547,7 +1600,7 @@ class AgenticPToDHostLoadManager:
                 )
             grant = matching[0]
             arena_numa_node = int(grant.get("arena_numa_node", -1))
-            if arena_numa_node < 0:
+            if arena_numa_node < 0 and not grant.get("remote_host_node"):
                 raise RuntimeError("P->D Host grant has no Arena NUMA node")
             if int(grant["token_count"]) != len(device_indices):
                 raise RuntimeError("P->D Host destination token count mismatch")
@@ -1564,6 +1617,16 @@ class AgenticPToDHostLoadManager:
             receiver._grant = grant
             receiver._owner = owner
             receiver._cross_numa = arena_numa_node != self.numa_node
+            if getattr(self, "_remote_bridge", None) is not None and (
+                torch.is_tensor(device_indices) and device_indices.is_cuda
+            ):
+                # The receiving scheduler creates GPU page indices on its
+                # stream. Publish that producer fence, never synchronize it
+                # here; the remote I/O worker mirrors only after it completes.
+                receiver._remote_indices_ready = torch.cuda.Event()
+                receiver._remote_indices_ready.record(
+                    torch.cuda.current_stream(device=device_indices.device)
+                )
             self._work.put((receiver, device_indices))
 
     def _worker(
@@ -1584,6 +1647,7 @@ class AgenticPToDHostLoadManager:
             prefetch_future = None
             host_copy_seconds = 0.0
             gpu_elapsed_ms = 0.0
+            remote_bridge = getattr(self, "_remote_bridge", None)
             try:
                 if receiver.abort_pending:
                     raise RuntimeError("P->D Host load aborted before H2D")
@@ -1593,7 +1657,19 @@ class AgenticPToDHostLoadManager:
                 ):
                     raise RuntimeError("P->D Host peer load aborted before H2D")
                 grant = receiver._grant
-                if hasattr(self.device_pool, "mamba_pool"):
+                if remote_bridge is not None:
+                    indices_ready = getattr(receiver, "_remote_indices_ready", None)
+                    if indices_ready is not None:
+                        indices_ready.synchronize()
+                    remote_bridge.load(
+                        receiver.snapshot_id, grant, device_indices,
+                        attempt_id=f"p2d:{receiver._owner}:{receiver.snapshot_id}",
+                        cancel_check=lambda: receiver.abort_pending or (
+                            (self.ledger.get(receiver.snapshot_id) or {}).get("state")
+                            == HostStageState.ABORTING.value
+                        ),
+                    )
+                elif hasattr(self.device_pool, "mamba_pool"):
                     from sglang.srt.disaggregation.agentic_hybrid_dma import RegisteredHybridHostSnapshot
                     snapshot = RegisteredHybridHostSnapshot(
                         path=str(grant["arena_path"]), token_count=int(grant["token_count"]),
@@ -1611,7 +1687,7 @@ class AgenticPToDHostLoadManager:
                         file_offset=int(grant.get("arena_offset", 0)),
                     )
                 device_indices_host = None
-                if _cuda_driver_batch_memcpy() is not None:
+                if remote_bridge is None and _cuda_driver_batch_memcpy() is not None:
                     try:
                         device_indices_host = _device_indices_to_host(device_indices)
                     except BaseException:
@@ -1623,6 +1699,7 @@ class AgenticPToDHostLoadManager:
                 ranges = [
                     (start, min(start + self.chunk_tokens, len(device_indices)))
                     for start in range(0, len(device_indices), self.chunk_tokens)
+                    if remote_bridge is None
                 ]
                 if ranges:
                     first_start, first_end = ranges[0]
@@ -1708,6 +1785,12 @@ class AgenticPToDHostLoadManager:
                         self._group_pending[receiver.snapshot_id] = completion
                     self._group_wakeup.set()
             except Exception as exc:
+                if isinstance(exc, UnfencedRemoteRead):
+                    self._dma_quarantine.append((device_indices, receiver))
+                    self._dma_poisoned = True
+                    receiver.mark_quarantined(exc)
+                    logger.exception("P->D remote READ has no physical fence; retaining D pages")
+                    return
                 if prefetch_future is not None:
                     # The Host mapping and bounce stay owned until this physical
                     # CPU read has stopped, just like a CUDA completion fence.

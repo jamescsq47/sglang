@@ -1124,6 +1124,22 @@ class DecodeKVCacheOffloadManager:
     def _assign_slow_host_target(self, candidate) -> None:
         if "selected_host_domain" in candidate:
             return
+        from sglang.srt.disaggregation.agentic_multinode import source_host_placement
+
+        source_placement = None
+        if os.getenv("SGLANG_AGENTIC_MULTINODE_ENABLED", "0").lower() in {
+            "1", "true", "yes", "on"
+        }:
+            source_placement = source_host_placement(
+                self.tp_world_size, self.agentic_host_staging_client.arena_domain
+            )
+        if source_placement is not None:
+            # Remote Slow writes to D's own DRAM; the P domain is only the
+            # recovery routing hint. Rank0 broadcasts this same shard vector.
+            domain, numa_nodes = source_placement
+            candidate["selected_host_domain"] = domain
+            candidate["selected_host_numa_nodes"] = numa_nodes
+            return
         if os.getenv("SGLANG_PD_ABLATION_RANDOM_ROUTING", "").strip().lower() in {
             "1",
             "true",
