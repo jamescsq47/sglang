@@ -11,6 +11,7 @@ export PYTHONPATH="${dualpd_sglang_root}/python:${dualpd_slime_root}/examples/pd
 cd -- "${dualpd_sglang_root}"
 "${dualpd_python}" -m pytest -q \
   python/sglang/srt/disaggregation/test_agentic_multinode*.py \
+  python/sglang/srt/disaggregation/test_agentic_minimax_layout.py \
   python/sglang/srt/disaggregation/test_agentic_remote_host*.py \
   python/sglang/srt/disaggregation/test_agentic_kv_lifecycle.py \
   python/sglang/srt/disaggregation/test_agentic_tp*.py \
