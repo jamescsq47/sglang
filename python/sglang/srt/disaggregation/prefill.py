@@ -25,6 +25,7 @@ import os
 import threading
 import time
 from collections import deque
+from contextlib import nullcontext
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
 
@@ -47,6 +48,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_LENGTH,
@@ -155,6 +157,12 @@ class PrefillBootstrapQueue:
         # source KV stays locked until D observes the ready marker and sends
         # the normal NIXL destination metadata.
         self.p_ready_dir = os.environ.get("SGLANG_PD_P_READY_DIR", "")
+        from sglang.srt.disaggregation.agentic_control_store import (
+            ReadySignals, control_enabled,
+        )
+        self.ready_signals = (
+            ReadySignals(self.p_ready_dir) if control_enabled() else None
+        )
         self.p2d_prebind_ablation = os.environ.get(
             "SGLANG_PD_ABLATION_P2D_PREBIND", "false"
         ).strip().lower() in {"1", "true", "yes", "on"}
@@ -165,7 +173,7 @@ class PrefillBootstrapQueue:
                 "SGLANG_AGENTIC_KV_LIFECYCLE requires SGLANG_PD_P_READY_DIR "
                 "(use a node-local path such as /dev/shm/sglang-agentic-p-ready)"
             )
-        if self.p_ready_dir:
+        if self.p_ready_dir and self.ready_signals is None:
             os.makedirs(self.p_ready_dir, exist_ok=True)
         self.kv_manager = self._init_kv_manager()
 
@@ -444,8 +452,10 @@ class SchedulerDisaggregationPrefillMixin:
         otherwise enough receivers waiting for metadata can exhaust the pool
         and permanently strand every later P result.
 
-        Request/KV cleanup remains scheduler-owned after a consumer publishes
-        a terminal cached poll.
+        With the controller-backed allocator, a separate native-retirement
+        worker frees the transferred P source after the TP/Host ownership
+        barrier; the scheduler only emits the completed request response.
+        Legacy allocators keep their scheduler-owned cleanup path.
         """
 
         default_enabled = "1" if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get() else "0"
@@ -456,6 +466,8 @@ class SchedulerDisaggregationPrefillMixin:
             return
         self._prefill_transfer_poll_lock = threading.Lock()
         self._prefill_transfer_terminal_queue = deque()
+        self._prefill_native_group_pending = set()
+        self._prefill_native_completed = {}
         self._prefill_transfer_prepare_queue = deque()
         self._prefill_transfer_prepare_keys = set()
         self._prefill_transfer_stop = threading.Event()
@@ -488,6 +500,21 @@ class SchedulerDisaggregationPrefillMixin:
             ),
         )
         self._prefill_transfer_tp_background_enabled = self.tp_size > 1
+        # Only the controller-backed allocator can retire P->D source pages
+        # outside the scheduler thread. The native/Radix state remains a
+        # single protected ownership domain, never two allocators.
+        self._prefill_native_release_enabled = bool(
+            getattr(getattr(self, "agentic_p_workset_broker", None), "controller_mode", False)
+        )
+        self._prefill_transfer_async_release_enabled = (
+            self.tp_size > 1
+            and (os.getenv("SGLANG_AGENTIC_MULTINODE_ENABLED", "0") == "1"
+                 or self._prefill_native_release_enabled)
+        )
+        self._prefill_native_state_lock = threading.RLock()
+        self._prefill_native_release_condition = threading.Condition()
+        self._prefill_native_release_queue = deque()
+        self._prefill_native_release_fatal = None
         if self._prefill_transfer_tp_background_enabled:
             # Each process owns one physical TP shard.  One FIFO worker per
             # rank is sufficient: rank0 publishes the logical command through
@@ -528,6 +555,17 @@ class SchedulerDisaggregationPrefillMixin:
                 daemon=True,
             )
             self._prefill_transfer_cleanup_thread.start()
+        self._prefill_native_release_thread = None
+        if self._prefill_native_release_enabled:
+            from sglang.srt.disaggregation.agentic_cuda_worker import run_rank_bound_worker
+
+            self._prefill_native_release_thread = threading.Thread(
+                target=run_rank_bound_worker,
+                args=(self.gpu_id, self._prefill_native_release_worker),
+                name=f"sglang-prefill-native-release-{os.getpid()}",
+                daemon=True,
+            )
+            self._prefill_native_release_thread.start()
         logger.info(
             "Prefill producer/ready-buffer/transfer pipeline enabled "
             "background_consumers=%d interval_ms=%.3f tp_owner=%s",
@@ -565,8 +603,173 @@ class SchedulerDisaggregationPrefillMixin:
             with self._prefill_transfer_cleanup_lock:
                 self._prefill_transfer_cleanup_pending.add(key)
 
+    def _prefill_transfer_authorize_release(self: Scheduler, req: Req, poll: int) -> int:
+        """Background-only: freeze Host ownership once, then report release-ready.
+
+        Physical sender reports are not release authorization: a Host offer may
+        have won since the last poll. Keep the existing CAS, but never run it on
+        the scheduler or repeat it after successful (consuming) authorization.
+        """
+        outcome = getattr(req, "_agentic_p2d_release_authorized", None)
+        if outcome is None:
+            # Also covers failures returned by fence_failed_launch outside the
+            # normal progress step. Peers need the physical terminal report
+            # before any release ACK; nothing may republish after that ACK.
+            self.agentic_tp_p2d_sender_mailbox.publish_local(
+                self._prefill_transfer_key(req), int(poll)
+            )
+            manager = getattr(self, "agentic_p2d_host_staging_manager", None)
+            if manager is not None:
+                authorize = (
+                    manager.prepare_scheduler_release
+                    if poll == int(KVPoll.Success) else manager.cancel_watch
+                )
+                if not authorize(req):
+                    return int(KVPoll.Transferring)
+            outcome = int(poll)
+            req._agentic_p2d_release_authorized = outcome
+        self.agentic_tp_p2d_cleanup_mailbox.publish_local(
+            "release-ready:" + self._prefill_transfer_key(req), outcome
+        )
+        return outcome
+
+    def _enqueue_prefill_native_release(self: Scheduler, req: Req, poll: int) -> None:
+        with self._prefill_native_release_condition:
+            if getattr(req, "_agentic_p2d_native_release_enqueued", False):
+                return
+            req._agentic_p2d_native_release_enqueued = True
+            self._prefill_native_release_queue.append((req, int(poll)))
+            self._prefill_native_release_condition.notify()
+
+    def _release_prefill_native_success(self: Scheduler, req: Req) -> None:
+        """Retire the exact P source after D ACK or durable Host ownership.
+
+        The caller owns ``_prefill_native_state_lock``. The transport worker
+        has quiesced, and TP release authorization has already resolved the
+        Direct/Host race. Native allocator and Radix mutations have one writer
+        at a time, even though this writer is not the Forward thread.
+        """
+        agentic_metadata = (
+            AgenticRequestMetadata.from_req(req)
+            if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get()
+            else None
+        )
+        committed_len = len(req.origin_input_ids)
+        rotation = getattr(req, "_agentic_checkpoint_rotation", None)
+        if rotation is not None:
+            rotation.allow_cleanup_owner(threading.current_thread())
+        release_kv_cache(req, self.tree_cache, is_insert=False)
+        fresh_admission = getattr(self, "agentic_fresh_workset_admission", None)
+        if fresh_admission is not None and fresh_admission.contains(req):
+            fresh_admission.terminal(req)
+        if agentic_metadata is not None:
+            release_agentic = getattr(self.tree_cache, "release_agentic_request_cache", None)
+            if release_agentic is not None:
+                released = release_agentic(req, committed_len=committed_len)
+                logger.info(
+                    "AgenticKV p_to_d_release tokens=%d req=%s extra_key=%s",
+                    released, req.rid, req.extra_key,
+                )
+        for name in (
+            "_agentic_workset_backed",
+            "_agentic_p_workset_lease",
+            "_agentic_p_workset_broker",
+            "_agentic_workset_suffix_allocated_tokens",
+            "_agentic_workset_suffix_indices",
+        ):
+            if hasattr(req, name):
+                delattr(req, name)
+
+    def _prefill_native_release_worker(self: Scheduler) -> None:
+        """Retire transferred P pages while the scheduler runs Prefill.
+
+        The controller/ledger remains the sole address authority. This worker
+        performs only native last-reference/Radix cleanup, guarded by the same
+        state lock as scheduler-side native mutations. It cannot infer a TP
+        terminal from a local DMA completion.
+        """
+        owner = threading.current_thread()
+        try:
+            bridge = self.agentic_p_workset_broker.native_bridge
+            bridge.allow_cleanup_owner(owner, self._prefill_native_state_lock)
+            self.agentic_p_workset_broker.allow_native_cleanup_owner(
+                owner, self._prefill_native_state_lock
+            )
+        except BaseException as error:
+            self._prefill_native_release_fatal = error
+            logger.exception("P->D native retirement worker failed to register")
+            return
+        while not self._prefill_transfer_stop.is_set():
+            with self._prefill_native_release_condition:
+                if not self._prefill_native_release_queue:
+                    self._prefill_native_release_condition.wait(timeout=0.1)
+                    continue
+                req, poll = self._prefill_native_release_queue.popleft()
+            key = self._prefill_transfer_key(req)
+            try:
+                if self.tp_size > 1:
+                    group_poll, _ = self.agentic_tp_p2d_cleanup_mailbox.transfer_group_status(
+                        "release-ready:" + key
+                    )
+                    if group_poll not in (int(KVPoll.Success), int(KVPoll.Failed)):
+                        with self._prefill_native_release_condition:
+                            self._prefill_native_release_queue.append((req, poll))
+                        self._prefill_transfer_stop.wait(self._prefill_transfer_interval)
+                        continue
+                    poll = int(group_poll)
+                p2d_host = getattr(self, "agentic_p2d_host_staging_manager", None)
+                if self.tp_size == 1 and p2d_host is not None:
+                    authorize = (
+                        p2d_host.prepare_scheduler_release
+                        if poll == int(KVPoll.Success) else p2d_host.cancel_watch
+                    )
+                    if not authorize(req):
+                        with self._prefill_native_release_condition:
+                            self._prefill_native_release_queue.append((req, poll))
+                        self._prefill_transfer_stop.wait(self._prefill_transfer_interval)
+                        continue
+                with self._prefill_native_state_lock:
+                    if getattr(req, "_agentic_p2d_native_release_done", None) is not None:
+                        continue
+                    rotation = getattr(req, "_agentic_checkpoint_rotation", None)
+                    if rotation is not None:
+                        rotation.allow_cleanup_owner(owner)
+                    if poll == int(KVPoll.Success):
+                        self._release_prefill_native_success(req)
+                    else:
+                        metadata = (
+                            AgenticRequestMetadata.from_req(req)
+                            if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get()
+                            else None
+                        )
+                        if not self._cleanup_failed_prefill_transfer(
+                            req, p2d_host, metadata, clear_mailboxes=False,
+                            release_authorized=self.tp_size == 1 and p2d_host is not None,
+                        ):
+                            with self._prefill_native_release_condition:
+                                self._prefill_native_release_queue.append((req, poll))
+                            continue
+                    req._agentic_p2d_native_release_done = poll
+                if self.tp_size > 1:
+                    self.agentic_tp_p2d_cleanup_mailbox.publish_local(
+                        "native-released:" + key, poll
+                    )
+                    if self.tp_rank == 0:
+                        with self._prefill_transfer_poll_lock:
+                            self._prefill_native_group_pending.add(key)
+                else:
+                    with self._prefill_transfer_poll_lock:
+                        self._prefill_transfer_terminal_queue.append(key)
+            except BaseException as error:
+                # A partially failed native release cannot be replayed: keep
+                # the source quarantined and surface the failure to scheduler.
+                req._agentic_p2d_native_release_error = error
+                self._prefill_native_release_fatal = error
+                logger.exception("P->D native retirement failed key=%s", key)
+                return
+
     def _prefill_transfer_cleanup_worker(self: Scheduler) -> None:
-        """Clear TP control files only after every scheduler released pages."""
+        """Publish group-native terminals and retire ACKed TP control state."""
 
         while not self._prefill_transfer_stop.wait(self._prefill_transfer_interval):
             self._prefill_transfer_cleanup_once()
@@ -574,6 +777,17 @@ class SchedulerDisaggregationPrefillMixin:
     def _prefill_transfer_cleanup_once(self: Scheduler) -> int:
         """Run one non-blocking TP0 cleanup scan; return cleared groups."""
 
+        if getattr(self, "_prefill_native_release_enabled", False):
+            with self._prefill_transfer_poll_lock:
+                release_pending = tuple(self._prefill_native_group_pending)
+            for key in release_pending:
+                poll = self.agentic_tp_p2d_cleanup_mailbox.group_status(
+                    "native-released:" + key
+                )
+                if poll in (int(KVPoll.Success), int(KVPoll.Failed)):
+                    with self._prefill_transfer_poll_lock:
+                        self._prefill_native_group_pending.discard(key)
+                        self._prefill_native_completed[key] = int(poll)
         with self._prefill_transfer_cleanup_lock:
             pending = tuple(self._prefill_transfer_cleanup_pending)
         cleared = 0
@@ -587,21 +801,40 @@ class SchedulerDisaggregationPrefillMixin:
             # completed allocator cleanup on its scheduler thread.
             self.agentic_tp_p2d_sender_mailbox.clear_group(key)
             self.agentic_tp_p2d_receiver_mailbox.clear_group(key)
+            if getattr(self, "_prefill_transfer_async_release_enabled", False):
+                self.agentic_tp_p2d_cleanup_mailbox.clear_group("release-ready:" + key)
+            if getattr(self, "_prefill_native_release_enabled", False):
+                self.agentic_tp_p2d_cleanup_mailbox.clear_group("native-released:" + key)
             self.agentic_tp_p2d_cleanup_mailbox.clear_group(key)
             with self._prefill_transfer_cleanup_lock:
                 self._prefill_transfer_cleanup_pending.discard(key)
             cleared += 1
         return cleared
 
+    @staticmethod
+    def _prefill_grammar_release_safe(req, p2d_host) -> bool:
+        if os.getenv("SGLANG_AGENTIC_CONTROL_ENDPOINT"):
+            # No rank-local async ACK may decide allocator cleanup here.
+            # The existing terminal transfer/all-rank release path handles
+            # _agentic_p2d_abort_after_copy after its physical fence instead.
+            return False
+        return p2d_host is None or p2d_host.cancel_watch(req)
+
     def _cleanup_failed_prefill_transfer(
         self: Scheduler,
         req: Req,
         p2d_host,
         agentic_metadata: Optional[AgenticRequestMetadata],
+        *,
+        clear_mailboxes: bool = True,
+        release_authorized: bool = False,
     ) -> bool:
         """Release one failed P->D generation back to its owning pools."""
 
-        if p2d_host is not None:
+        if getattr(self, "_prefill_transfer_async_release_enabled", False):
+            if getattr(req, "_agentic_p2d_release_authorized", None) is None:
+                return False
+        elif p2d_host is not None and not release_authorized:
             # Invalidate even an unclaimed watcher candidate before returning
             # its source pages to the allocator.
             cancel_watch = getattr(
@@ -622,6 +855,9 @@ class SchedulerDisaggregationPrefillMixin:
             )
             if release_agentic is not None:
                 release_agentic(req, committed_len=committed_len)
+        fresh_admission = getattr(self, "agentic_fresh_workset_admission", None)
+        if fresh_admission is not None and fresh_admission.contains(req):
+            fresh_admission.terminal(req)
         if hasattr(req.disagg_kv_sender, "clear"):
             req.disagg_kv_sender.clear()
         if hasattr(req, "_async_prefill_transfer_payload"):
@@ -635,7 +871,8 @@ class SchedulerDisaggregationPrefillMixin:
         ):
             if hasattr(req, name):
                 delattr(req, name)
-        self._clear_tp_prefill_transfer_mailboxes(req)
+        if clear_mailboxes:
+            self._clear_tp_prefill_transfer_mailboxes(req)
         return True
 
     def _prefill_queued_keys(self: Scheduler) -> set[str]:
@@ -822,6 +1059,9 @@ class SchedulerDisaggregationPrefillMixin:
         group_terminal = getattr(req, "_agentic_p2d_group_terminal", None)
         if group_terminal in (int(KVPoll.Success), int(KVPoll.Failed)):
             return int(group_terminal)
+        release_authorized = getattr(req, "_agentic_p2d_release_authorized", None)
+        if release_authorized is not None:
+            return int(release_authorized)
 
         if getattr(req, "_agentic_p2d_host_terminal", False):
             local_poll = int(KVPoll.Success)
@@ -1060,21 +1300,39 @@ class SchedulerDisaggregationPrefillMixin:
                         self._prefill_ready_next_publish_sequence += 1
                         self._prefill_ready_publish_condition.notify_all()
 
+            if (
+                getattr(self, "_prefill_transfer_async_release_enabled", False)
+                and poll in (int(KVPoll.Success), int(KVPoll.Failed))
+            ):
+                try:
+                    poll = self._prefill_transfer_authorize_release(req, poll)
+                except Exception:
+                    # A control-plane error is not a physical transfer failure.
+                    # Keep pages and retry authorization/publication in background.
+                    logger.exception("P->D release authorization deferred rid=%s", req.rid)
+                    poll = int(KVPoll.Transferring)
             terminal = poll in (int(KVPoll.Success), int(KVPoll.Failed))
             if terminal:
+                if getattr(self, "_prefill_native_release_enabled", False):
+                    self._enqueue_prefill_native_release(req, poll)
                 # For TP background progress this worker is the sole terminal
                 # authority.  Quiesce every source of mailbox publication
                 # before making the terminal result scheduler-visible;
                 # otherwise scheduler cleanup can clear the group while this
                 # worker is still able to recreate a sender file.
-                if getattr(self, "tp_size", 1) > 1:
+                if (
+                    getattr(self, "tp_size", 1) > 1
+                    and not getattr(self, "_prefill_transfer_async_release_enabled", False)
+                ):
                     self.agentic_tp_p2d_sender_mailbox.publish_local(key, poll)
                 with self._prefill_ready_condition:
                     self._prefill_transfer_active_reqs.pop(key, None)
                 with self._prefill_transfer_poll_lock:
                     req._async_prefill_transfer_consumer_active = False
                     req._async_prefill_transfer_poll = poll
-                if getattr(self, "tp_size", 1) == 1:
+                if getattr(self, "tp_size", 1) == 1 and not getattr(
+                    self, "_prefill_native_release_enabled", False
+                ):
                     self._prefill_transfer_terminal_queue.append(key)
             elif not self._prefill_transfer_stop.is_set():
                 # Keep the transfer active but relinquish this worker after
@@ -1255,6 +1513,11 @@ class SchedulerDisaggregationPrefillMixin:
         tp_size = int(getattr(self, "tp_size", 1))
         tp_rank = int(getattr(self, "tp_rank", 0))
         if tp_size > 1 and tp_rank != 0:
+            return True
+
+        signals = getattr(self.disagg_prefill_bootstrap_queue, "ready_signals", None)
+        if signals is not None:
+            signals.publish(req.bootstrap_room, ready_metadata)
             return True
 
         tmp_path = f"{ready_path}.{os.getpid()}.{ready_sequence}.tmp"
@@ -1494,6 +1757,8 @@ class SchedulerDisaggregationPrefillMixin:
     def get_next_disagg_prefill_batch_to_run(
         self: Scheduler,
     ) -> Optional[ScheduleBatch]:
+        if getattr(self, "_prefill_native_release_fatal", None) is not None:
+            raise RuntimeError("P->D native retirement stopped; source ownership retained") from self._prefill_native_release_fatal
         # Disaggregated Prefill has its own scheduler entry point and never
         # calls Scheduler.get_next_batch_to_run().  Service complete-workset
         # intents here so Direct and Slow background workers can reserve
@@ -1527,30 +1792,27 @@ class SchedulerDisaggregationPrefillMixin:
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
         while True:
-            # Receive requests
-            recv_reqs = self.recv_requests()
-            self.process_input_requests(recv_reqs)
-            self._merge_disagg_prefill_ready(
-                self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
-            )
-
-            # Get the next batch to run
-            batch = self.get_next_disagg_prefill_batch_to_run()
-            self.cur_batch = batch
+            with getattr(self, "_prefill_native_state_lock", nullcontext()):
+                recv_reqs = self.recv_requests()
+                self.process_input_requests(recv_reqs)
+                self._merge_disagg_prefill_ready(
+                    self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+                )
+                batch = self.get_next_disagg_prefill_batch_to_run()
+                self.cur_batch = batch
 
             # Launch the current batch
             if batch:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
                 result = self.run_batch(batch)
-                self.process_batch_result(batch, result)
-            else:
-                self.self_check_during_idle()
-
-            self.process_disagg_prefill_inflight_queue()
-
-            # Update last_batch
-            self.last_batch = batch
+            with getattr(self, "_prefill_native_state_lock", nullcontext()):
+                if batch:
+                    self.process_batch_result(batch, result)
+                else:
+                    self.self_check_during_idle()
+                self.process_disagg_prefill_inflight_queue()
+                self.last_batch = batch
 
     @torch.no_grad()
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
@@ -1558,16 +1820,14 @@ class SchedulerDisaggregationPrefillMixin:
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
         while True:
-            # Receive requests
-            recv_reqs = self.recv_requests()
-            self.process_input_requests(recv_reqs)
-            self._merge_disagg_prefill_ready(
-                self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
-            )
-
-            # Get the next batch to run
-            batch = self.get_next_disagg_prefill_batch_to_run()
-            self.cur_batch = batch
+            with getattr(self, "_prefill_native_state_lock", nullcontext()):
+                recv_reqs = self.recv_requests()
+                self.process_input_requests(recv_reqs)
+                self._merge_disagg_prefill_ready(
+                    self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+                )
+                batch = self.get_next_disagg_prefill_batch_to_run()
+                self.cur_batch = batch
 
             # Launch the current batch
             if batch:
@@ -1578,22 +1838,17 @@ class SchedulerDisaggregationPrefillMixin:
             else:
                 batch_result = None
 
-            # Process the last batch
-            if self.last_batch:
-                tmp_batch, tmp_result = self.result_queue.popleft()
-                self.process_batch_result(tmp_batch, tmp_result)
-            elif batch is None:
-                # When the server is idle, do self-check and re-init some states
-                self.self_check_during_idle()
-
-            self.process_disagg_prefill_inflight_queue()
-
-            # Run sample of the current batch
-            # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
-            self.launch_batch_sample_if_needed(batch_result)
-
-            # Update last_batch
-            self.last_batch = batch
+            with getattr(self, "_prefill_native_state_lock", nullcontext()):
+                if self.last_batch:
+                    tmp_batch, tmp_result = self.result_queue.popleft()
+                    self.process_batch_result(tmp_batch, tmp_result)
+                elif batch is None:
+                    self.self_check_during_idle()
+                self.process_disagg_prefill_inflight_queue()
+                # Sampling depends on the previous result and may touch the
+                # native request state, so it shares the ownership boundary.
+                self.launch_batch_sample_if_needed(batch_result)
+                self.last_batch = batch
 
     def process_batch_result_disagg_prefill(
         self: Scheduler,
@@ -1637,6 +1892,16 @@ class SchedulerDisaggregationPrefillMixin:
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
+            if getattr(req, "_agentic_controller_abort_pending", False):
+                # copy_done / token readback above is the native Forward
+                # completion boundary. Never retire a workset from HTTP abort
+                # while the previous overlapping chunk can still use it.
+                self._finish_controller_prefill_abort(req)
+                if batch.return_logprob:
+                    logprob_pt += max(
+                        0, extend_input_len_per_req[i] - extend_logprob_start_len_per_req[i]
+                    )
+                continue
             if req.is_chunked <= 0:
                 req.time_stats.set_prefill_finished_time()
 
@@ -1714,7 +1979,7 @@ class SchedulerDisaggregationPrefillMixin:
                         # Grammar accept_token can raise ValueError if the token is not in the grammar.
                         # This can happen if the grammar is not set correctly or the token is invalid.
                         error_message = f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-                        release_safe = p2d_host is None or p2d_host.cancel_watch(req)
+                        release_safe = self._prefill_grammar_release_safe(req, p2d_host)
                         if release_safe:
                             release_kv_cache(req, self.tree_cache)
                             prepare_abort(
@@ -1769,6 +2034,13 @@ class SchedulerDisaggregationPrefillMixin:
         """
         if len(self.disagg_prefill_inflight_queue) == 0:
             return []
+        if getattr(self, "_prefill_native_release_fatal", None) is not None:
+            raise RuntimeError("P->D native retirement stopped; source ownership retained") from self._prefill_native_release_fatal
+        if getattr(self, "_prefill_native_release_enabled", False):
+            for req in self.disagg_prefill_inflight_queue:
+                error = getattr(req, "_agentic_p2d_native_release_error", None)
+                if error is not None:
+                    raise RuntimeError("P->D native retirement failed; source ownership retained") from error
 
         full_inflight_queue = self.disagg_prefill_inflight_queue
         inflight_queue = full_inflight_queue
@@ -1956,7 +2228,18 @@ class SchedulerDisaggregationPrefillMixin:
                 # Resolve native-vs-Host ownership before freeing any GPU
                 # page.  A Host claim arriving after the last native poll
                 # keeps the request inflight until its D2H completes.
-                if p2d_host is not None and not p2d_host.prepare_scheduler_release(req):
+                if getattr(self, "_prefill_native_release_enabled", False):
+                    release_safe = (
+                        getattr(req, "_agentic_p2d_native_release_done", None)
+                        == int(KVPoll.Success)
+                    )
+                else:
+                    release_safe = (
+                        getattr(req, "_agentic_p2d_release_authorized", None) is not None
+                        if getattr(self, "_prefill_transfer_async_release_enabled", False)
+                        else p2d_host is None or p2d_host.prepare_scheduler_release(req)
+                    )
+                if not release_safe:
                     undone_reqs.append(req)
                     continue
                 staged_p2d = bool(
@@ -1974,7 +2257,9 @@ class SchedulerDisaggregationPrefillMixin:
                 agentic_committed_len = (
                     len(req.origin_input_ids) if agentic_metadata is not None else None
                 )
-                if agentic_metadata is not None:
+                if agentic_metadata is not None and not getattr(
+                    self, "_prefill_native_release_enabled", False
+                ):
                     digest_len = (
                         agentic_committed_len
                         // self.token_to_kv_pool_allocator.page_size
@@ -1996,30 +2281,34 @@ class SchedulerDisaggregationPrefillMixin:
                 # A transferred request-generation has left P.  Do not turn
                 # its completed branch into an opportunistic prefix cache:
                 # only live request-generations may own P-side KV.
-                release_kv_cache(req, self.tree_cache, is_insert=False)
-                if agentic_metadata is not None:
-                    release_agentic = getattr(
-                        self.tree_cache, "release_agentic_request_cache", None
-                    )
-                    if release_agentic is not None:
-                        released = release_agentic(
-                            req, committed_len=agentic_committed_len
+                if not getattr(self, "_prefill_native_release_enabled", False):
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                    fresh_admission = getattr(self, "agentic_fresh_workset_admission", None)
+                    if fresh_admission is not None and fresh_admission.contains(req):
+                        fresh_admission.terminal(req)
+                    if agentic_metadata is not None:
+                        release_agentic = getattr(
+                            self.tree_cache, "release_agentic_request_cache", None
                         )
-                        logger.info(
-                            "AgenticKV p_to_d_release tokens=%d req=%s extra_key=%s",
-                            released,
-                            req.rid,
-                            req.extra_key,
-                        )
-                for name in (
-                    "_agentic_workset_backed",
-                    "_agentic_p_workset_lease",
-                    "_agentic_p_workset_broker",
-                    "_agentic_workset_suffix_allocated_tokens",
-                    "_agentic_workset_suffix_indices",
-                ):
-                    if hasattr(req, name):
-                        delattr(req, name)
+                        if release_agentic is not None:
+                            released = release_agentic(
+                                req, committed_len=agentic_committed_len
+                            )
+                            logger.info(
+                                "AgenticKV p_to_d_release tokens=%d req=%s extra_key=%s",
+                                released,
+                                req.rid,
+                                req.extra_key,
+                            )
+                    for name in (
+                        "_agentic_workset_backed",
+                        "_agentic_p_workset_lease",
+                        "_agentic_p_workset_broker",
+                        "_agentic_workset_suffix_allocated_tokens",
+                        "_agentic_workset_suffix_indices",
+                    ):
+                        if hasattr(req, name):
+                            delattr(req, name)
                 abort_after_copy = getattr(req, "_agentic_p2d_abort_after_copy", None)
                 if abort_after_copy is None:
                     req.finished_reason = FINISH_LENGTH(length=0)
@@ -2057,11 +2346,19 @@ class SchedulerDisaggregationPrefillMixin:
                     if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get()
                     else None
                 )
-                if not self._cleanup_failed_prefill_transfer(
-                    req, p2d_host, agentic_metadata
-                ):
+                cleaned = (
+                    getattr(req, "_agentic_p2d_native_release_done", None)
+                    == int(KVPoll.Failed)
+                    if getattr(self, "_prefill_native_release_enabled", False)
+                    else self._cleanup_failed_prefill_transfer(
+                        req, p2d_host, agentic_metadata
+                    )
+                )
+                if not cleaned:
                     undone_reqs.append(req)
                     continue
+                if getattr(self, "_prefill_native_release_enabled", False):
+                    self._clear_tp_prefill_transfer_mailboxes(req)
                 if self.tp_size > 1:
                     # Failed becomes a level-triggered group terminal only
                     # after cleanup has proved that Host staging did not win
@@ -2138,6 +2435,12 @@ class SchedulerDisaggregationPrefillMixin:
             self.disagg_prefill_inflight_queue = [
                 req for req in full_inflight_queue if id(req) not in done_ids
             ]
+            if getattr(self, "_prefill_native_release_enabled", False) and self.tp_rank == 0:
+                with self._prefill_transfer_poll_lock:
+                    for req in done_reqs:
+                        self._prefill_native_completed.pop(
+                            self._prefill_transfer_key(req), None
+                        )
         else:
             self.disagg_prefill_inflight_queue = undone_reqs
 
@@ -2160,6 +2463,43 @@ class SchedulerDisaggregationPrefillMixin:
                 transferred_rids.append(req.rid)
 
         return transferred_rids
+
+    def _request_controller_prefill_abort(self: Scheduler, req: Req) -> bool:
+        """Stop future chunks; the native result boundary retires live compute."""
+        if not getattr(getattr(self, "agentic_p_workset_broker", None), "controller_mode", False):
+            return False
+        if req in self.disagg_prefill_inflight_queue:
+            # Its existing P->D terminal/physical-fence path owns cleanup.
+            return True
+        if not getattr(req, "disagg_p_ready_deferred", False) or getattr(
+            req, "disagg_p_ready_transfer_started", False
+        ):
+            raise RuntimeError("controller Prefill cancellation requires deferred full-snapshot delivery")
+        req._agentic_controller_abort_pending = True
+        if self.chunked_req is req:
+            self.chunked_req = None
+        # With overlap there is one previously submitted native result. Do
+        # not synchronize Forward here: its ordinary result consumer will
+        # perform cleanup. Without it the previous result has already retired.
+        if not any(req in batch.reqs for batch, _ in getattr(self, "result_queue", ())):
+            self._finish_controller_prefill_abort(req)
+        return True
+
+    def _finish_controller_prefill_abort(self: Scheduler, req: Req) -> None:
+        if getattr(req, "_agentic_controller_abort_finished", False):
+            return
+        if req in self.disagg_prefill_inflight_queue or getattr(req, "disagg_p_ready_transfer_started", False):
+            raise RuntimeError("cannot retire an in-flight P->D source from compute cleanup")
+        committed_len = int(req.kv_committed_len)
+        self._agentic_abort_cleanup(req)
+        release_kv_cache(req, self.tree_cache, is_insert=False)
+        release_branch = getattr(self.tree_cache, "release_agentic_request_cache", None)
+        if release_branch is not None:
+            release_branch(req, committed_len=committed_len)
+        release_req_to_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
+        req.finished_reason = req.to_finish
+        req._agentic_controller_abort_finished = True
+        self.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
 
     def process_prefill_chunk(self: Scheduler) -> None:
         chunked_req_to_exclude = set()

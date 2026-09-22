@@ -5,10 +5,10 @@ from __future__ import annotations
 The model scheduler already broadcasts one Python control record from TP rank
 zero to every follower.  Agentic KV transport therefore needs only the reverse
 direction: each physical rank reports completion of the command it was given.
-This module implements that report path with exact, run-scoped files in
-``/dev/shm``.  It deliberately performs no directory scans and no distributed
-collectives, so CUDA/NCCL model execution cannot be reordered by transport
-progress.
+With SGLANG_AGENTIC_TP_EVENT_ENDPOINT, the factory selects persistent socket
+reports and cached coordinator receipts: no mailbox files or directory scans.
+The legacy single-node file backend remains available when no endpoint is
+configured. Neither backend introduces model collectives or CUDA operations.
 """
 
 import hashlib
@@ -21,14 +21,54 @@ from typing import Optional
 from sglang.srt.disaggregation.base import KVPoll
 
 
+def bind_direct_wire_mailboxes(manifest, *mailboxes):
+    """Retain the existing immutable NIXL wire room as the TP Direct attempt.
+
+    File backends remain untouched. Socket callers must never silently rebind
+    a snapshot to a different room; that requires explicit captured EventKeys.
+    """
+    selected = [
+        mailbox for mailbox in mailboxes
+        if callable(getattr(mailbox, "bind_identity", None))
+    ]
+    if not selected:
+        return
+    from sglang.srt.disaggregation.agentic_tp_events import EventKey
+
+    if manifest.direct_room is None:
+        raise ValueError("Direct TP control requires the exact NIXL wire room")
+    identity = EventKey(manifest.snapshot_id, f"direct-room:{manifest.direct_room}")
+    for mailbox in selected:
+        mailbox.bind_identity(manifest.snapshot_id, identity)
+
+
+def tp_command_identity(mailbox, snapshot_id, attempt=None):
+    """A rank-zero command's immutable attempt; file callers are unchanged."""
+    if not callable(getattr(mailbox, "bind_identity", None)):
+        return snapshot_id
+    from sglang.srt.disaggregation.agentic_tp_events import EventKey
+
+    if not attempt:
+        raise ValueError("socket TP command is missing rank-zero attempt identity")
+    return EventKey(str(snapshot_id), str(attempt))
+
+
 class TPGroupMailbox:
     """Rank-local reports and one rank-zero logical receipt.
 
     A key is a request-generation identity (snapshot id or ``rid@room``), never
     a bare request id.  Followers may only publish their local status.  Rank
-    zero reads all rank files, decides the logical transition, and carries that
-    decision on the scheduler's existing native TP broadcast.
+    zero reduces local reports, decides the logical transition, and carries
+    that decision on the scheduler's existing native TP broadcast. Endpoint
+    mode dispatches to SocketTPGroupMailbox before touching any file path.
     """
+
+    def __new__(cls, *args, **kwargs):
+        if cls is TPGroupMailbox and os.getenv("SGLANG_AGENTIC_TP_EVENT_ENDPOINT"):
+            from sglang.srt.disaggregation.agentic_tp_socket_mailbox import SocketTPGroupMailbox
+
+            return SocketTPGroupMailbox(*args, **kwargs)
+        return super().__new__(cls)
 
     def __init__(
         self,
@@ -37,12 +77,25 @@ class TPGroupMailbox:
         tp_rank: int,
         tp_size: int,
         directory: Optional[str] = None,
+        group_local_directory: Optional[str] = None,
+        nnodes: int = 1,
     ) -> None:
         self.tp_rank = int(tp_rank)
         self.tp_size = int(tp_size)
         if self.tp_size < 1 or not 0 <= self.tp_rank < self.tp_size:
             raise ValueError("invalid TP rank/size")
         root = directory or os.getenv("SGLANG_PD_P_READY_DIR", "/dev/shm")
+        # Only intra-engine reports can use node-local tmpfs. In particular,
+        # p2d-receiver is deliberately NOT here: D writes its receipt, P reads
+        # and clears it. Unknown/new namespaces remain shared by default.
+        if group_local_directory:
+            if int(nnodes) != 1:
+                raise ValueError("local TP mailboxes require the entire TP group on one node")
+            if namespace in {
+                "d2p-direct", "d2p-direct-abort-p", "p-workset-retire",
+                "p2d-sender", "p2d-cleanup", "p2d-admission",
+            } or namespace.startswith("d2p-host:"):
+                root = group_local_directory
         digest = hashlib.sha256(str(namespace).encode("utf-8")).hexdigest()[:16]
         self.directory = Path(root) / f"tp-control-{digest}"
         self.directory.mkdir(parents=True, exist_ok=True)

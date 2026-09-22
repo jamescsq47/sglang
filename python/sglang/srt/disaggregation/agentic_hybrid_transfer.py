@@ -490,6 +490,33 @@ def snapshot_token_count_for_req(
     return tracked
 
 
+def prepare_workset_transfer_indices(parent_indices, state_device_indices, page_size):
+    """Freeze small CPU transport descriptors at the allocator boundary.
+
+    The blocking copy deliberately preserves the scheduler-stream index
+    readiness fence. Combining page starts and snapshot state slots makes it
+    one copy; transport workers must not read the GPU indices again. Runtime
+    Mamba slots are not snapshot destinations and are not included here.
+    """
+    if page_size <= 0 or parent_indices.ndim != 1:
+        raise ValueError("invalid workset page descriptor shape")
+    if parent_indices.numel() % page_size:
+        raise ValueError("workset parent allocation must be page aligned")
+    components = tuple(state_device_indices)
+    for indices in components:
+        if indices.ndim != 1 or indices.numel() != 1:
+            raise ValueError("snapshot state component must have one slot")
+        if indices.device != parent_indices.device:
+            raise ValueError("workset indices must share the allocator device")
+    page_starts = parent_indices[::page_size]
+    compact = torch.cat((page_starts, *components))
+    host = compact.detach().cpu().numpy()
+    pages = np.asarray(host[: page_starts.numel()] // page_size, dtype=np.int32)
+    pages.setflags(write=False)
+    slots = tuple((int(index),) for index in host[page_starts.numel() :])
+    return pages, slots
+
+
 def state_indices_for_workset(lease, state_types: Sequence[StateType]) -> list:
     if not state_types:
         return []
@@ -498,6 +525,11 @@ def state_indices_for_workset(lease, state_types: Sequence[StateType]) -> list:
     indices = getattr(lease, "state_device_indices", ())
     if len(indices) != 1 or indices[0].numel() != 1:
         raise RuntimeError("hybrid destination workset is missing its Mamba slot")
+    cpu_indices = getattr(lease, "state_cpu_indices", None)
+    if cpu_indices is not None:
+        if len(cpu_indices) != 1 or len(cpu_indices[0]) != 1:
+            raise RuntimeError("hybrid destination workset has invalid CPU Mamba slots")
+        return [[int(cpu_indices[0][0])]]
     return [[indices[0].detach().cpu().numpy().astype(np.int32)[0]]]
 
 

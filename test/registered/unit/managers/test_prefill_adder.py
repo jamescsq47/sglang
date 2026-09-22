@@ -135,6 +135,40 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIn(second, adder.can_run_list)
         self.assertEqual(adder.rem_total_token_offset, 0)
 
+    def test_controller_ignore_eos_uses_owned_pages_but_preserves_chunk_budget(self):
+        self.mock_tree_cache.disable = True
+        self.mock_token_allocator.available_size.return_value = 0
+        req = self.create_mock_req("controller", priority=0, max_new_tokens=4096)
+        req.sampling_params.ignore_eos = True
+        req.extend_input_len = 8
+        req.host_hit_length = 0
+        req.prefix_indices = torch.empty(0, dtype=torch.int64)
+        req.fill_ids = list(range(8))
+        req.last_node = MagicMock()
+        req._agentic_workset_backed = True
+        req._agentic_workset_suffix_indices = torch.arange(8)
+        req._agentic_p_workset_lease = SimpleNamespace(controller_plan=object())
+        adder = self.create_adder(self.create_running_batch(), page_size=4,
+                                  rem_input_tokens=4, rem_chunk_tokens=4)
+        adder.add_one_req_ignore_eos = MagicMock(side_effect=AssertionError("native capacity branch"))
+        result = adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+        self.assertEqual(result, AddReqResult.OTHER)
+        self.assertEqual(adder.can_run_list, [req])
+        req.set_extend_input_len.assert_called_once_with(4)
+        self.assertEqual(req.fill_ids, list(range(4)))
+        self.assertEqual(adder.rem_total_token_offset, 0)
+        self.assertEqual(adder.rem_input_tokens, 0)
+
+    def test_legacy_ignore_eos_keeps_native_capacity_branch(self):
+        self.mock_tree_cache.disable = True
+        req = self.create_mock_req("legacy", priority=0, max_new_tokens=1)
+        req.sampling_params.ignore_eos = True
+        adder = self.create_adder(self.create_running_batch())
+        adder.add_one_req_ignore_eos = MagicMock(return_value=AddReqResult.NO_TOKEN)
+        self.assertEqual(adder.add_one_req(req, has_chunked_req=False,
+            truncation_align_size=None), AddReqResult.NO_TOKEN)
+        adder.add_one_req_ignore_eos.assert_called_once_with(req)
+
     def test_agentic_lease_chunk_continuation_ignores_empty_ordinary_pool(self):
         self.mock_token_allocator.available_size.return_value = 0
         req = SimpleNamespace(

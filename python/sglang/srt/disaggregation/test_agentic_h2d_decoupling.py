@@ -13,6 +13,7 @@ from sglang.srt.disaggregation.agentic_host_staging import AgenticPHostStagingMa
 from sglang.srt.disaggregation.agentic_kv_lifecycle import RequestGeneration
 from sglang.srt.disaggregation.agentic_kv_lifecycle import token_ids_digest
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sglang.srt.disaggregation import agentic_workset as workset_module
 from sglang.srt.managers import scheduler as sched_module
 from sglang.srt.managers.scheduler import Scheduler, AgenticPWorksetLeaseBroker
 
@@ -75,6 +76,27 @@ def test_resident_stage_bounded_even_when_all_dmas_finish_but_binding_stalls():
     assert m._reserve_h2d_lane('overflow:0') is None
     m._release_h2d_lane('0:0')
     assert m._reserve_h2d_lane('overflow:0') == 0
+
+
+def test_background_controller_completed_worksets_do_not_consume_physical_lanes():
+    m = manager(lanes=2)
+    m.restore_controller = object()
+    copies = []
+    for i in range(12):
+        load = completed_load(m, str(i))
+        copies.append((load, load['record'], load['workset_lease']))
+        m._release_quiesced_h2d_lane(load)
+    assert len(m.h2d_selected_snapshots()) == 12
+    assert m.h2d_physical_occupancy() == 0
+    # Ready worksets/Host ownership are not released by returning the lane.
+    assert all(load['record'] is host and load['workset_lease'] is lease
+               for load, host, lease in copies)
+    assert m._reserve_h2d_lane('next:0') == 0
+    assert m._reserve_h2d_lane('next2:0') == 1
+    assert m._reserve_h2d_lane('overflow:0') is None
+    for load, _, _ in copies:
+        m._release_h2d_lane(load['request_generation'].snapshot_id)
+    assert m._h2d_lane_reservations == {'next:0': 0, 'next2:0': 1}
 
 
 def test_disabled_keeps_lane_until_original_handoff():
@@ -185,8 +207,8 @@ def test_both_slow_and_direct_preserve_index_readiness_sync(monkeypatch):
         def alloc(self, n): return torch.arange(n)
         def free(self, x): pass
     calls = []
-    original = sched_module.kv_to_page_indices
-    monkeypatch.setattr(sched_module, 'kv_to_page_indices', lambda *a: calls.append(True) or original(*a))
+    original = workset_module.kv_to_page_indices
+    monkeypatch.setattr(workset_module, 'kv_to_page_indices', lambda *a: calls.append(True) or original(*a))
     broker = AgenticPWorksetLeaseBroker(page_size=4)
     broker.request('slow:0', 4, 8, owner=broker.slow_owner('slow:0', 'rid'))
     broker.request('direct:0', 4, 8, owner=broker.direct_owner('direct:0'))

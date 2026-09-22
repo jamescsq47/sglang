@@ -601,6 +601,15 @@ class AgenticNodeLocalRawStore:
     native HiCache/Mooncake without putting KV data on the filesystem.
     """
 
+    def __new__(cls, directory: str):
+        from sglang.srt.disaggregation.agentic_control_store import control_enabled
+        if control_enabled():
+            from sglang.srt.disaggregation.agentic_control_store import BrokerRawStore
+            from sglang.srt.disaggregation.agentic_lifecycle_control import lifecycle_records
+            lifecycle_records()  # Subscribe once during engine initialization.
+            return BrokerRawStore(directory)
+        return super().__new__(cls)
+
     def __init__(self, directory: str):
         if not directory:
             raise ValueError("agentic metadata directory must be non-empty")
@@ -944,6 +953,12 @@ class SharedHostStagingLedger:
 
     VERSION = 1
 
+    def __new__(cls, path=None, *args, **kwargs):
+        if cls is SharedHostStagingLedger and os.getenv("SGLANG_AGENTIC_CONTROL_ENDPOINT"):
+            from sglang.srt.disaggregation.agentic_host_rpc import RemoteHostStagingLedger
+            return RemoteHostStagingLedger.from_environment(path)
+        return super().__new__(cls)
+
     def __init__(self, path: str):
         if not path:
             raise ValueError("host staging ledger path is required")
@@ -959,6 +974,12 @@ class SharedHostStagingLedger:
         self.path = os.path.abspath(path)
         self.event_directory = f"{self.path}.events"
         os.makedirs(self.event_directory, exist_ok=True)
+        from sglang.srt.disaggregation.agentic_multinode import control_poll_interval
+        from sglang.srt.disaggregation.agentic_early_claim import SharedDirectoryEventJournal
+        self.event_journal = (
+            SharedDirectoryEventJournal(self.event_directory)
+            if control_poll_interval() is not None else None
+        )
         self.lock_directory = os.path.join(self.event_directory, ".locks")
         os.makedirs(self.lock_directory, exist_ok=True)
         self.relay_marker_directory = os.path.join(
@@ -1112,6 +1133,14 @@ class SharedHostStagingLedger:
                 json.dump(payload, file_obj, separators=(",", ":"), sort_keys=True)
                 file_obj.flush()
             os.replace(temporary_path, event_path)
+            if getattr(self, "event_journal", None) is not None:
+                try:
+                    self.event_journal.publish(event_path)
+                except OSError:
+                    # The authoritative rename has committed. A notification
+                    # failure must not look like failed ownership mutation;
+                    # the background reconciliation discovers this update.
+                    logger.exception("Host notification failed after manifest commit")
         finally:
             try:
                 os.unlink(temporary_path)
@@ -2290,7 +2319,8 @@ class SharedHostStagingLedger:
                 HostStageState.HOST_READY.value,
                 HostStageState.H2D_LOADING.value,
                 HostStageState.HBM_READY.value,
-            }:
+            } and not (state == HostStageState.RETRY_PENDING.value
+                       and current.get("source_host_node")):
                 return False, False
             if state == HostStageState.HBM_READY.value and any(
                 claim.get("phase") == "handed"
@@ -2462,11 +2492,20 @@ class SharedHostStagingLedger:
         *,
         tp_rank: int,
         tp_size: int,
+        remote_read_epoch: Optional[int] = None,
     ) -> bool:
         """Re-arm Host recovery after every rank has quiesced and rolled back."""
 
         def callback(entries):
             current = entries.get(snapshot_id)
+            if current is not None and remote_read_epoch is not None:
+                epoch = int(current.get("remote_read_epoch", 0))
+                if epoch > int(remote_read_epoch):
+                    # A later epoch proves the preceding all-rank retry ACK
+                    # committed. Never apply a delayed ACK to that new epoch.
+                    return True, False
+                if epoch != int(remote_read_epoch):
+                    return False, False
             if (
                 current is None
                 or not self._d2p_recovery_owner_matches(current, owner)
@@ -2732,14 +2771,19 @@ class SharedHostStagingLedger:
             previous_lease_id = claim.get("lease_id")
             if previous_lease_id not in {None, lease_id}:
                 return False, False
-            changed = previous_lease_id is None or claim.get("phase") != "leased"
+            if previous_lease_id == lease_id:
+                # Retried preparation cannot undo a physical IO fence. In
+                # particular, io_inflight -> leased would let cancellation
+                # release a workset while DMA still references its pages.
+                return claim.get("phase") in {"leased", "io_inflight", "handed"}, False
+            if claim.get("phase") != "pinned":
+                return False, False
             claim = dict(claim)
             claim.update(lease_id=lease_id, phase="leased")
             claims[rank_key] = claim
             current["recovery_claims"] = claims
-            if changed:
-                current["updated_at"] = time.time()
-            return True, changed
+            current["updated_at"] = time.time()
+            return True, True
 
         return bool(self._mutate(callback, event_snapshot_id=snapshot_id))
 
@@ -3301,18 +3345,44 @@ class SharedHostStagingLedger:
         cutoff = time.time() - max(0.0, older_than_seconds)
         consumed_cutoff = time.time() - max(0.0, consumed_older_than_seconds)
 
+        def can_prune(current):
+            tp_size = int(current.get("tp_size", 1))
+            if current.get("source_host_node") and len(
+                current.get("source_host_released_ranks", [])
+            ) != tp_size:
+                return False
+            if current.get("state") == HostStageState.CONSUMED.value:
+                # CONSUMED means all shards are Radix-bound, not that every
+                # scheduler has accepted its workset.  Source Host release is
+                # safe at this point, but deleting the claim before the later
+                # TP COMMIT makes the destination's handoff impossible.  Keep
+                # this small ownership record until all worksets are handed;
+                # elapsed time is never a substitute for that acknowledgement.
+                claims = current.get("recovery_claims", {})
+                claim_id = current.get("recovery_claim_id")
+                if claims or claim_id is not None:
+                    if not claim_id or set(claims) != {
+                        str(rank) for rank in range(tp_size)
+                    }:
+                        return False
+                    if any(
+                        claim.get("phase") != "handed"
+                        or claim.get("claim_id") != claim_id
+                        or claim.get("lease_id") is None
+                        for claim in claims.values()
+                    ):
+                        return False
+                # Legacy/no-workset and explicit terminal-on-release entries
+                # have no recovery claim and retain their original TTL.
+                return float(current.get("updated_at", 0.0)) < consumed_cutoff
+            return (
+                current.get("state") in _TERMINAL_STATES
+                and float(current.get("updated_at", 0.0)) < cutoff
+            )
+
         candidates = self.snapshot_entries(force_refresh=True)
         for snapshot_id, value in candidates.items():
-            if value.get("source_host_node") and len(value.get("source_host_released_ranks", [])) != int(value.get("tp_size", 1)):
-                continue
-            doomed = (
-                value.get("state") == HostStageState.CONSUMED.value
-                and float(value.get("updated_at", 0.0)) < consumed_cutoff
-            ) or (
-                value.get("state") in _TERMINAL_STATES
-                and float(value.get("updated_at", 0.0)) < cutoff
-            )
-            if not doomed:
+            if not can_prune(value):
                 continue
             if self._is_relay_snapshot(snapshot_id):
                 with open(self.path, "r+", encoding="utf-8") as file_obj:
@@ -3329,16 +3399,7 @@ class SharedHostStagingLedger:
                             current = data.setdefault("entries", {}).get(snapshot_id)
                             if current is None:
                                 continue
-                            still_doomed = (
-                                current.get("state")
-                                == HostStageState.CONSUMED.value
-                                and float(current.get("updated_at", 0.0))
-                                < consumed_cutoff
-                            ) or (
-                                current.get("state") in _TERMINAL_STATES
-                                and float(current.get("updated_at", 0.0)) < cutoff
-                            )
-                            if not still_doomed:
+                            if not can_prune(current):
                                 continue
                             data["entries"].pop(snapshot_id, None)
                             self._write_locked(file_obj, data)
@@ -3361,14 +3422,7 @@ class SharedHostStagingLedger:
                 current = event.get("entry")
                 if current is None:
                     continue
-                still_doomed = (
-                    current.get("state") == HostStageState.CONSUMED.value
-                    and float(current.get("updated_at", 0.0)) < consumed_cutoff
-                ) or (
-                    current.get("state") in _TERMINAL_STATES
-                    and float(current.get("updated_at", 0.0)) < cutoff
-                )
-                if still_doomed:
+                if can_prune(current):
                     try:
                         os.unlink(self._event_path(snapshot_id))
                     except FileNotFoundError:
@@ -3706,6 +3760,11 @@ def _registered_host_arena(path: str, device) -> _RegisteredHostArenaMapping:
 def _write_startup_prewarm_record(path: str, payload: dict[str, Any]) -> None:
     """Atomically publish one run-scoped startup-prewarm record."""
 
+    from sglang.srt.disaggregation.agentic_control_store import control_enabled, control_kv
+    if control_enabled():
+        root = os.environ["SGLANG_AGENTIC_KV_REGISTER_PREWARM_DIR"]
+        control_kv("prewarm", root).call("upsert", os.path.relpath(path, root), payload)
+        return
     os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
     temporary = f"{path}.tmp-{os.getpid()}-{threading.get_ident()}"
     with open(temporary, "w", encoding="utf-8") as output:
@@ -3723,6 +3782,7 @@ def start_registered_host_arena_startup_prewarm(
     device,
     d2p_arena_path: Optional[str] = None,
     p2d_arena_path: Optional[str] = None,
+    local_source_paths: Optional[list[str]] = None,
 ) -> Optional[threading.Thread]:
     """Register every arena reachable by this CUDA context before traffic.
 
@@ -3731,6 +3791,8 @@ def start_registered_host_arena_startup_prewarm(
     maps and registers its required paths.  The worker is deliberately
     separate from request and Forward progress; the launcher does not send
     traffic until every participant publishes a completion record.
+    Multi-node callers instead supply only this rank's local source paths;
+    remote memfd paths must never be opened in this process.
     """
 
     enabled = os.getenv(
@@ -3738,6 +3800,11 @@ def start_registered_host_arena_startup_prewarm(
     ).strip().lower() not in {"0", "false", "no", "off"}
     if not enabled:
         return None
+    # CUDA's current device is thread-local. Capture the scheduler rank here,
+    # before either the startup worker or its window-prewarm thread is spawned.
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
     if role not in {"prefill", "decode"}:
         raise ValueError(f"invalid registered Host prewarm role: {role}")
     if os.getenv("SGLANG_AGENTIC_KV_REGISTER_EAGER_ARENA", "0").strip().lower() in {
@@ -3760,7 +3827,13 @@ def start_registered_host_arena_startup_prewarm(
     domain = int(os.environ.get("SGLANG_AGENTIC_KV_PREFILL_DOMAIN", "-1"))
     if domain_count <= 0 or not 0 <= int(tp_rank) < tp_size:
         raise ValueError("invalid startup Host prewarm topology")
-    if role == "prefill" and (
+    if local_source_paths is not None and not local_source_paths:
+        # A Direct-only D has no source Host arena. Still participate in the
+        # startup barrier and explicitly report zero registered bytes.
+        host_disabled = os.getenv("SGLANG_AGENTIC_KV_HOST_STAGING", "true").strip().lower() in {"0", "false"}
+        if role != "decode" or not host_disabled:
+            raise ValueError("local startup prewarm requires a source arena")
+    if local_source_paths is None and role == "prefill" and (
         domain < 0 or (d2p_arena_path is None and p2d_arena_path is None)
     ):
         raise ValueError("P startup Host prewarm requires an enabled Host arena")
@@ -3769,12 +3842,18 @@ def start_registered_host_arena_startup_prewarm(
     complete_dir = os.path.join(root, "complete")
     failed_dir = os.path.join(root, "failed")
     start_path = os.path.join(root, "start")
-    os.makedirs(arenas_dir, mode=0o700, exist_ok=True)
-    os.makedirs(complete_dir, mode=0o700, exist_ok=True)
-    os.makedirs(failed_dir, mode=0o700, exist_ok=True)
+    from sglang.srt.disaggregation.agentic_control_store import control_enabled, control_kv
+    controls = control_kv("prewarm", root) if control_enabled() else None
+    if controls is not None:
+        if local_source_paths is None:
+            raise ValueError("message-controlled prewarm requires rank-local Host sources")
+    else:
+        os.makedirs(arenas_dir, mode=0o700, exist_ok=True)
+        os.makedirs(complete_dir, mode=0o700, exist_ok=True)
+        os.makedirs(failed_dir, mode=0o700, exist_ok=True)
     participant = f"{role}-{engine_id}-rank-{int(tp_rank)}"
 
-    if role == "prefill":
+    if local_source_paths is None and role == "prefill":
         _write_startup_prewarm_record(
             os.path.join(arenas_dir, f"domain-{domain}-rank-{int(tp_rank)}.json"),
             {
@@ -3790,6 +3869,45 @@ def start_registered_host_arena_startup_prewarm(
             },
         )
 
+    def resolve_paths(deadline: float) -> list[str]:
+        if local_source_paths is not None:
+            return list(dict.fromkeys(str(path) for path in local_source_paths))
+        expected_manifests = domain_count * tp_size
+        while True:
+            manifest_paths = sorted(
+                os.path.join(arenas_dir, name)
+                for name in os.listdir(arenas_dir) if name.endswith(".json")
+            )
+            if len(manifest_paths) == expected_manifests:
+                manifests = []
+                for manifest_path in manifest_paths:
+                    with open(manifest_path, encoding="utf-8") as source:
+                        manifests.append(json.load(source))
+                break
+            if len(manifest_paths) > expected_manifests:
+                raise RuntimeError("too many startup Host arena manifests")
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "startup Host arena manifests timed out: "
+                    f"found={len(manifest_paths)} expected={expected_manifests}"
+                )
+            time.sleep(0.1)
+        rank_manifests = [
+            item for item in manifests if int(item["tp_rank"]) == int(tp_rank)
+        ]
+        if len(rank_manifests) != domain_count:
+            raise RuntimeError("startup Host arena manifest rank coverage mismatch")
+        paths = [str(item["d2p_path"]) for item in rank_manifests if item.get("d2p_path")]
+        if role == "decode":
+            paths.extend(str(item["p2d_path"]) for item in rank_manifests if item.get("p2d_path"))
+        else:
+            own = [item for item in rank_manifests if int(item["domain"]) == domain]
+            if len(own) != 1:
+                raise RuntimeError("P startup Host arena domain is not unique")
+            if own[0].get("p2d_path"):
+                paths.append(str(own[0]["p2d_path"]))
+        return list(dict.fromkeys(paths))
+
     def worker() -> None:
         worker_started_at = time.monotonic()
         timeout = float(
@@ -3797,64 +3915,23 @@ def start_registered_host_arena_startup_prewarm(
         )
         start_deadline = worker_started_at + max(1.0, timeout)
         try:
-            while not os.path.exists(start_path):
-                if time.monotonic() >= start_deadline:
-                    raise TimeoutError("startup Host prewarm start marker timed out")
-                time.sleep(0.1)
+            if controls is not None:
+                started = controls.client.wait_for_record(
+                    controls.namespace, "start", lambda record: record is not None,
+                    timeout=max(0.0, start_deadline - time.monotonic()),
+                )
+                if started is None:
+                    raise TimeoutError("startup Host prewarm start notification timed out")
+            else:
+                while not os.path.exists(start_path):
+                    if time.monotonic() >= start_deadline:
+                        raise TimeoutError("startup Host prewarm start marker timed out")
+                    time.sleep(0.1)
 
             started_at = time.monotonic()
             deadline = started_at + max(1.0, timeout)
 
-            expected_manifests = domain_count * tp_size
-            manifests: list[dict[str, Any]] = []
-            while True:
-                manifest_paths = sorted(
-                    name
-                    for name in (
-                        os.path.join(arenas_dir, item)
-                        for item in os.listdir(arenas_dir)
-                    )
-                    if name.endswith(".json")
-                )
-                if len(manifest_paths) == expected_manifests:
-                    manifests = []
-                    for manifest_path in manifest_paths:
-                        with open(manifest_path, encoding="utf-8") as source:
-                            manifests.append(json.load(source))
-                    break
-                if len(manifest_paths) > expected_manifests:
-                    raise RuntimeError("too many startup Host arena manifests")
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(
-                        "startup Host arena manifests timed out: "
-                        f"found={len(manifest_paths)} expected={expected_manifests}"
-                    )
-                time.sleep(0.1)
-
-            rank_manifests = [
-                item for item in manifests if int(item["tp_rank"]) == int(tp_rank)
-            ]
-            if len(rank_manifests) != domain_count:
-                raise RuntimeError("startup Host arena manifest rank coverage mismatch")
-            paths = [
-                str(item["d2p_path"])
-                for item in rank_manifests
-                if item.get("d2p_path")
-            ]
-            if role == "decode":
-                paths.extend(
-                    str(item["p2d_path"])
-                    for item in rank_manifests
-                    if item.get("p2d_path")
-                )
-            else:
-                own = [item for item in rank_manifests if int(item["domain"]) == domain]
-                if len(own) != 1:
-                    raise RuntimeError("P startup Host arena domain is not unique")
-                if own[0].get("p2d_path"):
-                    paths.append(str(own[0]["p2d_path"]))
-            paths = list(dict.fromkeys(paths))
-
+            paths = resolve_paths(deadline)
             mappings = [_registered_host_arena(path, device) for path in paths]
             for mapping in mappings:
                 remaining = max(0.0, deadline - time.monotonic())
@@ -5087,6 +5164,417 @@ class AgenticPHostStagingManager:
             self._state_lock = lock
         return lock
 
+    def _ledger_step(self, method, *args, **kwargs):
+        """One explicit scheduler continuation; pending is never success."""
+        if getattr(self.ledger, "is_event_control", False):
+            return self.ledger.poll_call(
+                method, *args, wakeup=getattr(self, "_control_wakeup", None), **kwargs
+            )
+        return True, getattr(self.ledger, method)(*args, **kwargs)
+
+    def register_tp_host_progress(self, snapshot_id, control_key, publish):
+        """Share one attempt-scoped publisher with the Host completion worker.
+
+        Completion facts belong to a physical lease/read epoch, not merely
+        this control key (a normal Slow retry may reuse the control key).
+        """
+        with self._get_state_lock():
+            records = getattr(self, "_tp_host_progress", None)
+            if records is None:
+                records = self._tp_host_progress = {}
+            previous = records.get(snapshot_id)
+            if previous is not None and previous["key"] == control_key:
+                return
+            if previous is not None:
+                previous["retired"] = True
+            records[snapshot_id] = {
+                "key": control_key, "publish": publish, "cancelled": False,
+                "retired": False, "ready": False, "status": None, "context": None,
+            }
+
+    def _capture_tp_host_context(self, load):
+        """Freeze the exact physical attempt before any worker I/O starts."""
+        if (int(getattr(self, "tp_size", 1)) <= 1
+                or not getattr(self.ledger, "is_event_control", False)):
+            return None
+        sid = load["request_generation"].snapshot_id
+        identity = self._host_recovery_rpc_identity(load)
+        with self._get_state_lock():
+            progress = getattr(self, "_tp_host_progress", {}).get(sid)
+            if progress is None or progress["retired"] or progress["cancelled"]:
+                return None
+            context = {
+                "progress": progress, "key": progress["key"],
+                "identity": (identity["claim_id"], identity["lease_id"], identity["remote_read_epoch"]),
+                "phase": 0, "cancelled": False, "timing": {},
+            }
+            previous = progress.get("context")
+            if previous is not None:
+                previous["cancelled"] = True
+                job = getattr(self, "_tp_host_handoff_jobs", {}).get(sid)
+                if job is not None and job.get("context") is previous:
+                    job["cancelled"] = True
+            progress["context"] = load["tp_progress_context"] = context
+            progress["ready"] = False
+            self.publish_tp_host_status(sid, progress["key"], 0)
+            return context
+
+    def _report_tp_host_completion(self, snapshot_id, context, phase):
+        """Publish a committed fact, never a rank-local scheduling decision."""
+        if context is None:
+            return
+        with self._get_state_lock():
+            progress = context["progress"]
+            if (context["cancelled"] or progress["cancelled"] or progress["retired"]
+                    or progress.get("context") is not context
+                    or getattr(self, "_tp_host_progress", {}).get(snapshot_id) is not progress):
+                return
+            context["phase"] = max(context["phase"], phase)
+            self.publish_tp_host_status(snapshot_id, context["key"], phase)
+
+    def _invalidate_tp_host_load(self, load):
+        context = load.get("tp_progress_context")
+        if context is None:
+            return
+        with AgenticPHostStagingManager._get_state_lock(self):
+            progress = context["progress"]
+            if progress.get("context") is context:
+                self._cancel_tp_host_handoff(load["request_generation"].snapshot_id)
+            else:
+                context["cancelled"] = True
+
+    def publish_tp_host_status(self, snapshot_id, control_key, status, *, cancelled=False):
+        with self._get_state_lock():
+            progress = getattr(self, "_tp_host_progress", {}).get(snapshot_id)
+            if progress is None or progress["key"] != control_key:
+                return None
+            if cancelled:
+                progress["cancelled"] = True
+                progress["ready"] = False
+            if progress["cancelled"]:
+                # Only the scheduler can declare cancellation physically
+                # quiescent. A late worker ACK cannot resurrect admission.
+                status = 5 if cancelled and status == 5 else (
+                    5 if progress["status"] == 5 else 0
+                )
+            elif progress["ready"] and 0 <= status < 4:
+                status = 4
+            elif 0 <= status <= 3:
+                context = progress.get("context")
+                if context is not None and not context["cancelled"]:
+                    # A native BIND installs Req metadata before its async
+                    # bound ACK. Do not let that local flag publish phase 3
+                    # until the exact lease's ACK actually committed.
+                    if status == 3 and context["phase"] < 3:
+                        status = min(context["phase"], 2)
+                    status = max(status, context["phase"])
+            if progress["status"] != status:
+                progress["publish"](control_key, status)
+                progress["status"] = status
+            return status
+
+    def clear_tp_host_progress(self, snapshot_id, control_key):
+        with self._get_state_lock():
+            progress = getattr(self, "_tp_host_progress", {}).get(snapshot_id)
+            if progress is not None and progress["key"] == control_key:
+                progress["retired"] = True
+                self._tp_host_progress.pop(snapshot_id)
+                self._cancel_tp_host_handoff(snapshot_id)
+
+    def _cancel_tp_host_handoff(self, snapshot_id):
+        """Invalidate notification only; existing abort fences own resources."""
+        with self._get_state_lock():
+            progress = getattr(self, "_tp_host_progress", {}).get(snapshot_id)
+            if progress is not None:
+                progress["ready"] = False
+                context = progress.get("context")
+                if context is not None:
+                    context["cancelled"] = True
+                    progress["context"] = None
+                    if not progress["cancelled"] and not progress["retired"]:
+                        self.publish_tp_host_status(snapshot_id, progress["key"], 0)
+            job = getattr(self, "_tp_host_handoff_jobs", {}).get(snapshot_id)
+            if job is not None:
+                job["cancelled"] = True
+        wakeup = getattr(self, "_control_wakeup", None)
+        if wakeup is not None:
+            wakeup.set()
+
+    def _queue_tp_host_handoff(self, req, snapshot_id, lease, progress):
+        """Scheduler has handed physical ownership to Req; queue metadata only."""
+        with self._get_state_lock():
+            jobs = getattr(self, "_tp_host_handoff_jobs", None)
+            if jobs is None:
+                jobs = self._tp_host_handoff_jobs = {}
+            job = jobs.get(snapshot_id)
+            if job is not None:
+                if (job["progress"] is not progress or job["lease_id"] != lease.lease_id
+                        or job["rid"] != str(req.rid)):
+                    raise RuntimeError("Slow handoff completion identity changed")
+                if not job["bound_ready"]:
+                    raise RuntimeError("Slow handoff preceded committed bound ACK")
+                job["handed_requested"] = True
+            else:
+                jobs[snapshot_id] = {
+                    "progress": progress, "context": progress.get("context"),
+                    "rid": str(req.rid), "lease_id": lease.lease_id,
+                    "claim_id": lease.owner, "epoch": req._agentic_host_remote_read_epoch,
+                    "cancelled": False, "ready": False, "future": None,
+                    "bound_ready": True, "handed_requested": True,
+                    "record": self.host_ready.get(snapshot_id),
+                }
+        self._control_wakeup.set()
+
+    def _queue_tp_host_bound_ack(self, req, load):
+        """Native BIND commits local Req ownership before publishing its receipt.
+
+        This does not admit Forward: every shard must still complete the
+        existing worker receipts and receive rank0's native ADMIT command.
+        """
+        context = load.get("tp_progress_context")
+        if context is None:
+            return False
+        sid = load["request_generation"].snapshot_id
+        # Radix already owns the parent at this scheduler boundary. Install
+        # rollback metadata even if cancellation invalidated the notification
+        # context just before we arrived here; silently deferring would orphan
+        # a binding lease and its pin.
+        req._agentic_host_rank_token_count = int(load["record"]["offer"]["token_count"])
+        req._agentic_host_workset_lease = load["workset_lease"]
+        req._agentic_host_remote_read_epoch = context["identity"][2]
+        with self._get_state_lock():
+            progress = context["progress"]
+            if (context["cancelled"] or progress["retired"] or progress["cancelled"]
+                    or progress.get("context") is not context):
+                raise RuntimeError("Slow BIND lost its completion context")
+            jobs = getattr(self, "_tp_host_handoff_jobs", None)
+            if jobs is None:
+                jobs = self._tp_host_handoff_jobs = {}
+            if sid in jobs:
+                raise RuntimeError("Slow BIND still has a prior completion context")
+        # Scheduler-only ownership changes.  Keep the rollback metadata before
+        # handoff validation, so a failed last-rank handoff can undo this bind
+        # without ever publishing a bound receipt or consuming Host ownership.
+        self.workset_broker.handoff_to_req(sid, req, load["workset_lease"])
+        with self._get_state_lock():
+            if (context["cancelled"] or progress["retired"] or progress["cancelled"]
+                    or progress.get("context") is not context):
+                raise RuntimeError("Slow BIND cancelled during local handoff")
+            context["timing"]["bound_queued"] = time.monotonic()
+            claim, lease, epoch = context["identity"]
+            jobs[sid] = {
+                "progress": progress, "context": context, "rid": str(req.rid),
+                "lease_id": lease, "claim_id": claim, "epoch": epoch,
+                "cancelled": False, "ready": False, "future": None,
+                "bound_ready": False, "handed_requested": True,
+                "bind_handoff": True,
+                "record": load["record"],
+                "request_generation": load["request_generation"],
+            }
+            # These are local ownership facts, not permission to run Forward.
+            # Keep status 2 until the full group and handed receipts are ready.
+            req._agentic_host_rank_loaded = True
+            if self.loads.get(req.rid) is load:
+                self.loads.pop(req.rid)
+        self._control_wakeup.set()
+        return True
+
+    def _progress_tp_host_handoffs(self):
+        """Existing Host worker closes mappings and ACKs; never touches live Req."""
+        with self._get_state_lock():
+            jobs = tuple(getattr(self, "_tp_host_handoff_jobs", {}).items())
+        for snapshot_id, job in jobs:
+            progress = job["progress"]
+            with self._get_state_lock():
+                cancelled = (job["cancelled"] or progress["retired"] or progress["cancelled"])
+                if cancelled:
+                    future = job["future"]
+                    manifest_key = job.get("manifest_key")
+                    manifest_future = getattr(self, "_agentic_lifecycle_futures", {}).get(manifest_key)
+                    # An already submitted exact-attempt ACK may still commit.
+                    # Drain it before retiring the context; no success report.
+                    if ((future is None or future.done())
+                            and (manifest_future is None or manifest_future.done())):
+                        getattr(self, "_agentic_lifecycle_futures", {}).pop(manifest_key, None)
+                        self._tp_host_handoff_jobs.pop(snapshot_id, None)
+                    continue
+                if job["ready"] or job.get("error") is not None:
+                    continue
+            try:
+                if not job["bound_ready"]:
+                    with self._get_state_lock():
+                        if job["cancelled"] or progress["retired"] or progress["cancelled"]:
+                            continue
+                        if job["future"] is None:
+                            job["future"] = self.ledger.submit(
+                                "complete_host_bind_rank", snapshot_id, self.owner,
+                                tp_rank=self.tp_rank, tp_size=self.tp_size,
+                                claim_id=job["claim_id"], lease_id=job["lease_id"],
+                                remote_read_epoch=job["epoch"],
+                            )
+                            job["future"].add_done_callback(lambda _: self._control_wakeup.set())
+                        future = job["future"]
+                    if not future.done():
+                        continue
+                    if not future.result():
+                        raise RuntimeError("Slow BIND lost lifecycle ownership")
+                    with self._get_state_lock():
+                        job["bound_ready"] = True
+                        job["future"] = None
+                        job["context"]["timing"]["bound_ack"] = time.monotonic()
+                        if (not job["cancelled"] and self.tp_rank != 0
+                                and not job.get("bind_handoff")):
+                            self._report_tp_host_completion(snapshot_id, job["context"], 3)
+                if job.get("bind_handoff") and not job.get("group_bound_ready"):
+                    # Local handoff is not a group commit. In particular a
+                    # follower cannot close its Host shard while another rank
+                    # is still binding or has requested a retry. Once proven,
+                    # keep this exact-context fact: all handed receipts may
+                    # permit ledger pruning before our reply is observed.
+                    if not self._tp_host_consumed_matches(snapshot_id, job):
+                        continue
+                    job["group_bound_ready"] = True
+                if (self.tp_rank == 0 and job.get("context") is not None
+                        and not job.get("manifest_ready", False)):
+                    if not self._progress_tp_host_manifest(snapshot_id, job):
+                        continue
+                if not job["handed_requested"]:
+                    continue
+                record = job["record"]
+                if record is not None:
+                    if not self._release_record(record):
+                        continue
+                    if job.get("context") is not None:
+                        job["context"]["timing"]["host_released"] = time.monotonic()
+                    with self._get_state_lock():
+                        if self.host_ready.get(snapshot_id) is record:
+                            self.host_ready.pop(snapshot_id)
+                        job["record"] = None
+                    logger.info("AgenticKV shared_host_group_commit_release snapshot=%s tp_rank=%d",
+                                snapshot_id, self.tp_rank)
+                with self._get_state_lock():
+                    if job["cancelled"] or progress["retired"] or progress["cancelled"]:
+                        continue
+                    if job["future"] is None:
+                        # submit only enqueues bytes, never waits for a reply.
+                        job["future"] = self.ledger.submit(
+                            "mark_d2p_recovery_phase_rank", snapshot_id, self.owner,
+                            tp_rank=self.tp_rank, tp_size=self.tp_size,
+                            claim_id=job["claim_id"], lease_id=job["lease_id"],
+                            phase="handed", remote_read_epoch=job["epoch"],
+                        )
+                        job["future"].add_done_callback(lambda _: self._control_wakeup.set())
+                    future = job["future"]
+                if not future.done():
+                    continue
+                if not future.result():
+                    raise RuntimeError("Slow handoff lost lifecycle ownership")
+                with self._get_state_lock():
+                    if (job["cancelled"] or progress["retired"] or progress["cancelled"]
+                            or getattr(self, "_tp_host_progress", {}).get(snapshot_id) is not progress):
+                        continue
+                    job["ready"] = progress["ready"] = True
+                    self.publish_tp_host_status(snapshot_id, progress["key"], 4)
+                context = job.get("context")
+                if context is not None:
+                    timing = context["timing"]
+                    now = time.monotonic()
+                    def elapsed(start, end, *, optional=False):
+                        if optional and (start not in timing or end not in timing):
+                            return float("nan")
+                        return 1000 * (timing.get(end, now) - timing.get(start, now))
+                    logger.info(
+                        "AgenticKV host_completion_timing snapshot=%s tp_rank=%d epoch=%d "
+                        "copy_to_loaded_ack_ms=%.3f loaded_to_bound_queue_ms=%.3f "
+                        "bound_queue_to_ack_ms=%.3f bound_ack_to_host_release_ms=%.3f "
+                        "release_to_handed_ack_ms=%.3f prepared_to_start_ms=%.3f "
+                        "start_to_submit_ms=%.3f submit_to_copy_ms=%.3f",
+                        snapshot_id, self.tp_rank, job["epoch"],
+                        elapsed("copy_done", "loaded_ack"), elapsed("loaded_ack", "bound_queued"),
+                        elapsed("bound_queued", "bound_ack"), elapsed("bound_ack", "host_released"),
+                        1000 * (now - timing.get("host_released", now)),
+                        elapsed("prepared_ack", "prepared_start_at", optional=True),
+                        elapsed("prepared_start_at", "io_submitted", optional=True),
+                        elapsed("io_submitted", "copy_done", optional=True),
+                    )
+                self._notify_scheduler("host_handed", snapshot_id)
+            except Exception as exc:
+                # Retain an ambiguous/failed completion; never manufacture an
+                # ACK or release workset pages from this metadata worker.
+                job["error"] = exc
+                logger.exception("AgenticKV shared_host_handoff_failed snapshot=%s tp_rank=%d",
+                                 snapshot_id, self.tp_rank)
+
+    def _tp_host_consumed_matches(self, snapshot_id, job):
+        """Read-only exact all-rank ownership fence from the pushed mirror."""
+        entry = self.ledger.get(snapshot_id)
+        rank_claim = (entry or {}).get("recovery_claims", {}).get(str(self.tp_rank), {})
+        return bool(entry is not None and entry.get("state") == HostStageState.CONSUMED.value
+                    and entry.get("recovery_owner") == self.owner
+                    and entry.get("recovery_claim_id") == job["claim_id"]
+                    and int(entry.get("remote_read_epoch", 0)) == job["epoch"]
+                    and int(entry.get("tp_size", 1)) == self.tp_size
+                    and set(entry.get("binder_acks", ())) == set(range(self.tp_size))
+                    and rank_claim.get("claim_id") == job["claim_id"]
+                    and rank_claim.get("lease_id") == job["lease_id"])
+
+    def _progress_tp_host_manifest(self, snapshot_id, job):
+        """Leader worker finishes metadata before advertising native COMMIT.
+
+        CONSUMED proves all physical shards are bound.  The exact attempt is
+        checked on the pushed ledger mirror before the existing lifecycle
+        worker is submitted; neither this helper nor that worker changes Req.
+        """
+        if not self._tp_host_consumed_matches(snapshot_id, job):
+            return False
+        from sglang.srt.disaggregation.agentic_lifecycle_control import poll_lifecycle_call
+        with self._get_state_lock():
+            context, progress = job["context"], job["progress"]
+            if (job["cancelled"] or context["cancelled"] or progress["cancelled"]
+                    or progress["retired"] or progress.get("context") is not context):
+                return False
+            key = ("host-manifest-worker", snapshot_id, self.owner,
+                   job["claim_id"], job["lease_id"], job["epoch"])
+            job["manifest_key"] = key
+            ready, result = poll_lifecycle_call(
+                self, key, AgenticPHostStagingManager._complete_shared_host_manifest_sync,
+                self, job["request_generation"],
+            )
+            future = getattr(self, "_agentic_lifecycle_futures", {}).get(key)
+            if future is not None and not job.get("manifest_wakeup_registered"):
+                job["manifest_wakeup_registered"] = True
+                future.add_done_callback(lambda _: self._control_wakeup.set())
+            if not ready:
+                return False
+            if not result:
+                raise RuntimeError("Slow manifest completion lost lifecycle ownership")
+            job["manifest_ready"] = True
+            context["timing"]["manifest_ack"] = time.monotonic()
+            # The committed result now belongs to this bounded exact job.
+            # Repeated scheduler checks read it, never re-submit metadata I/O.
+            self._agentic_lifecycle_futures.pop(key, None)
+            if not job.get("bind_handoff"):
+                self._report_tp_host_completion(snapshot_id, context, 3)
+            logger.info(
+                "AgenticKV host_manifest_completion snapshot=%s tp_rank=%d epoch=%d "
+                "bound_ack_to_manifest_ack_ms=%.3f",
+                snapshot_id, self.tp_rank, job["epoch"],
+                1000 * (context["timing"]["manifest_ack"] - context["timing"]["bound_ack"]),
+            )
+            return True
+
+    def _host_recovery_rpc_identity(self, load):
+        if not getattr(self.ledger, "is_event_control", False):
+            return {}
+        attempt = load.get("remote_h2d_attempt")
+        if load.get("record", {}).get("network_host") and not attempt:
+            raise RuntimeError("remote Host completion lost its frozen attempt")
+        return {
+            "claim_id": load["recovery_claim_id"],
+            "lease_id": load["workset_lease"].lease_id,
+            "remote_read_epoch": 0 if attempt is None else int(attempt.rsplit(":epoch:", 1)[1]),
+        }
+
     def __init__(
         self,
         *,
@@ -5185,19 +5673,28 @@ class AgenticPHostStagingManager:
             and tree_cache.supports_mamba()
             and request_owned_mamba_enabled()
         )
+        # Transport-lane reuse is independent of TP1's optional scheduler
+        # event/async-prepare path. TP still binds/commits via rank0 commands.
+        self.h2d_lane_overlap = self.tp_size > 1
         # Experimental scheduler-side refill only; no allocator or Radix
         # mutation moves to an I/O thread. Dense models and TP keep their
         # existing admission path, including when this variable is inherited.
         self.h2d_event_progress = self.h2d_decoupled and os.getenv(
             "SGLANG_AGENTIC_KV_P_HOST_EVENT_PROGRESS", "0"
         ).lower() in {"1", "true"}
-        self.h2d_async_prepare = self.h2d_event_progress and os.getenv(
+        self.tp_h2d_async_prepare = bool(
+            self.tp_size > 1 and self._multinode_config is not None
+            and os.getenv("SGLANG_AGENTIC_KV_TP_HOST_ASYNC_PREPARE", "0").lower()
+            in {"1", "true"}
+        )
+        self.h2d_async_prepare = self.tp_h2d_async_prepare or (self.h2d_event_progress and os.getenv(
             "SGLANG_AGENTIC_KV_P_HOST_ASYNC_PREPARE", "0"
-        ).lower() in {"1", "true"}
+        ).lower() in {"1", "true"})
         # Only the control worker prepares these scheduler-selected requests.
         # No live Req is shared with that worker; tokens are immutable copies.
         self._host_prepares: dict[str, dict[str, Any]] = {}
         self._host_prepare_results: dict[str, tuple] = {}
+        self._prestart_remote_retries: dict[tuple, dict[str, Any]] = {}
         # One bounded stage may await scheduler binding while the other is
         # preparing/copying. This does not reserve a separate HBM pool: every
         # item must still obtain the original complete hybrid workset lease.
@@ -5255,10 +5752,11 @@ class AgenticPHostStagingManager:
         self._h2d_stream = self._h2d_lanes[0]["stream"]
         self._h2d_staging = self._h2d_lanes[0]["staging"]
         self._h2d_host_bounce = self._h2d_lanes[0]["host_bounce"]
-        # A reservation owns only an I/O lane, never HBM token capacity.  It is
-        # acquired before a Slow workset intent is created and retained through
-        # H2D plus Radix bind/handoff.  Consequently the number of Slow intents
-        # and physical leases can never exceed the number of independent lanes.
+        # A lane is acquired before a Slow workset intent. In overlap mode it
+        # is recycled after the physical fence, while a separate resident slot
+        # retains Host/workset ownership through bind/handoff. Physical copies
+        # stay <= lane count; total resident worksets stay <= twice that count.
+        # Legacy TP1 without decoupling retains its lane through handoff.
         self._h2d_lane_reservations: dict[str, int] = {}
         self._spill_threads: dict[str, threading.Thread] = {}
         self._spilling_pressure = False
@@ -5291,6 +5789,11 @@ class AgenticPHostStagingManager:
         self._async_control = os.getenv(
             "SGLANG_AGENTIC_KV_P_ASYNC_CONTROL", "1"
         ).lower() not in {"0", "false", "no", "off"}
+        if getattr(self.ledger, "is_event_control", False):
+            if not self._async_control:
+                raise ValueError("event Host control requires asynchronous control worker")
+            self.h2d_async_prepare = True
+            self.tp_h2d_async_prepare = self.tp_size > 1
         self.h2d_async_prepare = self.h2d_async_prepare and self._async_control
         self._control_interval = max(
             0.001,
@@ -5336,6 +5839,7 @@ class AgenticPHostStagingManager:
         self._last_ledger_refresh = 0.0
         self._ledger_watcher = None
         self._ledger_watcher_thread = None
+        self._ledger_background_resync = False
         # The arena is physically allocated and first-touched once at startup.
         # Snapshot admission therefore needs no per-generation prefault pool.
         self._prefault_worker_count = 0
@@ -5364,9 +5868,14 @@ class AgenticPHostStagingManager:
         )
         if self._async_control:
             try:
-                self._ledger_watcher = AgenticDirectoryChangeWatcher(
-                    self.ledger.event_directory
-                )
+                if getattr(self.ledger, "is_event_control", False):
+                    self._ledger_watcher = self.ledger.create_watcher()
+                    self._ledger_background_resync = True
+                else:
+                    self._ledger_watcher = AgenticDirectoryChangeWatcher(
+                        self.ledger.event_directory, journal=self.ledger.event_journal
+                    )
+                    self._ledger_background_resync = self.ledger.event_journal is not None
                 self._ledger_watcher_thread = threading.Thread(
                     target=self._ledger_watch_worker,
                     name=f"agentic-p-ledger-watch-{os.getpid()}",
@@ -5374,6 +5883,10 @@ class AgenticPHostStagingManager:
                 )
                 self._ledger_watcher_thread.start()
             except Exception:
+                if getattr(self.ledger, "is_event_control", False):
+                    # A broker failure is not permission to create a second,
+                    # file-backed authority or silently scan stale NFS state.
+                    raise
                 # Keep the previous bounded polling behavior on platforms
                 # without inotify. Linux node-local deployments take the
                 # event-driven path.
@@ -6435,6 +6948,9 @@ class AgenticPHostStagingManager:
                 or getattr(self, "_pending_host_abort_requests", {})
                 or getattr(self, "_prestart_recovery_aborts", {})
                 or getattr(self, "_host_prepares", {})
+                or getattr(self, "_prestart_remote_retries", {})
+                or any(not job["ready"] and job.get("error") is None
+                       for job in getattr(self, "_tp_host_handoff_jobs", {}).values())
                 or pending_grant
             )
 
@@ -6442,11 +6958,51 @@ class AgenticPHostStagingManager:
         watcher = self._ledger_watcher
         if watcher is None:
             return
+        if getattr(self.ledger, "is_event_control", False):
+            try:
+                self._ledger_event_queue.put({"resync_entries": watcher.initial_entries})
+                self._ledger_changed.clear()
+                self._ledger_event_ready.set()
+                self._control_wakeup.set()
+                while watcher.healthy:
+                    events = watcher.wait_events()
+                    for event in events:
+                        self._ledger_event_queue.put(event)
+                    if events:
+                        self._last_ledger_refresh = time.monotonic()
+                        self._ledger_event_ready.set()
+                        self._control_wakeup.set()
+                        # Event-driven metadata GC, rank0 only; never a
+                        # scheduler directory walk or a polling network read.
+                        if self.tp_rank == 0 and time.monotonic() - self._last_prune > 5.0:
+                            self._last_prune = time.monotonic()
+                            self.ledger.prune()
+            except Exception:
+                logger.exception("Agentic Host control stream failed closed")
+            finally:
+                watcher.healthy = False
+                self._control_wakeup.set()
+            return
         try:
             while watcher.healthy:
-                paths, overflow = watcher.poll(timeout_seconds=None)
+                paths, overflow = watcher.poll(timeout_seconds=0.1)
                 if overflow:
                     self._ledger_changed.set()
+                if self._ledger_background_resync and (
+                    self._ledger_changed.is_set()
+                    or time.monotonic() - self._last_ledger_refresh >= self._control_idle_backstop
+                ):
+                    # All NFS directory walks (including prune) happen here,
+                    # never on the thread that polls CUDA/RDMA completion.
+                    self._ledger_changed.clear()
+                    entries = self.ledger.snapshot_entries(force_refresh=True)
+                    self._ledger_event_queue.put({"resync_entries": entries})
+                    self._last_ledger_refresh = time.monotonic()
+                    self._ledger_event_ready.set()
+                    self._control_wakeup.set()
+                    if time.monotonic() - self._last_prune > 5.0:
+                        self.ledger.prune()
+                        self._last_prune = time.monotonic()
                 for path in paths:
                     try:
                         event = self.ledger.read_entry_event(path)
@@ -6481,6 +7037,12 @@ class AgenticPHostStagingManager:
                 event = self._ledger_event_queue.get_nowait()
             except queue.Empty:
                 break
+            if "resync_entries" in event:
+                changed.update(self._ledger_entries_cache)
+                self._ledger_entries_cache = event["resync_entries"]
+                changed.update(self._ledger_entries_cache)
+                self._ledger_resynced = True
+                continue
             snapshot_id = str(event["snapshot_id"])
             incoming_revision = int(event.get("revision", 0))
             current = self._ledger_entries_cache.get(snapshot_id)
@@ -6504,8 +7066,11 @@ class AgenticPHostStagingManager:
         # D can observe every new grant in this same control cycle.
         self._progress_arena_grants()
         self._progress_host_abort_requests()
+        if getattr(self.ledger, "is_event_control", False):
+            self._progress_prestart_remote_retries()
         self._progress_prestart_aborts()
         self._progress_h2d_loads()
+        self._progress_tp_host_handoffs()
         self._progress_host_prepares()
         self._progress_spills()
         self._maybe_spill()
@@ -6518,6 +7083,16 @@ class AgenticPHostStagingManager:
         if now - self._last_ledger_refresh >= self._control_idle_backstop:
             full_resync = True
         full_snapshot = None
+        if getattr(self, "_ledger_background_resync", False) and watcher_healthy:
+            if force_ledger:
+                if getattr(self.ledger, "is_event_control", False):
+                    self._ledger_event_queue.put({
+                        "resync_entries": self.ledger.snapshot_entries()
+                    })
+                    self._ledger_changed.clear()
+                else:
+                    self._ledger_changed.set()
+            full_resync = False
         if full_resync:
             # Clear before reading. A concurrent overflow/failure will set the
             # edge again and therefore cannot be lost behind this snapshot.
@@ -6529,6 +7104,9 @@ class AgenticPHostStagingManager:
         # Apply events after a resync. Revision checks discard edges already
         # represented by that snapshot while retaining a concurrent newer one.
         changed_snapshot_ids = self._apply_ledger_events()
+        if getattr(self, "_ledger_resynced", False):
+            self._ledger_resynced = False
+            full_snapshot = self._ledger_entries_cache
         if full_snapshot is not None:
             self._poll_active(self._ledger_entries_cache)
             self._poll_aborting(self._ledger_entries_cache)
@@ -6566,7 +7144,8 @@ class AgenticPHostStagingManager:
             self._admit_batch(changed_entries)
         else:
             self._maybe_evict_shared_host()
-        if time.monotonic() - self._last_prune > 5.0:
+        if (not (getattr(self, "_ledger_background_resync", False) and watcher_healthy)
+                and time.monotonic() - self._last_prune > 5.0):
             self.ledger.prune()
             self._last_prune = time.monotonic()
 
@@ -6578,6 +7157,9 @@ class AgenticPHostStagingManager:
             started = time.monotonic()
             try:
                 self._poll_once(force_ledger=False)
+                restore_controller = getattr(self, "restore_controller", None)
+                if restore_controller is not None:
+                    restore_controller.progress()
             except Exception:
                 self._control_errors += 1
                 logger.exception("Agentic P async control progress failed")
@@ -6636,6 +7218,18 @@ class AgenticPHostStagingManager:
                     - (time.monotonic() - self._last_ledger_refresh),
                 )
             )
+            if (
+                getattr(self.ledger, "is_event_control", False)
+                and watcher_healthy and not self._has_local_io_progress()
+                and not self._ledger_event_ready.is_set()
+                and not self._ledger_changed.is_set()
+            ):
+                timeout = None
+            restore_controller = getattr(self, "restore_controller", None)
+            if restore_controller is not None and restore_controller.has_pending():
+                # Bounded live intents only. TP command/status mirrors and
+                # workset readiness are memory reads, never NFS/RPC scans.
+                timeout = self._control_interval
             self._control_wakeup.wait(timeout)
 
     def poll(self) -> None:
@@ -6650,6 +7244,114 @@ class AgenticPHostStagingManager:
         if self._async_control:
             return
         self._poll_once()
+
+    def terminal_restore_reason(self, request_generation) -> Optional[str]:
+        """Read explicit terminal ownership from the pushed memory view only."""
+        state = getattr(self, "_ledger_entries_cache", {}).get(
+            request_generation.snapshot_id, {}
+        ).get("state")
+        return {
+            HostStageState.RECOMPUTE_REQUIRED.value: "shared_host_evicted",
+            HostStageState.FAILED.value: "shared_host_h2d_failed",
+        }.get(state)
+
+    def prepare_terminal_restore(self, req, parent, reason: str) -> bool:
+        """Drain a terminal parent without acquiring an I/O lane or workset.
+
+        TP callers supply rank0's frozen reason; a follower's delayed ledger
+        mirror must not make it choose a different recovery branch.
+        """
+        self._cancel_tp_host_handoff(parent.snapshot_id)
+        # Called on the scheduler thread: undo even a partially acknowledged
+        # bind here, never on the Host worker. Radix-bound implies completed I/O.
+        with self._get_state_lock():
+            load_rid, load = self._find_h2d_load(parent.snapshot_id, rid=req.rid)
+            if load is not None and load.get("radix_bound"):
+                if load_rid != str(req.rid):
+                    return False  # The original Req owns this Radix pin.
+                req._agentic_host_workset_lease = load["workset_lease"]
+                req._agentic_host_rank_token_count = int(load["record"]["offer"]["token_count"])
+                self.rollback_bound_parent(req, parent)
+                load["radix_bound"] = False
+            elif getattr(req, "_agentic_host_rank_loaded", False):
+                self.rollback_bound_parent(req, parent)
+                record = self.host_ready.get(parent.snapshot_id)
+                if record is not None:
+                    record["loading"] = False
+        if not getattr(self, "h2d_async_prepare", False):
+            return self._progress_terminal_restore(str(req.rid), {"parent": parent})
+        with self._get_state_lock():
+            results = getattr(self, "_host_terminal_results", {})
+            if results.get(req.rid) == (parent.snapshot_id, reason):
+                results.pop(req.rid)
+                return True
+            for existing_rid, prepare in self._host_prepares.items():
+                if prepare["parent"] != parent:
+                    continue
+                if str(existing_rid) == str(req.rid) and not prepare["cancelled"]:
+                    # The same worker owns both normal preparation and fenced
+                    # cleanup. Switch its existing job, rather than wait for
+                    # successful preparation of Host data that is now terminal.
+                    # Never replace another HTTP attempt's job or its fences.
+                    prepare["terminal_reason"] = reason
+                    self._control_wakeup.set()
+                return False
+            self._host_prepares[req.rid] = {
+                "view": SimpleNamespace(rid=str(req.rid)), "parent": parent,
+                "queued_at": time.monotonic(), "cancelled": False,
+                "terminal_reason": reason,
+            }
+        self._control_wakeup.set()
+        return False
+
+    def _progress_terminal_restore(self, rid, prepare) -> bool:
+        """Background cleanup only; in-flight/bound ownership retains its fence."""
+        sid = prepare["parent"].snapshot_id
+        with self._get_state_lock():
+            load_rid, load = self._find_h2d_load(sid)
+        if load is not None:
+            load["terminal_cleanup_requested"] = True
+            load["start_allowed"] = False
+            if load.get("radix_bound"):
+                return False  # Scheduler must undo a bound parent first.
+            if not self._discard_failed_h2d_load(load_rid, load, terminal=True):
+                return False
+        with self._get_state_lock():
+            if any(
+                sid in getattr(self, name, {}) for name in (
+                    "active", "aborting", "_pending_host_abort_requests",
+                    "_prestart_recovery_aborts",
+                )
+            ):
+                return False
+            record = self.host_ready.get(sid)
+            # These two markers belong to this single preparation worker,
+            # before any load/IO attempt is installed.  A terminal job replaces
+            # normal preparation, so waiting for that worker to clear its own
+            # marker would deadlock and leave its pending workset uncancelled.
+            # Actual copy/bind/spill ownership remains fenced above/below.
+            prestart = {"h2d_claiming", "h2d_reserving"}
+            if (record is not None and record.get("loading")
+                    and record.get("loading") not in prestart):
+                return False
+        broker = self.workset_broker
+        owners = (broker.direct_owner(sid), broker.slow_owner(sid, rid))
+        for owner in owners:
+            broker.supersede_unstarted(sid, owner=owner)
+        if (broker.get(sid) is not None
+                or any(broker.owner_has_unretired_work(sid, owner=o) for o in owners)):
+            return False
+        if record is not None:
+            with self._get_state_lock():
+                if record.get("loading") in prestart:
+                    record["loading"] = False
+            if not self._release_record(record):
+                return False
+            with self._get_state_lock():
+                if self.host_ready.get(sid) is record:
+                    self.host_ready.pop(sid)
+        self._release_h2d_lane(sid)
+        return True
 
     def snapshot_ready(self, request_generation) -> bool:
         """Discover readable Host metadata before TP selects a restore.
@@ -6700,6 +7402,11 @@ class AgenticPHostStagingManager:
         """
 
         with self._get_state_lock():
+            if snapshot_id in getattr(self, "_tp_host_handoff_jobs", {}):
+                return False
+            if any(p["parent"].snapshot_id == snapshot_id
+                   for p in getattr(self, "_host_prepares", {}).values()):
+                return False
             if self._find_h2d_load(snapshot_id, rid=rid)[1] is not None:
                 return False
             for name in (
@@ -6814,16 +7521,22 @@ class AgenticPHostStagingManager:
                 return int(existing)
             lane_count = max(1, int(getattr(self, "max_h2d_inflight", 1)))
             resident = getattr(self, "_h2d_resident_reservations", None)
-            if getattr(self, "h2d_decoupled", False):
+            overlap = getattr(self, "h2d_decoupled", False) or getattr(self, "h2d_lane_overlap", False)
+            if overlap:
                 if resident is None:
                     resident = self._h2d_resident_reservations = set()
-                if snapshot_id not in resident and len(resident) >= 2 * lane_count:
+                # The background controller gates new TP copies using the
+                # all-shard copy fence. Completed worksets may wait for native
+                # BIND/ADMIT without retaining an I/O admission credit. Keep
+                # legacy TP1/non-controller admission unchanged.
+                if (getattr(self, "restore_controller", None) is None
+                        and snapshot_id not in resident and len(resident) >= 2 * lane_count):
                     return None
             occupied = set(int(value) for value in reservations.values())
             for lane_id in range(lane_count):
                 if lane_id not in occupied:
                     reservations[snapshot_id] = lane_id
-                    if getattr(self, "h2d_decoupled", False):
+                    if overlap:
                         resident.add(snapshot_id)
                     return lane_id
             return None
@@ -6842,7 +7555,7 @@ class AgenticPHostStagingManager:
     def _release_quiesced_h2d_lane(self, load: dict[str, Any]) -> None:
         """Recycle transport resources, NOT the Host copy or destination lease."""
 
-        if not getattr(self, "h2d_decoupled", False):
+        if not (getattr(self, "h2d_decoupled", False) or getattr(self, "h2d_lane_overlap", False)):
             return
         if not (load.get("h2d_copy_complete") and load.get("io_quiesced")):
             return
@@ -6858,8 +7571,9 @@ class AgenticPHostStagingManager:
             self._h2d_lane_reservations.pop(snapshot_id, None)
             load["transport_lane_released"] = True
             load["copy_done_at"] = time.monotonic()
-        # No Host/lease/CAS mutation here. The bounded resident credit stays
-        # until the existing handoff/cancel path calls _release_h2d_lane().
+        # No Host/lease/CAS mutation here. Retain resident *ownership* tracking
+        # until handoff/cancel. With the background TP controller it is not an
+        # admission cap: the leader may refill copies after all-rank phase 2.
         self._control_wakeup.set()
 
     def h2d_physical_occupancy(self) -> int:
@@ -6943,7 +7657,7 @@ class AgenticPHostStagingManager:
 
         request_generation = load["request_generation"]
         if int(getattr(self, "tp_size", 1)) > 1:
-            return bool(
+            prepared = bool(
                 self.ledger.prepare_tp_host_load_rank(
                     request_generation.snapshot_id,
                     self.owner,
@@ -6951,6 +7665,10 @@ class AgenticPHostStagingManager:
                     tp_size=int(getattr(self, "tp_size", 1)),
                 )
             )
+            context = load.get("tp_progress_context")
+            if prepared and context is not None:
+                context["timing"].setdefault("prepared_ack", time.monotonic())
+            return prepared
         return bool(
             self.ledger.begin_host_load_rank(
                 request_generation.snapshot_id,
@@ -6961,9 +7679,58 @@ class AgenticPHostStagingManager:
             )
         )
 
+    def _authorize_prepared_tp_host_load(self, load, entry):
+        """Execute native PREPARE once its exact all-rank resources exist.
+
+        PREPARE selected this snapshot on rank0; the native workset plan still
+        allocates every shard.  The worker consumes only the pushed prepared
+        receipts, not another scheduler START round.  This is not an ownership
+        transfer: mark_io_inflight, the ledger CAS and the remote read fence
+        remain mandatory, including when cancellation races this local check.
+        """
+        if (load.get("ledger_prepare_pending") or load.get("abort_requested")
+                or load.get("io_error") or entry is None):
+            return False
+        sid = load["request_generation"].snapshot_id
+        context = load.get("tp_progress_context")
+        if context is None:
+            return False
+        claim_id, lease_id, epoch = context["identity"]
+        claims = entry.get("recovery_claims", {})
+        expected = set(range(self.tp_size))
+        if (entry.get("state") != HostStageState.H2D_LOADING.value
+                or entry.get("recovery_owner") != self.owner
+                or entry.get("recovery_claim_id") != claim_id
+                or int(entry.get("remote_read_epoch", 0)) != epoch
+                or int(entry.get("tp_size", 1)) != self.tp_size
+                or set(entry.get("h2d_prepared_ranks", ())) != expected
+                or set(claims) != {str(rank) for rank in expected}
+                or any(claim.get("claim_id") != claim_id
+                       or claim.get("lease_id") is None
+                       or claim.get("phase") not in {"leased", "io_inflight"}
+                       for claim in claims.values())
+                or claims[str(self.tp_rank)].get("lease_id") != lease_id):
+            return False
+        lease = load["workset_lease"]
+        if (self.workset_broker.get(sid, owner=claim_id) is not lease
+                or lease.lease_id != lease_id or lease.state != "io_reserved"
+                or lease.io_attempt != load["io_attempt"]):
+            return False
+        with self._get_state_lock():
+            progress = context["progress"]
+            if (context["cancelled"] or progress["cancelled"] or progress["retired"]
+                    or progress.get("context") is not context
+                    or getattr(self, "_tp_host_progress", {}).get(sid) is not progress
+                    or load.get("abort_requested") or load.get("io_error")):
+                return False
+            load["start_allowed"] = True
+            context["timing"].setdefault("prepared_start_at", time.monotonic())
+        return True
+
     def _cancel_unstarted_h2d_load(self, rid: str, load: dict[str, Any]) -> None:
         """Release a prepared lane whose DMA was never published."""
 
+        AgenticPHostStagingManager._invalidate_tp_host_load(self, load)
         if (getattr(self, "_remote_host_bridge", None) is not None
                 and load.get("record", {}).get("network_host")):
             self._fence_unstarted_remote_h2d(load)
@@ -6995,10 +7762,43 @@ class AgenticPHostStagingManager:
                 self.loads.pop(rid, None)
             load["record"]["loading"] = False
             load["record"].pop("recovery_claim_id", None)
+            load["record"].pop("remote_h2d_attempt", None)
         AgenticPHostStagingManager._release_h2d_lane(self, snapshot_id)
 
     def _complete_shared_host_manifest(self, request_generation) -> bool:
         """Release the persistent fallback fence after P owns the full GPU KV."""
+
+        if (int(getattr(self, "tp_size", 1)) > 1
+                and getattr(getattr(self, "ledger", None), "is_event_control", False)):
+            with AgenticPHostStagingManager._get_state_lock(self):
+                progress = getattr(self, "_tp_host_progress", {}).get(request_generation.snapshot_id)
+                if progress is not None:
+                    context = progress.get("context")
+                    job = getattr(self, "_tp_host_handoff_jobs", {}).get(request_generation.snapshot_id)
+                    return bool(context is not None and job is not None
+                                and job.get("context") is context
+                                and context["identity"] == (job["claim_id"], job["lease_id"], job["epoch"])
+                                and not context["cancelled"] and not job["cancelled"]
+                                and not progress["cancelled"] and not progress["retired"]
+                                and job.get("manifest_ready", False))
+                # A retired/unregistered native attempt has no completion
+                # proof.  Never recreate metadata work from a stale command.
+                return False
+        from sglang.srt.disaggregation.agentic_control_store import control_enabled
+        if control_enabled():
+            from sglang.srt.disaggregation.agentic_lifecycle_control import poll_lifecycle_call
+            key = ("host-manifest", request_generation.snapshot_id)
+            ready, result = poll_lifecycle_call(
+                self, key, AgenticPHostStagingManager._complete_shared_host_manifest_sync,
+                self, request_generation,
+            )
+            if ready and result:
+                self._agentic_lifecycle_futures.pop(key, None)
+            return bool(ready and result)
+        return AgenticPHostStagingManager._complete_shared_host_manifest_sync(self, request_generation)
+
+    def _complete_shared_host_manifest_sync(self, request_generation) -> bool:
+        """Metadata-only I/O worker phase; callers retain their physical lease."""
 
         controller = getattr(self, "cache_controller", None)
         backend = getattr(controller, "storage_backend", None)
@@ -7090,6 +7890,10 @@ class AgenticPHostStagingManager:
     @staticmethod
     def _configure_hybrid_h2d_state(load: dict[str, Any]) -> None:
         """Configure the immutable destination once, on the H2D worker."""
+        if load["record"].get("network_host"):
+            # The remote worker consumes the same pinned lease's state indices;
+            # there is no local mmap snapshot to bind on this node.
+            return
         state_indices = getattr(load["workset_lease"], "state_device_indices", ())
         if not state_indices or load.get("hybrid_state_configured"):
             return
@@ -7123,11 +7927,18 @@ class AgenticPHostStagingManager:
                 lease_id=load["workset_lease"].lease_id,
                 phase="io_inflight",
             ):
-                self.workset_broker.mark_io_quiesced(
+                if not self.workset_broker.mark_io_quiesced(
                     load["request_generation"].snapshot_id,
                     load["workset_lease"],
                     load["io_attempt"],
-                )
+                ):
+                    load["remote_h2d_unfenced"] = True
+                    load["dma_quarantined"] = True
+                    raise RuntimeError("Slow pre-H2D rollback lost its workset lease")
+                # A peer can start group retry between broker fencing and
+                # ledger admission. No DMA was submitted; record the completed
+                # rollback so failure cleanup does not cancel it a second time.
+                load["io_quiesced"] = True
                 raise RuntimeError(
                     "Slow recovery lost Host ownership before H2D"
                 )
@@ -7136,16 +7947,23 @@ class AgenticPHostStagingManager:
             if load.get("remote_h2d_future") is not None:
                 return False
             snapshot_id = load["request_generation"].snapshot_id
-            entry = self.ledger.get(snapshot_id)
-            if entry is None or not entry.get("recovery_claim_id"):
-                raise RuntimeError("remote Host read lost group recovery claim")
-            attempt = f"{entry['recovery_claim_id']}:epoch:{entry['remote_read_epoch']}"
+            attempt = load.get("remote_h2d_attempt")
+            if attempt is None:
+                # Compatibility for callers without a prepared context.
+                entry = self.ledger.get(snapshot_id)
+                if entry is None or not entry.get("recovery_claim_id"):
+                    raise RuntimeError("remote Host read lost group recovery claim")
+                attempt = f"{entry['recovery_claim_id']}:epoch:{entry['remote_read_epoch']}"
             load["remote_h2d_attempt"] = attempt
             record["loading"] = "h2d"
+            context = load.get("tp_progress_context")
+            if context is not None:
+                context["timing"].setdefault("io_submitted", time.monotonic())
             load["remote_h2d_future"] = self._h2d_host_copy_pool.submit(
                 self._remote_host_bridge.load, snapshot_id,
                 record["snapshot"].grant, device_indices,
                 attempt_id=attempt,
+                state_indices=(getattr(load["workset_lease"], "state_device_indices", ()) or (None,))[0],
                 cancel_check=lambda: bool(load.get("abort_requested") or load.get("io_error")),
             )
             return True
@@ -7276,10 +8094,16 @@ class AgenticPHostStagingManager:
             if entry is None or not entry.get("recovery_claim_id"):
                 raise RuntimeError("remote Host cancellation lost recovery claim")
             attempt = f"{entry['recovery_claim_id']}:epoch:{entry['remote_read_epoch']}"
+            load["remote_h2d_attempt"] = attempt
         self._remote_host_bridge.cancel_unstarted(snapshot_id, attempt_id=attempt)
 
-    def _discard_failed_h2d_load(self, rid: str, load: dict[str, Any]) -> bool:
+    def _discard_failed_h2d_load(self, rid: str, load: dict[str, Any], *, terminal=False) -> bool:
         """Quiesce one failed shard and retain Host for a group retry."""
+        AgenticPHostStagingManager._invalidate_tp_host_load(self, load)
+        remote_retry = bool(
+            getattr(self, "_remote_host_bridge", None) is not None
+            and load.get("record", {}).get("network_host")
+        )
         if load.get("remote_h2d_unfenced"):
             return False
         remote_future = load.get("remote_h2d_future")
@@ -7352,7 +8176,9 @@ class AgenticPHostStagingManager:
                 )
                 return False
         drop_host_on_abort = bool(load.get("drop_host_on_abort"))
-        if drop_host_on_abort:
+        if terminal:
+            pass  # Rank0 already observed an authoritative terminal receipt.
+        elif drop_host_on_abort:
             try:
                 if not self.ledger.request_host_load_failure(
                     load["request_generation"].snapshot_id,
@@ -7366,7 +8192,7 @@ class AgenticPHostStagingManager:
                     load["request_generation"].snapshot_id,
                 )
                 return False
-        else:
+        elif not (remote_retry and load.get("retry_cleanup_started")):
             try:
                 if not self.ledger.request_d2p_retry(
                     load["request_generation"].snapshot_id,
@@ -7374,6 +8200,8 @@ class AgenticPHostStagingManager:
                     reason=type(load.get("io_error")).__name__,
                 ):
                     return False
+                if remote_retry:
+                    load["retry_cleanup_started"] = True
             except Exception:
                 logger.exception(
                     "AgenticKV shared_host_retry_publish_retry snapshot=%s",
@@ -7398,6 +8226,22 @@ class AgenticPHostStagingManager:
                 ):
                     return False
             load["io_quiesced"] = True
+        if terminal:
+            snapshot_id = load["request_generation"].snapshot_id
+            if not load.get("device_released"):
+                self.workset_broker.request_release(snapshot_id, workset_lease)
+                load["device_released"] = True
+            if self.workset_broker.owner_has_unretired_work(snapshot_id, owner=workset_lease.owner):
+                return False
+            if not self._release_record(load["record"]):
+                return False
+            with self._get_state_lock():
+                if self.loads.get(rid) is load:
+                    self.loads.pop(rid)
+                if self.host_ready.get(snapshot_id) is load["record"]:
+                    self.host_ready.pop(snapshot_id)
+            self._release_h2d_lane(snapshot_id)
+            return True
         if drop_host_on_abort:
             snapshot_id = load["request_generation"].snapshot_id
             workset_lease = load.get("workset_lease")
@@ -7477,13 +8321,35 @@ class AgenticPHostStagingManager:
                 )
             AgenticPHostStagingManager._release_h2d_lane(self, snapshot_id)
             return True
+        if remote_retry:
+            # Keep the frozen attempt, lease and lane until the durable retry
+            # ACK succeeds. Dropping them first turns a failed ACK into an
+            # apparently metadata-only waiter on the next scheduler tick.
+            if not load.get("device_released"):
+                self.workset_broker.request_release(
+                    load["request_generation"].snapshot_id, workset_lease
+                )
+                load["device_released"] = True
+            owner_pending = getattr(self.workset_broker, "owner_has_unretired_work", None)
+            if callable(owner_pending) and owner_pending(
+                load["request_generation"].snapshot_id,
+                owner=workset_lease.owner,
+            ):
+                return False
+            if not self.ledger.complete_d2p_retry_rank(
+                load["request_generation"].snapshot_id, self.owner,
+                tp_rank=self.tp_rank, tp_size=self.tp_size,
+                remote_read_epoch=int(load["remote_h2d_attempt"].rsplit(":epoch:", 1)[1]),
+            ):
+                return False
         # No prefetch or composite DMA can still access the old destination.
         # Keep Host bytes for the group retry but discard the old lease's
         # recurrent-slot binding before publishing this record as ready again.
         with self._get_state_lock():
             if self.loads.get(rid) is not load:
                 return True
-            if getattr(workset_lease, "state_device_indices", ()):
+            if (getattr(workset_lease, "state_device_indices", ())
+                    and not load["record"].get("network_host")):
                 load["record"]["snapshot"].reset_state_indices_after_quiesce()
             self.loads.pop(rid, None)
             if not load.get("device_released"):
@@ -7494,6 +8360,9 @@ class AgenticPHostStagingManager:
                 load["device_released"] = True
             record = load["record"]
             record["loading"] = False
+            if remote_retry and record.get("remote_h2d_attempt") == load.get("remote_h2d_attempt"):
+                record.pop("recovery_claim_id", None)
+                record.pop("remote_h2d_attempt", None)
             self.host_ready[load["request_generation"].snapshot_id] = record
             AgenticPHostStagingManager._notify_scheduler(
                 self,
@@ -7503,25 +8372,136 @@ class AgenticPHostStagingManager:
         AgenticPHostStagingManager._release_h2d_lane(
             self, load["request_generation"].snapshot_id
         )
-        self.ledger.complete_d2p_retry_rank(
-            load["request_generation"].snapshot_id,
-            self.owner,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
-        )
+        if not remote_retry:
+            self.ledger.complete_d2p_retry_rank(
+                load["request_generation"].snapshot_id,
+                self.owner,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+            )
+        return True
+
+    def _fence_prestart_remote_retry(self, req, request_generation, entry) -> bool:
+        if getattr(self.ledger, "is_event_control", False):
+            # Scheduler only posts the frozen old-attempt identity. The
+            # existing control worker performs cancellation/RPC/drain; no live
+            # Req is passed across threads and no allocator code is replayed
+            # by the scheduler while a reply is outstanding.
+            key = (request_generation.snapshot_id, req.rid,
+                   entry.get("recovery_claim_id"), entry.get("remote_read_epoch"))
+            with self._get_state_lock():
+                pending = self._prestart_remote_retries.get(key)
+                if pending is None:
+                    frozen = {name: entry[name] for name in ("recovery_claim_id", "remote_read_epoch")}
+                    self._prestart_remote_retries[key] = {
+                        "req": SimpleNamespace(rid=req.rid, _agentic_remote_retry_entry=frozen,
+                                               _agentic_host_retry_reason=True, _agentic_tp_host_failed=True),
+                        "parent": request_generation, "entry": frozen, "done": False,
+                    }
+                elif pending["done"]:
+                    self._prestart_remote_retries.pop(key)
+                    for name in ("_agentic_remote_retry_entry", "_agentic_host_retry_reason", "_agentic_tp_host_failed"):
+                        if not hasattr(pending["req"], name) and hasattr(req, name):
+                            delattr(req, name)
+                    return pending["result"]
+            self._control_wakeup.set()
+            return False
+        try:
+            return self._complete_prestart_remote_retry(req, request_generation, entry)
+        except Exception:
+            # No-load still carries an old epoch/intent. Retain that exact
+            # context on any control/fence failure instead of killing Forward
+            # or treating an exception as permission to recycle its pages.
+            logger.exception("AgenticKV remote prestart retry pending snapshot=%s",
+                             request_generation.snapshot_id)
+            return False
+
+    def _progress_prestart_remote_retries(self):
+        with self._get_state_lock():
+            pending = list(self._prestart_remote_retries.values())
+        for item in pending:
+            if item["done"]:
+                continue
+            try:
+                result = self._complete_prestart_remote_retry(item["req"], item["parent"], item["entry"])
+            except Exception:
+                logger.exception("AgenticKV remote prestart retry worker pending snapshot=%s", item["parent"].snapshot_id)
+                continue
+            if result or not hasattr(item["req"], "_agentic_remote_retry_entry"):
+                with self._get_state_lock():
+                    item.update(done=True, result=bool(result))
+                self._notify_scheduler("host_retry_done", item["parent"].snapshot_id)
+
+    def _complete_prestart_remote_retry(self, req, request_generation, entry) -> bool:
+        """A missing load is not proof that its old epoch has no resources.
+
+        Retry may win before a rank constructs a load, or while its allocator
+        intent is awaiting service. Publish the no-READ receipt and retire that
+        exact owner before allowing the ledger to re-arm the whole TP group.
+        This is only a remote failure path; normal admission is unchanged.
+        """
+        snapshot_id = request_generation.snapshot_id
+        claim_id = entry.get("recovery_claim_id")
+        if not claim_id:
+            return False
+        current = self.ledger.get(snapshot_id)
+        if current is not None and current.get("state") in {
+            HostStageState.ABORTING.value, HostStageState.FAILED.value,
+        }:
+            # Cancellation supersedes retry, including a metadata-only waiter.
+            # Let the existing abort worker finish; do not leave a Req retry
+            # flag that keeps asking ABORTING/FAILED to become RETRY_PENDING.
+            attempt = f"{claim_id}:epoch:{entry['remote_read_epoch']}"
+            # An abort still needs the old epoch's no-READ proof: terminal
+            # ledger state alone cannot release a remotely registered source.
+            self._remote_host_bridge.cancel_unstarted(snapshot_id, attempt_id=attempt)
+            self.abort_request(req.rid, request_generation)
+            for attr in ("_agentic_remote_retry_entry", "_agentic_host_retry_reason",
+                         "_agentic_tp_host_failed"):
+                if hasattr(req, attr):
+                    delattr(req, attr)
+            return False
+        attempt = f"{claim_id}:epoch:{entry['remote_read_epoch']}"
+        self._remote_host_bridge.cancel_unstarted(snapshot_id, attempt_id=attempt)
+        owner = str(claim_id)
+        self.workset_broker.cancel_unstarted(snapshot_id, owner=owner)
+        if self.workset_broker.owner_has_unretired_work(snapshot_id, owner=owner):
+            return False
+        if not self.ledger.complete_d2p_retry_rank(
+            snapshot_id, self.owner, tp_rank=self.tp_rank, tp_size=self.tp_size,
+            remote_read_epoch=int(entry["remote_read_epoch"]),
+        ):
+            return False
+        with self._get_state_lock():
+            record = self.host_ready.get(snapshot_id)
+            if record is not None:
+                record["loading"] = False
+                if record.get("remote_h2d_attempt") in {None, attempt}:
+                    record.pop("recovery_claim_id", None)
+                    record.pop("remote_h2d_attempt", None)
+        self._release_h2d_lane(snapshot_id)
         return True
 
     def _publish_d2p_hbm_ready(self, load: dict[str, Any]) -> bool:
         """Idempotently ACK a physically complete H2D shard to the ledger."""
 
         snapshot_id = load["request_generation"].snapshot_id
+        if load.get("io_complete"):
+            return True
+        context = load.get("tp_progress_context")
+        if context is not None:
+            context["timing"].setdefault("copy_done", load.get("copy_done_at", time.monotonic()))
         try:
-            acknowledged = self.ledger.complete_d2p_host_load_rank(
+            ack_ready, acknowledged = AgenticPHostStagingManager._ledger_step(
+                self, "complete_d2p_host_load_rank",
                 snapshot_id,
                 self.owner,
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
+                **AgenticPHostStagingManager._host_recovery_rpc_identity(self, load),
             )
+            if not ack_ready:
+                return False
         except Exception:
             logger.exception(
                 "AgenticKV shared_host_hbm_ack_retry snapshot=%s tp_rank=%d",
@@ -7532,6 +8512,9 @@ class AgenticPHostStagingManager:
         if not acknowledged:
             return False
         load["io_complete"] = True
+        if context is not None:
+            context["timing"]["loaded_ack"] = time.monotonic()
+            self._report_tp_host_completion(snapshot_id, context, 2)
         AgenticPHostStagingManager._notify_scheduler(
             self, "hbm_ready", snapshot_id
         )
@@ -7576,11 +8559,35 @@ class AgenticPHostStagingManager:
         with self._get_state_lock():
             loads = list(self.loads.items())
         for rid, load in loads:
+            if load.get("terminal_cleanup_requested"):
+                if not load.get("radix_bound"):
+                    self._discard_failed_h2d_load(rid, load, terminal=True)
+                continue
+            if (getattr(self.ledger, "is_event_control", False)
+                    and load.get("ledger_prepare_pending")
+                    and not load.get("abort_requested") and not load.get("io_error")):
+                if not self._prepare_h2d_load_ledger(load):
+                    self._cancel_unstarted_h2d_load(rid, load)
+                    continue
+                load["ledger_prepare_pending"] = False
+                self._notify_scheduler("host_prepared", load["request_generation"].snapshot_id)
             if load.get("abort_requested"):
                 self._discard_failed_h2d_load(rid, load)
                 continue
             snapshot_id = load["request_generation"].snapshot_id
             entry = self.ledger.get(snapshot_id)
+            if (getattr(self, "_remote_host_bridge", None) is not None
+                    and entry is not None
+                    and entry.get("state") == HostStageState.ABORTING.value
+                    and entry.get("h2d_abort_started")):
+                # A peer/application abort supersedes retry. Every shard must
+                # enter the same drained-ACK path, even if only one received
+                # the HTTP cancellation. Never keep asking ABORTING to retry.
+                load["abort_requested"] = True
+                load["drop_host_on_abort"] = True
+                load.setdefault("io_error", RuntimeError("TP peer aborted Host load"))
+                self._discard_failed_h2d_load(rid, load)
+                continue
             if entry is not None and entry.get("state") == HostStageState.FAILED.value:
                 load.setdefault(
                     "io_error", RuntimeError("another TP rank failed Slow H2D")
@@ -7618,6 +8625,11 @@ class AgenticPHostStagingManager:
             if load.get("h2d_copy_complete"):
                 self._publish_d2p_hbm_ready(load)
                 continue
+            if (getattr(self.ledger, "is_event_control", False)
+                    and getattr(self, "tp_h2d_async_prepare", False)
+                    and self.tp_size > 1 and not load.get("io_inflight")):
+                if not self._authorize_prepared_tp_host_load(load, entry):
+                    continue
             if not load.get("start_allowed"):
                 continue
             if self.tp_size > 1:
@@ -7787,6 +8799,30 @@ class AgenticPHostStagingManager:
                 context.get("recovery_claim_id")
                 or self.workset_broker.slow_owner(snapshot_id, rid)
             )
+            if (getattr(self, "_remote_host_bridge", None) is not None
+                    and entry is not None and entry.get("source_host_node")):
+                # No load/future was created, but a peer may already have
+                # opened the group attempt. Its source cannot retire until
+                # this rank also publishes a durable no-I/O receipt.
+                attempt = context.get("remote_h2d_attempt")
+                if (attempt is None and entry.get("recovery_claim_id")
+                        and entry.get("remote_read_epoch")):
+                    attempt = context["remote_h2d_attempt"] = (
+                        f"{entry['recovery_claim_id']}:epoch:{entry['remote_read_epoch']}"
+                    )
+                # An unclaimed Host snapshot has no remote attempt to drain.
+                # Never invent one from a new HTTP rid after group retry.
+                if attempt is not None:
+                    try:
+                        self._remote_host_bridge.cancel_unstarted(
+                            snapshot_id, attempt_id=attempt,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "AgenticKV prestart remote abort fence retry snapshot=%s",
+                            snapshot_id,
+                        )
+                        continue
             lease = self.workset_broker.get(snapshot_id, owner=claim_id)
             if lease is None:
                 self.workset_broker.cancel_unstarted(
@@ -7868,13 +8904,24 @@ class AgenticPHostStagingManager:
             )
         for context in pending:
             self.abort_request(
-                str(context["rid"]), context["request_generation"]
+                str(context["rid"]), context["request_generation"], _from_control=True
             )
 
-    def abort_request(self, rid: str, request_generation) -> None:
+    def abort_request(self, rid: str, request_generation, *, _from_control=False) -> None:
         """Cancel one Slow restore without racing an in-flight H2D."""
 
         snapshot_id = request_generation.snapshot_id
+        self._cancel_tp_host_handoff(snapshot_id)
+        if getattr(self.ledger, "is_event_control", False) and not _from_control:
+            # The existing abort worker owns CAS/drain. A scheduler callback
+            # only submits an immutable identity; it does not wait for RPC.
+            with self._get_state_lock():
+                pending = getattr(self, "_pending_host_abort_requests", None)
+                if pending is None:
+                    pending = self._pending_host_abort_requests = {}
+                pending[snapshot_id] = {"rid": str(rid), "request_generation": request_generation}
+            self._control_wakeup.set()
+            return
         # A CPU preparation may still hold the mapping or be publishing a
         # claim. Let its sole worker finish before the existing abort/fence
         # path can close Host or release a granted workset. Never wait here.
@@ -7894,6 +8941,7 @@ class AgenticPHostStagingManager:
                 self._control_wakeup.set()
                 return
             getattr(self, "_host_prepare_results", {}).pop(str(rid), None)
+            getattr(self, "_host_terminal_results", {}).pop(str(rid), None)
         prestart_abort = False
         with self._get_state_lock():
             pending = getattr(self, "_pending_host_abort_requests", None)
@@ -7920,6 +8968,25 @@ class AgenticPHostStagingManager:
             self._control_wakeup.set()
             return
         if not authorized:
+            # All binder ACKs may have committed before this cancellation
+            # CAS. CONSUMED deliberately rejects a new load failure/retry,
+            # but the cancelled Req still owns a local completed Host mapping.
+            # The scheduler already rolls back/releases its own HBM lease;
+            # this sole Host worker only closes the now-unneeded Host copy.
+            # Never do this for RETRY_PENDING: that copy is still retry input.
+            entry = (self.ledger.get(snapshot_id)
+                     if getattr(self.ledger, "is_event_control", False) else None)
+            if (entry is not None
+                    and entry.get("state") == HostStageState.CONSUMED.value):
+                with self._get_state_lock():
+                    record = self.host_ready.get(snapshot_id)
+                if record is not None:
+                    if not self._release_record(record):
+                        self._control_wakeup.set()
+                        return
+                    with self._get_state_lock():
+                        if self.host_ready.get(snapshot_id) is record:
+                            self.host_ready.pop(snapshot_id)
             with self._get_state_lock():
                 getattr(self, "_pending_host_abort_requests", {}).pop(
                     snapshot_id, None
@@ -7967,6 +9034,8 @@ class AgenticPHostStagingManager:
                             "request_generation": request_generation,
                             "recovery_claim_id": str(claim_id),
                         }
+                        if record.get("remote_h2d_attempt") is not None:
+                            prestart[snapshot_id]["remote_h2d_attempt"] = record["remote_h2d_attempt"]
                         prestart_abort = True
                     else:
                         self.workset_broker.cancel_unstarted(
@@ -8004,6 +9073,12 @@ class AgenticPHostStagingManager:
     def rollback_bound_parent(self, req, request_generation) -> None:
         """Undo a locally bound TP parent after a peer restore failure."""
 
+        workset_lease = getattr(req, "_agentic_host_workset_lease", None)
+        if (getattr(workset_lease, "state", None) == "handed"
+                and (getattr(req, "req_pool_idx", None) is not None
+                     or getattr(req, "_agentic_kv_gate_complete", False))):
+            raise RuntimeError("Cannot roll back an admitted Host workset")
+        self._cancel_tp_host_handoff(request_generation.snapshot_id)
         pin = getattr(req, "_agentic_kv_host_pin_node", None)
         if pin is not None:
             self.tree_cache.dec_lock_ref(pin)
@@ -8016,13 +9091,30 @@ class AgenticPHostStagingManager:
                 committed_len=committed_len,
                 _defer_if_blocked=False,
             )
-        workset_lease = getattr(req, "_agentic_host_workset_lease", None)
         if workset_lease is not None:
-            self.workset_broker.abort_bind(
-                request_generation.snapshot_id,
-                workset_lease,
-                parent_bound=True,
-            )
+            if getattr(workset_lease, "state", None) == "handed":
+                if not self.workset_broker.release_handed(
+                    request_generation.snapshot_id, workset_lease, req=req
+                ):
+                    raise RuntimeError("Host rollback lost handed Req ownership")
+                # Handoff donated runtime Mamba slots to Req, not to Radix or
+                # the lease. Native pre-admission cleanup already handles its
+                # active/tracking/checkpoint indices without a req-pool slot.
+                if (getattr(req, "_agentic_mamba_runtime_reserved", False)
+                        or getattr(req, "mamba_pool_idx", None) is not None
+                        or getattr(req, "_agentic_mamba_prefill_checkpoint", None) is not None):
+                    from sglang.srt.mem_cache.common import release_kv_cache
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                for name in ("_agentic_workset_backed", "_agentic_p_workset_lease",
+                             "_agentic_p_workset_broker", "_agentic_workset_suffix_indices"):
+                    if hasattr(req, name):
+                        delattr(req, name)
+            else:
+                self.workset_broker.abort_bind(
+                    request_generation.snapshot_id,
+                    workset_lease,
+                    parent_bound=True,
+                )
             delattr(req, "_agentic_host_workset_lease")
         else:
             self.workset_broker.cancel_unstarted(
@@ -8037,6 +9129,8 @@ class AgenticPHostStagingManager:
         for name in (
             "_agentic_host_rank_loaded",
             "_agentic_host_rank_token_count",
+            "_agentic_host_handoff_ready",
+            "_agentic_host_remote_read_epoch",
         ):
             if hasattr(req, name):
                 delattr(req, name)
@@ -8048,6 +9142,20 @@ class AgenticPHostStagingManager:
         if entry is None:
             with self._get_state_lock():
                 return True if sid in self.active or sid in self.host_ready or sid in self.aborting else None
+        if (getattr(self, "tp_h2d_async_prepare", False)
+                and entry.get("state") == HostStageState.ABORTING.value):
+            # A peer may cancel before this rank enqueues PREPARE. Reuse the
+            # worker's existing cancellation/fence path without claiming HBM
+            # or performing ledger I/O on the scheduler thread.
+            with self._get_state_lock():
+                prepare = self._host_prepares.setdefault(req.rid, {
+                    "view": SimpleNamespace(rid=str(req.rid)),
+                    "parent": request_generation,
+                    "queued_at": time.monotonic(),
+                })
+                prepare["cancelled"] = True
+            self._control_wakeup.set()
+            return True
         if entry.get("state") not in {
             HostStageState.HOST_READY.value, HostStageState.H2D_LOADING.value,
             HostStageState.FAILED.value, HostStageState.RECOMPUTE_REQUIRED.value,
@@ -8096,6 +9204,18 @@ class AgenticPHostStagingManager:
                 if self._host_prepares.get(rid) is not prepare:
                     continue
                 cancelled = prepare["cancelled"]
+            if (getattr(self, "tp_h2d_async_prepare", False) and not cancelled
+                    and "terminal_reason" not in prepare):
+                entry = self._ledger_entries_cache.get(prepare["parent"].snapshot_id, {})
+                if entry.get("state") == HostStageState.RETRY_PENDING.value:
+                    # Return control to the existing epoch-fenced retry gate.
+                    # Do not drop its Host claim, workset or lane here.
+                    with self._get_state_lock():
+                        self._host_prepares.pop(rid, None)
+                    self._notify_scheduler("host_prepare_retry", prepare["parent"].snapshot_id)
+                    continue
+                if entry.get("state") == HostStageState.ABORTING.value:
+                    prepare["cancelled"] = cancelled = True
             if cancelled:
                 # Runs on the same thread as preparation: all CPU accesses to
                 # the mapping have quiesced before the old abort path runs.
@@ -8123,18 +9243,32 @@ class AgenticPHostStagingManager:
                 continue
             result = True
             try:
+                if "terminal_reason" in prepare:
+                    if self._progress_terminal_restore(rid, prepare):
+                        with self._get_state_lock():
+                            if not prepare["cancelled"]:
+                                self._host_prepares.pop(rid, None)
+                                if not hasattr(self, "_host_terminal_results"):
+                                    self._host_terminal_results = {}
+                                self._host_terminal_results[rid] = (
+                                    prepare["parent"].snapshot_id, prepare["terminal_reason"],
+                                )
+                                self._host_prepare_results.pop(rid, None)
+                                self._notify_scheduler("host_terminal", prepare["parent"].snapshot_id)
+                    continue
                 with self._get_state_lock():
                     load = self.loads.get(rid)
                 if load is None:
                     result = self._prepare_host_restore(
                         prepare["view"], prepare["parent"],
+                        allow_start=not getattr(self, "tp_h2d_async_prepare", False),
                     )
                     with self._get_state_lock():
                         load = self.loads.get(rid)
                 elif load.get("ledger_prepare_pending"):
                     if self._prepare_h2d_load_ledger(load):
                         load["ledger_prepare_pending"] = False
-                        load["start_allowed"] = True
+                        load["start_allowed"] = not getattr(self, "tp_h2d_async_prepare", False)
                     else:
                         self._cancel_unstarted_h2d_load(rid, load)
                         load = None
@@ -8171,7 +9305,8 @@ class AgenticPHostStagingManager:
                 with self._get_state_lock():
                     sid = prepare["parent"].snapshot_id
                     if (
-                        self._host_prepares.get(rid) is prepare
+                        "terminal_reason" not in prepare
+                        and self._host_prepares.get(rid) is prepare
                         and not prepare["cancelled"]
                         and rid not in self.loads
                         and sid not in self._h2d_resident_reservations
@@ -8199,13 +9334,36 @@ class AgenticPHostStagingManager:
         """
 
         snapshot_id = request_generation.snapshot_id
+        remote_retry_entry = getattr(req, "_agentic_remote_retry_entry", None)
+        if remote_retry_entry is not None:
+            if not self._fence_prestart_remote_retry(req, request_generation, remote_retry_entry):
+                return True
+            delattr(req, "_agentic_remote_retry_entry")
+            for attr in ("_agentic_tp_host_failed", "_agentic_host_retry_reason"):
+                if hasattr(req, attr):
+                    delattr(req, attr)
+            return True
         if getattr(self, "h2d_async_prepare", False):
+            if int(getattr(self, "tp_size", 1)) == 1:
+                reason = self.terminal_restore_reason(request_generation)
+                if reason is not None:
+                    if not self.prepare_terminal_restore(req, request_generation, reason):
+                        return True
+                    req._agentic_kv_gate_complete = True
+                    req._agentic_kv_fallback = reason
+                    return False
             with self._get_state_lock():
                 if req.rid in self._host_prepares:
                     return True
                 prepared_result = self._host_prepare_results.pop(req.rid, None)
             if prepared_result is not None:
                 result, fallback = prepared_result
+                if (self.tp_size > 1 and result is False
+                        and fallback in {"shared_host_evicted", "shared_host_h2d_failed"}):
+                    # A late terminal update during ordinary preparation is
+                    # not permission for this rank to enter Forward alone.
+                    # Rank0 selects the separate terminal handoff next tick.
+                    return True
                 if result is False:
                     req._agentic_kv_gate_complete = True
                     req._agentic_kv_fallback = fallback
@@ -8215,19 +9373,30 @@ class AgenticPHostStagingManager:
             # None preserves Direct/non-Host discovery in the caller.
             if (req.rid not in self.loads
                     and not getattr(req, "_agentic_host_retry_reason", None)
-                    and not getattr(req, "_agentic_host_rank_loaded", False)):
+                    and not getattr(req, "_agentic_host_rank_loaded", False)
+                    and not (
+                        getattr(self, "tp_h2d_async_prepare", False)
+                        and self._ledger_entries_cache.get(snapshot_id, {}).get("state")
+                        == HostStageState.RETRY_PENDING.value
+                    )):
                 return self._queue_host_prepare(
                     req, request_generation,
-                    allow_prepare=allow_prepare and allow_start,
+                    allow_prepare=allow_prepare and (
+                        allow_start or getattr(self, "tp_h2d_async_prepare", False)
+                    ),
                 )
         pending_retry_reason = getattr(req, "_agentic_host_retry_reason", None)
         if pending_retry_reason is not None:
+            self._cancel_tp_host_handoff(snapshot_id)
             try:
-                retry_started = self.ledger.request_d2p_retry(
+                retry_ready, retry_started = AgenticPHostStagingManager._ledger_step(
+                    self, "request_d2p_retry",
                     snapshot_id,
                     self.owner,
                     reason=pending_retry_reason,
                 )
+                if not retry_ready:
+                    return True
             except Exception:
                 logger.exception(
                     "AgenticKV shared_host_retry_publish_retry snapshot=%s",
@@ -8242,8 +9411,11 @@ class AgenticPHostStagingManager:
             retry_entry is not None
             and retry_entry.get("state") == HostStageState.RETRY_PENDING.value
         ):
+            self._cancel_tp_host_handoff(snapshot_id)
             with self._get_state_lock():
                 retry_load = self.loads.get(req.rid)
+                if retry_load is None and getattr(self, "_remote_host_bridge", None) is not None:
+                    _, retry_load = self._find_h2d_load(snapshot_id)
             if retry_load is not None:
                 retry_load.setdefault(
                     "io_error", RuntimeError("TP group requested Slow retry")
@@ -8252,12 +9424,19 @@ class AgenticPHostStagingManager:
                 return True
             if getattr(req, "_agentic_host_rank_loaded", False):
                 self.rollback_bound_parent(req, request_generation)
-            self.ledger.complete_d2p_retry_rank(
-                snapshot_id,
-                self.owner,
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
-            )
+            if (getattr(self, "_remote_host_bridge", None) is not None
+                    and retry_entry.get("source_host_node")):
+                req._agentic_remote_retry_entry = dict(retry_entry)
+                if not self._fence_prestart_remote_retry(req, request_generation, retry_entry):
+                    return True
+                delattr(req, "_agentic_remote_retry_entry")
+            else:
+                retry_ready, retry_done = AgenticPHostStagingManager._ledger_step(
+                    self, "complete_d2p_retry_rank", snapshot_id, self.owner,
+                    tp_rank=self.tp_rank, tp_size=self.tp_size,
+                )
+                if not retry_ready or not retry_done:
+                    return True
             if hasattr(req, "_agentic_tp_host_failed"):
                 delattr(req, "_agentic_tp_host_failed")
             if hasattr(req, "_agentic_host_retry_reason"):
@@ -8294,45 +9473,53 @@ class AgenticPHostStagingManager:
                 raise RuntimeError(
                     f"TP Host workset lease disappeared for {snapshot_id}"
                 )
+            event_handoff = tp_size > 1 and getattr(self.ledger, "is_event_control", False)
+            progress, handoff_job = None, None
+            if event_handoff:
+                with AgenticPHostStagingManager._get_state_lock(self):
+                    progress = getattr(self, "_tp_host_progress", {}).get(snapshot_id)
+                    handoff_job = getattr(self, "_tp_host_handoff_jobs", {}).get(snapshot_id)
+            if event_handoff and progress is not None:
+                if progress["cancelled"] or progress["retired"]:
+                    return True
+                if handoff_job is not None and handoff_job["ready"]:
+                    if snapshot_id not in getattr(self, "tp_host_admit_snapshots", ()):
+                        return True
+                    # Rank0's ADMIT proves all exact handed ACKs committed.
+                    # This branch performs no RPC, Host close, or Future wait.
+                    return AgenticPHostStagingManager._finish_tp_host_handoff(self, req, snapshot_id)
+                if handoff_job is not None and not handoff_job["bound_ready"]:
+                    return True
+                if handoff_job is None or not handoff_job["handed_requested"]:
+                    try:
+                        self.workset_broker.handoff_to_req(snapshot_id, req, workset_lease)
+                        self._queue_tp_host_handoff(req, snapshot_id, workset_lease, progress)
+                    except Exception:
+                        logger.exception("AgenticKV shared_host_handoff_retry snapshot=%s tp_rank=%d",
+                                         snapshot_id, self.tp_rank)
+                return True
+            if event_handoff and getattr(req, "_agentic_host_handoff_ready", False):
+                if snapshot_id not in getattr(self, "tp_host_admit_snapshots", ()):
+                    return True
+                # All physical/metadata work completed before rank0 selected
+                # this native TP admission command. Do not consult a local
+                # Future or launch another RPC on this deterministic boundary.
+                return AgenticPHostStagingManager._finish_tp_host_handoff(self, req, snapshot_id)
             try:
                 self.workset_broker.handoff_to_req(
                     snapshot_id, req, workset_lease
                 )
-                if not self.ledger.mark_d2p_recovery_phase_rank(
-                    snapshot_id,
-                    self.owner,
-                    tp_rank=self.tp_rank,
-                    tp_size=self.tp_size,
-                    claim_id=workset_lease.owner,
-                    lease_id=workset_lease.lease_id,
-                    phase="handed",
-                ):
-                    raise RuntimeError(
-                        f"Slow handoff lost lifecycle ownership for {snapshot_id}"
-                    )
-            except Exception:
-                # Host remains authoritative and every cleanup marker remains
-                # intact.  Retry this idempotent ownership commit before
-                # releasing the lane or any Host extent.
-                logger.exception(
-                    "AgenticKV shared_host_handoff_retry snapshot=%s tp_rank=%d",
-                    snapshot_id,
-                    int(getattr(self, "tp_rank", 0)),
-                )
-                return True
-            tp_rank = int(getattr(self, "tp_rank", 0))
-            if tp_size > 1:
-                # Keep every physical Host shard until the entire TP group has
-                # loaded successfully and TP0 broadcasts COMMIT.  Releasing a
-                # fast rank's extent at local H2D completion makes a partially
-                # loaded group impossible to retry or diagnose safely.
+                # Close retryable local mappings before the final lifecycle
+                # ACK.  Once all ranks are handed, prune may remove this
+                # record; no later cleanup may depend on reading it again.
                 host_ready = getattr(self, "host_ready", None)
                 record = None
                 if host_ready is not None:
                     with AgenticPHostStagingManager._get_state_lock(self):
                         record = host_ready.get(snapshot_id)
                 if record is not None:
-                    self._release_record(record)
+                    if not self._release_record(record):
+                        return True
                     with AgenticPHostStagingManager._get_state_lock(self):
                         if host_ready.get(snapshot_id) is record:
                             host_ready.pop(snapshot_id, None)
@@ -8342,22 +9529,48 @@ class AgenticPHostStagingManager:
                         snapshot_id,
                         int(getattr(self, "tp_rank", 0)),
                     )
-            delattr(req, "_agentic_host_rank_loaded")
-            AgenticPHostStagingManager._release_h2d_lane(self, snapshot_id)
-            delattr(req, "_agentic_host_workset_lease")
-            req._agentic_kv_gate_complete = True
-            req._agentic_kv_host_hit_tokens = int(
-                getattr(req, "_agentic_host_rank_token_count", 0)
-            )
-            if tp_size > 1:
-                req._agentic_tp_bootstrap_snapshot_id = snapshot_id
-            if hasattr(req, "_agentic_host_rank_token_count"):
-                delattr(req, "_agentic_host_rank_token_count")
-            return False
+                handed_ready, handed = AgenticPHostStagingManager._ledger_step(
+                    self, "mark_d2p_recovery_phase_rank",
+                    snapshot_id,
+                    self.owner,
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
+                    claim_id=workset_lease.owner,
+                    lease_id=workset_lease.lease_id,
+                    phase="handed",
+                    **({"remote_read_epoch": req._agentic_host_remote_read_epoch}
+                       if getattr(self.ledger, "is_event_control", False) else {}),
+                )
+                if not handed_ready:
+                    return True
+                if not handed:
+                    raise RuntimeError(
+                        f"Slow handoff lost lifecycle ownership for {snapshot_id}"
+                    )
+            except Exception:
+                # The bound workset and request retain retry context even if
+                # local Host cleanup already succeeded.  Keep the lifecycle
+                # claim until this final idempotent acknowledgement succeeds.
+                logger.exception(
+                    "AgenticKV shared_host_handoff_retry snapshot=%s tp_rank=%d",
+                    snapshot_id,
+                    int(getattr(self, "tp_rank", 0)),
+                )
+                return True
+            if event_handoff:
+                # An asynchronous rank-local ACK cannot authorize Forward.
+                # Report ready, retain the Req/lease metadata, and wait for
+                # rank0 to admit the complete TP group on a later broadcast.
+                req._agentic_host_handoff_ready = True
+                return True
+            return AgenticPHostStagingManager._finish_tp_host_handoff(self, req, snapshot_id)
         with self._get_state_lock():
             load = self.loads.get(req.rid)
         if load is not None:
             if load.get("ledger_prepare_pending"):
+                if getattr(self.ledger, "is_event_control", False):
+                    self._control_wakeup.set()
+                    return True
                 try:
                     prepared = AgenticPHostStagingManager._prepare_h2d_load_ledger(
                         self, load
@@ -8377,6 +9590,9 @@ class AgenticPHostStagingManager:
                 load["start_allowed"] = bool(allow_start)
                 self._control_wakeup.set()
             if load.get("io_error") is not None:
+                if getattr(self.ledger, "is_event_control", False):
+                    self._control_wakeup.set()
+                    return True
                 if not self._discard_failed_h2d_load(req.rid, load):
                     return True
                 return True
@@ -8481,13 +9697,33 @@ class AgenticPHostStagingManager:
                     req.rid,
                 )
                 return None
+            if tp_size > 1 and load.get("tp_progress_context") is not None:
+                try:
+                    self._queue_tp_host_bound_ack(req, load)
+                except Exception:
+                    # No bound receipt has been queued unless local Req
+                    # handoff succeeded. Other ranks can therefore still
+                    # retain Host and follow the existing group retry fence.
+                    self.rollback_bound_parent(req, request_generation)
+                    record["loading"] = False
+                    with self._get_state_lock():
+                        self.loads.pop(req.rid, None)
+                        self.host_ready[snapshot_id] = record
+                    req._agentic_host_retry_reason = "slow_local_handoff_failed"
+                    logger.exception("AgenticKV shared_host_bound_handoff_retry snapshot=%s tp_rank=%d",
+                                     snapshot_id, tp_rank)
+                return True
             try:
-                bind_committed = self.ledger.complete_host_bind_rank(
+                bind_ready, bind_committed = AgenticPHostStagingManager._ledger_step(
+                    self, "complete_host_bind_rank",
                     snapshot_id,
                     self.owner,
                     tp_rank=tp_rank,
                     tp_size=tp_size,
+                    **AgenticPHostStagingManager._host_recovery_rpc_identity(self, load),
                 )
+                if not bind_ready:
+                    return True
             except Exception:
                 # Parent pages are already inserted and pinned, while the
                 # complete Host extent remains owned.  Retry only this
@@ -8518,6 +9754,8 @@ class AgenticPHostStagingManager:
                     record["offer"]["token_count"]
                 )
                 req._agentic_host_workset_lease = load["workset_lease"]
+                if getattr(self.ledger, "is_event_control", False):
+                    req._agentic_host_remote_read_epoch = AgenticPHostStagingManager._host_recovery_rpc_identity(self, load)["remote_read_epoch"]
                 return True
             try:
                 if not self._complete_shared_host_manifest(request_generation):
@@ -8532,7 +9770,10 @@ class AgenticPHostStagingManager:
                 self.workset_broker.handoff_to_req(
                     snapshot_id, req, load["workset_lease"]
                 )
-                if not self.ledger.mark_d2p_recovery_phase_rank(
+                if not self._release_completed_h2d_host(load):
+                    return True
+                handed_ready, handed = AgenticPHostStagingManager._ledger_step(
+                    self, "mark_d2p_recovery_phase_rank",
                     snapshot_id,
                     self.owner,
                     tp_rank=self.tp_rank,
@@ -8540,7 +9781,12 @@ class AgenticPHostStagingManager:
                     claim_id=load["recovery_claim_id"],
                     lease_id=load["workset_lease"].lease_id,
                     phase="handed",
-                ):
+                    **({"remote_read_epoch": AgenticPHostStagingManager._host_recovery_rpc_identity(self, load)["remote_read_epoch"]}
+                       if getattr(self.ledger, "is_event_control", False) else {}),
+                )
+                if not handed_ready:
+                    return True
+                if not handed:
                     raise RuntimeError(
                         f"Slow handoff lost lifecycle ownership for {snapshot_id}"
                     )
@@ -8551,8 +9797,6 @@ class AgenticPHostStagingManager:
                     "AgenticKV shared_host_handoff_retry snapshot=%s tp_rank=0",
                     snapshot_id,
                 )
-                return True
-            if not self._release_completed_h2d_host(load):
                 return True
             if getattr(self, "h2d_decoupled", False):
                 now = time.monotonic()
@@ -8576,12 +9820,32 @@ class AgenticPHostStagingManager:
         if getattr(self, "h2d_async_prepare", False):
             return self._queue_host_prepare(
                 req, request_generation,
-                allow_prepare=allow_prepare and allow_start,
+                allow_prepare=allow_prepare and (
+                    allow_start or getattr(self, "tp_h2d_async_prepare", False)
+                ),
             )
         return self._prepare_host_restore(
             req, request_generation, allow_prepare=allow_prepare,
             allow_start=allow_start,
         )
+
+    def _finish_tp_host_handoff(self, req, snapshot_id):
+        """Scheduler-only, memory-only finalization of an admitted TP request."""
+        with AgenticPHostStagingManager._get_state_lock(self):
+            getattr(self, "_tp_host_handoff_jobs", {}).pop(snapshot_id, None)
+        delattr(req, "_agentic_host_rank_loaded")
+        AgenticPHostStagingManager._release_h2d_lane(self, snapshot_id)
+        delattr(req, "_agentic_host_workset_lease")
+        for name in ("_agentic_host_remote_read_epoch", "_agentic_host_handoff_ready"):
+            if hasattr(req, name):
+                delattr(req, name)
+        req._agentic_kv_gate_complete = True
+        req._agentic_kv_host_hit_tokens = int(getattr(req, "_agentic_host_rank_token_count", 0))
+        if int(getattr(self, "tp_size", 1)) > 1:
+            req._agentic_tp_bootstrap_snapshot_id = snapshot_id
+        if hasattr(req, "_agentic_host_rank_token_count"):
+            delattr(req, "_agentic_host_rank_token_count")
+        return False
 
     def _prepare_host_restore(
         self, req, request_generation, *, allow_prepare=True, allow_start=True,
@@ -8728,11 +9992,11 @@ class AgenticPHostStagingManager:
             # before that CAS succeeds.
             if not loading:
                 record["loading"] = "h2d_claiming"
-        # Each admitted snapshot owns one isolated H2D lane.  The lane is
-        # reserved before this workset intent is created, so no more than
-        # ``max_h2d_inflight`` Slow leases can consume P HBM.  Distinct streams,
-        # pinned bounces, and GPU staging tensors let the control worker pipeline
-        # several snapshots without cross-request buffer reuse.
+        # Reserve an isolated H2D lane before requesting a workset. Pending
+        # copies are lane-bounded; copied worksets may independently remain in
+        # HBM awaiting Prefill, bounded by the complete-workset allocator.
+        # Distinct streams, bounces and staging tensors prevent buffer reuse
+        # until each physical copy fence completes.
         offer = record["offer"]
         parent_tokens = req.origin_input_ids[: int(offer["token_count"])]
         from sglang.srt.disaggregation.agentic_kv_lifecycle import token_ids_digest
@@ -8798,6 +10062,28 @@ class AgenticPHostStagingManager:
             return True
         record["recovery_claim_id"] = recovery_claim_id
         record["loading"] = "h2d_reserving"
+        if record.get("network_host"):
+            claimed_entry = self.ledger.get(snapshot_id)
+            if (claimed_entry is None
+                    or claimed_entry.get("recovery_claim_id") != recovery_claim_id):
+                return True
+            if getattr(self.workset_broker, "controller_mode", False):
+                # Only the authoritative Host claim supplies a new epoch. A
+                # local absence of a lease is not permission to revive a
+                # cancelled capacity waiter. This epoch can advance only after
+                # the previous all-rank Host retry/drain barrier re-armed it.
+                if not self.workset_broker.bind_restore_epoch(
+                    snapshot_id, workset_owner, int(claimed_entry["remote_read_epoch"])
+                ):
+                    return True
+            # Freeze the epoch before asynchronous prepare/start and retry can
+            # race; an old context must never fence the successor's attempt.
+            remote_attempt = (
+                f"{recovery_claim_id}:epoch:{claimed_entry['remote_read_epoch']}"
+            )
+            if record.get("remote_h2d_attempt") not in {None, remote_attempt}:
+                raise RuntimeError("prepared Host context belongs to a different recovery epoch")
+            record.setdefault("remote_h2d_attempt", remote_attempt)
         prompt_tokens = len(req.origin_input_ids)
         # Async preparation is single-writer and its cancellation is queued
         # back to that same worker. Scheduler gate cannot touch this rid until
@@ -8878,6 +10164,7 @@ class AgenticPHostStagingManager:
                 "device_indices": device_indices,
                 "workset_lease": workset_lease,
                 "recovery_claim_id": recovery_claim_id,
+                "remote_h2d_attempt": record.get("remote_h2d_attempt"),
                 "io_attempt": io_attempt,
                 "io_inflight": False,
                 "io_quiesced": False,
@@ -8894,6 +10181,7 @@ class AgenticPHostStagingManager:
                 "h2d_lane_id": h2d_lane_id,
                 "ledger_prepare_pending": True,
             }
+            AgenticPHostStagingManager._capture_tp_host_context(self, self.loads[req.rid])
         try:
             prepared = AgenticPHostStagingManager._prepare_h2d_load_ledger(
                 self, self.loads[req.rid]
@@ -8914,6 +10202,12 @@ class AgenticPHostStagingManager:
             return True
         self.loads[req.rid]["ledger_prepare_pending"] = False
         self.loads[req.rid]["start_allowed"] = bool(allow_start)
+        logger.info(
+            "AgenticKV shared_host_h2d_prepared snapshot=%s tp_rank=%d lane=%d "
+            "selected_to_grant_ms=%.3f",
+            snapshot_id, self.tp_rank, h2d_lane_id,
+            1000 * (time.monotonic() - record["selected_at"]),
+        )
         # TP ranks still wait for the shared ledger to enter H2D_LOADING; TP1
         # can start immediately.  Both are progressed by the independent worker.
         self._control_wakeup.set()
@@ -9877,7 +11171,10 @@ class AgenticDHostStagingClient:
         local_write_only: bool = False,
     ) -> str:
         snapshot_id = candidate["manifest"].snapshot_id
-        if local_write_only:
+        # Every rank follows the same physical-copy path after obtaining an
+        # immutable Host grant. Shared state is consulted again at the final
+        # durable CAS, not once per chunk (particularly expensive on NFS).
+        if local_write_only or self.has_active_local_write(candidate):
             if not self.has_active_local_write(candidate):
                 raise ValueError("local D2H progress requires an active Host write")
             # The immutable extent and transfer mode were captured before the
@@ -10038,9 +11335,19 @@ class AgenticDHostStagingClient:
             candidate.pop("arena_write_retry_at", None)
         chunks = write["chunks"]
 
-        # Retire at most one physical stage per progress visit.  This keeps the
-        # control worker bounded while allowing DMA(N+1) to run as soon as the
-        # previous DMA hands bounce[N] to an independent CPU commit worker.
+        if any(
+            chunk.get("launch_fence") is not None and chunk["launch_fence"].unavailable
+            for chunk in chunks.values()
+        ):
+            # A failed local fence is never safe to advance, even when shared
+            # cancellation state is not polled. Reuse the existing quarantine
+            # cleanup, which retains both source and destination ownership.
+            self._cleanup_write(candidate)
+            return "waiting"
+
+        # Retire ready commits and hand completed DMA to the CPU worker in the
+        # same bounded visit. There is still only one _start_write_chunk below:
+        # never enqueue the remainder of a long snapshot in a loop.
         for lane_id, chunk in tuple(chunks.items()):
             cpu_future = chunk.get("cpu_future")
             if cpu_future is None or not cpu_future.done():
@@ -10072,7 +11379,6 @@ class AgenticDHostStagingClient:
             chunks.pop(lane_id, None)
             lane["snapshot_id"] = None
             lane["phase"] = "free"
-            return "waiting"
 
         for lane_id, chunk in tuple(chunks.items()):
             if chunk.get("launch_error") is None:
@@ -10138,7 +11444,6 @@ class AgenticDHostStagingClient:
                     **copy_kwargs,
                 )
             chunk["cpu_future"] = future
-            return "waiting"
 
         has_unassigned_range = bool(write["retry_ranges"]) or int(
             write["next_offset"]

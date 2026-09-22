@@ -805,7 +805,8 @@ class MambaRadixCache(BasePrefixCache):
         self._release_unowned_mamba_checkpoints()
 
         if (chunked and getattr(req, "_agentic_prefill_mamba_admitted", False)
-                and getattr(req, "_agentic_mamba_prefill_checkpoint", None) is None):
+                and getattr(req, "_agentic_mamba_prefill_checkpoint", None) is None
+                and getattr(req, "_agentic_checkpoint_rotation", None) is None):
             # Recycle the just-retired chunk checkpoint before another input
             # workset can take it. No in-flight or shared state is evicted.
             req._agentic_mamba_prefill_checkpoint = self.req_to_token_pool.mamba_pool.alloc(1)

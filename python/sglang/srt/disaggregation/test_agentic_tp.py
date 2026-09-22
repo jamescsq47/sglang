@@ -278,6 +278,22 @@ def test_relay_claim_and_prune_preserve_unrelated_relay_snapshot():
             assert set(json.load(handle)["entries"]) == {snapshot_ids[1]}
 
 
+def test_host_notification_failure_does_not_undo_authoritative_commit():
+    ledger, path = _ledger()
+    def fail_notification(_):
+        raise OSError("injected notification write failure")
+    ledger.event_journal = SimpleNamespace(publish=fail_notification)
+    try:
+        first = ledger.offer(_rank_offer(0))
+        second = ledger.offer(_rank_offer(1))
+        assert second["state"] == HostStageState.OFFERED.value
+        assert ledger.get(first["snapshot_id"])["_event_revision"] == 2
+        assert ledger.snapshot_entries(force_refresh=True)[first["snapshot_id"]]["state"] == HostStageState.OFFERED.value
+    finally:
+        os.unlink(path)
+        shutil.rmtree(ledger.event_directory)
+
+
 def test_host_control_applies_only_new_snapshot_delta():
     manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
     manager._ledger_event_queue = queue.SimpleQueue()
@@ -316,6 +332,62 @@ def test_host_control_applies_only_new_snapshot_delta():
         == HostStageState.HOST_READY.value
     )
     assert manager._ledger_event_ready.is_set() is False
+
+
+def test_host_background_resync_cannot_block_physical_progress():
+    manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
+    entered, release = threading.Event(), threading.Event()
+    manager._ledger_changed = threading.Event()
+    manager._ledger_changed.set()
+    manager._ledger_event_queue = queue.SimpleQueue()
+    manager._ledger_event_ready = threading.Event()
+    manager._control_wakeup = threading.Event()
+    manager._ledger_background_resync = True
+    manager._ledger_entries_cache = {}
+    manager._last_ledger_refresh = manager._last_prune = 0
+    manager._control_idle_backstop = 5.0
+    watcher = SimpleNamespace(healthy=True, poll=lambda **kw: ((), False))
+    manager._ledger_watcher = watcher
+
+    def scan(**kw):
+        entered.set()
+        assert release.wait(2)
+        watcher.healthy = False
+        return {"r:0": {"_event_revision": 3}}
+
+    manager.ledger = SimpleNamespace(snapshot_entries=scan, prune=lambda: None)
+    manager._next_poll_at = manager._poll_interval = 0
+    visits = []
+    for name in ("_progress_arena_grants", "_progress_host_abort_requests",
+                 "_progress_prestart_aborts", "_progress_h2d_loads",
+                 "_progress_host_prepares", "_progress_spills", "_maybe_spill",
+                 "_maybe_evict_shared_host"):
+        setattr(manager, name, lambda name=name: visits.append(name))
+    worker = threading.Thread(target=manager._ledger_watch_worker)
+    worker.start()
+    try:
+        assert entered.wait(1)
+        for _ in range(3):
+            manager._poll_once()
+        assert visits.count("_progress_h2d_loads") == 3
+        assert not manager._ledger_changed.is_set()  # no rescan feedback loop
+    finally:
+        release.set()
+        worker.join(2)
+    assert not worker.is_alive()
+    assert manager._apply_ledger_events() == {"r:0"}
+
+
+def test_host_resync_then_new_event_preserves_latest_revision():
+    manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
+    manager._ledger_event_queue = queue.SimpleQueue()
+    manager._ledger_event_ready = threading.Event()
+    manager._ledger_entries_cache = {"pruned:0": {"_event_revision": 1}}
+    manager._ledger_event_queue.put({"resync_entries": {"r:0": {"_event_revision": 2}}})
+    manager._ledger_event_queue.put({"snapshot_id": "r:0", "revision": 3,
+                                   "entry": {"_event_revision": 3}})
+    assert manager._apply_ledger_events() == {"pruned:0", "r:0"}
+    assert manager._ledger_entries_cache == {"r:0": {"_event_revision": 3}}
 
 
 def test_ledger_force_refresh_bypasses_cross_process_cache(monkeypatch):
@@ -4101,6 +4173,65 @@ def test_d2p_slow_control_uses_sticky_bounded_round_robin_window():
     )
 
 
+@pytest.mark.parametrize("tp_size", [2, 8])
+def test_follower_slow_progress_does_not_query_unrelated_rank_mailboxes(tp_size):
+    manager = DecodeKVCacheOffloadManager.__new__(DecodeKVCacheOffloadManager)
+    manager.tp_world_size = tp_size
+    manager.tp_rank = 1
+    manager.agentic_relay_worker = None
+    manager._agentic_candidates_lock = threading.RLock()
+    manager._agentic_slow_active_limit = 4
+    manager._agentic_slow_progress_budget = 4
+    progressed = []
+
+    def unexpected_status(*_args):
+        raise AssertionError("authoritative Slow must not scan Direct abort files")
+
+    manager.agentic_tp_direct_abort_mailbox = SimpleNamespace(
+        local_status=unexpected_status,
+    )
+    manager.agentic_host_staging_client = SimpleNamespace(
+        max_active_writes=4,
+        progress=lambda c, _indices: progressed.append(c["manifest"].snapshot_id),
+    )
+    manager.agentic_direct_candidates = {}
+    # Waiting Direct candidates must be handled by the Direct worker, not
+    # scanned on each small Slow DMA progress step.
+    for index in range(64):
+        manager.agentic_direct_candidates[f"wait:{index}"] = {"tp_command": "wait"}
+    for index in range(56):
+        sid = f"slow:{index}"
+        manager.agentic_direct_candidates[sid] = {
+            "tp_command": "slow", "staging": True,
+            "manifest": SimpleNamespace(snapshot_id=sid, state=SnapshotState.SLOW_FALLBACK),
+            "io_lock": threading.RLock(), "source_token_indices": [1],
+            "local_prepared": True, "setup_committed": True, "setup_logged": True,
+        }
+    manager._check_agentic_tp_follower_progress(progress_relay=False, progress_class="slow")
+    assert progressed == [f"slow:{i}" for i in range(4)]
+    # Sticky window: do not offer the queued 52 snapshots on the next visit.
+    progressed.clear()
+    manager._check_agentic_tp_follower_progress(progress_relay=False, progress_class="slow")
+    assert progressed == [f"slow:{i}" for i in range(4)]
+
+
+def test_follower_direct_skips_slow_before_any_mailbox_io():
+    def unexpected_status(*_args):
+        raise AssertionError("Direct must not touch a Slow candidate's old epoch")
+
+    manager = SimpleNamespace(
+        tp_world_size=8, tp_rank=1, agentic_relay_worker=None,
+        agentic_tp_direct_abort_mailbox=SimpleNamespace(local_status=unexpected_status),
+        _agentic_candidate_items=lambda: tuple(
+            (f"slow:{i}", {"tp_command": "slow", "tp_direct_abort_requested": True})
+            for i in range(56)
+        ),
+    )
+    DecodeKVCacheOffloadManager._check_agentic_tp_follower_progress(
+        manager, progress_relay=False, progress_class="direct"
+    )
+
+
 def test_d2p_active_host_write_can_progress_without_ledger_poll():
     candidate = {
         "manifest": SimpleNamespace(snapshot_id="slow:local"),
@@ -4120,6 +4251,7 @@ def test_d2p_active_host_write_can_progress_without_ledger_poll():
     client._start_write_chunk = lambda _candidate, _indices: False
 
     assert client.has_active_local_write(candidate)
+    assert client.progress(candidate, [0]) == "waiting"
     assert client.progress(candidate, [0], local_write_only=True) == "waiting"
 
 
@@ -4134,8 +4266,9 @@ def test_shared_arena_spill_capability_has_one_compatibility_rule():
 @pytest.mark.parametrize(
     ("commit_succeeds", "expected"), [(True, "host_ready"), (False, "failed")]
 )
+@pytest.mark.parametrize("tp_size", [1, 2, 8])
 def test_tp1_d2p_local_write_uses_final_commit_as_durability_fence(
-    commit_succeeds, expected
+    commit_succeeds, expected, tp_size
 ):
     snapshot_id = "slow:final-fence"
 
@@ -4187,8 +4320,8 @@ def test_tp1_d2p_local_write_uses_final_commit_as_durability_fence(
     }
     drained = []
     client = AgenticDHostStagingClient.__new__(AgenticDHostStagingClient)
-    client.tp_rank = 0
-    client.tp_size = 1
+    client.tp_rank = tp_size - 1
+    client.tp_size = tp_size
     client._d2h_lanes = [
         {"snapshot_id": snapshot_id, "host_bounce": object(), "phase": "dma"}
     ]
@@ -4198,18 +4331,15 @@ def test_tp1_d2p_local_write_uses_final_commit_as_durability_fence(
             (args, kwargs)
         )
         or True,
-        get=lambda _snapshot_id: pytest.fail(
-            "TP1 final commit must not perform a second ledger read"
+        get=lambda _snapshot_id: (
+            {"state": HostStageState.HOST_READY.value}
+            if tp_size > 1 else pytest.fail("TP1 final commit must not read again")
         ),
     )
     client._cleanup_relay_senders = lambda _candidate: None
 
-    # DMA completion, CPU commit retirement and final durability publication
-    # are three independently bounded progress stages.
-    assert (
-        client.progress(candidate, torch.arange(1), local_write_only=True)
-        == "waiting"
-    )
+    # DMA completion hands off to CPU. The next visit retires the CPU fence
+    # and publishes durability without an extra idle progress round.
     assert (
         client.progress(candidate, torch.arange(1), local_write_only=True)
         == "waiting"
@@ -4219,6 +4349,9 @@ def test_tp1_d2p_local_write_uses_final_commit_as_durability_fence(
     assert snapshot.closed
     assert client._d2h_lanes[0]["snapshot_id"] is None
     assert bool(drained) is (not commit_succeeds)
+    if drained:
+        assert drained[0][1]["tp_rank"] == tp_size - 1
+        assert drained[0][1]["tp_size"] == tp_size
 
 
 def test_d2p_pageable_commit_retains_d_source_and_bounce_until_cpu_fence():
@@ -4307,10 +4440,6 @@ def test_d2p_pageable_commit_retains_d_source_and_bounce_until_cpu_fence():
     function, args, kwargs = pool.job
     function(*args, **kwargs)
     pool.future.set_result(0.003)
-    assert (
-        client.progress(candidate, torch.arange(1), local_write_only=True)
-        == "waiting"
-    )
     assert client.progress(candidate, torch.arange(1), local_write_only=True) == "host_ready"
     assert snapshot.commits == [
         (bounce, {"destination_start": 0, "token_count": 1})
@@ -4405,17 +4534,18 @@ def test_d2p_next_dma_overlaps_previous_cpu_commit_without_extra_dma_pressure():
     ]
 
     indices = torch.arange(8)
-    # Visit 1 hands chunk 0 to the CPU worker.  Its Future remains pending.
+    # One visit retires DMA 0 and starts at most one next DMA. CPU 0 remains
+    # pending, so its bounce must stay pinned while DMA 1 uses the other slot.
     assert client.progress(candidate, indices, local_write_only=True) == "waiting"
     assert client._d2h_lanes[0]["phase"] == "cpu"
-    # Visit 2 is allowed to launch chunk 1 into the alternate bounce, while
-    # the prior CPU Future still owns bounce 0.  DMA inflight remains capped at 1.
-    assert client.progress(candidate, indices, local_write_only=True) == "waiting"
     chunks = candidate["arena_write"]["chunks"]
     assert set(chunks) == {0, 1}
     assert chunks[0]["cpu_future"] is client._d2h_host_copy_pool.future
     assert chunks[1]["phase"] == "dma"
     assert sum(lane["phase"] == "dma" for lane in client._d2h_lanes) == 1
+    assert len(snapshot.started) == 1
+    assert client.progress(candidate, indices, local_write_only=True) == "waiting"
+    assert len(snapshot.started) == 1
 
 
 def test_d2p_shared_arena_offer_omits_unused_spill_hashes():
@@ -6669,6 +6799,7 @@ def test_d_host_extent_open_transient_failure_retains_d_source_and_retries():
         tp_rank=0,
         tp_size=1,
         relay_enabled=False,
+        has_active_local_write=AgenticDHostStagingClient.has_active_local_write,
         _start_write=lambda *_args: (_ for _ in ()).throw(
             OSError(errno.EAGAIN, "injected transient open failure")
         ),
@@ -9596,7 +9727,8 @@ def test_fast_direct_failure_recompute_keeps_slow_tools_on_host(
 @pytest.mark.parametrize("poll_state", [KVPoll.Success, KVPoll.Failed, KVPoll.Transferring])
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("adaptive", [None, False, True])
-def test_returned_direct_claim_policy_respects_physical_fence(sent, poll_state, enabled, adaptive, monkeypatch):
+@pytest.mark.parametrize("host_enabled", [False, True])
+def test_returned_direct_claim_policy_respects_physical_fence(sent, poll_state, enabled, adaptive, host_enabled, monkeypatch):
     request = RequestGeneration("returned-direct-policy", 1)
     manifest = SimpleNamespace(
         request=request, snapshot_id=request.snapshot_id,
@@ -9613,7 +9745,8 @@ def test_returned_direct_claim_policy_respects_physical_fence(sent, poll_state, 
     manager = SimpleNamespace(
         tp_world_size=1, tp_rank=0, agentic_relay_worker=None,
         agentic_fast_threshold=1000.0, agentic_fast_direct_failure_recompute=enabled,
-        agentic_host_staging_client=object(),
+        agentic_host_staging_client=object() if host_enabled else None,
+        _decode_io_async_enabled=True,
         _agentic_candidate_items=lambda: ((request.snapshot_id, candidate),),
         _agentic_candidate_is_live_locked=lambda sid, value: value is candidate,
         _agentic_try_final_confirmation=lambda _: False,
@@ -9644,7 +9777,7 @@ def test_returned_direct_claim_policy_respects_physical_fence(sent, poll_state, 
     DecodeKVCacheOffloadManager._check_agentic_direct_progress(manager, progress_relay=False)
     if sent and poll_state == KVPoll.Transferring:
         assert events == []
-    elif (enabled if adaptive is None else adaptive):
+    elif not host_enabled or (enabled if adaptive is None else adaptive):
         assert events == ["terminal", "recompute", "cleanup", "release"]
     else:
         assert events == ["slow", "host_writing"]
@@ -10642,6 +10775,7 @@ def test_tp_direct_group_completion_wakes_router_without_scheduler_tick():
         scheduler = SimpleNamespace(
             tp_rank=0,
             agentic_tp_direct_mailbox=mailboxes[0],
+            tp_size=2,
             agentic_early_direct_poll_lock=nullcontext(),
             agentic_tp_direct_admission_active={request.snapshot_id: object()},
             agentic_early_direct_receives={request.snapshot_id: entry},

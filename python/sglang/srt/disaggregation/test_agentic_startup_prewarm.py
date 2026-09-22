@@ -1,4 +1,5 @@
 import json
+import pytest
 from pathlib import Path
 
 from sglang.srt.disaggregation import agentic_host_staging as staging
@@ -12,6 +13,91 @@ class _FakeMapping:
 
     def wait_prewarm(self, timeout):
         self.waits.append(timeout)
+
+
+@pytest.mark.parametrize("role", ["prefill", "decode"])
+@pytest.mark.parametrize("fails", [False, True])
+def test_multinode_prewarm_only_local_source(monkeypatch, tmp_path, role, fails):
+    _configure(monkeypatch, tmp_path)
+    opened = []
+
+    def open_mapping(path, device):
+        assert path == "local-source"
+        opened.append(path)
+        if fails:
+            raise RuntimeError("injected registration failure")
+        return _FakeMapping(path)
+
+    monkeypatch.setattr(staging, "_registered_host_arena", open_mapping)
+    worker = staging.start_registered_host_arena_startup_prewarm(
+        role=role, engine_id="engine", tp_rank=0, device="cuda:0",
+        d2p_arena_path="remote-must-not-open", p2d_arena_path="remote-must-not-open",
+        local_source_paths=["local-source"],
+    )
+    # No remote arena manifests exist: explicit source mode must not need them.
+    assert not list((tmp_path / "complete").glob("*.json"))
+    (tmp_path / "start").touch()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert opened == ["local-source"]
+    assert len(list((tmp_path / "failed").glob("*.json"))) == int(fails)
+    assert len(list((tmp_path / "complete").glob("*.json"))) == int(not fails)
+
+
+def test_direct_only_decode_reports_zero_byte_prewarm(monkeypatch, tmp_path):
+    _configure(monkeypatch, tmp_path)
+    monkeypatch.setenv("SGLANG_AGENTIC_KV_HOST_STAGING", "false")
+    def no_mapping(*args, **kwargs):
+        pytest.fail("Direct-only D must not register any Host arena")
+    monkeypatch.setattr(staging, "_registered_host_arena", no_mapping)
+    worker = staging.start_registered_host_arena_startup_prewarm(
+        role="decode", engine_id="engine", tp_rank=0, device="cuda:0",
+        local_source_paths=[],
+    )
+    (tmp_path / "start").touch()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    record = json.loads(next((tmp_path / "complete").glob("*.json")).read_text())
+    assert record["arena_count"] == 0
+    assert record["registered_bytes"] == 0
+
+
+@pytest.mark.parametrize("role,enabled", [("prefill", "false"), ("decode", "true")])
+def test_empty_source_rejected_for_enabled_host(monkeypatch, tmp_path, role, enabled):
+    _configure(monkeypatch, tmp_path)
+    monkeypatch.setenv("SGLANG_AGENTIC_KV_HOST_STAGING", enabled)
+    with pytest.raises(ValueError, match="requires a source arena"):
+        staging.start_registered_host_arena_startup_prewarm(
+            role=role, engine_id="engine", tp_rank=0, device="cuda:0",
+            local_source_paths=[],
+        )
+
+
+def test_prewarm_captures_rank_device_before_spawning(monkeypatch, tmp_path):
+    import threading
+    _configure(monkeypatch, tmp_path)
+    caller = threading.get_ident()
+    devices = []
+
+    def current_device():
+        assert threading.get_ident() == caller
+        return 7
+
+    def open_mapping(path, device):
+        assert threading.get_ident() != caller
+        devices.append(str(device))
+        return _FakeMapping(path)
+
+    monkeypatch.setattr(staging.torch.cuda, "current_device", current_device)
+    monkeypatch.setattr(staging, "_registered_host_arena", open_mapping)
+    (tmp_path / "start").touch()
+    worker = staging.start_registered_host_arena_startup_prewarm(
+        role="decode", engine_id="decode-0", tp_rank=0, device="cuda",
+        local_source_paths=["source-local"],
+    )
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert devices == ["cuda:7"]
 
 
 def _configure(monkeypatch, root: Path, *, domain: int = 0):

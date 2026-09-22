@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
-SCRIPT_DIR="/homes/siqic/slime/examples/pd/scripts/new_method/internal"
+SCRIPT_DIR="${PD_SCRIPT_INTERNAL_DIR:-/homes/siqic/slime/examples/pd/scripts/new_method/internal}"
 PD_DIR="$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"
 REPO_ROOT="$(cd -- "${PD_DIR}/../.." && pwd)"
 WORKSPACE_ROOT="$(dirname -- "${REPO_ROOT}")"

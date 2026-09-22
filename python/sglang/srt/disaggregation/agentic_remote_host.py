@@ -34,6 +34,7 @@ class HostShard:
     address: int
     byte_size: int
     metadata_b64: str
+    peer_id: str = ""
 
     def validate(self) -> None:
         if not self.snapshot_id or not self.export_id or not self.layout:
@@ -284,28 +285,67 @@ class RemoteHostTransport:
     dedicated to remote Host I/O. No HTTP/NFS data fallback is provided.
     """
 
-    def __init__(self, agent: Any, *, lock=None, backends=("UCX",), max_reads=128):
-        if int(max_reads) < 1:
-            raise ValueError("max_reads must be positive")
+    def __init__(self, agent: Any, *, lock=None, backends=("UCX",), max_reads=128,
+                 max_peer_imports=256):
+        if int(max_reads) < 1 or int(max_peer_imports) < 1:
+            raise ValueError("read and peer import limits must be positive")
         self.agent = agent
         self.lock = lock if lock is not None else threading.RLock()
+        self._peer_condition = threading.Condition(self.lock)
         self.backends = list(backends)
         # Registry owns live mappings even if an integration drops its wrapper.
         self.exports = {}
         self.quarantined = {}
         self.max_reads = int(max_reads)
+        self.max_peer_imports = int(max_peer_imports)
         # Retain handles across caller exceptions/GC. Completed entries also
         # suppress duplicate posts until the authoritative attempt is retired.
         self.reads = {}
-        self._remote_peers = set()
+        # Loading partial metadata also establishes the UCX connection. Keep
+        # that connection across reads: disconnect/reconnect for every idle
+        # gap eventually exhausts mlx5 DevX QP creation resources.  Metadata
+        # for old, deregistered extents is reclaimed by a bounded rollover,
+        # but only after every READ using this peer is physically fenced.
+        self._remote_peers = {}
+        self._imported_exports = {}
+        self._imported_ranges = {}
 
-    def _retire_unused_peers(self):
-        active = {getattr(record[1], "peer", None) for record in self.reads.values()}
-        for peer in self._remote_peers - active:
-            # Called only under the agent lock after all handles for this peer
-            # are fenced. Future reads reload fresh partial metadata.
-            self.agent.remove_remote_agent(peer)
-            self._remote_peers.remove(peer)
+    def _active_peers(self):
+        return {getattr(record[1], "peer", None) for record in self.reads.values()}
+
+    def _drop_peer(self, peer_id):
+        record = self._remote_peers.pop(peer_id)
+        self.agent.remove_remote_agent(record["peer"])
+        for export_id, imported_peer_id in tuple(self._imported_exports.items()):
+            if imported_peer_id == peer_id:
+                self._imported_exports.pop(export_id)
+                self._imported_ranges.pop(export_id, None)
+
+    def _rollover_saturated_peers(self, *, force=False):
+        active = self._active_peers()
+        for peer_id, record in tuple(self._remote_peers.items()):
+            if record["peer"] in active or (not force and record["imports"] < self.max_peer_imports):
+                continue
+            self._drop_peer(peer_id)
+
+    def _peer_range_conflicts(self, peer_id, shard):
+        start, end = int(shard.address), int(shard.address) + int(shard.byte_size)
+        return any(
+            imported_peer_id == peer_id and left < end and start < right
+            for export_id, imported_peer_id in self._imported_exports.items()
+            for left, right in (self._imported_ranges[export_id],)
+        )
+
+    def close_remote_peers(self) -> None:
+        """Disconnect idle peers explicitly at engine teardown.
+
+        Process exit remains the final fallback.  A live READ is never treated
+        as fenced merely because shutdown was requested.
+        """
+        with self.lock:
+            if self.reads:
+                raise RuntimeError("cannot close remote peers with live READ handles")
+            self._rollover_saturated_peers(force=True)
 
     def retire_read(self, export_id: str, read_id: str) -> bool:
         """Forget a physically fenced attempt after control-plane retirement.
@@ -317,7 +357,7 @@ class RemoteHostTransport:
         with self.lock:
             record = self.reads.get(key)
             if record is None:
-                self._retire_unused_peers()
+                self._rollover_saturated_peers()
                 return False
             pending = record[1]
             if pending.handle is not None or (
@@ -325,14 +365,16 @@ class RemoteHostTransport:
             ):
                 raise RuntimeError("cannot retire an unfenced READ handle")
             self.reads.pop(key)
-            self._retire_unused_peers()
+            self._rollover_saturated_peers()
+            self._peer_condition.notify_all()
             return True
 
     def export(self, *, snapshot_id, tp_rank, tp_size, layout, token_count, address,
                byte_size, keepalive) -> RemoteHostExport:
         """Call ONLY after local D2H fence + authoritative eviction pin."""
         shard = HostShard(str(snapshot_id), uuid.uuid4().hex, int(tp_rank),
-                          int(tp_size), str(layout), int(token_count), int(address), int(byte_size), "")
+                          int(tp_size), str(layout), int(token_count), int(address), int(byte_size), "",
+                          str(getattr(self.agent, "name", "")))
         shard.validate()
         if keepalive is None:
             raise ValueError("a live source mapping reference is required")
@@ -383,7 +425,7 @@ class RemoteHostTransport:
 
     def prepare_read(self, shard: HostShard, *, read_id: str, tp_rank: int,
                      tp_size: int, layout: str, gpu_id: int,
-                     spans: Sequence[tuple[int, int, int]]) -> RemoteHostRead:
+                     spans: Sequence[tuple[int, int, int]], payload_ranges=None) -> RemoteHostRead:
         """Prepare after source claim and full destination workset allocation.
 
         Spans must cover the entire exported shard exactly once in source order.
@@ -394,11 +436,28 @@ class RemoteHostTransport:
             raise ValueError("TP shard/layout mismatch")
         if not read_id or gpu_id < 0:
             raise ValueError("missing read lease or invalid GPU")
-        offset = 0
+        # Hybrid extents contain declared alignment padding between Attention
+        # and state. All payload bytes (not padding) must be covered once.
+        # The engine derives ranges from the fingerprinted local pool layout.
+        ranges = tuple(payload_ranges) if payload_ranges is not None else ((0, shard.byte_size),)
+        previous_end = 0
+        for start, size in ranges:
+            if start < previous_end or size <= 0 or start + size > shard.byte_size:
+                raise ValueError("invalid payload ranges")
+            previous_end = start + size
+        if not ranges or ranges[0][0] != 0 or previous_end != shard.byte_size:
+            raise ValueError("payload ranges must cover both ends of the shard")
+        range_index, offset = 0, 0
         local, remote, destinations = [], [], []
         for source_offset, target_address, length in spans:
+            if range_index < len(ranges) and offset == sum(ranges[range_index]):
+                range_index += 1
+                if range_index < len(ranges):
+                    offset = ranges[range_index][0]
             if source_offset != offset or target_address <= 0 or length <= 0:
                 raise ValueError("incomplete or invalid shard span")
+            if range_index >= len(ranges) or offset + length > sum(ranges[range_index]):
+                raise ValueError("span crosses payload/padding boundary")
             offset += length
             local.append((int(target_address), int(length), int(gpu_id)))
             remote.append((shard.address + int(source_offset), int(length), 0))
@@ -418,8 +477,47 @@ class RemoteHostTransport:
                 return existing[1]
             if len(self.reads) >= self.max_reads:
                 raise RuntimeError("remote Host READ registry capacity reached")
-            peer = self.agent.add_remote_agent(base64.b64decode(shard.metadata_b64))
-            self._remote_peers.add(peer)
+            peer_id = shard.peer_id or hashlib.sha256(
+                base64.b64decode(shard.metadata_b64)
+            ).hexdigest()
+            peer_record = self._remote_peers.get(peer_id)
+            imported_peer_id = self._imported_exports.get(shard.export_id)
+            if imported_peer_id is not None and imported_peer_id != peer_id:
+                raise RuntimeError("remote Host export changed its source peer")
+            while (imported_peer_id is None and peer_record is not None and (
+                peer_record["imports"] >= self.max_peer_imports
+                or self._peer_range_conflicts(peer_id, shard)
+            )):
+                # Drain one bounded peer generation without failing a recovery
+                # attempt. NIXL cannot import a new registration that overlaps
+                # stale metadata for a recycled Host-arena address, so address
+                # reuse also starts a fresh generation. This runs only on Host
+                # I/O workers; retiring reads signal the condition and never
+                # need this worker's scheduler.
+                if peer_record["peer"] in self._active_peers():
+                    self._peer_condition.wait()
+                    peer_record = self._remote_peers.get(peer_id)
+                    continue
+                self._drop_peer(peer_id)
+                peer_record = None
+                imported_peer_id = None
+            if imported_peer_id is None:
+                peer = self.agent.add_remote_agent(base64.b64decode(shard.metadata_b64))
+                if peer_record is None:
+                    peer_record = self._remote_peers[peer_id] = {
+                        "peer": peer, "imports": 0,
+                    }
+                elif peer_record["peer"] != peer:
+                    raise RuntimeError("remote Host peer identity changed")
+                peer_record["imports"] += 1
+                self._imported_exports[shard.export_id] = peer_id
+                self._imported_ranges[shard.export_id] = (
+                    int(shard.address), int(shard.address) + int(shard.byte_size)
+                )
+            else:
+                if peer_record is None:
+                    raise RuntimeError("remote Host peer cache lost an imported export")
+                peer = peer_record["peer"]
             try:
                 local_desc = self.agent.get_xfer_descs(local, "VRAM")
                 remote_desc = self.agent.get_xfer_descs(remote, "DRAM")
@@ -430,8 +528,9 @@ class RemoteHostTransport:
                     raise RuntimeError("NIXL returned no READ handle")
             except Exception:
                 # No transfer is posted by initialize. Do not retain imported
-                # source registrations after a rejected descriptor/handle.
-                self._retire_unused_peers()
+                # source registrations past the bounded peer generation. The
+                # same export retry reuses its already imported metadata.
+                self._rollover_saturated_peers()
                 raise
             pending = RemoteHostRead(self, shard, str(read_id), handle)
             pending.peer = peer

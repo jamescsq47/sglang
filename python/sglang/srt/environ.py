@@ -311,7 +311,7 @@ class Envs:
     # generic Radix write-back, storage prefetch, and ordinary Decode offload.
     # Baseline launchers leave this disabled and retain stock SGLang behavior.
     SGLANG_AGENTIC_KV_CUSTOM_STORAGE_ONLY = EnvBool(False)
-    SGLANG_AGENTIC_KV_FAST_TOOL_THRESHOLD = EnvFloat(0.2)
+    SGLANG_AGENTIC_KV_FAST_TOOL_THRESHOLD = EnvFloat(1.0)
     # Ablation only: keep the request-generation lifecycle and Shared Host
     # recovery enabled while bypassing D->P Direct admission.
     SGLANG_AGENTIC_KV_FORCE_SLOW_PATH = EnvBool(False)
@@ -327,6 +327,10 @@ class Envs:
     # The request harness also omits parent-generation metadata, making every
     # later turn an intentional full-Prefill request.
     SGLANG_AGENTIC_KV_DISABLE_D2P_REUSE = EnvBool(False)
+    # Opt-in ablation: retain the D parent until Direct succeeds, regardless
+    # of tool/admission delay. No D->P Host or policy recompute is permitted.
+    # Physical transport faults remain fail-closed, never timeout-free frees.
+    SGLANG_AGENTIC_KV_DIRECT_WAIT_ONLY = EnvBool(False)
     SGLANG_AGENTIC_KV_DIRECT_BOOTSTRAP_PORT = EnvInt(0)
     SGLANG_AGENTIC_KV_DIRECT_HANDSHAKE_TIMEOUT = EnvFloat(2.0)
     SGLANG_AGENTIC_KV_HOST_TRANSITION_GRACE = EnvFloat(8.0)

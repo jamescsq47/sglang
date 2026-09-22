@@ -8,6 +8,7 @@ without making the scheduler wait for that preparation.
 import ast
 import inspect
 import queue
+import tempfile
 import textwrap
 import threading
 from types import SimpleNamespace as NS
@@ -26,6 +27,13 @@ from sglang.srt.disaggregation.test_agentic_h2d_decoupling import manager
 from sglang.srt.managers.scheduler import AgenticPWorksetLeaseBroker
 
 
+@pytest.fixture
+def remote_test_ledger():
+    from sglang.srt.disaggregation.agentic_host_staging import SharedHostStagingLedger
+    with tempfile.TemporaryDirectory(prefix="tp-async-prepare-", dir="/dev/shm") as directory:
+        yield SharedHostStagingLedger(directory + "/ledger.json")
+
+
 class MainThreadAllocator:
     def __init__(self):
         self.owner = threading.get_ident()
@@ -42,14 +50,15 @@ class MainThreadAllocator:
         self.freed.append(len(indices))
 
 
-def fixture(lanes=2, count=1):
+def fixture(lanes=2, count=1, tp_size=1):
     m = manager(lanes=lanes)
     m.h2d_event_progress = m.h2d_async_prepare = True
+    m.tp_h2d_async_prepare = tp_size > 1
     m._host_prepares, m._host_prepare_results = {}, {}
     m._scheduler_events = queue.SimpleQueue()
     m.active, m.aborting, m.host_ready, m.spills = {}, {}, {}, {}
     m._ledger_entries_cache = {}
-    m.tp_rank, m.tp_size, m.arena_domain, m.owner = 0, 1, 0, "p:async-test"
+    m.tp_rank, m.tp_size, m.arena_domain, m.owner = 0, tp_size, 0, "p:async-test"
     m.workset_broker = AgenticPWorksetLeaseBroker(page_size=4)
     m._progress_h2d_loads = lambda: None  # Never submit CUDA in this CPU suite.
     m.released_records = []
@@ -80,6 +89,7 @@ def fixture(lanes=2, count=1):
         claim_d2p_recovery_rank=claim,
         attach_d2p_recovery_lease_rank=lambda *args, **kwargs: True,
         begin_host_load_rank=lambda *args, **kwargs: True,
+        prepare_tp_host_load_rank=lambda *args, **kwargs: True,
         request_host_load_failure=abort,
         cancel_d2p_recovery_rank=cancel,
         mark_host_load_rank_drained=drained,
@@ -133,6 +143,189 @@ def test_real_broker_grant_starts_without_second_scheduler_gate():
     assert not hasattr(req, "_agentic_kv_gate_complete")
     assert not hasattr(req, "_agentic_p_workset_lease")
     assert not m.released_records and not alloc.freed
+
+
+@pytest.mark.parametrize("tp_size", [2, 8])
+@pytest.mark.parametrize("ack_retry", [False, True])
+def test_tp_async_prepare_preserves_leader_start_barrier(tp_size, ack_retry):
+    m, alloc, (req,) = fixture(tp_size=tp_size)
+    assert m.gate_request(req, req.parent,
+                         allow_prepare=True, allow_start=False, allow_bind=False) is True
+    assert req.rid in m._host_prepares and not alloc.allocated
+    worker_once(m)
+    m.workset_broker.service(alloc)
+    original_ack = m.ledger.prepare_tp_host_load_rank
+    calls = []
+
+    def acknowledge(*args, **kwargs):
+        calls.append(threading.get_ident())
+        if ack_retry and len(calls) == 1:
+            raise OSError("prepare ACK reply lost")
+        return original_ack(*args, **kwargs)
+
+    m.ledger.prepare_tp_host_load_rank = acknowledge
+    worker_once(m)
+    load = m.loads[req.rid]
+    if ack_retry:
+        assert load["ledger_prepare_pending"]
+        assert not load["start_allowed"]
+        assert m.gate_request(req, req.parent,
+                             allow_prepare=True, allow_start=False, allow_bind=False) is True
+        worker_once(m)
+    assert m.loads[req.rid] is load and not load["ledger_prepare_pending"]
+    assert not load["start_allowed"]
+    assert not m._host_prepares
+    assert all(tid != alloc.owner for tid in calls)
+    assert m.gate_request(req, req.parent,
+                         allow_prepare=True, allow_start=False, allow_bind=False) is True
+    assert not load["start_allowed"]
+    # Only consuming the leader's START command grants transport permission.
+    assert m.gate_request(req, req.parent,
+                         allow_prepare=True, allow_start=True, allow_bind=False) is True
+    assert load["start_allowed"] and not load.get("radix_bound")
+    assert not hasattr(req, "_agentic_kv_gate_complete")
+    assert alloc.allocated == [8] and not alloc.freed
+
+
+@pytest.mark.parametrize("tp_size", [2, 8])
+@pytest.mark.parametrize("already_queued", [False, True])
+def test_tp_async_prepare_retry_still_publishes_prestart_no_io_receipt(
+    remote_test_ledger, tp_size, already_queued,
+):
+    from sglang.srt.disaggregation.test_agentic_multinode_d2p import ready_group
+    m, alloc, (req,) = fixture(tp_size=tp_size)
+    req.parent = RequestGeneration("request", 0)
+    sid = req.parent.snapshot_id
+    record = next(iter(m.host_ready.values()))
+    m.host_ready = {sid: record}
+    m.ledger = remote_test_ledger
+    ready_group(m.ledger, tp_size)
+    assert m.ledger.assign_d2p_recovery_domain(sid, 0)
+    m._ledger_entries_cache = {sid: m.ledger.get(sid)}
+    if already_queued:
+        assert m.gate_request(req, req.parent,
+                             allow_prepare=True, allow_start=False) is True
+        assert req.rid in m._host_prepares
+    claim = m.workset_broker.slow_owner(sid, req.rid)
+    assert m.ledger.claim_d2p_recovery_rank(sid, m.owner, tp_rank=0,
+        tp_size=tp_size, claim_id=claim, recovery_domain=0)
+    m.workset_broker.request(sid, 1, 2, owner=claim)
+    assert m.ledger.request_d2p_retry(sid, m.owner, reason="peer QP failure")
+    m._ledger_entries_cache[sid] = m.ledger.get(sid)
+    receipts = []
+    m._remote_host_bridge = NS(cancel_unstarted=lambda *args, **kwargs:
+        receipts.append((args, kwargs)))
+    if already_queued:
+        worker_once(m)
+        assert req.rid not in m._host_prepares
+        # No preparation worker may drop ownership before the old retry gate.
+        assert m.workset_broker.owner_has_unretired_work(sid, owner=claim)
+        assert sid in m.h2d_selected_snapshots()
+    assert m.gate_request(req, req.parent,
+                         allow_prepare=False, allow_start=False) is True
+    assert receipts == [((sid,), {"attempt_id": claim + ":epoch:1"})]
+    assert m.ledger.get(sid)["retry_acks"] == [0]
+    assert not m.workset_broker.owner_has_unretired_work(sid, owner=claim)
+    assert not m.h2d_selected_snapshots() and not m.loads
+    assert not m._host_prepares and not alloc.allocated
+
+
+@pytest.mark.parametrize("tp_size", [2, 8])
+def test_tp_peer_abort_before_enqueue_uses_worker_without_lane_or_workset(remote_test_ledger, tp_size):
+    from sglang.srt.disaggregation.test_agentic_multinode_d2p import ready_group
+    m, alloc, (req,) = fixture(tp_size=tp_size)
+    req.parent = RequestGeneration("request", 0)
+    sid = req.parent.snapshot_id
+    m.host_ready = {sid: next(iter(m.host_ready.values()))}
+    m.ledger = remote_test_ledger
+    ready_group(m.ledger, tp_size)
+    assert m.ledger.assign_d2p_recovery_domain(sid, 0)
+    claim = m.workset_broker.slow_owner(sid, req.rid)
+    for rank in range(tp_size):
+        assert m.ledger.claim_d2p_recovery_rank(sid, m.owner, tp_rank=rank,
+            tp_size=tp_size, claim_id=claim, recovery_domain=0)
+    assert m.ledger.request_host_load_failure(sid, m.owner, reason="peer cancelled")
+    m._ledger_entries_cache = {sid: m.ledger.get(sid)}
+    receipt_threads = []
+    m._remote_host_bridge = NS(cancel_unstarted=lambda *args, **kwargs:
+        receipt_threads.append(threading.get_ident()))
+    original_get = m.ledger.get
+    m.ledger.get = lambda *args: pytest.fail("scheduler touched ledger on cancelled enqueue")
+    assert m.gate_request(req, req.parent,
+                         allow_prepare=False, allow_start=False) is True
+    m.ledger.get = original_get
+    assert m._host_prepares[req.rid]["cancelled"]
+    assert not m.h2d_selected_snapshots() and not m.workset_broker._intents
+    worker_once(m)
+    assert receipt_threads and all(tid != alloc.owner for tid in receipt_threads)
+    assert m.ledger.get(sid)["loader_drained_ranks"] == [0]
+    assert "0" not in m.ledger.get(sid)["recovery_claims"]
+    assert not m._host_prepares and not m.loads and not alloc.allocated
+
+
+@pytest.mark.parametrize("tp_size", [2, 8])
+def test_tp_abort_without_imported_record_retires_plan_and_source(
+    remote_test_ledger, tmp_path, tp_size,
+):
+    from sglang.srt.disaggregation.test_agentic_multinode_d2p import ready_group
+    from sglang.srt.disaggregation.test_agentic_remote_host_engine import bridge, publish
+    ledger = remote_test_ledger
+    ready_group(ledger, tp_size)
+    sid, rid = "request:0", "child"
+    owner = "p:async-test"
+    claim = AgenticPWorksetLeaseBroker.slow_owner(sid, rid)
+    assert ledger.assign_d2p_recovery_domain(sid, 0)
+    # Rank0 prepared its Host metadata. Followers have only the authoritative
+    # allocation plan: no imported Host record, no recovery claim and no READ.
+    assert ledger.claim_d2p_recovery_rank(sid, owner, tp_rank=0,
+        tp_size=tp_size, claim_id=claim, recovery_domain=0)
+    contexts, sources = [], []
+    for rank in range(tp_size):
+        source, _ = bridge(tmp_path, rank=rank, size=tp_size, direction="d2p")
+        publish(source, sid)
+        sources.append(source)
+        target, _ = bridge(tmp_path, rank=rank, size=tp_size, node="p", direction="d2p")
+        m, alloc, (req,) = fixture(tp_size=tp_size)
+        m.tp_rank, m.ledger, m._remote_host_bridge = rank, ledger, target
+        req.rid, req.parent = rid, RequestGeneration("request", 0)
+        record = next(iter(m.host_ready.values()))
+        record.update(network_host=True, remote_host=True,
+                      recovery_claim_id=claim, remote_h2d_attempt=claim + ":epoch:1")
+        m.host_ready = {sid: record} if rank == 0 else {}
+        m.workset_broker.install_tp_plan(1, [(sid, claim, 1, 2)])
+        m.workset_broker.service(alloc)
+        assert m.workset_broker.get(sid, owner=claim) is not None
+        contexts.append((m, alloc, req))
+    assert ledger.request_host_load_failure(sid, owner, reason="peer cancelled")
+    for m, alloc, req in contexts:
+        m._ledger_entries_cache = {sid: ledger.get(sid)}
+        assert m.gate_request(req, req.parent,
+                             allow_prepare=False, allow_start=False) is True
+        worker_once(m)
+        # A local no-READ fact is not permission to recycle the TP allocation
+        # plan or CLEAR its control descriptor independently.
+        assert not alloc.freed
+        assert not m.tp_host_control_quiescent(sid, rid)
+    assert ledger.get(sid)["state"] == "aborting"
+    for source in sources:
+        assert not source.cleanup_source(sid, ledger.get(sid))
+    assert all(m.workset_broker.prepare_tp_retire(sid) for m, _, _ in contexts)
+    for m, alloc, _ in contexts:
+        assert m.workset_broker.commit_tp_retire(sid)
+        m.workset_broker.service(alloc)
+        m._progress_prestart_aborts()
+        assert alloc.freed == [8]
+        assert m.tp_host_control_quiescent(sid, rid)
+    terminal = ledger.get(sid)
+    assert terminal["state"] == "failed"
+    assert terminal["loader_drained_ranks"] == list(range(tp_size))
+    assert not terminal["recovery_claims"]
+    # Followers never entered the bridge. Existing terminal-only synthesis
+    # requires their real drained ACK and absence of a destination; no extra
+    # engine transition or speculative READ receipt is needed.
+    assert sources[0]._receipts(sid, claim + ":epoch:1") is None
+    for source in sources:
+        assert source.cleanup_source(sid, terminal)
 
 
 def test_queue_freezes_prompt_and_preserves_original_request():
@@ -196,8 +389,9 @@ def test_abort_before_worker_cannot_create_late_intent():
 
 @pytest.mark.parametrize("phase", ["materialize", "claim", "attach"])
 @pytest.mark.parametrize("retry_rid", [False, True])
-def test_cancel_during_cpu_phase_is_nonblocking_and_prevents_launch(phase, retry_rid):
-    m, alloc, (req,) = fixture()
+@pytest.mark.parametrize("tp_size", [1, 2, 8])
+def test_cancel_during_cpu_phase_is_nonblocking_and_prevents_launch(phase, retry_rid, tp_size):
+    m, alloc, (req,) = fixture(tp_size=tp_size)
     m.gate_request(req, req.parent)
     if phase == "attach":
         worker_once(m)
@@ -415,20 +609,36 @@ def test_cancelled_old_descriptor_cannot_release_new_retry_metadata_credit():
     assert not m.released_records and not alloc.allocated
 
 
-def test_async_switch_requires_prior_tp1_hybrid_event_mode(monkeypatch):
+def test_async_switch_preserves_tp1_and_requires_multinode_tp_opt_in(monkeypatch):
     init = ast.parse(textwrap.dedent(inspect.getsource(Manager.__init__)))
-    assignment = next(node for node in ast.walk(init)
-                      if isinstance(node, ast.Assign) and any(
-                          isinstance(target, ast.Attribute) and target.attr == "h2d_async_prepare"
-                          for target in node.targets))
-    expression = compile(ast.Expression(assignment.value), "<mode>", "eval")
+
+    def expression_for(name):
+        assignment = next(node for node in ast.walk(init)
+                          if isinstance(node, ast.Assign) and any(
+                              isinstance(target, ast.Attribute) and target.attr == name
+                              for target in node.targets))
+        return compile(ast.Expression(assignment.value), "<mode>", "eval")
+
+    tp_expression = expression_for("tp_h2d_async_prepare")
+    expression = expression_for("h2d_async_prepare")
     import os
-    for previous in (False, True):
-        for enabled in ("0", "true"):
-            monkeypatch.setenv("SGLANG_AGENTIC_KV_P_HOST_ASYNC_PREPARE", enabled)
-            assert eval(expression, {"os": os, "self": NS(h2d_event_progress=previous)}) is (
-                previous and enabled == "true"
-            )
+    for tp_size in (1, 2, 8):
+        for multinode in (False, True):
+            for previous in ((False, True) if tp_size == 1 else (False,)):
+                for legacy_enabled in ("0", "true"):
+                    for tp_enabled in ("0", "true"):
+                        monkeypatch.setenv("SGLANG_AGENTIC_KV_P_HOST_ASYNC_PREPARE", legacy_enabled)
+                        monkeypatch.setenv("SGLANG_AGENTIC_KV_TP_HOST_ASYNC_PREPARE", tp_enabled)
+                        m = NS(tp_size=tp_size,
+                               _multinode_config=object() if multinode else None,
+                               h2d_event_progress=previous)
+                        scope = {"os": os, "self": m}
+                        m.tp_h2d_async_prepare = eval(tp_expression, scope)
+                        expected_tp = tp_size > 1 and multinode and tp_enabled == "true"
+                        assert m.tp_h2d_async_prepare is expected_tp
+                        assert eval(expression, scope) is (
+                            expected_tp or (previous and legacy_enabled == "true")
+                        )
 
 
 def test_disabled_worker_is_noop_without_async_fields():

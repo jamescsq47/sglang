@@ -14,6 +14,8 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Iterable, Mapping, Optional, Protocol, Sequence
 
+from sglang.srt.disaggregation.agentic_control_store import control_enabled
+
 
 MANIFEST_VERSION = 1
 MANIFEST_PREFIX = "sglang:agentic-kv:v1:manifest:"
@@ -62,6 +64,10 @@ def _discard_shared_ledger_snapshot(snapshot_id: str) -> None:
     released immediately rather than at the next D reconciliation.
     """
 
+    if control_enabled():
+        # This obsolete admission ledger belongs to native Mooncake spill,
+        # not the independently owned Shared Host lifecycle.
+        return
     path = os.getenv("SGLANG_AGENTIC_KV_LEDGER_PATH", "")
     directory = os.path.dirname(path)
     if not path or (
@@ -687,6 +693,10 @@ class MooncakeSnapshotStore:
     def _local_claim_path(request: RequestGeneration) -> Optional[str]:
         """Return the node-local fence shared by P and every D worker.
 
+        With socket control this is only a generation-wide broker key. No
+        filesystem is accessed and ownership is checked on the broker when
+        committing a manifest transition.
+
         Mooncake's create-if-absent claim protects the storage object, but a
         claim-key PUT and a manifest UPSERT are two independent transactions.
         In addition, an ambiguous UPSERT can still be completing in the master
@@ -697,6 +707,8 @@ class MooncakeSnapshotStore:
         """
 
         directory = os.getenv("SGLANG_PD_P_READY_DIR", "")
+        if control_enabled() and not directory:
+            directory = "broker-lifecycle"
         if not directory:
             return None
         digest = hashlib.sha256(request.snapshot_id.encode("utf-8")).hexdigest()
@@ -715,6 +727,9 @@ class MooncakeSnapshotStore:
         """
 
         path = cls._local_claim_path(request)
+        if control_enabled():
+            from sglang.srt.disaggregation.agentic_lifecycle_control import lifecycle_records
+            return tuple(lifecycle_records().call("claim", path, claim_id))
         if path is None:
             # Lightweight tests and non-node-local storage configurations keep
             # the original Mooncake-only behavior.
@@ -746,6 +761,13 @@ class MooncakeSnapshotStore:
         cls, request: RequestGeneration, claim_id: Optional[str]
     ) -> None:
         path = cls._local_claim_path(request)
+        if control_enabled():
+            from sglang.srt.disaggregation.agentic_lifecycle_control import lifecycle_records
+            records = lifecycle_records()
+            owner = claim_id if claim_id is not None else records.get(path)
+            if owner is not None:
+                records.call("remove", path, owner)
+            return
         if path is None:
             return
         try:
@@ -765,6 +787,9 @@ class MooncakeSnapshotStore:
     @classmethod
     def _local_claim_owner(cls, request: RequestGeneration) -> Optional[str]:
         path = cls._local_claim_path(request)
+        if control_enabled():
+            from sglang.srt.disaggregation.agentic_lifecycle_control import lifecycle_records
+            return lifecycle_records().get(path)
         if path is None:
             return None
         try:
@@ -792,6 +817,10 @@ class MooncakeSnapshotStore:
     def _create_local_marker(path: str, value: bytes = b"1") -> bool:
         """Create one tiny tmpfs marker and report O_EXCL ownership."""
 
+        if control_enabled():
+            from sglang.srt.disaggregation.agentic_lifecycle_control import lifecycle_records
+            return lifecycle_records().call("put", path, value.decode("utf-8")) == 0
+
         try:
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError:
@@ -801,6 +830,24 @@ class MooncakeSnapshotStore:
         finally:
             os.close(fd)
         return True
+
+    @staticmethod
+    def _local_marker_exists(path: str) -> bool:
+        if control_enabled():
+            from sglang.srt.disaggregation.agentic_lifecycle_control import lifecycle_records
+            return lifecycle_records().get(path) is not None
+        return os.path.exists(path)
+
+    @staticmethod
+    def _remove_local_marker(path: str) -> None:
+        if control_enabled():
+            from sglang.srt.disaggregation.agentic_lifecycle_control import lifecycle_records
+            lifecycle_records().call("remove", path)
+            return
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
 
     @classmethod
     def _require_local_claim_owner(
@@ -850,6 +897,14 @@ class MooncakeSnapshotStore:
                 f"claimed transition for {manifest.snapshot_id} has no owner"
             )
         self._require_local_claim_owner(manifest.request, owner_claim_id)
+        if control_enabled():
+            from sglang.srt.disaggregation.agentic_lifecycle_control import lifecycle_records
+            fences = lifecycle_records()
+            records = self.store.records
+            records.call("upsert_if_owner", manifest.manifest_key,
+                         self.store._encode(manifest.to_bytes()), fences.namespace,
+                         self._local_claim_path(manifest.request), owner_claim_id)
+            return
         retry_delay = 0.01
         last_code = 0
         for attempt in range(max_attempts):
@@ -1122,7 +1177,7 @@ class MooncakeSnapshotStore:
             if ack_path is None:
                 raise RuntimeError("local TP Direct ACK path disappeared")
             self._create_local_marker(ack_path, f"{tp_rank}/{tp_size}".encode())
-            if not all(path is not None and os.path.exists(path) for path in ack_paths):
+            if not all(path is not None and self._local_marker_exists(path) for path in ack_paths):
                 return manifest
 
             done_path = self._local_tp_direct_path(
@@ -1134,7 +1189,7 @@ class MooncakeSnapshotStore:
             if done_path is None or finalize_path is None:
                 raise RuntimeError("local TP Direct completion path disappeared")
             received = manifest.transition(SnapshotState.P_RECEIVED)
-            if os.path.exists(done_path):
+            if self._local_marker_exists(done_path):
                 current = self.load(manifest.request, require_ready=False)
                 return current if current is not None else received
             if not self._create_local_marker(
@@ -1150,10 +1205,7 @@ class MooncakeSnapshotStore:
                 self._create_local_marker(done_path)
                 return received
             except Exception:
-                try:
-                    os.unlink(finalize_path)
-                except FileNotFoundError:
-                    pass
+                self._remove_local_marker(finalize_path)
                 raise
 
         ack_key = manifest.request.direct_rank_ack_key(claim_id, tp_rank)
@@ -1453,7 +1505,7 @@ class MooncakeSnapshotStore:
                 return True
             self.complete_slow_fallback(current)
             return True
-        if os.path.exists(done_path):
+        if self._local_marker_exists(done_path):
             return True
         if not self._create_local_marker(finalizer_path):
             return False
@@ -1464,10 +1516,7 @@ class MooncakeSnapshotStore:
             self._create_local_marker(done_path)
             return True
         except Exception:
-            try:
-                os.unlink(finalizer_path)
-            except FileNotFoundError:
-                pass
+            self._remove_local_marker(finalizer_path)
             raise
 
     def publish_failure(

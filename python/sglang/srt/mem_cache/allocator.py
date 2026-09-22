@@ -54,27 +54,54 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self.release_pages = None
         self.is_not_in_free_group = True
         self.free_group = []
+        self._agentic_workset_adapter = None
+
+    def install_workset_adapter(self, adapter):
+        """Opt-in only before any native allocation; no second writable pool."""
+        if getattr(self, "_agentic_workset_adapter", None) is not None:
+            raise RuntimeError("workset adapter already installed")
+        if self.available_size() != (self.size // self.page_size) * self.page_size:
+            raise RuntimeError("workset adapter requires an empty native KV pool")
+        adapter._native()
+        if (adapter.page_size != self.page_size
+                or adapter.available_size("attention") != self.available_size()):
+            raise RuntimeError("workset/native KV page size or capacity mismatch")
+        self._agentic_workset_adapter = adapter
+        self.free_pages = self.release_pages = None
+        self.free_group = []
+
+    def _reject_native_workset_allocation(self):
+        if getattr(self, "_agentic_workset_adapter", None) is not None:
+            raise RuntimeError("complete workset required; native KV allocation/state mutation is disabled")
 
     def debug_print(self) -> str:
         return ""
 
     def available_size(self):
+        if getattr(self, "_agentic_workset_adapter", None) is not None:
+            return self._agentic_workset_adapter.available_size("attention")
         return (len(self.free_pages) + len(self.release_pages)) * self.page_size
 
     def get_kvcache(self):
         return self._kvcache
 
     def restore_state(self, state):
+        self._reject_native_workset_allocation()
         self.free_pages, self.release_pages = state
 
     def backup_state(self):
+        self._reject_native_workset_allocation()
         return (self.free_pages, self.release_pages)
 
     def free_group_begin(self):
+        if getattr(self, "_agentic_workset_adapter", None) is not None:
+            return self._agentic_workset_adapter.free_group_begin()
         self.is_not_in_free_group = False
         self.free_group = []
 
     def free_group_end(self):
+        if getattr(self, "_agentic_workset_adapter", None) is not None:
+            return self._agentic_workset_adapter.free_group_end()
         self.is_not_in_free_group = True
         if self.free_group:
             self.free(torch.cat(self.free_group))
@@ -86,6 +113,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         return free_index.clone()
 
     def merge_and_sort_free(self):
+        self._reject_native_workset_allocation()
         if len(self.release_pages) > 0:
             self.free_pages = torch.cat((self.free_pages, self.release_pages))
             self.free_pages, _ = torch.sort(self.free_pages)
@@ -135,6 +163,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.clear()
 
     def clear(self):
+        self._reject_native_workset_allocation()
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.free_pages = torch.arange(
             1, self.size + 1, dtype=torch.int64, device=self.device
@@ -144,10 +173,13 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
 
     def available_size(self):
+        if getattr(self, "_agentic_workset_adapter", None) is not None:
+            return self._agentic_workset_adapter.available_size("attention")
         # To avoid minor "len(free_pages) * 1" overhead
         return len(self.free_pages) + len(self.release_pages)
 
     def alloc(self, need_size: int):
+        self._reject_native_workset_allocation()
         if self.need_sort and need_size > len(self.free_pages):
             self.merge_and_sort_free()
 
@@ -159,6 +191,8 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return select_index
 
     def free(self, free_index: torch.Tensor):
+        if getattr(self, "_agentic_workset_adapter", None) is not None:
+            return self._agentic_workset_adapter.free(free_index, resource="attention")
         if free_index.numel() == 0:
             return
 
@@ -384,6 +418,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.clear()
 
     def alloc(self, need_size: int):
+        self._reject_native_workset_allocation()
         # page-aligned allocation, returning contiguous indices of pages
         if self.debug_mode:
             assert (
@@ -415,6 +450,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         last_loc: torch.Tensor,
         extend_num_tokens: int,
     ):
+        self._reject_native_workset_allocation()
         if self.debug_mode:
             assert torch.all(
                 (last_loc + 1) % self.page_size == prefix_lens % self.page_size
@@ -460,6 +496,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
     ):
+        self._reject_native_workset_allocation()
         if self.debug_mode:
             assert torch.all(
                 (last_loc + 2) % self.page_size == seq_lens % self.page_size
@@ -494,6 +531,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return out_indices
 
     def free(self, free_index: torch.Tensor):
+        if getattr(self, "_agentic_workset_adapter", None) is not None:
+            return self._agentic_workset_adapter.free(free_index, resource="attention")
         if free_index.numel() == 0:
             return
 
@@ -539,6 +578,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             assert len(torch.unique(self.free_pages)) == len(self.free_pages)
 
     def clear(self):
+        self._reject_native_workset_allocation()
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.free_pages = torch.arange(
             1, self.num_pages + 1, dtype=torch.int64, device=self.device

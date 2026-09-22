@@ -369,6 +369,12 @@ class DecodePreallocQueue:
             os.environ.get("SGLANG_PD_MAX_TRANSFER_INFLIGHT", default_transfer_inflight)
         )
         self.p_ready_dir = os.environ.get("SGLANG_PD_P_READY_DIR", "")
+        from sglang.srt.disaggregation.agentic_control_store import (
+            ReadySignals, control_enabled,
+        )
+        self.ready_signals = (
+            ReadySignals(self.p_ready_dir) if control_enabled() else None
+        )
         self.p2d_prebind_ablation = os.environ.get(
             "SGLANG_PD_ABLATION_P2D_PREBIND", "false"
         ).strip().lower() in {"1", "true", "yes", "on"}
@@ -379,13 +385,19 @@ class DecodePreallocQueue:
                 "SGLANG_AGENTIC_KV_LIFECYCLE requires SGLANG_PD_P_READY_DIR "
                 "(use a node-local path such as /dev/shm/sglang-agentic-p-ready)"
             )
-        if self.p_ready_dir:
+        if self.p_ready_dir and self.ready_signals is None:
             os.makedirs(self.p_ready_dir, exist_ok=True)
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
         self.pending_reqs: List[DecodeRequest] = []
         self._async_progress_enabled = False
+        self._async_ready_marker_enabled = (
+            self.tp_size > 1
+            and os.getenv("SGLANG_AGENTIC_MULTINODE_ENABLED", "0") == "1"
+        )
+        self._ready_marker_work: thread_queue.SimpleQueue = thread_queue.SimpleQueue()
+        self._ready_marker_pending: dict[str, list[bool]] = {}
         self._async_pending_lock = threading.Lock()
         self._async_metadata_work: thread_queue.SimpleQueue = thread_queue.SimpleQueue()
         self._async_metadata_done: thread_queue.SimpleQueue = thread_queue.SimpleQueue()
@@ -492,6 +504,7 @@ class DecodePreallocQueue:
         if not self._async_progress_enabled:
             return
         self._background_prepare_metadata()
+        self._background_consume_p_ready_markers()
 
     def _publish_tp_admission_readiness(self) -> None:
         """Report shard-local readiness; TP0 alone chooses admission order."""
@@ -535,7 +548,7 @@ class DecodePreallocQueue:
             ready_path = os.path.join(
                 self.p_ready_dir, f"{decode_req.req.bootstrap_room}.ready"
             )
-            if os.path.exists(ready_path):
+            if self._p_ready_exists(ready_path):
                 self._record_p_ready_domain(decode_req, ready_path)
                 decode_req._async_p_ready = True
                 decode_req._async_p_ready_path = ready_path
@@ -546,8 +559,14 @@ class DecodePreallocQueue:
         """Record the P group that produced this wire request."""
 
         try:
-            with open(ready_path, encoding="utf-8") as ready_file:
-                metadata = json.load(ready_file)
+            signals = getattr(self, "ready_signals", None)
+            if signals is not None:
+                metadata = signals.get(os.path.basename(ready_path).removesuffix(".ready"))
+                if metadata is None:
+                    raise FileNotFoundError(ready_path)
+            else:
+                with open(ready_path, encoding="utf-8") as ready_file:
+                    metadata = json.load(ready_file)
             decode_req.req._agentic_prefill_domain = int(
                 metadata.get(
                     "prefill_domain",
@@ -558,6 +577,12 @@ class DecodePreallocQueue:
             decode_req.req._agentic_prefill_domain = int(
                 os.environ.get("SGLANG_AGENTIC_KV_PREFILL_DOMAIN", "0")
             )
+
+    def _p_ready_exists(self, ready_path):
+        signals = getattr(self, "ready_signals", None)
+        if signals is not None:
+            return signals.get(os.path.basename(ready_path).removesuffix(".ready")) is not None
+        return os.path.exists(ready_path)
 
     def _background_prepare_metadata(self) -> None:
         # Metadata setup includes CPU index conversion and NIXL publication.
@@ -592,6 +617,20 @@ class DecodePreallocQueue:
 
         if not ready_path:
             return
+        signals = getattr(self, "ready_signals", None)
+        if signals is not None:
+            signals.admit(
+                os.path.basename(ready_path).removesuffix(".ready"),
+                group=os.environ["SGLANG_AGENTIC_CONTROL_GROUP_ID"],
+                rank=self.tp_rank, size=self.tp_size,
+            )
+            return
+        if (
+            self._async_progress_enabled
+            and getattr(self, "_async_ready_marker_enabled", False)
+        ):
+            self._ready_marker_work.put(ready_path)
+            return
         if self.tp_size == 1:
             try:
                 os.unlink(ready_path)
@@ -616,6 +655,46 @@ class DecodePreallocQueue:
                 os.unlink(path)
             except FileNotFoundError:
                 pass
+
+    def _background_consume_p_ready_markers(self) -> None:
+        """Persist admission ACKs off scheduler; rank0 alone retires the latch.
+
+        Keep progress across partial unlink failures. In particular, never
+        recreate an ACK after all ACKs were seen and cleanup already started.
+        A stopped worker leaves markers intact rather than inferring admission.
+        """
+        if not getattr(self, "_async_ready_marker_enabled", False):
+            return
+        while True:
+            try:
+                path = self._ready_marker_work.get_nowait()
+            except thread_queue.Empty:
+                break
+            self._ready_marker_pending.setdefault(path, [False, False])
+        for ready_path, progress in tuple(self._ready_marker_pending.items()):
+            ack_paths = [
+                f"{ready_path}.tp-rank-{rank}.admitted" for rank in range(self.tp_size)
+            ]
+            try:
+                if not progress[0]:
+                    fd = os.open(ack_paths[self.tp_rank], os.O_CREAT | os.O_WRONLY, 0o600)
+                    os.close(fd)
+                    progress[0] = True
+                if self.tp_rank != 0:
+                    del self._ready_marker_pending[ready_path]
+                    continue
+                if not progress[1]:
+                    if not all(os.path.exists(path) for path in ack_paths):
+                        continue
+                    progress[1] = True
+                for path in [ready_path, *ack_paths]:
+                    try:
+                        os.unlink(path)
+                    except FileNotFoundError:
+                        pass
+                del self._ready_marker_pending[ready_path]
+            except OSError:
+                logger.warning("P-ready ACK cleanup deferred path=%s", ready_path, exc_info=True)
 
     def _drain_background_metadata(self):
         ready = []
@@ -643,6 +722,16 @@ class DecodePreallocQueue:
                 logger.debug(
                     "Receiver abort after metadata failure failed", exc_info=True
                 )
+            if (
+                isinstance(decode_req.kv_receiver, AgenticPToDHostReceiver)
+                and getattr(decode_req.kv_receiver.manager, "_async_host_control", False)
+            ):
+                # bind() may already have queued H2D before a subsequent
+                # metadata/ready-marker operation failed. Abort is intent,
+                # not a DMA fence. Let the normal TP transfer queue retain
+                # indices/metadata until all shards have physically drained.
+                ready.append(decode_req)
+                continue
             if decode_req.metadata_buffer_index != -1:
                 self.req_to_metadata_buffer_idx_allocator.free(
                     decode_req.metadata_buffer_index
@@ -1188,6 +1277,8 @@ class DecodePreallocQueue:
                 + self._async_metadata_pending_count
                 >= self.max_transfer_inflight
             ):
+                blocked_reason = "transfer_inflight_cap"
+                blocked_req = decode_req
                 break
             if not selected(decode_req):
                 continue
@@ -1213,7 +1304,7 @@ class DecodePreallocQueue:
                         self.p_ready_dir,
                         f"{decode_req.req.bootstrap_room}.ready",
                     )
-                    if not os.path.exists(ready_path):
+                    if not self._p_ready_exists(ready_path):
                         continue
                     self._record_p_ready_domain(decode_req, ready_path)
 
@@ -1427,7 +1518,8 @@ class DecodePreallocQueue:
                     req.waiting_for_input,
                     getattr(req, "_async_p_ready", False),
                     (
-                        os.path.exists(
+                        getattr(req, "_async_p_ready", False)
+                        if self._async_progress_enabled else self._p_ready_exists(
                             os.path.join(
                                 self.p_ready_dir,
                                 f"{req.req.bootstrap_room}.ready",
@@ -1615,6 +1707,10 @@ class DecodeTransferQueue:
         self.staging_handler = None
         self._async_progress_enabled = False
         self._async_poll_lock = threading.Lock()
+        self._async_tp_control_enabled = (
+            os.getenv("SGLANG_AGENTIC_MULTINODE_ENABLED", "0") == "1"
+            and scheduler.tp_size > 1
+        )
 
     def enable_async_progress(self) -> None:
         self._async_progress_enabled = True
@@ -1712,13 +1808,56 @@ class DecodeTransferQueue:
                 decode_req._async_transfer_poll = int(poll)
                 decode_req._async_transfer_poll_inflight = False
                 scheduler = getattr(self, "scheduler", None)
-                if scheduler is not None and getattr(scheduler, "tp_size", 1) > 1:
+                if (
+                    scheduler is not None and getattr(scheduler, "tp_size", 1) > 1
+                    and not getattr(self, "_async_tp_control_enabled", False)
+                ):
                     scheduler.agentic_tp_p2d_receiver_mailbox.publish_local(
                         request_generation_key(
                             decode_req.req.rid, decode_req.req.bootstrap_room
                         ),
                         int(poll),
                     )
+
+        # Only receiver lookup/poll needs the lifecycle lock. Filesystem I/O
+        # must not hold it: a stalled NFS report would otherwise stop Forward
+        # when the scheduler next commits a different completed receiver.
+        if getattr(self, "_async_tp_control_enabled", False):
+            mailbox = self.scheduler.agentic_tp_p2d_receiver_mailbox
+            for decode_req, poll in zip(queue_snapshot, polls):
+                previous = getattr(
+                    decode_req, "_async_tp_transfer_result", (None, False)
+                )
+                if previous[0] in (int(KVPoll.Success), int(KVPoll.Failed)):
+                    # P may already have consumed/cleared the shared receipt.
+                    # A durable group terminal cannot be downgraded/recreated.
+                    continue
+                key = request_generation_key(
+                    decode_req.req.rid, decode_req.req.bootstrap_room
+                )
+                published = getattr(decode_req, "_async_tp_rank_report", None)
+                if (
+                    published not in (int(KVPoll.Success), int(KVPoll.Failed))
+                    and published != int(poll)
+                ):
+                    mailbox.publish_local(key, int(poll))
+                    decode_req._async_tp_rank_report = int(poll)
+                if self.tp_rank == 0:
+                    status, cancel_requested = mailbox.transfer_group_status(key)
+                    if status in (int(KVPoll.Success), int(KVPoll.Failed)):
+                        # Do not expose a terminal result until P can observe
+                        # the destination-authored receipt. Failure to publish
+                        # retains the previous nonterminal cache/source owner.
+                        mailbox.publish_receipt(key, int(status))
+                    decode_req._async_tp_transfer_result = (status, cancel_requested)
+
+    def cached_tp_transfer_results(self):
+        """Scheduler-only local read; never polls a receiver or filesystem."""
+        return {
+            (str(dr.req.rid), int(dr.req.bootstrap_room)):
+                getattr(dr, "_async_tp_transfer_result", (None, False))
+            for dr in self.queue
+        }
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -1939,7 +2078,13 @@ class DecodeTransferQueue:
         indices_to_remove = set()
         for i, decode_req, poll in zip(selected_indices, selected_queue, polls):
             if poll == KVPoll.Failed:
-                if self.tp_rank == 0 and getattr(self.scheduler, "tp_size", 1) > 1:
+                if (
+                    self.tp_rank == 0 and getattr(self.scheduler, "tp_size", 1) > 1
+                    and not (
+                        self._async_progress_enabled
+                        and getattr(self, "_async_tp_control_enabled", False)
+                    )
+                ):
                     self.scheduler.agentic_tp_p2d_receiver_mailbox.publish_receipt(
                         request_generation_key(
                             decode_req.req.rid,
@@ -1992,7 +2137,13 @@ class DecodeTransferQueue:
                     # forever on a transfer that D has already consumed.
                     # This does not change P->D ordering or staging policy; it
                     # only closes the completion-notification race.
-                    if self.tp_rank == 0 and getattr(self.scheduler, "tp_size", 1) > 1:
+                    if (
+                        self.tp_rank == 0 and getattr(self.scheduler, "tp_size", 1) > 1
+                        and not (
+                            self._async_progress_enabled
+                            and getattr(self, "_async_tp_control_enabled", False)
+                        )
+                    ):
                         self.scheduler.agentic_tp_p2d_receiver_mailbox.publish_receipt(
                             request_generation_key(
                                 decode_req.req.rid,

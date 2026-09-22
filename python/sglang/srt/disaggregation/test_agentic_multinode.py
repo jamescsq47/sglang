@@ -69,7 +69,6 @@ def test_invalid_deployment_refused(changes):
     ("SGLANG_AGENTIC_KV_P_HOST_ASYNC_PREPARE", "1"),
     ("SGLANG_AGENTIC_KV_P_HOST_EVENT_PROGRESS", "1"),
     ("SGLANG_AGENTIC_KV_NUMA_HOST_POOL", "1"),
-    ("SGLANG_AGENTIC_KV_REGISTER_STARTUP_BARRIER", "1"),
     ("SGLANG_PD_ABLATION_P2D_PREBIND", "1"),
 ])
 def test_disagreement_and_unsupported_flags_refused(key, value):
@@ -164,6 +163,9 @@ def test_runtime_guard_checks_enabled_engine(monkeypatch):
                            disaggregation_mode="prefill", disaggregation_transfer_backend="nixl")
     config = m.validate_multinode_runtime(args, SimpleNamespace(k_buffer=[], v_buffer=[]))
     assert config.tp_size == 8
+    monkeypatch.setenv("SGLANG_AGENTIC_KV_HOST_STAGING", "false")
+    assert m.validate_multinode_runtime(args).tp_size == 8
+    monkeypatch.setenv("SGLANG_AGENTIC_KV_HOST_STAGING", "true")
     with pytest.raises(ValueError):
         m.validate_multinode_runtime(args, SimpleNamespace(mamba_pool=object()))
     monkeypatch.setenv("SGLANG_AGENTIC_KV_STAGING_LEDGER_PATH", "/dev/shm/wrong-run")

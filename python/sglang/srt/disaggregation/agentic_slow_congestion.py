@@ -74,8 +74,8 @@ class SlowCongestionReader:
         if now >= self.next_read:
             self.next_read = now + 1.0
             try:
-                with open(self.path, encoding="utf-8") as handle:
-                    payload = json.load(handle)
+                from sglang.srt.disaggregation.agentic_control_store import read_pressure_record
+                payload = read_pressure_record(self.path)
                 sample = payload.get("slow_recovery") if isinstance(payload, dict) else None
                 if not isinstance(sample, dict) or sample.get("version") != 1:
                     sample = None

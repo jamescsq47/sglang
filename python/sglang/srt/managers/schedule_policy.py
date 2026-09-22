@@ -812,7 +812,11 @@ class PrefillAdder:
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
             return AddReqResult.OTHER
 
-        if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
+        controller_workset = getattr(
+            getattr(req, "_agentic_p_workset_lease", None), "controller_plan", None
+        ) is not None
+        if (req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True)
+                and not controller_workset):
             return self.add_one_req_ignore_eos(req)
 
         total_tokens = req.extend_input_len + min(

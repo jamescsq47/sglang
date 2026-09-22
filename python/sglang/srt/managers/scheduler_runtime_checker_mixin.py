@@ -21,6 +21,78 @@ logger = logging.getLogger(__name__)
 
 
 class SchedulerRuntimeCheckerMixin:
+    def _check_controller_memory(self: Scheduler):
+        """Audit one installed ownership cut, not asynchronous native free lists.
+
+        Req/Radix donation changes references, not address ownership. Likewise a
+        native last-reference return remains owned until the all-rank RETURN is
+        installed. Count those ranges exactly once, including preparation and
+        pending fences. This is a diagnostic live-set walk, never progress or
+        admission, and does not read GPU tensors or query the control service.
+        """
+        broker = getattr(self, "agentic_p_workset_broker", None)
+        if not getattr(broker, "controller_mode", False):
+            return None
+        broker.check_health()
+        counts, views = broker.runtime.conservation_snapshot()
+        allocator = self.token_to_kv_pool_allocator
+        page_size = allocator.page_size
+        page_capacity = allocator.size // page_size
+        pool = getattr(self.req_to_token_pool, "mamba_pool", None)
+        slot_capacity = 0 if pool is None else pool.size
+        errors = []
+        if counts.live_leases != len(views):
+            errors.append("live lease count differs from installed owners")
+        keys = set()
+        for view in views:
+            plan = view.plan
+            if plan.key in keys:
+                errors.append("duplicate live lease identity")
+            keys.add(plan.key)
+            if not view.installed or plan.sequence > counts.sequence or plan.page_size != page_size:
+                errors.append("owner outside installed allocation cut")
+
+        def audit_ranges(name, capacity, free, remaining_name, plan_names):
+            ranges = []
+            for view in views:
+                granted = sorted((run.start, run.end) for field in plan_names
+                                 for run in getattr(view.plan, field))
+                for run in getattr(view, remaining_name):
+                    lo, hi = run.start, run.end
+                    if lo < 1 or hi <= lo or hi > capacity + 1:
+                        errors.append(f"{name} owned range outside pool")
+                    # Adjacent original runs can merge after a partial return.
+                    cursor = lo
+                    for start, end in granted:
+                        if start > cursor:
+                            break
+                        if end > cursor:
+                            cursor = end
+                        if cursor >= hi:
+                            break
+                    if cursor < hi:
+                        errors.append(f"{name} range outside exact lease grant")
+                    ranges.append((lo, hi))
+            end = 0
+            for lo, hi in sorted(ranges):
+                if lo < end:
+                    errors.append(f"{name} duplicate physical ownership")
+                end = max(end, hi)
+            owned = sum(hi - lo for lo, hi in ranges)
+            if not 0 <= free <= capacity or free + owned != capacity:
+                errors.append(f"{name} free plus owned differs from capacity")
+            return owned
+
+        pages = audit_ranges("attention", page_capacity, counts.free_pages,
+                             "remaining_pages", ("parent_pages", "suffix_pages"))
+        slots = audit_ranges("mamba", slot_capacity, counts.free_mamba_slots,
+                             "remaining_slots", ("checkpoint_slots", "runtime_slots"))
+        message = (f"controller_sequence={counts.sequence}, controller_live={len(views)}, "
+                   f"attention_free={counts.free_pages}, attention_owned={pages}, "
+                   f"attention_capacity={page_capacity}, mamba_free={counts.free_mamba_slots}, "
+                   f"mamba_owned={slots}, mamba_capacity={slot_capacity}, errors={errors}\n")
+        return bool(errors), message
+
     def _agentic_reserved_tokens(
         self: Scheduler, *, include_pending_releases: bool = True
     ) -> int:
@@ -153,6 +225,9 @@ class SchedulerRuntimeCheckerMixin:
         return memory_leak, token_msg
 
     def _check_mamba_memory(self: Scheduler):
+        controller_check = self._check_controller_memory()
+        if controller_check is not None:
+            return controller_check
         (
             full_num_used,
             mamba_num_used,
@@ -246,6 +321,9 @@ class SchedulerRuntimeCheckerMixin:
         return counts
 
     def _check_radix_cache_memory(self: Scheduler):
+        controller_check = self._check_controller_memory()
+        if controller_check is not None:
+            return controller_check
         _, _, available_size, evictable_size = self._get_token_info()
         protected_size = self.tree_cache.protected_size()
         session_held = self._session_held_tokens()
@@ -276,6 +354,11 @@ class SchedulerRuntimeCheckerMixin:
         return ret
 
     def self_check_during_busy(self: Scheduler):
+        controller_check = self._check_controller_memory()
+        if controller_check is not None:
+            memory_leak, message = controller_check
+            assert not memory_leak, f"Mem Leak Detected! {message}"
+            return
         current_batch: ScheduleBatch = self.last_batch
 
         if current_batch is None:
@@ -450,8 +533,20 @@ class SchedulerRuntimeCheckerMixin:
                 broker = getattr(self, "agentic_p_workset_broker", None)
                 if broker is not None:
                     with broker._lock:
-                        if broker._leases:
-                            return  # Bound/in-flight worksets are not idle.
+                        has_leases = bool(broker._leases)
+                    if has_leases:
+                        if getattr(broker, "controller_mode", False):
+                            memory_leak, message = self._check_controller_memory()
+                            if memory_leak:
+                                raise_error_or_warn(
+                                    self,
+                                    envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get(),
+                                    "count_memory_leak_warnings",
+                                    "token_to_kv_pool_allocator memory leak detected! " + message,
+                                )
+                        # Provisional Req/Radix bindings are not Req-pool idle;
+                        # controller address conservation was checked above.
+                        return
             if len(self.disagg_prefill_inflight_queue) > 0 or len(
                 getattr(self, "agentic_kv_waiting_queue", ())
             ) > 0:

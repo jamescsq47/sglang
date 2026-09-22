@@ -82,3 +82,117 @@ def test_default_single_node_still_uses_inotify(tmp_path, monkeypatch):
         request = RequestGeneration("local", 1)
         store.publish_arrival(request, prompt_token_count=128)
         assert any(item[0] == request for item in watcher.poll(0.2))
+        assert not store._arrival_events.exists()
+
+
+def test_remote_idle_poll_never_rereads_retained_history(tmp_path, remote_poll, monkeypatch):
+    store = early.AgenticEarlyClaimStore(str(tmp_path))
+    for i in range(1000):
+        store.publish_arrival(RequestGeneration("old", i), arrived_at=time.time() - 600)
+    watchers = [store.watch_arrivals(max_age_seconds=5) for _ in range(8)]
+    reads = []
+    original = store.read_arrival_path
+    monkeypatch.setattr(store, "read_arrival_path", lambda p, **kw: (reads.append(p), original(p, **kw))[1])
+    monkeypatch.setattr(store, "iter_arrivals", lambda **kw: pytest.fail("historical rescan"))
+    request = RequestGeneration("fresh", 0)
+    try:
+        for watcher in watchers:
+            assert watcher.poll() == []
+        assert reads == []
+        store.publish_arrival(request, prompt_token_count=128)
+        for watcher in watchers:
+            watcher._shared_poll.next_scan = 0
+            assert [r for r, _ in watcher.poll()] == [request]
+            watcher._shared_poll.next_scan = 0
+            assert watcher.poll() == []
+        assert len(reads) == 8  # One NEW marker per rank, not 1000 old files.
+    finally:
+        for watcher in watchers:
+            watcher.close()
+
+
+def test_remote_concurrent_publishers_and_bounded_batches(tmp_path, remote_poll):
+    from concurrent.futures import ThreadPoolExecutor
+    store = early.AgenticEarlyClaimStore(str(tmp_path))
+    with store.watch_arrivals(max_age_seconds=60) as watcher:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(lambda i: store.publish_arrival(RequestGeneration("burst", i)), range(300)))
+        first = watcher.poll()
+        assert len(first) == 256
+        watcher._shared_poll.next_scan = 0
+        second = watcher.poll()
+        assert len(second) == 44
+        assert len({r for r, _ in first + second}) == 300
+
+
+def test_remote_partial_event_is_not_consumed_and_writer_repairs_tail(tmp_path, remote_poll):
+    store = early.AgenticEarlyClaimStore(str(tmp_path))
+    with store.watch_arrivals(max_age_seconds=60) as watcher:
+        with store._arrival_events.open("ab") as f:
+            f.write(b"partial")
+        assert watcher.poll() == []
+        assert watcher._journal_cursor == 0
+        request = RequestGeneration("after-crashed-publisher", 0)
+        store.publish_arrival(request)
+        watcher._shared_poll.next_scan = 0
+        assert [r for r, _ in watcher.poll()] == [request]
+
+
+def test_remote_startup_scan_race_is_replayed_once(tmp_path, remote_poll, monkeypatch):
+    store = early.AgenticEarlyClaimStore(str(tmp_path))
+    request = RequestGeneration("startup-race", 0)
+    original = store.iter_arrivals
+    def scan(**kw):
+        store.publish_arrival(request)
+        return original(**kw)
+    monkeypatch.setattr(store, "iter_arrivals", scan)
+    with store.watch_arrivals(max_age_seconds=60) as watcher:
+        assert [r for r, _ in watcher.poll()] == [request]
+        watcher._shared_poll.next_scan = 0
+        assert watcher.poll() == []
+
+
+def test_host_journal_only_returns_changes_and_coalesces(tmp_path, remote_poll):
+    import hashlib
+    journal = early.SharedDirectoryEventJournal(tmp_path)
+    path = tmp_path / (hashlib.sha256(b"snapshot").hexdigest() + ".json")
+    journal.publish(path)  # historical event covered by startup resync
+    with early.AgenticDirectoryChangeWatcher(tmp_path, journal=journal) as watcher:
+        assert watcher.poll(0) == ((), False)
+        journal.publish(path)
+        journal.publish(path)
+        assert watcher.poll(0.2) == ((path,), False)
+        assert watcher.poll(0.2) == ((), False)
+
+
+def test_host_journal_concurrent_writers_partial_tail_and_reset(tmp_path):
+    import hashlib
+    from concurrent.futures import ThreadPoolExecutor
+    journal = early.SharedDirectoryEventJournal(tmp_path)
+    cursors = journal.cursors()
+    paths = [tmp_path / (hashlib.sha256(str(i).encode()).hexdigest() + ".json") for i in range(500)]
+    with journal.paths[0].open("ab") as stream:
+        stream.write(b"partial")
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(journal.publish, paths))
+    seen = set()
+    while True:
+        changed, cursors, reset = journal.read(cursors)
+        assert not reset
+        seen.update(changed)
+        if not changed:
+            break
+    assert seen == set(paths)
+    with journal.paths[0].open("wb"):
+        pass
+    _, _, reset = journal.read(cursors)
+    assert reset  # consumer must reconcile a truncated/rotated epoch
+
+
+def test_host_journal_reader_does_not_wait_for_writer(tmp_path):
+    import fcntl
+    journal = early.SharedDirectoryEventJournal(tmp_path)
+    cursors = journal.cursors()
+    with journal.paths[0].open("rb") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        assert journal.read(cursors) == ((), cursors, False)

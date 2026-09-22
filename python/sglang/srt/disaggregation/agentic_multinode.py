@@ -69,6 +69,7 @@ class MultiNodeConfig:
     pp_size: int = 1
     engine_nnodes: int = 1
     control_poll_interval: float = 0.1
+    event_control: bool = False
 
     @property
     def control_directory(self) -> str:
@@ -100,16 +101,34 @@ class MultiNodeConfig:
             raise ValueError("multi-node custom Host staging cannot enable native storage")
         if bool(getattr(server_args, "disaggregation_decode_enable_offload_kvcache", False)):
             raise ValueError("multi-node uses custom lifecycle offload, not native Decode offload")
+        if _enabled(os.getenv("SGLANG_AGENTIC_MULTINODE_QWEN35_HYBRID", "0"), "QWEN35_HYBRID"):
+            if bool(getattr(server_args, "enable_int8_mamba_checkpoint", False)):
+                raise ValueError("remote Qwen3.5 does not support int8 Mamba checkpoint payloads")
+            if (getattr(server_args, "mamba_scheduler_strategy", None) != "extra_buffer"
+                    or getattr(server_args, "mamba_track_interval", None) != getattr(server_args, "page_size", None)):
+                raise ValueError("remote Qwen3.5 requires extra_buffer and page-aligned Mamba checkpoints")
 
     def validate_kv_pool(self, kv_pool) -> None:
         """Reject unsupported layouts before starting any agentic I/O workers.
 
-        A hybrid snapshot is not just attention KV. Until the network adapter
-        covers its recurrent/conv checkpoint, do not silently transfer a subset.
+        A hybrid snapshot includes recurrent/conv checkpoints. Only the explicit
+        request-owned Qwen3.5 composite adapter may transfer that layout.
         """
         pool = getattr(kv_pool, "full_kv_pool", kv_pool)
         if hasattr(kv_pool, "mamba_pool") or hasattr(pool, "mamba_pool"):
-            raise ValueError("multi-node V1 supports MHA KV only; Mamba state transport is not integrated")
+            from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
+            from sglang.srt.disaggregation.agentic_hybrid_transfer import request_owned_mamba_enabled
+            from sglang.srt.disaggregation.agentic_remote_hybrid import HybridWireLayout
+            if (not _enabled(os.getenv("SGLANG_AGENTIC_MULTINODE_QWEN35_HYBRID", "0"), "QWEN35_HYBRID")
+                    or not request_owned_mamba_enabled()
+                    or not _enabled(os.getenv("SGLANG_AGENTIC_KV_MAMBA_PROMPT_CHECKPOINT", "0"), "MAMBA_PROMPT_CHECKPOINT")
+                    or not isinstance(kv_pool, HybridLinearKVPool)
+                    or not isinstance(pool, MHATokenToKVPool)
+                    or str(pool.store_dtype) != "torch.bfloat16"):
+                raise ValueError("remote hybrid requires explicit request-owned BF16 Qwen3.5 MHA+GDN adapter")
+            HybridWireLayout(kv_pool, 1)
+            HybridWireLayout(kv_pool, 2)
+            return
         if pool is not kv_pool or not all(hasattr(pool, name) for name in ("k_buffer", "v_buffer")):
             raise ValueError("multi-node V1 requires the native MHA KV pool, not MLA/SWA/hybrid layouts")
 
@@ -122,18 +141,33 @@ def validate_multinode_runtime(server_args, kv_pool=None) -> Optional[MultiNodeC
         for key in (
             "SGLANG_AGENTIC_KV_LIFECYCLE",
             "SGLANG_AGENTIC_KV_CUSTOM_STORAGE_ONLY",
-            "SGLANG_AGENTIC_KV_HOST_STAGING",
             "SGLANG_AGENTIC_KV_P2D_HOST_STAGING",
         ):
             if not _enabled(os.getenv(key, "0"), key):
                 raise ValueError(f"multi-node full method requires {key}=true")
+        # D->P Host is optional for Direct-only ablations. Its absence uses
+        # the existing fenced failure/recompute path, never native offload.
+        _enabled(os.getenv("SGLANG_AGENTIC_KV_HOST_STAGING", "true"),
+                 "SGLANG_AGENTIC_KV_HOST_STAGING")
+        if _enabled(os.getenv("SGLANG_AGENTIC_KV_DIRECT_WAIT_ONLY", "false"),
+                    "SGLANG_AGENTIC_KV_DIRECT_WAIT_ONLY"):
+            if not config.event_control:
+                raise ValueError("Direct wait-only requires socket event control")
+            for key in ("SGLANG_AGENTIC_KV_HOST_STAGING",
+                        "SGLANG_AGENTIC_KV_FORCE_SLOW_PATH",
+                        "SGLANG_AGENTIC_KV_FAST_DIRECT_FAILURE_RECOMPUTE",
+                        "SGLANG_AGENTIC_KV_SLOW_CONGESTION_RECOMPUTE",
+                        "SGLANG_AGENTIC_KV_DISABLE_D2P_REUSE"):
+                if _enabled(os.getenv(key, "false"), key):
+                    raise ValueError(f"Direct wait-only requires {key}=false")
         if config.role == "decode" and not _enabled(
             os.getenv("SGLANG_AGENTIC_KV_D_HOSTLESS", "0"), "SGLANG_AGENTIC_KV_D_HOSTLESS"
         ):
             raise ValueError("multi-node Decode requires custom D_HOSTLESS, not native offload storage")
         if os.getenv("SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_BACKEND", "") != "memfd":
             raise ValueError("multi-node Host data must use source-local memfd DRAM")
-        shared_root = os.path.realpath(config.control_directory)
+        shared_root = (os.path.normpath(config.control_directory) if config.event_control
+                       else os.path.realpath(config.control_directory))
         for key in (
             "SGLANG_AGENTIC_KV_LEDGER_PATH", "SGLANG_AGENTIC_KV_STAGING_LEDGER_PATH",
             "SGLANG_AGENTIC_KV_P2D_STAGING_LEDGER_PATH", "SGLANG_AGENTIC_KV_METADATA_DIR",
@@ -141,9 +175,10 @@ def validate_multinode_runtime(server_args, kv_pool=None) -> Optional[MultiNodeC
         ):
             value = os.getenv(key, "")
             if not value or not os.path.isabs(value) or os.path.commonpath(
-                [shared_root, os.path.realpath(value)]
+                [shared_root, os.path.normpath(value) if config.event_control else os.path.realpath(value)]
             ) != shared_root:
-                raise ValueError(f"{key} must be inside the shared run control directory")
+                scope = "run control namespace" if config.event_control else "shared run control directory"
+                raise ValueError(f"{key} must be inside the {scope}")
         if kv_pool is not None:
             config.validate_kv_pool(kv_pool)
     return config
@@ -180,12 +215,20 @@ def load_multinode_config(environ: Optional[Mapping[str, str]] = None) -> Option
         if _integer(env, name, 1) != 1:
             raise ValueError(f"{PREFIX + name} must be 1: each whole TP group stays on one host")
     control_root = os.path.normpath(_required(env, "CONTROL_ROOT"))
+    event_control = bool(env.get("SGLANG_AGENTIC_CONTROL_ENDPOINT", ""))
+    if event_control:
+        for key in ("SGLANG_AGENTIC_CONTROL_RUN_ID", "SGLANG_AGENTIC_CONTROL_TOKEN",
+                    "SGLANG_AGENTIC_TP_EVENT_ENDPOINT"):
+            if not env.get(key):
+                raise ValueError(f"message control requires {key}")
+        if env["SGLANG_AGENTIC_CONTROL_RUN_ID"] != run_id:
+            raise ValueError("control broker and engine run IDs disagree")
     if not os.path.isabs(control_root) or control_root == "/":
         raise ValueError("CONTROL_ROOT must be a dedicated absolute shared-filesystem directory")
     # realpath also catches an existing alias to /dev/shm. This is a negative
     # guard only: a path outside these trees is NOT proof of cross-host sharing.
-    resolved = os.path.realpath(control_root)
-    if any(resolved == path or resolved.startswith(path + "/") for path in ("/dev", "/proc", "/sys", "/run")):
+    resolved = os.path.normpath(control_root) if event_control else os.path.realpath(control_root)
+    if not event_control and any(resolved == path or resolved.startswith(path + "/") for path in ("/dev", "/proc", "/sys", "/run")):
         raise ValueError("CONTROL_ROOT must be shared across hosts, not local tmpfs/device state")
     try:
         poll_interval = float(env.get(PREFIX + "CONTROL_POLL_INTERVAL", "0.1"))
@@ -194,7 +237,7 @@ def load_multinode_config(environ: Optional[Mapping[str, str]] = None) -> Option
     if not math.isfinite(poll_interval) or not 0.05 <= poll_interval <= 1.0:
         raise ValueError("CONTROL_POLL_INTERVAL must be between 0.05 and 1.0 seconds")
     config = MultiNodeConfig(run_id, node_id, engine_id, role, host_ip, tp_size, peer_tp_size, control_root,
-                             control_poll_interval=poll_interval)
+                             control_poll_interval=poll_interval, event_control=event_control)
     agreements = {
         "SGLANG_HOST_IP": host_ip,
         "HOST_IP": host_ip,
@@ -212,7 +255,6 @@ def load_multinode_config(environ: Optional[Mapping[str, str]] = None) -> Option
         "SGLANG_AGENTIC_KV_P_HOST_ASYNC_PREPARE",
         "SGLANG_AGENTIC_KV_P_HOST_EVENT_PROGRESS",
         "SGLANG_AGENTIC_KV_NUMA_HOST_POOL",
-        "SGLANG_AGENTIC_KV_REGISTER_STARTUP_BARRIER",
         "SGLANG_PD_ABLATION_P2D_PREBIND",
     ):
         if _enabled(env.get(key, "0"), key):
@@ -223,7 +265,7 @@ def load_multinode_config(environ: Optional[Mapping[str, str]] = None) -> Option
 def control_poll_interval(environ: Optional[Mapping[str, str]] = None) -> Optional[float]:
     """Remote filesystem changes need bounded polling, not inotify alone."""
     config = load_multinode_config(environ)
-    return None if config is None else config.control_poll_interval
+    return None if config is None or config.event_control else config.control_poll_interval
 
 
 def source_host_placement(tp_size: int, recovery_domain: int) -> Optional[tuple[int, list[int]]]:
@@ -249,6 +291,20 @@ def capabilities() -> dict:
     return {
         "integrated": True,
         "engine_integration": True,
+        # Production adapters passed CPU fault tests + independent audit.
+        # a10/a11 TP8 Direct and both Host directions passed bounded exact-
+        # output probes. This is not all-topology/full-workload acceptance.
+        "socket_control_engine": True,
+        "socket_control_validation": "tp8_two_host_smoke_passed_full_workload_unverified",
+        "socket_control_smoke": {
+            "tp_size": 8,
+            "nodes": 2,
+            "model": "Qwen3.5-122B-A10B",
+            "paths": ["direct", "d2p_host", "p2d_host"],
+            "exact_output_match": True,
+            "run": "qwen35-122b-swe500-tp8-c128-socket-control-r5-p2d-device",
+            "load_test": False,
+        },
         "hardware_verified": False,
         "status": "experimental_remote_smoke_required",
         "features": [

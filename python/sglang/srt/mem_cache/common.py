@@ -330,6 +330,60 @@ def alloc_req_slots(
     return req_pool_indices
 
 
+def preflight_controller_worksets(batch):
+    """Validate a controller-backed native batch before allocating Req slots.
+
+    This is a local ownership check/descriptor consumption boundary, not an
+    admission loop. Rank zero must already have selected the common ready cut.
+    Missing reservations are errors: controller mode never falls back to a
+    second native Attention/Mamba allocator. No CUDA readback, waits or RPC.
+    """
+    allocator = batch.tree_cache.token_to_kv_pool_allocator
+    if getattr(allocator, "_agentic_workset_adapter", None) is None:
+        return
+    page_size = int(allocator.page_size)
+    if page_size <= 1:
+        raise RuntimeError("controller worksets require paged KV allocation")
+    ready = []
+    for index, req in enumerate(batch.reqs):
+        lease = getattr(req, "_agentic_p_workset_lease", None)
+        broker = getattr(req, "_agentic_p_workset_broker", None)
+        plan = getattr(lease, "controller_plan", None)
+        if (not getattr(req, "_agentic_workset_backed", False)
+                or broker is None or lease is None or plan is None
+                or lease.state != "handed" or broker.get(lease.snapshot_id) is not lease
+                or getattr(lease, "prepared_descriptor", None) is None):
+            raise RuntimeError("native Prefill requires its exact prepared controller workset")
+        prefix_len, extend_len = int(batch.prefix_lens[index]), int(batch.extend_lens[index])
+        reserved = getattr(req, "_agentic_workset_suffix_indices", None)
+        remaining = lease.remaining_suffix_indices
+        if (prefix_len != lease.parent_tokens + lease.suffix_cursor
+                or len(req.prefix_indices) != prefix_len
+                or prefix_len % page_size or extend_len < 0
+                or prefix_len + extend_len > lease.prompt_tokens
+                or (prefix_len + extend_len < lease.prompt_tokens and extend_len % page_size)
+                or reserved is None or reserved.numel() != remaining.numel()
+                or reserved.data_ptr() != remaining.data_ptr()
+                or reserved.numel() < extend_len):
+            raise RuntimeError("native Prefill prefix/chunk does not match its complete workset")
+        if plan.runtime_slots:
+            from sglang.srt.disaggregation.agentic_mamba_prefill import missing_runtime_slots
+            if (getattr(batch.req_to_token_pool, "mamba_pool", None) is None
+                    or missing_runtime_slots(req, batch.req_to_token_pool)):
+                raise RuntimeError("native Prefill lacks prepared Mamba runtime")
+            if not callable(getattr(broker, "prepare_req_checkpoints", None)):
+                raise RuntimeError("controller workset lacks its checkpoint ownership bridge")
+        ready.append((req, lease, broker))
+    # Validate the whole batch before any ownership handoff; setup below is
+    # idempotent local-only and never chooses/allocates physical addresses.
+    for req, lease, broker in ready:
+        if lease.controller_plan.runtime_slots:
+            broker.prepare_req_checkpoints(req, lease)
+            rotation = getattr(req, "_agentic_checkpoint_rotation", None)
+            if rotation is None or rotation.key != lease.controller_plan.key or not rotation.can_take():
+                raise RuntimeError("controller checkpoint is not safely reusable")
+
+
 def alloc_for_extend(
     batch: ScheduleBatch,
 ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
@@ -341,6 +395,8 @@ def alloc_for_extend(
         req_pool_indices_device: request pool indices at a device tensor
         req_pool_indices: request pool indices as list
     """
+    preflight_controller_worksets(batch)
+
     # free out-of-window swa tokens
     batch.maybe_evict_swa()
 
@@ -565,7 +621,8 @@ def release_unadmitted_mamba_cow(req: Req, tree_cache: BasePrefixCache):
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
-    if getattr(req, "_agentic_mamba_prefill_checkpoint", None) is not None:
+    if (getattr(req, "_agentic_mamba_prefill_checkpoint", None) is not None
+            or getattr(req, "_agentic_checkpoint_rotation", None) is not None):
         from sglang.srt.disaggregation.agentic_mamba_prefill import release_prefill_checkpoint
         release_prefill_checkpoint(req, tree_cache.req_to_token_pool.mamba_pool)
     # MambaRadixCache may alloc mamba state before alloc KV cache

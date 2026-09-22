@@ -13,12 +13,14 @@ copy immutable, scheduler-pinned pages and publish completion state.
 """
 
 import logging
+from contextlib import contextmanager
 import math
 import mmap
 import os
 import queue
 import threading
 import time
+import uuid
 from typing import Any, Optional
 
 import torch
@@ -43,6 +45,82 @@ from sglang.srt.disaggregation.agentic_remote_host_engine import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _scheduler_host_lock(manager):
+    # The offer worker may be awaiting a committed broker reply. Forward must
+    # never wait for that worker's ownership lock; retry this local step later.
+    acquired = manager._lock.acquire(
+        blocking=not getattr(getattr(manager, "ledger", None), "is_event_control", False)
+    )
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            manager._lock.release()
+
+
+def _scheduler_release_decision(manager, snapshot_id):
+    if getattr(manager.ledger, "is_event_control", False):
+        return manager.ledger.poll_call(
+            "arbitrate_p2d_release", snapshot_id, tp_size=manager.tp_size,
+            wakeup=manager._candidate_wakeup,
+        )
+    return True, manager.ledger.arbitrate_p2d_release(
+        snapshot_id, tp_size=manager.tp_size
+    )
+
+
+def _receiver_identity(manager, receiver, *, include_rank=False):
+    if not getattr(manager.ledger, "is_event_control", False):
+        return {}
+    identity = {"decode_domain": manager.decode_domain, "attempt_id": receiver._host_load_attempt}
+    if include_rank:
+        identity.update(tp_rank=manager.tp_rank, tp_size=manager.tp_size)
+    return identity
+
+
+def _start_ledger_wakeup(manager, *events):
+    """Fan pushed changes into existing workers; no history/filesystem scan."""
+    if not getattr(manager.ledger, "is_event_control", False):
+        return
+    watcher = manager.ledger.create_watcher()
+    manager._ledger_watcher = watcher
+    def consume():
+        try:
+            while not manager._stop.is_set():
+                watcher.wait_events()
+                for event in events:
+                    event.set()
+        except Exception:
+            if not manager._stop.is_set():
+                logger.exception("P->D Host control stream failed closed")
+            for event in events:
+                event.set()
+    manager._ledger_watcher_thread = threading.Thread(
+        target=consume, name="agentic-p2d-ledger-events", daemon=True,
+    )
+    manager._ledger_watcher_thread.start()
+
+
+def _stop_ledger_wakeup(manager):
+    watcher = getattr(manager, "_ledger_watcher", None)
+    if watcher is not None:
+        watcher.close()
+        manager._ledger_watcher_thread.join(timeout=2.0)
+
+
+def _group_wait_timeout(manager):
+    if not getattr(manager.ledger, "is_event_control", False):
+        return 0.01
+    # Committed Host events wake normal progress. A physical cleanup retry
+    # (registration/remote READ fence) can finish in another service without
+    # changing this ledger; retain a bounded retry only while such work exists.
+    if (getattr(manager, "_records", None) or getattr(manager, "_group_pending", None)
+            or getattr(manager, "_pending_aborts", None)):
+        return 0.05
+    return None
 
 P2D_CUSTOM_SNAPSHOT_ID = "agentic_p2d_host_snapshot_id"
 P2D_CUSTOM_PREFILL_DOMAIN = "agentic_p2d_prefill_domain"
@@ -601,6 +679,10 @@ class AgenticPToDHostStagingManager:
         # that offer, so a long subsequent Prefill cannot pin completed KV in
         # P HBM merely because control progress is delayed.
         self._candidates: dict[str, dict[str, Any]] = {}
+        self._async_watch_registration = (
+            self.tp_size > 1 and self._remote_bridge is not None
+        ) or getattr(self.ledger, "is_event_control", False)
+        self._watch_registrations: queue.SimpleQueue = queue.SimpleQueue()
         self._candidate_wakeup = threading.Event()
         self._stop = threading.Event()
         self._offer_thread = threading.Thread(
@@ -622,6 +704,7 @@ class AgenticPToDHostStagingManager:
             name=f"agentic-p2d-spill-completion-{os.getpid()}",
             daemon=True,
         )
+        _start_ledger_wakeup(self, self._candidate_wakeup, self._group_wakeup)
         self._offer_thread.start()
         for thread in self._threads:
             thread.start()
@@ -698,6 +781,19 @@ class AgenticPToDHostStagingManager:
         """Register completed P KV for scheduler-independent Host admission."""
 
         snapshot_id = p2d_snapshot_id(req.bootstrap_room)
+        if getattr(self, "_async_watch_registration", False):
+            source_ready_event = None
+            if torch.is_tensor(source_indices) and source_indices.is_cuda:
+                source_ready_event = torch.cuda.Event()
+                source_ready_event.record(
+                    torch.cuda.current_stream(device=source_indices.device)
+                )
+            self._watch_registrations.put((snapshot_id, {
+                "req": req, "source_indices": source_indices,
+                "source_ready_event": source_ready_event,
+            }))
+            self._candidate_wakeup.set()
+            return True
         with self._lock:
             if (
                 snapshot_id in self._active
@@ -725,14 +821,16 @@ class AgenticPToDHostStagingManager:
         """Cancel before page release, or return False when Host owns KV."""
 
         snapshot_id = p2d_snapshot_id(req.bootstrap_room)
-        with self._lock:
+        with _scheduler_host_lock(self) as acquired:
+            if not acquired:
+                return False
             local_snapshot = getattr(req, "_agentic_p2d_host_snapshot_id", None)
             if local_snapshot in self._active:
                 return False
             if local_snapshot is None:
-                ownership = self.ledger.arbitrate_p2d_release(
-                    snapshot_id, tp_size=self.tp_size
-                )
+                ready, ownership = _scheduler_release_decision(self, snapshot_id)
+                if not ready:
+                    return False
                 if ownership == P2D_RELEASE_HOST_OWNED:
                     return False
             req._agentic_p2d_host_terminal = True
@@ -946,13 +1044,22 @@ class AgenticPToDHostStagingManager:
             return snapshot_id in self._active or snapshot_id in self._results
 
     def poll(self, req) -> Optional[int]:
+        # A physical terminal result is immutable for this request-generation.
+        # Release arbitration is a separate step: lock contention there must
+        # never turn an already reported terminal fence back into Transferring.
+        terminal = getattr(req, "_agentic_p2d_host_physical_terminal", None)
+        if terminal is not None:
+            return terminal
         snapshot_id = getattr(req, "_agentic_p2d_host_snapshot_id", None)
         if snapshot_id is None:
             return int(KVPoll.Transferring) if self.group_claimed(req) else None
-        with self._lock:
+        with _scheduler_host_lock(self) as acquired:
+            if not acquired:
+                return int(KVPoll.Transferring)
             result = self._results.get(snapshot_id)
             active = snapshot_id in self._active
         if result == int(KVPoll.Success):
+            req._agentic_p2d_host_physical_terminal = result
             return result
         if result == int(KVPoll.Failed):
             # Host ownership is exclusive once any TP rank claims the offer.
@@ -960,6 +1067,7 @@ class AgenticPToDHostStagingManager:
             # can resurrect stale NIXL metadata and split one logical request
             # across transfer modes.  Fail this generation closed; the caller
             # may retry it as a fresh request-generation.
+            req._agentic_p2d_host_physical_terminal = result
             return result
         return int(KVPoll.Transferring) if active else None
 
@@ -972,7 +1080,9 @@ class AgenticPToDHostStagingManager:
         """
 
         candidate_id = p2d_snapshot_id(req.bootstrap_room)
-        with self._lock:
+        with _scheduler_host_lock(self) as acquired:
+            if not acquired:
+                return False
             snapshot_id = getattr(req, "_agentic_p2d_host_snapshot_id", None)
             if snapshot_id is not None:
                 if snapshot_id in self._active:
@@ -983,17 +1093,17 @@ class AgenticPToDHostStagingManager:
             elif candidate_id in self._active or candidate_id in self._results:
                 return False
             elif candidate_id in self._prepared:
-                ownership = self.ledger.arbitrate_p2d_release(
-                    candidate_id, tp_size=self.tp_size
-                )
+                ready, ownership = _scheduler_release_decision(self, candidate_id)
+                if not ready:
+                    return False
                 if ownership == P2D_RELEASE_HOST_OWNED:
                     return False
                 prepared = self._prepared.pop(candidate_id)
                 self._release_unwritten_snapshot(candidate_id, prepared["snapshot"])
             else:
-                ownership = self.ledger.arbitrate_p2d_release(
-                    candidate_id, tp_size=self.tp_size
-                )
+                ready, ownership = _scheduler_release_decision(self, candidate_id)
+                if not ready:
+                    return False
                 if ownership == P2D_RELEASE_HOST_OWNED:
                     # Another TP rank won live Host ownership after our last
                     # poll.  Keep this shard until its offer worker joins.  A
@@ -1014,6 +1124,7 @@ class AgenticPToDHostStagingManager:
         """Stop the background worker before its tmpfs control files vanish."""
 
         self._stop.set()
+        _stop_ledger_wakeup(self)
         self._candidate_wakeup.set()
         self._group_wakeup.set()
         for _ in self._threads:
@@ -1051,12 +1162,31 @@ class AgenticPToDHostStagingManager:
                 self.arena.release(record["snapshot"])
             self.arena.close()
 
+    def _drain_watch_registrations(self) -> None:
+        """Offer-worker only; terminal requests can never re-enter staging."""
+        while True:
+            try:
+                snapshot_id, candidate = self._watch_registrations.get_nowait()
+            except queue.Empty:
+                return
+            with self._lock:
+                if (
+                    not getattr(candidate["req"], "_agentic_p2d_host_terminal", False)
+                    and snapshot_id not in self._active
+                    and snapshot_id not in self._prepared
+                    and snapshot_id not in self._results
+                ):
+                    self._candidates.setdefault(snapshot_id, candidate)
+
     def _offer_worker(self) -> None:
         """Claim new D Host offers without waiting for the P scheduler."""
 
         while not self._stop.is_set():
-            self._candidate_wakeup.wait(timeout=0.02)
+            self._candidate_wakeup.wait(
+                timeout=None if getattr(self.ledger, "is_event_control", False) else 0.02
+            )
             self._candidate_wakeup.clear()
+            self._drain_watch_registrations()
             with self._lock:
                 candidates = list(self._candidates.items())
             for snapshot_id, candidate in candidates:
@@ -1114,6 +1244,9 @@ class AgenticPToDHostStagingManager:
         staging: LayerFirstD2HStaging,
         bounces: tuple[PinnedMHAHostBounce, ...],
     ) -> None:
+        # CUDA current device is thread-local. The stream was created on the
+        # owning TP rank; select it before Host registration or any CUDA work.
+        torch.cuda.set_device(stream.device)
         while not self._stop.is_set():
             try:
                 work = self._work.get(timeout=0.1)
@@ -1348,7 +1481,9 @@ class AgenticPToDHostStagingManager:
 
     def _completion_worker(self) -> None:
         while not self._stop.is_set():
-            self._group_wakeup.wait(timeout=0.01)
+            self._group_wakeup.wait(
+                timeout=_group_wait_timeout(self)
+            )
             self._group_wakeup.clear()
             self._progress_group_completions_once()
             self._cleanup_consumed()
@@ -1412,6 +1547,8 @@ class AgenticPToDHostStagingManager:
                     continue
             with self._lock:
                 self._records.pop(snapshot_id, None)
+            if getattr(self.ledger, "is_event_control", False):
+                self._candidate_wakeup.set()
             logger.info(
                 "AgenticKV p2d_host_release snapshot=%s state=%s",
                 snapshot_id,
@@ -1487,6 +1624,10 @@ class AgenticPToDHostLoadManager:
         self._dma_poisoned = False
         self._completion_lock = threading.RLock()
         self._group_pending: dict[str, dict[str, Any]] = {}
+        self._async_host_control = (
+            self._remote_bridge is not None and self.tp_size > 1
+        ) or getattr(self.ledger, "is_event_control", False)
+        self._pending_aborts: dict[str, tuple[Any, bool]] = {}
         self._group_wakeup = threading.Event()
         self._stop = threading.Event()
         self._threads = [
@@ -1505,6 +1646,7 @@ class AgenticPToDHostLoadManager:
             name=f"agentic-p2d-load-completion-{os.getpid()}",
             daemon=True,
         )
+        _start_ledger_wakeup(self, self._group_wakeup)
         self._completion_thread.start()
         logger.info(
             "Agentic P->D Host load enabled D_domain=%d numa=%d "
@@ -1517,6 +1659,7 @@ class AgenticPToDHostLoadManager:
 
     def close(self) -> None:
         self._stop.set()
+        _stop_ledger_wakeup(self)
         self._group_wakeup.set()
         for _ in self._threads:
             self._work.put(None)
@@ -1532,6 +1675,17 @@ class AgenticPToDHostLoadManager:
     ) -> None:
         """Publish cancellation without releasing a peer rank's Host extent."""
 
+        if getattr(self, "_async_host_control", False):
+            # Called under Decode's receiver lifecycle lock. Never perform
+            # ledger I/O here; submitted/queued targets remain pinned until
+            # the load worker proves no DMA or drains its physical fence.
+            with self._completion_lock:
+                self._pending_aborts[receiver.snapshot_id] = (receiver, locally_quiesced)
+            self._group_wakeup.set()
+            return
+        self._publish_abort(receiver, locally_quiesced=locally_quiesced)
+
+    def _publish_abort(self, receiver, *, locally_quiesced: bool) -> None:
         entry = self.ledger.get(receiver.snapshot_id)
         if entry is None:
             return
@@ -1542,6 +1696,7 @@ class AgenticPToDHostLoadManager:
             receiver.snapshot_id,
             owner,
             reason="p2d_h2d_cancelled",
+            **_receiver_identity(self, receiver, include_rank=True),
         )
         if not locally_quiesced:
             with self._completion_lock:
@@ -1552,6 +1707,7 @@ class AgenticPToDHostLoadManager:
                 owner,
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
+                **_receiver_identity(self, receiver),
             )
         self._group_wakeup.set()
 
@@ -1563,71 +1719,71 @@ class AgenticPToDHostLoadManager:
                 receiver._terminal = True
                 receiver._poll = int(KVPoll.Failed)
                 return
-            entry = self.ledger.get(receiver.snapshot_id)
-            if (
-                entry is not None
-                and entry.get("state") == HostStageState.ABORTING.value
-                and entry.get("h2d_abort_started", False)
-            ):
-                owner = entry.get("p_owner")
-                self.ledger.mark_host_load_rank_drained(
-                    receiver.snapshot_id,
-                    owner,
-                    tp_rank=self.tp_rank,
-                    tp_size=self.tp_size,
-                )
-                receiver._owner = owner
-                receiver._terminal = True
-                receiver._error = RuntimeError("P->D Host peer load aborted")
-                receiver._poll = int(KVPoll.Failed)
+            if getattr(self, "_async_host_control", False):
+                if torch.is_tensor(device_indices) and device_indices.is_cuda:
+                    receiver._remote_indices_ready = torch.cuda.Event()
+                    receiver._remote_indices_ready.record(
+                        torch.cuda.current_stream(device=device_indices.device)
+                    )
+                receiver._submitted = True
+                receiver._poll = int(KVPoll.Transferring)
+                self._work.put((receiver, device_indices))
                 return
-            if entry is None or entry.get("state") not in {
-                HostStageState.HOST_READY.value,
-                HostStageState.H2D_LOADING.value,
-            }:
-                raise RuntimeError("P->D Host snapshot is not ready")
-            grants = entry.get("grants", [])
-            matching = [
-                grant
-                for grant in grants
-                if grant.get("kind") == "shared_host_extent"
-                and int(grant.get("tp_rank", 0)) == int(getattr(self, "tp_rank", 0))
-            ]
-            if len(matching) != 1:
-                raise RuntimeError(
-                    f"P->D Host snapshot has no TP rank "
-                    f"{getattr(self, 'tp_rank', 0)} extent"
-                )
-            grant = matching[0]
-            arena_numa_node = int(grant.get("arena_numa_node", -1))
-            if arena_numa_node < 0 and not grant.get("remote_host_node"):
-                raise RuntimeError("P->D Host grant has no Arena NUMA node")
-            if int(grant["token_count"]) != len(device_indices):
-                raise RuntimeError("P->D Host destination token count mismatch")
-            owner = entry.get("p_owner")
-            if not self.ledger.begin_host_load_rank(
-                receiver.snapshot_id,
-                owner,
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
-            ):
-                raise RuntimeError("P->D H2D ownership transition was rejected")
-            receiver._submitted = True
-            receiver._poll = int(KVPoll.Transferring)
-            receiver._grant = grant
-            receiver._owner = owner
-            receiver._cross_numa = arena_numa_node != self.numa_node
-            if getattr(self, "_remote_bridge", None) is not None and (
-                torch.is_tensor(device_indices) and device_indices.is_cuda
-            ):
-                # The receiving scheduler creates GPU page indices on its
-                # stream. Publish that producer fence, never synchronize it
-                # here; the remote I/O worker mirrors only after it completes.
-                receiver._remote_indices_ready = torch.cuda.Event()
-                receiver._remote_indices_ready.record(
-                    torch.cuda.current_stream(device=device_indices.device)
-                )
+            if not self._prepare_load(receiver, device_indices):
+                return
             self._work.put((receiver, device_indices))
+
+    def _prepare_load(self, receiver, device_indices) -> bool:
+        """Validate/claim the same grant; multi-node calls only on I/O worker."""
+        # No receiver lock here: remote metadata may block. Only this load's
+        # unique worker writes its grant. Concurrent abort sets a local flag;
+        # the worker checks it before DMA and follows the original drain path.
+        entry = self.ledger.get(receiver.snapshot_id)
+        receiver._owner = None if entry is None else entry.get("p_owner")
+        if (
+            entry is not None
+            and entry.get("state") == HostStageState.ABORTING.value
+            and entry.get("h2d_abort_started", False)
+        ):
+            self.ledger.mark_host_load_rank_drained(
+                receiver.snapshot_id, receiver._owner,
+                tp_rank=self.tp_rank, tp_size=self.tp_size,
+                **_receiver_identity(self, receiver),
+            )
+            receiver.mark_terminal(KVPoll.Failed, error=RuntimeError("P->D Host peer load aborted"))
+            return False
+        if entry is None or entry.get("state") not in {
+            HostStageState.HOST_READY.value, HostStageState.H2D_LOADING.value,
+        }:
+            raise RuntimeError("P->D Host snapshot is not ready")
+        matching = [
+            grant for grant in entry.get("grants", [])
+            if grant.get("kind") == "shared_host_extent"
+            and int(grant.get("tp_rank", 0)) == self.tp_rank
+        ]
+        if len(matching) != 1:
+            raise RuntimeError(f"P->D Host snapshot has no TP rank {self.tp_rank} extent")
+        grant = matching[0]
+        arena_numa_node = int(grant.get("arena_numa_node", -1))
+        if arena_numa_node < 0 and not grant.get("remote_host_node"):
+            raise RuntimeError("P->D Host grant has no Arena NUMA node")
+        if int(grant["token_count"]) != len(device_indices):
+            raise RuntimeError("P->D Host destination token count mismatch")
+        if not self.ledger.begin_host_load_rank(
+            receiver.snapshot_id, receiver._owner, tp_rank=self.tp_rank, tp_size=self.tp_size,
+            **_receiver_identity(self, receiver),
+        ):
+            raise RuntimeError("P->D H2D ownership transition was rejected")
+        receiver._submitted = True
+        receiver._poll = int(KVPoll.Transferring)
+        receiver._grant = grant
+        receiver._cross_numa = arena_numa_node != self.numa_node
+        if (not getattr(self, "_async_host_control", False)
+                and getattr(self, "_remote_bridge", None) is not None
+                and torch.is_tensor(device_indices) and device_indices.is_cuda):
+            receiver._remote_indices_ready = torch.cuda.Event()
+            receiver._remote_indices_ready.record(torch.cuda.current_stream(device=device_indices.device))
+        return True
 
     def _worker(
         self,
@@ -1636,6 +1792,9 @@ class AgenticPToDHostLoadManager:
         staging: LayerFirstD2HStaging,
         bounces: tuple[PinnedMHAHostBounce, ...],
     ) -> None:
+        # Match the owner-created stream before preparing a Host mapping or
+        # receiver. An unindexed pool.device ("cuda") means this thread's GPU.
+        torch.cuda.set_device(stream.device)
         while not self._stop.is_set():
             work = self._work.get()
             if work is None:
@@ -1649,6 +1808,9 @@ class AgenticPToDHostLoadManager:
             gpu_elapsed_ms = 0.0
             remote_bridge = getattr(self, "_remote_bridge", None)
             try:
+                if getattr(self, "_async_host_control", False):
+                    if not self._prepare_load(receiver, device_indices):
+                        continue
                 if receiver.abort_pending:
                     raise RuntimeError("P->D Host load aborted before H2D")
                 current = self.ledger.get(receiver.snapshot_id)
@@ -1664,6 +1826,7 @@ class AgenticPToDHostLoadManager:
                     remote_bridge.load(
                         receiver.snapshot_id, grant, device_indices,
                         attempt_id=f"p2d:{receiver._owner}:{receiver.snapshot_id}",
+                        state_indices=getattr(receiver, "state_indices", None),
                         cancel_check=lambda: receiver.abort_pending or (
                             (self.ledger.get(receiver.snapshot_id) or {}).get("state")
                             == HostStageState.ABORTING.value
@@ -1760,6 +1923,7 @@ class AgenticPToDHostLoadManager:
                     receiver._owner,
                     tp_rank=self.tp_rank,
                     tp_size=self.tp_size,
+                    **_receiver_identity(self, receiver),
                 ):
                     raise RuntimeError("P->D CONSUMED publication was rejected")
                 completion = {
@@ -1803,6 +1967,7 @@ class AgenticPToDHostLoadManager:
                         receiver.snapshot_id,
                         receiver._owner,
                         reason=f"p2d_h2d_failed:{exc}",
+                        **_receiver_identity(self, receiver, include_rank=True),
                     )
                 except Exception:
                     logger.exception("Failed to publish P->D H2D abort intent")
@@ -1838,6 +2003,7 @@ class AgenticPToDHostLoadManager:
                         receiver._owner,
                         tp_rank=self.tp_rank,
                         tp_size=self.tp_size,
+                        **_receiver_identity(self, receiver),
                     )
                 except Exception:
                     logger.exception("Failed to publish P->D H2D drain ACK")
@@ -1940,6 +2106,7 @@ class AgenticPToDHostLoadManager:
                     completion["receiver"]._owner,
                     tp_rank=self.tp_rank,
                     tp_size=self.tp_size,
+                    **_receiver_identity(self, completion["receiver"]),
                 )
                 current = self.ledger.get(snapshot_id)
             if (
@@ -1966,9 +2133,26 @@ class AgenticPToDHostLoadManager:
 
     def _completion_worker(self) -> None:
         while not self._stop.is_set():
-            self._group_wakeup.wait(timeout=0.01)
+            self._group_wakeup.wait(
+                timeout=_group_wait_timeout(self)
+            )
             self._group_wakeup.clear()
+            self._progress_abort_requests_once()
             self._progress_group_completions_once()
+
+    def _progress_abort_requests_once(self) -> None:
+        with self._completion_lock:
+            pending = list(getattr(self, "_pending_aborts", {}).items())
+        for snapshot_id, command in pending:
+            receiver, locally_quiesced = command
+            try:
+                self._publish_abort(receiver, locally_quiesced=locally_quiesced)
+            except Exception:
+                logger.exception("P->D Host abort publication will retry: %s", snapshot_id)
+                continue
+            with self._completion_lock:
+                if self._pending_aborts.get(snapshot_id) is command:
+                    self._pending_aborts.pop(snapshot_id, None)
 
 
 class AgenticPToDHostReceiver:
@@ -1983,6 +2167,7 @@ class AgenticPToDHostReceiver:
         self._submitted = False
         self._grant: Optional[dict[str, Any]] = None
         self._owner: Optional[str] = None
+        self._host_load_attempt = uuid.uuid4().hex
         self._error: Optional[BaseException] = None
         self._abort_pending = False
         self._terminal = False

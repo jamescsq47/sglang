@@ -48,6 +48,13 @@ def reserve_prefill_state(req, req_pool, tree_cache, *, checkpoint_slots=1):
     newly allocated fields to Req's ordinary cancellation/completion cleanup.
     """
     pool = req_pool.mamba_pool
+    rotation = getattr(req, "_agentic_checkpoint_rotation", None)
+    if rotation is not None:
+        if missing_runtime_slots(req, req_pool):
+            raise RuntimeError("controller workset lacks complete Mamba runtime")
+        if not rotation.can_take():
+            return None
+        return PrefillStateReservation(req, pool, None, [])
     need = missing_runtime_slots(req, req_pool)
     checkpoint = getattr(req, "_agentic_mamba_prefill_checkpoint", None)
     extra = max(0, checkpoint_slots - (0 if checkpoint is None else checkpoint.numel()))
@@ -84,6 +91,10 @@ def reserve_prefill_state(req, req_pool, tree_cache, *, checkpoint_slots=1):
 
 
 def release_prefill_checkpoint(req, pool):
+    rotation = getattr(req, "_agentic_checkpoint_rotation", None)
+    if rotation is not None:
+        rotation.close()
+        req._agentic_checkpoint_rotation = None
     indices = getattr(req, "_agentic_mamba_prefill_checkpoint", None)
     if indices is not None:
         pool.free(indices)
@@ -91,6 +102,15 @@ def release_prefill_checkpoint(req, pool):
 
 
 def fork_prefill_checkpoint(req, pool, source):
+    rotation = getattr(req, "_agentic_checkpoint_rotation", None)
+    if rotation is not None:
+        target = rotation.take()
+        try:
+            pool.copy_from(source, target)
+        except BaseException:
+            rotation.release(target)  # Keeps the last-copy stream fence.
+            raise
+        return target
     indices = getattr(req, "_agentic_mamba_prefill_checkpoint", None)
     if indices is None:
         return pool.fork_from(source)

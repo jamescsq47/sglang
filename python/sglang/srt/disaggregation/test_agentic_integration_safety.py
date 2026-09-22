@@ -73,7 +73,8 @@ def test_four_failed_direct_slots_return_after_all_rank_rollback(ledger_dir, tp_
     broker.install_tp_plan = lambda *_a, **_kw: None
     owner.agentic_p_workset_broker = broker
     request = requests[0]
-    lease = SimpleNamespace(lease_id="invisible-start", owner="direct", state="active", io_attempt=None)
+    lease = SimpleNamespace(lease_id="invisible-start", owner="direct", state="active",
+                            parent_tokens=128, io_attempt=None)
     broker._leases[request.snapshot_id] = lease
     owner.agentic_tp_direct_admission_active[request.snapshot_id] = (request, 0.0, None, 128, lease)
     assert broker.begin_io_attempt(request.snapshot_id, lease, "attempt")

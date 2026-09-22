@@ -8,9 +8,11 @@ slow one.  It allocates no P HBM and carries no global capacity/credit policy.
 from __future__ import annotations
 
 import ctypes
+import fcntl
 import hashlib
 import json
 import os
+import queue
 import select
 import struct
 import threading
@@ -118,6 +120,12 @@ class AgenticArrivalWatcher:
         if self._shared_poll is not None:
             self._closed = False
             self._seen_arrivals = {}
+            # Capture the append cursor BEFORE the one-time recovery scan:
+            # an arrival racing that scan is replayed, never lost. Normal
+            # polling reads only new fixed-size event records, not retained
+            # TP tombstones or every historical marker on NFS.
+            self._journal_cursor = store._arrival_journal_size()
+            self._startup = store.iter_arrivals(max_age_seconds=self.max_age_seconds)
             return
         self.fd = _inotify_init()
         try:
@@ -164,11 +172,24 @@ class AgenticArrivalWatcher:
         if self._shared_poll is not None:
             if not self._shared_poll.due(timeout_seconds):
                 return []
-            current = self.store.iter_arrivals(max_age_seconds=self.max_age_seconds)
-            seen = {request.snapshot_id: payload for request, payload in current}
+            paths, self._journal_cursor = self.store._read_arrival_events(
+                self._journal_cursor
+            )
+            current = self._startup
+            self._startup = []
+            for path in paths:
+                item = self.store.read_arrival_path(path, max_age_seconds=self.max_age_seconds)
+                if item is not None:
+                    current.append(item)
+            # Multiple updates of one marker in a batch resolve to its latest
+            # authoritative value; the journal is a notification, not a grant.
+            current = list({req.snapshot_id: (req, payload) for req, payload in current}.values())
             arrivals = [(request, payload) for request, payload in current
                         if self._seen_arrivals.get(request.snapshot_id) != payload]
-            self._seen_arrivals = seen
+            cutoff = time.time() - self.max_age_seconds
+            self._seen_arrivals = {sid: p for sid, p in self._seen_arrivals.items()
+                                   if float(p["arrived_at"]) >= cutoff}
+            self._seen_arrivals.update({req.snapshot_id: p for req, p in current})
             return sorted(arrivals, key=lambda item: float(item[1]["arrived_at"]))
         arrivals = self._startup
         self._startup = []
@@ -347,6 +368,81 @@ class AgenticFileChangeWatcher:
         self.close()
 
 
+class SharedDirectoryEventJournal:
+    """Sharded, bounded notifications for atomic JSON manifests on shared FS.
+
+    Eight append streams avoid one global lock across independent snapshots.
+    Readers never wait for a writer. Records name manifests, not ownership;
+    callers must retain startup/periodic reconciliation for publisher crashes.
+    """
+
+    SHARDS = 8
+    RECORD_BYTES = 65
+
+    def __init__(self, directory: str | Path):
+        self.directory = Path(directory)
+        self.paths = tuple(self.directory / f".changes-{i}" for i in range(self.SHARDS))
+        for path in self.paths:
+            with path.open("ab"):
+                pass
+
+    def cursors(self) -> tuple[int, ...]:
+        return tuple(path.stat().st_size // 65 * 65 for path in self.paths)
+
+    def publish(self, manifest_path: str | Path) -> None:
+        name = Path(manifest_path).stem
+        if len(name) != 64 or any(c not in "0123456789abcdef" for c in name):
+            raise ValueError("invalid Host manifest digest")
+        path = self.paths[int(name[:8], 16) % self.SHARDS]
+        with path.open("a+b", buffering=0) as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            try:
+                size = os.fstat(stream.fileno()).st_size
+                end = size // 65 * 65
+                if size != end:
+                    os.ftruncate(stream.fileno(), end)
+                data = (name + "\n").encode("ascii")
+                try:
+                    while data:
+                        written = os.write(stream.fileno(), data)
+                        if written <= 0:
+                            raise OSError("short Host notification write")
+                        data = data[written:]
+                except BaseException:
+                    os.ftruncate(stream.fileno(), end)
+                    raise
+            finally:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+    def read(self, cursors: tuple[int, ...]):
+        changed = set()
+        next_cursors = list(cursors)
+        reset = False
+        for i, path in enumerate(self.paths):
+            with path.open("rb") as stream:
+                try:
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    continue
+                try:
+                    cursor = cursors[i]
+                    if os.fstat(stream.fileno()).st_size < cursor:
+                        cursor = 0
+                        reset = True
+                    stream.seek(cursor)
+                    data = stream.read(65 * 32)
+                    data = data[:len(data) // 65 * 65]
+                finally:
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            for offset in range(0, len(data), 65):
+                record = data[offset:offset + 65]
+                if record[-1:] != b"\n" or any(c not in b"0123456789abcdef" for c in record[:64]):
+                    raise ValueError("corrupt Host notification journal")
+                changed.add(self.directory / (record[:64].decode("ascii") + ".json"))
+            next_cursors[i] = cursor + len(data)
+        return tuple(sorted(changed)), tuple(next_cursors), reset
+
+
 class AgenticDirectoryChangeWatcher:
     """Return the exact JSON paths changed in one node-local directory.
 
@@ -359,13 +455,16 @@ class AgenticDirectoryChangeWatcher:
 
     _shared_poll = None
 
-    def __init__(self, directory: str | Path):
+    def __init__(self, directory: str | Path, *, journal=None):
         self.directory = Path(directory).resolve()
         self.directory.mkdir(parents=True, exist_ok=True)
         self._shared_poll = _shared_control_poller()
         if self._shared_poll is not None:
             self._closed = False
             self.healthy = True
+            self._journal = journal
+            # Captured before the consumer's initial reconciliation scan.
+            self._journal_cursors = None if journal is None else journal.cursors()
             return
         self.fd = _inotify_init()
         try:
@@ -411,9 +510,12 @@ class AgenticDirectoryChangeWatcher:
         if self._closed:
             return (), False
         if self._shared_poll is not None:
-            # Remote changes cannot be named by local inotify. Request the
-            # existing authoritative resync, on the background control worker.
-            return (), self._shared_poll.due(timeout_seconds)
+            if not self._shared_poll.due(timeout_seconds):
+                return (), False
+            if self._journal is None:
+                return (), True
+            paths, self._journal_cursors, reset = self._journal.read(self._journal_cursors)
+            return paths, reset
         timeout_ms = (
             -1
             if timeout_seconds is None
@@ -471,6 +573,65 @@ class AgenticDirectoryChangeWatcher:
         self.close()
 
 
+class BrokerPathWatcher:
+    """One startup snapshot, then only pushed changes on a private queue."""
+
+    def __init__(self, store, prefix):
+        self.store = store
+        self.prefix = prefix
+        records = store._records
+        self.events = records.client.watch(records.namespace)
+        self.events.ready.result(timeout=30)  # startup / control worker only
+        self._startup = tuple(self.events.initial_snapshot)
+        self._closed = False
+        self.healthy = True
+
+    def poll(self, timeout_seconds=0.0):
+        if self._closed:
+            return (), False
+        self.events.changed.clear()
+        keys, self._startup = list(self._startup), ()
+        while True:
+            try:
+                event = self.events.get_nowait()
+            except queue.Empty:
+                break
+            keys.append(event["key"])
+        self.store._records.client.check_health()
+        if not keys and (timeout_seconds is None or timeout_seconds > 0):
+            self.events.changed.wait(timeout_seconds)
+            return BrokerPathWatcher.poll(self, 0.0)
+        return tuple(self.store.directory / key for key in dict.fromkeys(keys)
+                     if key.startswith(self.prefix)), False
+
+    def close(self):
+        self._closed = True
+        self.healthy = False
+        self.events.close()
+        self.events.changed.set()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
+class BrokerArrivalWatcher(BrokerPathWatcher):
+    def __init__(self, store, max_age_seconds):
+        self.max_age_seconds = float(max_age_seconds)
+        super().__init__(store, "arrivals/")
+
+    def poll(self, timeout_seconds=0.0):
+        paths, _ = super().poll(timeout_seconds)
+        result = []
+        for path in paths:
+            item = self.store.read_arrival_path(path, max_age_seconds=self.max_age_seconds)
+            if item is not None:
+                result.append(item)
+        return result
+
+
 class AgenticEarlyClaimStore:
     def __init__(self, directory: str):
         if not directory:
@@ -485,11 +646,75 @@ class AgenticEarlyClaimStore:
         # must observe this negative-send guarantee before recycling a
         # receiver whose transport still reports WaitingForInput.
         self.direct_abort_directory = self.directory / "direct-aborts"
+        from sglang.srt.disaggregation.agentic_control_store import (
+            control_enabled, control_kv,
+        )
+        self._records = (
+            control_kv("early-claim", directory) if control_enabled() else None
+        )
+        if self._records is not None:
+            # Paths below are compatibility identity labels, never opened.
+            self._journal_enabled = False
+            return
         self.marker_directory.mkdir(parents=True, exist_ok=True)
         self.final_directory.mkdir(parents=True, exist_ok=True)
         self.tool_directory.mkdir(parents=True, exist_ok=True)
         self.route_directory.mkdir(parents=True, exist_ok=True)
         self.direct_abort_directory.mkdir(parents=True, exist_ok=True)
+        self._journal_enabled = _shared_control_poller() is not None
+        self._arrival_events = self.directory / "arrival.events"
+
+    def _arrival_journal_size(self) -> int:
+        with self._arrival_events.open("ab") as stream:
+            # Incomplete tail can only belong to an interrupted publisher;
+            # it is not an event. A later publisher repairs it under EX lock.
+            return os.fstat(stream.fileno()).st_size // 65 * 65
+
+    def _read_arrival_events(self, cursor: int):
+        """Bounded, nonblocking notification read; never mutates ownership."""
+        with self._arrival_events.open("rb") as stream:
+            try:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return (), cursor
+            try:
+                stream.seek(cursor)
+                data = stream.read(65 * 256)
+                data = data[:len(data) // 65 * 65]
+            finally:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        names = []
+        for offset in range(0, len(data), 65):
+            record = data[offset:offset + 65]
+            if record[-1:] != b"\n" or any(c not in b"0123456789abcdef" for c in record[:64]):
+                raise RuntimeError("corrupt Direct arrival event journal")
+            names.append(self.marker_directory / (record[:64].decode("ascii") + ".json"))
+        return tuple(dict.fromkeys(names)), cursor + len(data)
+
+    def _publish_arrival_event(self, request, **kwargs):
+        # One short writer transaction across Router processes. Readers never
+        # block waiting for it. Retained lifecycle markers remain unchanged.
+        with self._arrival_events.open("a+b", buffering=0) as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            try:
+                size = os.fstat(stream.fileno()).st_size
+                end = size // 65 * 65
+                if end != size:
+                    os.ftruncate(stream.fileno(), end)
+                payload = self._publish(self.marker_path(request), request, "arrival", **kwargs)
+                data = (self._digest(request) + "\n").encode("ascii")
+                try:
+                    while data:
+                        written = os.write(stream.fileno(), data)
+                        if written <= 0:
+                            raise OSError("short Direct event journal write")
+                        data = data[written:]
+                except BaseException:
+                    os.ftruncate(stream.fileno(), end)
+                    raise
+                return payload
+            finally:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
     @staticmethod
     def _digest(request: RequestGeneration) -> str:
@@ -528,6 +753,9 @@ class AgenticEarlyClaimStore:
 
         path = self.producer_path(request)
         owner = str(producer_id or os.getpid())
+        if self._records is not None:
+            acquired, created = self._records.call("claim", self._record_key(path), owner)
+            return bool(acquired and (created or producer_id is not None))
         # Publish a fully-written tombstone atomically.  Creating ``path`` and
         # then writing its owner leaves a short empty-file window in which a
         # sibling TP rank can incorrectly conclude that it belongs to a
@@ -574,6 +802,13 @@ class AgenticEarlyClaimStore:
         path = self.producer_path(request)
         owner = str(producer_id)
         deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        if self._records is not None:
+            value = self._records.client.wait_for_record(
+                self._records.namespace, self._record_key(path),
+                lambda record: record is not None,
+                timeout=max(0.0, float(timeout_seconds)),
+            )
+            return value == owner
         while True:
             try:
                 return path.read_text(encoding="utf-8").strip() == owner
@@ -584,8 +819,8 @@ class AgenticEarlyClaimStore:
             except OSError:
                 return False
 
-    @staticmethod
     def _publish(
+        self,
         path: Path,
         request: RequestGeneration,
         kind: str,
@@ -609,19 +844,7 @@ class AgenticEarlyClaimStore:
         }
         if extra:
             payload.update(extra)
-        temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}")
-        data = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
-        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        try:
-            with os.fdopen(fd, "wb") as file_obj:
-                file_obj.write(data)
-                file_obj.flush()
-            os.replace(temporary, path)
-        finally:
-            try:
-                temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
+        self._publish_payload(path, payload)
         return payload
 
     def publish_arrival(
@@ -640,6 +863,10 @@ class AgenticEarlyClaimStore:
             if prompt_token_count <= 0:
                 raise ValueError("prompt_token_count must be positive")
             extra["prompt_token_count"] = prompt_token_count
+        if self._journal_enabled:
+            return self._publish_arrival_event(
+                request, extra=extra or None, published_at=arrived_at,
+            )
         payload = self._publish(
             self.marker_path(request),
             request,
@@ -649,8 +876,23 @@ class AgenticEarlyClaimStore:
         )
         return payload
 
-    @staticmethod
-    def _publish_payload(path: Path, payload: dict[str, Any]) -> None:
+    def _record_key(self, path: Path) -> str:
+        return str(path.relative_to(self.directory))
+
+    def _read_payload(self, path: Path):
+        if self._records is not None:
+            value = self._records.get(self._record_key(path))
+            if value is None:
+                raise FileNotFoundError(str(path))
+            return value
+        return json.loads(path.read_bytes())
+
+    def _publish_payload(self, path: Path, payload: dict[str, Any]) -> None:
+        if self._records is not None:
+            # Publication can precede ownership transitions (notably abort
+            # fences), so callers must observe the acknowledgement.
+            self._records.call("upsert", self._record_key(path), payload)
+            return
         temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}")
         data = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -712,7 +954,7 @@ class AgenticEarlyClaimStore:
         max_age_seconds: float = 3600.0,
     ) -> Optional[dict[str, Any]]:
         try:
-            payload = json.loads(self.route_path(request).read_bytes())
+            payload = self._read_payload(self.route_path(request))
             published_at = float(payload["published_at"])
         except (FileNotFoundError, OSError, ValueError, KeyError, json.JSONDecodeError):
             return None
@@ -765,8 +1007,8 @@ class AgenticEarlyClaimStore:
             },
         )
 
-    @staticmethod
     def _read(
+        self,
         path: Path,
         request: RequestGeneration,
         *,
@@ -774,7 +1016,7 @@ class AgenticEarlyClaimStore:
         max_age_seconds: float,
     ) -> Optional[dict[str, Any]]:
         try:
-            payload = json.loads(path.read_bytes())
+            payload = self._read_payload(path)
             arrived_at = float(payload["arrived_at"])
         except (FileNotFoundError, OSError, ValueError, KeyError, json.JSONDecodeError):
             return None
@@ -814,7 +1056,12 @@ class AgenticEarlyClaimStore:
 
         arrivals: list[tuple[RequestGeneration, dict[str, Any]]] = []
         try:
-            paths = tuple(self.marker_directory.glob("*.json"))
+            paths = (
+                tuple(self.directory / key for key in self._records.snapshot()
+                      if key.startswith("arrivals/"))
+                if self._records is not None
+                else tuple(self.marker_directory.glob("*.json"))
+            )
         except OSError:
             return arrivals
         for path in paths:
@@ -830,7 +1077,7 @@ class AgenticEarlyClaimStore:
         """Validate one path delivered by :class:`AgenticArrivalWatcher`."""
 
         try:
-            payload = json.loads(path.read_bytes())
+            payload = self._read_payload(path)
             request = RequestGeneration(
                 str(payload["request_id"]), int(payload["generation"])
             )
@@ -854,7 +1101,14 @@ class AgenticEarlyClaimStore:
         return request, payload
 
     def watch_arrivals(self, *, max_age_seconds: float) -> AgenticArrivalWatcher:
+        if self._records is not None:
+            return BrokerArrivalWatcher(self, max_age_seconds)
         return AgenticArrivalWatcher(self, max_age_seconds)
+
+    def watch_direct_aborts(self):
+        if self._records is not None:
+            return BrokerPathWatcher(self, "direct-aborts/")
+        return AgenticDirectoryChangeWatcher(self.direct_abort_directory)
 
     def read_final(
         self,
@@ -911,25 +1165,22 @@ class AgenticEarlyClaimStore:
     def remove_arrival(self, request: RequestGeneration) -> None:
         """Remove only the ingress marker; no capacity ledger is involved."""
 
-        try:
-            self.marker_path(request).unlink(missing_ok=True)
-        except OSError:
-            pass
+        self._remove_payload(self.marker_path(request))
 
     def remove_final(self, request: RequestGeneration) -> None:
-        try:
-            self.final_path(request).unlink(missing_ok=True)
-        except OSError:
-            pass
+        self._remove_payload(self.final_path(request))
 
     def remove_tool(self, request: RequestGeneration) -> None:
-        try:
-            self.tool_path(request).unlink(missing_ok=True)
-        except OSError:
-            pass
+        self._remove_payload(self.tool_path(request))
 
     def remove_direct_abort(self, request: RequestGeneration) -> None:
+        self._remove_payload(self.direct_abort_path(request))
+
+    def _remove_payload(self, path: Path) -> None:
+        if self._records is not None:
+            self._records.call("remove", self._record_key(path))
+            return
         try:
-            self.direct_abort_path(request).unlink(missing_ok=True)
+            path.unlink(missing_ok=True)
         except OSError:
             pass

@@ -1,6 +1,8 @@
 """CPU-only NIXL API/fence contract tests, not bandwidth or GPU validation."""
 
 import gc
+import threading
+import time
 import weakref
 
 import pytest
@@ -13,6 +15,7 @@ from sglang.srt.disaggregation.agentic_remote_host import (
 
 class FakeNixl:
     def __init__(self):
+        self.name = "source-agent"
         self.status = "PROC"
         self.post_raises = False
         self.release_raises = False
@@ -22,6 +25,7 @@ class FakeNixl:
         self.metadata_raises = False
         self.deregister_raises = False
         self.removed_peers = []
+        self.added_peers = []
 
     def remove_remote_agent(self, peer):
         self.removed_peers.append(peer)
@@ -43,6 +47,7 @@ class FakeNixl:
 
     def add_remote_agent(self, metadata):
         assert metadata == b"source-agent"
+        self.added_peers.append(metadata)
         return "source-agent"
 
     def get_xfer_descs(self, regions, mem_type):
@@ -68,7 +73,7 @@ class FakeNixl:
         self.released.append(handle)
 
 
-def test_peer_metadata_not_removed_under_another_live_read():
+def test_peer_connection_persists_across_idle_read_gaps():
     agent = FakeNixl()
     transport = RemoteHostTransport(agent)
     sources = [export(transport, rank, 2) for rank in range(2)]
@@ -81,14 +86,65 @@ def test_peer_metadata_not_removed_under_another_live_read():
     assert not agent.removed_peers
     transfers[1].poll()
     transport.retire_read(sources[1].shard.export_id, "read-epoch")
+    assert not agent.removed_peers
+    assert len(agent.added_peers) == 2
+    transport.close_remote_peers()
     assert agent.removed_peers == ["source-agent"]
 
 
-def export(transport, rank=0, size=1):
+def test_peer_metadata_rollover_is_bounded_and_waits_for_live_reads():
+    agent = FakeNixl()
+    transport = RemoteHostTransport(agent, max_peer_imports=2)
+    first = export(transport, address=1000)
+    second = export(transport, address=1100)
+    third = export(transport, address=1200)
+    first_read, second_read = read(transport, first), read(transport, second)
+    first_read.start()
+    second_read.start()
+    agent.status = "DONE"
+    first_read.poll()
+    transport.retire_read(first.shard.export_id, "read-epoch")
+    assert not agent.removed_peers
+    result = []
+    worker = threading.Thread(target=lambda: result.append(read(transport, third)))
+    worker.start()
+    time.sleep(0.02)
+    assert worker.is_alive() and not result
+    second_read.poll()
+    transport.retire_read(second.shard.export_id, "read-epoch")
+    worker.join(timeout=1)
+    assert not worker.is_alive() and len(result) == 1
+    assert agent.removed_peers == ["source-agent"]
+    assert len(agent.added_peers) == 3
+
+
+def test_recycled_source_range_rolls_peer_after_live_reads_drain():
+    agent = FakeNixl()
+    transport = RemoteHostTransport(agent)
+    first = export(transport, address=1000)
+    recycled = export(transport, address=1000)
+    pending = read(transport, first)
+    pending.start()
+    result = []
+    worker = threading.Thread(target=lambda: result.append(read(transport, recycled)))
+    worker.start()
+    time.sleep(0.02)
+    assert worker.is_alive() and not result
+    agent.status = "DONE"
+    pending.poll()
+    transport.retire_read(first.shard.export_id, "read-epoch")
+    worker.join(timeout=1)
+    assert not worker.is_alive() and len(result) == 1
+    assert agent.removed_peers == ["source-agent"]
+    assert len(agent.added_peers) == 2
+
+
+def export(transport, rank=0, size=1, address=None):
     return transport.export(snapshot_id="request:turn:epoch", tp_rank=rank,
         tp_size=size, layout=layout_fingerprint({"dtype": "fp16", "heads": 1,
                                                "dim": 2, "layers": 1}), token_count=3,
-        address=1000 + rank * 100, byte_size=24, keepalive=object())
+        address=1000 + rank * 100 if address is None else address,
+        byte_size=24, keepalive=object())
 
 
 def read(transport, source, rank=None, spans=None):

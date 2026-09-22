@@ -338,14 +338,44 @@ class MambaPool:
         return self.mamba_cache.at_layer_idx(layer_id)
 
     def available_size(self):
+        if getattr(self, "_agentic_workset_adapter", None) is not None:
+            return self._agentic_workset_adapter.available_size("mamba")
         return len(self.free_slots)
 
+    def install_workset_adapter(self, adapter):
+        """Install sole-authority free bridge before any Mamba allocation."""
+        if getattr(self, "_agentic_workset_adapter", None) is not None:
+            raise RuntimeError("Mamba workset adapter already installed")
+        if len(self.free_slots) != self.size:
+            raise RuntimeError("workset adapter requires an empty Mamba pool")
+        adapter._native()
+        if adapter.available_size("mamba") != self.size:
+            raise RuntimeError("workset/native Mamba capacity mismatch")
+        self._agentic_workset_adapter = adapter
+        self.free_slots = None
+
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
+        if getattr(self, "_agentic_workset_adapter", None) is not None:
+            raise RuntimeError("complete workset required; native Mamba allocation is disabled")
         if need_size > len(self.free_slots):
             return None
 
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
+        self.initialize_slots(select_index)
+        return select_index
+
+    def initialize_slots(self, select_index: torch.Tensor) -> None:
+        """Initialize exact owned slots without choosing or freeing addresses.
+
+        Native alloc uses this on its current stream. The workset controller
+        can use the same operation on its preparation stream after installing
+        an exact grant, and must publish that stream's completion event before
+        these slots are read. This method does not modify the free list.
+        """
+        need_size = select_index.numel()
+        if not need_size:
+            return
         # clear at alloc time — expand a scalar GPU zero to the right shape, no CPU-GPU sync
         for i in range(len(self.mamba_cache.conv)):
             t = self.mamba_cache.conv[i]
@@ -359,14 +389,19 @@ class MambaPool:
         )
         t[:, select_index] = z
 
-        return select_index
-
     def free(self, free_index: torch.Tensor):
+        rotation = getattr(free_index, "_agentic_checkpoint_rotation", None)
+        if rotation is not None:
+            return rotation.release(free_index)
+        if getattr(self, "_agentic_workset_adapter", None) is not None:
+            return self._agentic_workset_adapter.free(free_index, resource="mamba")
         if free_index.numel() == 0:
             return
         self.free_slots = torch.cat((self.free_slots, free_index))
 
     def clear(self):
+        if getattr(self, "_agentic_workset_adapter", None) is not None:
+            raise RuntimeError("cannot clear a controller-owned Mamba pool")
         self.free_slots = torch.arange(
             1, self.size + 1, dtype=torch.int64, device=self.device
         )
@@ -595,7 +630,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def free_mamba_cache(
         self, req: "Req", mamba_ping_pong_track_buffer_to_keep: Optional[int] = None
     ):
-        if getattr(req, "_agentic_mamba_prefill_checkpoint", None) is not None:
+        if (getattr(req, "_agentic_mamba_prefill_checkpoint", None) is not None
+                or getattr(req, "_agentic_checkpoint_rotation", None) is not None):
             from sglang.srt.disaggregation.agentic_mamba_prefill import release_prefill_checkpoint
             release_prefill_checkpoint(req, self.mamba_pool)
         mamba_index = req.mamba_pool_idx

@@ -2,6 +2,7 @@
 import threading
 import queue
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -49,6 +50,86 @@ def publish(source, snapshot_id="s"):
     return {"token_count": 3, "byte_size": 24, "remote_host_node": "source"}
 
 
+def test_read_stage_diagnostics_are_bounded_and_do_not_replay_io(tmp_path, caplog):
+    source, _ = bridge(tmp_path)
+    grant = publish(source)
+    target, agent = bridge(tmp_path, node="target")
+    target.load("s", grant, [1, 2, 3], attempt_id="one")
+    assert target._read_timing_count == 1
+    assert set(target._read_timing_totals) == {
+        "descriptors", "claim", "destination", "prepare", "transfer", "receipt", "retire",
+    }
+    assert all(value >= 0 for value in target._read_timing_totals.values())
+    target.load("s", grant, [1, 2, 3], attempt_id="one")
+    assert len(agent.reads) == 1
+    assert target._read_timing_count == 1
+    with caplog.at_level("INFO"):
+        for _ in range(63):
+            target._record_read_timing(transfer=0.001)
+    assert target._read_timing_count == 0
+    assert target._read_timing_totals == {}
+    assert "remote_host_read_timing direction=p2d rank=0 reads=64" in caplog.text
+
+
+def test_read_diagnostics_failure_cannot_cancel_completed_transfer(tmp_path):
+    source, _ = bridge(tmp_path)
+    grant = publish(source)
+    target, _ = bridge(tmp_path, node="target")
+    target._record_read_timing = Mock(side_effect=OSError("log unavailable"))
+    receipt = target.load("s", grant, [1, 2, 3], attempt_id="one")
+    assert receipt.outcome == "loaded"
+    assert target._receipts("s", "one")[0].outcome == "loaded"
+    assert source.cleanup_source("s", {"state": "consumed"})
+
+
+def registration_bridge(tmp_path, monkeypatch):
+    import torch
+    monkeypatch.setattr(torch.cuda, 'set_device', lambda _: None)
+    result, _ = bridge(tmp_path)
+    agent = Mock()
+    agent.get_reg_descs.side_effect = lambda regions, kind: (kind, regions)
+    result._factory = None
+    result._transport = RemoteHostTransport(agent)
+    result.pool.get_contiguous_buf_infos = Mock(return_value=([100, 200], [64, 64], None))
+    result.hybrid = SimpleNamespace(pool=SimpleNamespace(
+        get_state_buf_infos=Mock(return_value=([300], [256], None))))
+    return result, agent
+
+
+def test_source_export_transport_does_not_register_vram(tmp_path, monkeypatch):
+    result, agent = registration_bridge(tmp_path, monkeypatch)
+    result._transport_for_worker()
+    agent.register_memory.assert_not_called()
+    result.pool.get_contiguous_buf_infos.assert_not_called()
+    result.hybrid.pool.get_state_buf_infos.assert_not_called()
+
+
+def test_destination_registers_attention_and_state_only_once(tmp_path, monkeypatch):
+    result, agent = registration_bridge(tmp_path, monkeypatch)
+    result._transport_for_worker(destination=True)
+    result._transport_for_worker(destination=True)
+    agent.register_memory.assert_called_once()
+    assert result._registration_descriptors == ('VRAM', [
+        (100, 64, 0, ''), (200, 64, 0, ''), (300, 256, 0, '')])
+    assert result._destination_registered
+
+
+@pytest.mark.parametrize('cleanup_fails', [False, True])
+def test_failed_registration_rolls_back_and_never_creates_retry_agents(tmp_path, monkeypatch, cleanup_fails):
+    result, agent = registration_bridge(tmp_path, monkeypatch)
+    agent.register_memory.side_effect = RuntimeError('injected backend failure')
+    if cleanup_fails:
+        agent.deregister_memory.side_effect = RuntimeError('injected cleanup failure')
+    with pytest.raises(RuntimeError):
+        result._transport_for_worker(destination=True)
+    with pytest.raises(RuntimeError, match='initialization failed'):
+        result._transport_for_worker(destination=True)
+    agent.register_memory.assert_called_once()
+    agent.deregister_memory.assert_called_once()
+    assert not result._destination_registered
+    assert (result._registration_descriptors is not None) == cleanup_fails
+
+
 @pytest.mark.parametrize("size", [1, 2, 8])
 def test_whole_tp_commit_required_before_source_release(tmp_path, size):
     sources = [bridge(tmp_path, rank, size) for rank in range(size)]
@@ -90,13 +171,15 @@ def test_unfenced_read_never_releases_source(tmp_path):
     assert not source_agent.deregistered
 
 
-def test_duplicate_read_not_reposted_and_peer_metadata_retired(tmp_path):
+def test_duplicate_read_not_reposted_and_peer_connection_persists(tmp_path):
     source, _ = bridge(tmp_path)
     grant = publish(source)
     target, agent = bridge(tmp_path, node="target")
     receipt = target.load("s", grant, [1, 2, 3], attempt_id="one")
     assert target.load("s", grant, [1, 2, 3], attempt_id="one") == receipt
     assert len(agent.reads) == 1
+    assert not agent.removed_peers
+    target._transport.close_remote_peers()
     assert agent.removed_peers == ["source-agent"]
     with pytest.raises(RuntimeError, match="destination"):
         target.load("s", grant, [4, 5, 6], attempt_id="one")
@@ -206,7 +289,8 @@ def test_p2d_worker_remote_branch_never_opens_source_path(tmp_path, monkeypatch)
     def forbidden(*args, **kwargs):
         raise AssertionError("remote payload must not be mmap'ed on the target")
     monkeypatch.setattr(module, "SharedMHAHostSnapshot", forbidden)
-    manager._worker(0, None, None, ())
+    monkeypatch.setattr(module.torch.cuda, "set_device", lambda device: None)
+    manager._worker(0, SimpleNamespace(device="cuda:0"), None, ())
     assert len(agent.reads) == 1
     assert len(completions) == 1 and completions[0]["snapshot"] is None
     assert source.cleanup_source("s", entry)
