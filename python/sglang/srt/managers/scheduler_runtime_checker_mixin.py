@@ -20,6 +20,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _optional_queue(owner, name: str, child: str | None = None):
+    value = getattr(owner, name, None)
+    if value is None:
+        return ()
+    if child is not None:
+        value = getattr(value, child, None)
+    return () if value is None else value
+
+
 class SchedulerRuntimeCheckerMixin:
     def _agentic_reserved_tokens(
         self: Scheduler, *, include_pending_releases: bool = True
@@ -419,17 +428,21 @@ class SchedulerRuntimeCheckerMixin:
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.stats.num_prefill_prealloc_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_prefill_bootstrap_queue.queue, priority_enabled
+                    _optional_queue(self, "disagg_prefill_bootstrap_queue", "queue"),
+                    priority_enabled,
                 )
                 self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_prefill_inflight_queue, priority_enabled
+                    _optional_queue(self, "disagg_prefill_inflight_queue"),
+                    priority_enabled,
                 )
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_decode_prealloc_queue.queue, priority_enabled
+                    _optional_queue(self, "disagg_decode_prealloc_queue", "queue"),
+                    priority_enabled,
                 )
                 self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_decode_transfer_queue.queue, priority_enabled
+                    _optional_queue(self, "disagg_decode_transfer_queue", "queue"),
+                    priority_enabled,
                 )
             self.metrics_collector.log_stats(self.stats)
         self._publish_kv_events()

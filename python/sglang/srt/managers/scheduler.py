@@ -9704,7 +9704,7 @@ class Scheduler(
                 logger.info(
                     "Deferring disaggregated Prefill chunk: no allocatable "
                     "KV tokens (inflight=%d)",
-                    len(self.disagg_prefill_inflight_queue),
+                    len(getattr(self, "disagg_prefill_inflight_queue", ())),
                 )
                 return None
             if getattr(self, "_agentic_mamba_prefill_admission", False):

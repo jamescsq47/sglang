@@ -46,6 +46,22 @@ LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
 ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
 
 
+def _optional_queue(owner, name: str, child: Optional[str] = None):
+    """Return a legacy PD queue, or empty when multinode V2 omitted it."""
+
+    value = getattr(owner, name, None)
+    if value is None:
+        return ()
+    if child is not None:
+        value = getattr(value, child, None)
+    return () if value is None else value
+
+
+def _optional_counter(owner, name: str, child: str) -> int:
+    value = getattr(owner, name, None)
+    return 0 if value is None else int(getattr(value, child, 0))
+
+
 @dataclasses.dataclass
 class PrefillStats:
     """Stats for logging prefill batch metrics."""
@@ -396,8 +412,8 @@ class SchedulerMetricsMixin:
         )
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            msg += f"#prealloc-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
-            msg += f"#inflight-req: {len(self.disagg_prefill_inflight_queue)}, "
+            msg += f"#prealloc-req: {len(_optional_queue(self, 'disagg_prefill_bootstrap_queue', 'queue'))}, "
+            msg += f"#inflight-req: {len(_optional_queue(self, 'disagg_prefill_inflight_queue'))}, "
 
         if (
             self.server_args.language_only
@@ -475,19 +491,23 @@ class SchedulerMetricsMixin:
             # PD disaggregation
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.stats.num_prefill_prealloc_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_prefill_bootstrap_queue.queue, priority_enabled
+                    _optional_queue(self, "disagg_prefill_bootstrap_queue", "queue"),
+                    priority_enabled,
                 )
                 self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_prefill_inflight_queue, priority_enabled
+                    _optional_queue(self, "disagg_prefill_inflight_queue"),
+                    priority_enabled,
                 )
                 self.stats.kv_transfer_speed_gb_s = self.kv_transfer_speed_gb_s
                 self.stats.kv_transfer_latency_ms = self.kv_transfer_latency_ms
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
                 self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_decode_prealloc_queue.queue, priority_enabled
+                    _optional_queue(self, "disagg_decode_prealloc_queue", "queue"),
+                    priority_enabled,
                 )
                 self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_decode_transfer_queue.queue, priority_enabled
+                    _optional_queue(self, "disagg_decode_transfer_queue", "queue"),
+                    priority_enabled,
                 )
 
             # Others
@@ -633,10 +653,10 @@ class SchedulerMetricsMixin:
         cache_hit_rate = 0.0
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:
-            msg += f"pre-allocated usage: {self.disagg_decode_prealloc_queue.num_tokens_pre_allocated / self.max_total_num_tokens:.2f}, "
-            msg += f"#prealloc-req: {len(self.disagg_decode_prealloc_queue.queue)}, "
-            msg += f"#transfer-req: {len(self.disagg_decode_transfer_queue.queue)}, "
-            msg += f"#retracted-req: {len(self.disagg_decode_prealloc_queue.retracted_queue)}, "
+            msg += f"pre-allocated usage: {_optional_counter(self, 'disagg_decode_prealloc_queue', 'num_tokens_pre_allocated') / self.max_total_num_tokens:.2f}, "
+            msg += f"#prealloc-req: {len(_optional_queue(self, 'disagg_decode_prealloc_queue', 'queue'))}, "
+            msg += f"#transfer-req: {len(_optional_queue(self, 'disagg_decode_transfer_queue', 'queue'))}, "
+            msg += f"#retracted-req: {len(_optional_queue(self, 'disagg_decode_prealloc_queue', 'retracted_queue'))}, "
 
         if (
             self.server_args.language_only
@@ -713,17 +733,21 @@ class SchedulerMetricsMixin:
             # PD disaggregation
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.stats.num_prefill_prealloc_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_prefill_bootstrap_queue.queue, priority_enabled
+                    _optional_queue(self, "disagg_prefill_bootstrap_queue", "queue"),
+                    priority_enabled,
                 )
                 self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_prefill_inflight_queue, priority_enabled
+                    _optional_queue(self, "disagg_prefill_inflight_queue"),
+                    priority_enabled,
                 )
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
                 self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_decode_prealloc_queue.queue, priority_enabled
+                    _optional_queue(self, "disagg_decode_prealloc_queue", "queue"),
+                    priority_enabled,
                 )
                 self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_decode_transfer_queue.queue, priority_enabled
+                    _optional_queue(self, "disagg_decode_transfer_queue", "queue"),
+                    priority_enabled,
                 )
             running_routing_keys = [r.routing_key for r in batch.reqs]
             waiting_routing_keys = [r.routing_key for r in self.waiting_queue]
@@ -876,23 +900,33 @@ class SchedulerMetricsMixin:
         # Tokens in waiting queue, bootstrap queue, prealloc queue
         waiting_queues = [self.waiting_queue]
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            waiting_queues.append(self.disagg_prefill_bootstrap_queue.queue)
+            waiting_queues.append(
+                _optional_queue(self, "disagg_prefill_bootstrap_queue", "queue")
+            )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            waiting_queues.append(self.disagg_decode_prealloc_queue.queue)
-            waiting_queues.append(self.disagg_decode_transfer_queue.queue)
-            waiting_queues.append(self.disagg_decode_prealloc_queue.retracted_queue)
+            waiting_queues.append(
+                _optional_queue(self, "disagg_decode_prealloc_queue", "queue")
+            )
+            waiting_queues.append(
+                _optional_queue(self, "disagg_decode_transfer_queue", "queue")
+            )
+            waiting_queues.append(
+                _optional_queue(self, "disagg_decode_prealloc_queue", "retracted_queue")
+            )
 
         decode_prealloc_reqs = decode_transfer_reqs = 0
         decode_prealloc_tokens = decode_transfer_tokens = 0
         if self.disaggregation_mode == DisaggregationMode.DECODE:
-            decode_prealloc_reqs = len(self.disagg_decode_prealloc_queue.queue)
-            decode_transfer_reqs = len(self.disagg_decode_transfer_queue.queue)
-            decode_prealloc_tokens = sum(
-                req.seqlen for req in self.disagg_decode_prealloc_queue.queue
+            prealloc_queue = _optional_queue(
+                self, "disagg_decode_prealloc_queue", "queue"
             )
-            decode_transfer_tokens = sum(
-                req.seqlen for req in self.disagg_decode_transfer_queue.queue
+            transfer_queue = _optional_queue(
+                self, "disagg_decode_transfer_queue", "queue"
             )
+            decode_prealloc_reqs = len(prealloc_queue)
+            decode_transfer_reqs = len(transfer_queue)
+            decode_prealloc_tokens = sum(req.seqlen for req in prealloc_queue)
+            decode_transfer_tokens = sum(req.seqlen for req in transfer_queue)
 
         num_tokens += sum(req.seqlen for queue in waiting_queues for req in queue)
         num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
@@ -934,11 +968,19 @@ class SchedulerMetricsMixin:
 
         waiting_queues = [self.waiting_queue]
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            waiting_queues.append(self.disagg_prefill_bootstrap_queue.queue)
+            waiting_queues.append(
+                _optional_queue(self, "disagg_prefill_bootstrap_queue", "queue")
+            )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            waiting_queues.append(self.disagg_decode_prealloc_queue.queue)
-            waiting_queues.append(self.disagg_decode_transfer_queue.queue)
-            waiting_queues.append(self.disagg_decode_prealloc_queue.retracted_queue)
+            waiting_queues.append(
+                _optional_queue(self, "disagg_decode_prealloc_queue", "queue")
+            )
+            waiting_queues.append(
+                _optional_queue(self, "disagg_decode_transfer_queue", "queue")
+            )
+            waiting_queues.append(
+                _optional_queue(self, "disagg_decode_prealloc_queue", "retracted_queue")
+            )
 
         num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
 
@@ -1005,22 +1047,32 @@ class SchedulerMetricsMixin:
 
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 mode_str = "prefill"
-                prefill_prealloc = len(self.disagg_prefill_bootstrap_queue.queue)
-                prefill_inflight = len(self.disagg_prefill_inflight_queue)
+                prefill_prealloc = len(
+                    _optional_queue(self, "disagg_prefill_bootstrap_queue", "queue")
+                )
+                prefill_inflight = len(
+                    _optional_queue(self, "disagg_prefill_inflight_queue")
+                )
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
                 mode_str = "decode"
-                decode_prealloc = len(self.disagg_decode_prealloc_queue.queue)
-                decode_transfer = len(self.disagg_decode_transfer_queue.queue)
+                prealloc_queue = _optional_queue(
+                    self, "disagg_decode_prealloc_queue", "queue"
+                )
+                transfer_queue = _optional_queue(
+                    self, "disagg_decode_transfer_queue", "queue"
+                )
+                decode_prealloc = len(prealloc_queue)
+                decode_transfer = len(transfer_queue)
                 decode_prealloc_tokens = sum(
-                    request.seqlen
-                    for request in self.disagg_decode_prealloc_queue.queue
+                    request.seqlen for request in prealloc_queue
                 )
                 decode_transfer_tokens = sum(
-                    request.seqlen
-                    for request in self.disagg_decode_transfer_queue.queue
+                    request.seqlen for request in transfer_queue
                 )
                 decode_retracted = len(
-                    self.disagg_decode_prealloc_queue.retracted_queue
+                    _optional_queue(
+                        self, "disagg_decode_prealloc_queue", "retracted_queue"
+                    )
                 )
 
             disaggregation = DisaggregationMetrics(
