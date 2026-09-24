@@ -1968,9 +1968,37 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
         evict_from_tree_cache(self.tree_cache, num_tokens)
+        requests = (
+            self.reqs
+            if selected_indices is None
+            else [self.reqs[i] for i in selected_indices]
+        )
+        bridges = [
+            getattr(req, "_agentic_d_memory_bridge", None) for req in requests
+        ]
+        owned = [bridge for bridge in bridges if bridge is not None]
+        if owned:
+            bridge = owned[0]
+            if len(owned) != len(bridges) or any(
+                other is not bridge for other in owned
+            ):
+                raise RuntimeError(
+                    "V2 decode batch mixes physical memory authorities"
+                )
+            indices = (
+                list(range(len(self.reqs)))
+                if selected_indices is None
+                else selected_indices
+            )
+            seq_lens_next = self.seq_lens_cpu[indices] + 1
+            if not bridge.ensure_decode_growth_headroom(
+                requests, seq_lens_next=seq_lens_next
+            ):
+                return False
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
     def retract_all(self, server_args: ServerArgs):
+        self._reject_agentic_v2_native_retract()
         retracted_reqs = self.reqs
         for idx in range(len(self.reqs)):
             self.release_req(idx, len(self.reqs) - idx, server_args)
@@ -1982,6 +2010,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self, server_args: ServerArgs
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
+        self._reject_agentic_v2_native_retract()
         sorted_indices = list(range(len(self.reqs)))
 
         # TODO(lsyin): improve retraction policy for radix cache
@@ -2048,6 +2077,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         new_estimate_ratio = min(1.0, new_estimate_ratio)
 
         return retracted_reqs, new_estimate_ratio, reqs_to_abort
+
+    def _reject_agentic_v2_native_retract(self) -> None:
+        """Reject every native retract entry before it mutates V2 ownership."""
+
+        if any(
+            getattr(req, "__dict__", {}).get(
+                "_agentic_d_memory_bridge"
+            ) is not None
+            for req in self.reqs
+        ):
+            # V2 owns both the physical lease and native request mapping.
+            # Native retract frees/offloads behind that authority's back and
+            # would leave a live lease naming released pages.  Fail closed
+            # until a request-level, authority-owned mid-decode spill exists.
+            raise RuntimeError(
+                "multi-node V2 decode growth capacity was exhausted; native "
+                "retract is forbidden because it bypasses the memory authority. "
+                "Increase decode growth credit or reduce admission pressure."
+            )
 
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
         req = self.reqs[idx]

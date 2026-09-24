@@ -5,6 +5,9 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 
+from sglang.srt.disaggregation.agentic_kv_lifecycle import (
+    agentic_finished_req_needs_parent_handoff,
+)
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -88,7 +91,26 @@ class SchedulerOutputProcessorMixin:
             req.time_stats.set_decode_prebuilt_finish_time()
             req.check_finished()
             if req.finished():
+                memory_bridge = getattr(req, "_agentic_d_memory_bridge", None)
+                configured_memory_bridge = getattr(
+                    self, "agentic_d_memory_v2_bridge", None
+                )
                 if (
+                    configured_memory_bridge is not None
+                    and memory_bridge is configured_memory_bridge
+                ):
+                    if agentic_finished_req_needs_parent_handoff(req):
+                        completion = memory_bridge.publish_decode_complete(req)
+                        if completion is None:
+                            raise RuntimeError(
+                                f"failed to publish quick V2 Decode completion for {req.rid}"
+                            )
+                    elif not memory_bridge.release_final(req):
+                        raise RuntimeError(
+                            f"failed to release quick final V2 Decode request {req.rid}"
+                        )
+                    req.time_stats.set_quick_finish_time()
+                elif (
                     envs.SGLANG_AGENTIC_KV_LIFECYCLE.get()
                     and getattr(req, "mamba_pool_idx", None) is not None
                     and self.decode_offload_manager is not None
@@ -446,7 +468,19 @@ class SchedulerOutputProcessorMixin:
                 value=can_run_cuda_graph
             )
 
-        self.token_to_kv_pool_allocator.free_group_begin()
+        configured_v2_bridge = getattr(self, "agentic_d_memory_v2_bridge", None)
+        v2_bridges = [
+            getattr(req, "_agentic_d_memory_bridge", None) for req in batch.reqs
+        ]
+        v2_batch = configured_v2_bridge is not None and any(
+            bridge is configured_v2_bridge for bridge in v2_bridges
+        )
+        if v2_batch and any(
+            bridge is not configured_v2_bridge for bridge in v2_bridges
+        ):
+            raise RuntimeError("V2 Decode result batch mixes memory authorities")
+        if not v2_batch:
+            self.token_to_kv_pool_allocator.free_group_begin()
 
         # NOTE: in any case, we should check finish here
         # if finished, also clean up committed kv cache and over-allocated kv cache here
@@ -493,7 +527,25 @@ class SchedulerOutputProcessorMixin:
                 self.maybe_collect_routed_experts(req)
 
                 response_ready = True
-                if self.decode_offload_manager is not None:
+                memory_bridge = getattr(req, "_agentic_d_memory_bridge", None)
+                configured_memory_bridge = getattr(
+                    self, "agentic_d_memory_v2_bridge", None
+                )
+                if (
+                    configured_memory_bridge is not None
+                    and memory_bridge is configured_memory_bridge
+                ):
+                    if agentic_finished_req_needs_parent_handoff(req):
+                        completion = memory_bridge.publish_decode_complete(req)
+                        if completion is None:
+                            raise RuntimeError(
+                                f"failed to publish V2 Decode completion for {req.rid}"
+                            )
+                    elif not memory_bridge.release_final(req):
+                        raise RuntimeError(
+                            f"failed to release final V2 Decode request {req.rid}"
+                        )
+                elif self.decode_offload_manager is not None:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                     if self.decode_offload_manager.offload_kv_cache(req):
                         # Do not block the scheduler on Device->Host->storage.
@@ -573,7 +625,8 @@ class SchedulerOutputProcessorMixin:
                 req.grammar.finished = req.finished()
 
         self.stream_output(batch.reqs, batch.return_logprob)
-        self.token_to_kv_pool_allocator.free_group_end()
+        if not v2_batch:
+            self.token_to_kv_pool_allocator.free_group_end()
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
         self.report_decode_stats(

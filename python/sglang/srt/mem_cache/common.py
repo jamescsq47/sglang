@@ -417,7 +417,14 @@ def alloc_for_extend(
                     )
                     + extend_len
                 )
-                remaining = lease.remaining_suffix_indices
+                remaining_getter = getattr(
+                    broker, "remaining_suffix_indices", None
+                )
+                remaining = (
+                    remaining_getter(lease)
+                    if remaining_getter is not None
+                    else lease.remaining_suffix_indices
+                )
                 if remaining.numel():
                     req._agentic_workset_suffix_indices = remaining
                 else:
@@ -515,14 +522,9 @@ def alloc_paged_token_slots_decode(
     return out_cache_loc
 
 
-def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
-    """
-    Allocate KV cache for decode batch and write to req_to_token_pool.
-
-    Returns:
-        out_cache_loc: allocated cache locations
-    """
-
+def _alloc_for_decode_native(
+    batch: ScheduleBatch, token_per_req: int
+) -> torch.Tensor:
     batch.maybe_evict_swa()
 
     bs = batch.seq_lens.shape[0]
@@ -555,6 +557,32 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     )
 
     return out_cache_loc
+
+
+def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
+    """Allocate decode KV, optionally through the V2 memory authority."""
+
+    bridges = [
+        getattr(req, "_agentic_d_memory_bridge", None) for req in batch.reqs
+    ]
+    owned = [bridge for bridge in bridges if bridge is not None]
+    if not owned:
+        return _alloc_for_decode_native(batch, token_per_req)
+
+    bridge = owned[0]
+    if len(owned) != len(bridges) or any(other is not bridge for other in owned):
+        raise RuntimeError("V2 decode batch mixes physical memory authorities")
+    allocator = batch.tree_cache.token_to_kv_pool_allocator
+    if bridge.authority.token_allocator is not allocator:
+        raise RuntimeError("V2 decode bridge wraps a different token allocator")
+    seq_lens_next = batch.seq_lens_cpu + token_per_req
+    return bridge.allocate_decode_growth(
+        batch.reqs,
+        seq_lens_next=seq_lens_next,
+        allocate=lambda _allocator: _alloc_for_decode_native(
+            batch, token_per_req
+        ),
+    )
 
 
 def release_unadmitted_mamba_cow(req: Req, tree_cache: BasePrefixCache):

@@ -2062,6 +2062,9 @@ class SchedulerDisaggregationDecodeMixin:
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+            runtime = getattr(self, "agentic_multinode_runtime_v2", None)
+            if runtime is not None:
+                runtime.progress_nonblocking()
             # polling and allocating kv cache
             self.process_decode_queue()
 
@@ -2077,6 +2080,9 @@ class SchedulerDisaggregationDecodeMixin:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
 
+            if runtime is not None:
+                runtime.progress_nonblocking()
+
             # Update last_batch
             self.last_batch = batch
 
@@ -2089,6 +2095,9 @@ class SchedulerDisaggregationDecodeMixin:
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+            runtime = getattr(self, "agentic_multinode_runtime_v2", None)
+            if runtime is not None:
+                runtime.progress_nonblocking()
             # polling and allocating kv cache
             self.process_decode_queue()
 
@@ -2109,6 +2118,9 @@ class SchedulerDisaggregationDecodeMixin:
                 self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
                 self.self_check_during_idle()
+
+            if runtime is not None:
+                runtime.progress_nonblocking()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -2132,33 +2144,43 @@ class SchedulerDisaggregationDecodeMixin:
         self: Scheduler,
     ) -> Optional[ScheduleBatch]:
         """Process prebuilt batch and schedule the next decode batch."""
-        # Process pending prebuilt batch: output processing + filter + merge
-        new_prebuilt_batch = self.get_new_prebuilt_batch()
-        if new_prebuilt_batch:
-            assert self.chunked_req is None
-            self.process_batch_result_prebuilt(new_prebuilt_batch)
-            new_prebuilt_batch.filter_batch()
-            if not new_prebuilt_batch.is_empty():
-                if self.running_batch.is_empty():
-                    self.running_batch = new_prebuilt_batch
-                    if self.enable_hisparse:
-                        self.running_batch.hisparse_coordinator = (
-                            self.hisparse_coordinator
-                        )
-                else:
-                    self.running_batch.merge_batch(new_prebuilt_batch)
+        def prepare_batch():
+            # Process pending prebuilt batch: output processing + filter + merge
+            new_prebuilt_batch = self.get_new_prebuilt_batch()
+            if new_prebuilt_batch:
+                assert self.chunked_req is None
+                self.process_batch_result_prebuilt(new_prebuilt_batch)
+                new_prebuilt_batch.filter_batch()
+                if not new_prebuilt_batch.is_empty():
+                    if self.running_batch.is_empty():
+                        self.running_batch = new_prebuilt_batch
+                        if self.enable_hisparse:
+                            self.running_batch.hisparse_coordinator = (
+                                self.hisparse_coordinator
+                            )
+                    else:
+                        self.running_batch.merge_batch(new_prebuilt_batch)
 
-        # Schedule decode batch
-        if self.running_batch.is_empty():
-            ret = None
-        else:
-            self.running_batch = self.update_running_batch(self.running_batch)
-            ret = self.running_batch if not self.running_batch.is_empty() else None
+            # Schedule decode batch
+            if self.running_batch.is_empty():
+                ret = None
+            else:
+                self.running_batch = self.update_running_batch(self.running_batch)
+                ret = (
+                    self.running_batch if not self.running_batch.is_empty() else None
+                )
 
-        ret = self.maybe_prepare_mlp_sync_batch(ret)
-        if ret:
-            set_schedule_time_batch(ret)
-        return ret
+            ret = self.maybe_prepare_mlp_sync_batch(ret)
+            if ret:
+                set_schedule_time_batch(ret)
+            return ret
+
+        memory_bridge = getattr(self, "agentic_d_memory_v2_bridge", None)
+        if memory_bridge is None:
+            return prepare_batch()
+        # Forward is launched only after this short CPU mutation scope exits.
+        with memory_bridge.native_guard("d-scheduler-prepare"):
+            return prepare_batch()
 
     def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:
         """Create a schedulebatch for fake completed prefill"""
@@ -2230,6 +2252,13 @@ class SchedulerDisaggregationDecodeMixin:
         return new_batch
 
     def process_decode_queue(self: Scheduler):
+        memory_bridge = getattr(self, "agentic_d_memory_v2_bridge", None)
+        if memory_bridge is not None:
+            # TP0's native scheduler broadcast installs activated Decode
+            # requests directly into waiting_queue.  Never drain the
+            # rank-local physical-ready FIFO independently on each TP rank.
+            return
+
         if self.decode_offload_manager is not None:
             self.decode_offload_manager.check_offload_progress()
             ready_responses = self.decode_offload_manager.pop_ready_responses()

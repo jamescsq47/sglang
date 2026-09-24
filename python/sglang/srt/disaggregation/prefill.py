@@ -418,6 +418,34 @@ class PrefillBootstrapQueue:
 
 
 class SchedulerDisaggregationPrefillMixin:
+    def _uses_v2_prefill_workset(self: Scheduler, req: Req) -> bool:
+        """Return whether ``req`` is owned by the V2 P memory controller.
+
+        V2 transfers the complete Prefill result only after the final local
+        compute completion.  In particular, chunk boundaries are local
+        scheduler bookkeeping and must never enter the legacy KV sender.
+        """
+
+        bridge = getattr(self, "agentic_p_memory_v2_bridge", None)
+        return (
+            bridge is not None
+            and getattr(req, "_agentic_p_workset_broker", None) is bridge
+        )
+
+    def _send_legacy_prefill_chunk_if_needed(
+        self: Scheduler,
+        req: Req,
+        *,
+        last_chunk: bool = False,
+        end_idx: Optional[int] = None,
+    ) -> bool:
+        """Send one V1 chunk while keeping V2 entirely on its handoff path."""
+
+        if self._uses_v2_prefill_workset(req):
+            return False
+        self.send_kv_chunk(req, last_chunk=last_chunk, end_idx=end_idx)
+        return True
+
     """
     Mixin for Scheduler to handle disaggregation prefill
     """
@@ -1500,26 +1528,44 @@ class SchedulerDisaggregationPrefillMixin:
         # parent+suffix pages at the same allocator-safe boundary as ordinary
         # Prefill.  Without this call intents remain queued forever even when
         # P HBM is empty.
-        self._agentic_service_p_workset_leases()
-        # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
-        # Otherwise, it hangs under high concurrency
-        self.running_batch.batch_is_full = False
+        memory_bridge = getattr(self, "agentic_p_memory_v2_bridge", None)
+        if memory_bridge is None:
+            self._agentic_service_p_workset_leases()
+        # V2 staged leases are consumed only through TP0's activation record
+        # on the native request broadcast.  Draining the rank-local FIFO here
+        # would let TCP arrival skew split a TP group.
 
-        self.process_prefill_chunk()
+        def prepare_batch():
+            # HACK (byronhsu): reset the batch_is_full flag because we never
+            # enter update_running_batch which resets it.
+            self.running_batch.batch_is_full = False
+            self.process_prefill_chunk()
+            # V2 admits only requests that already own a complete workset.
+            # Its memory controller, rather than the legacy P-ready HBM cap,
+            # supplies backpressure.  Reusing the V1 throttle here would make
+            # an unrelated transfer backlog pause compute-ready Prefill work.
+            throttle_compute = (
+                False
+                if memory_bridge is not None
+                else self._should_throttle_p_ready_compute_ahead()
+            )
+            if not throttle_compute:
+                batch = self.get_new_batch_prefill()
+            else:
+                # Backpressure applies to the complete native queue. KV source
+                # is not a compute-admission priority class.
+                batch = None
+            batch = self.maybe_prepare_mlp_sync_batch(batch)
+            if batch:
+                set_schedule_time_batch(batch)
+            return batch
 
-        throttle_compute = self._should_throttle_p_ready_compute_ahead()
-        if not throttle_compute:
-            batch = self.get_new_batch_prefill()
-        else:
-            # Backpressure applies to the complete native queue. KV source is
-            # not a compute-admission priority class.
-            batch = None
-        batch = self.maybe_prepare_mlp_sync_batch(batch)
-
-        if batch:
-            set_schedule_time_batch(batch)
-
-        return batch
+        if memory_bridge is None:
+            return prepare_batch()
+        # This covers only allocator/Radix CPU mutation.  The caller launches
+        # GPU Forward after this method returns, with no authority lock held.
+        with memory_bridge.native_guard("p-scheduler-prepare"):
+            return prepare_batch()
 
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
@@ -1530,9 +1576,13 @@ class SchedulerDisaggregationPrefillMixin:
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
-            self._merge_disagg_prefill_ready(
-                self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
-            )
+            runtime = getattr(self, "agentic_multinode_runtime_v2", None)
+            if runtime is not None:
+                runtime.progress_nonblocking()
+            else:
+                self._merge_disagg_prefill_ready(
+                    self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+                )
 
             # Get the next batch to run
             batch = self.get_next_disagg_prefill_batch_to_run()
@@ -1547,7 +1597,10 @@ class SchedulerDisaggregationPrefillMixin:
             else:
                 self.self_check_during_idle()
 
-            self.process_disagg_prefill_inflight_queue()
+            if runtime is not None:
+                runtime.progress_nonblocking()
+            else:
+                self.process_disagg_prefill_inflight_queue()
 
             # Update last_batch
             self.last_batch = batch
@@ -1561,9 +1614,13 @@ class SchedulerDisaggregationPrefillMixin:
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
-            self._merge_disagg_prefill_ready(
-                self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
-            )
+            runtime = getattr(self, "agentic_multinode_runtime_v2", None)
+            if runtime is not None:
+                runtime.progress_nonblocking()
+            else:
+                self._merge_disagg_prefill_ready(
+                    self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+                )
 
             # Get the next batch to run
             batch = self.get_next_disagg_prefill_batch_to_run()
@@ -1586,7 +1643,10 @@ class SchedulerDisaggregationPrefillMixin:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
 
-            self.process_disagg_prefill_inflight_queue()
+            if runtime is not None:
+                runtime.progress_nonblocking()
+            else:
+                self.process_disagg_prefill_inflight_queue()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -1643,7 +1703,13 @@ class SchedulerDisaggregationPrefillMixin:
                 # There is no output_ids for prefill
                 req.output_ids.append(next_token_id)
                 tracked = getattr(req, "mamba_last_track_seqlen", None)
-                self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
+                memory_bridge = getattr(req, "_agentic_p_workset_broker", None)
+                is_v2_memory = self._uses_v2_prefill_workset(req)
+                if is_v2_memory:
+                    with memory_bridge.native_guard("p-scheduler-cache-result"):
+                        self.tree_cache.cache_unfinished_req(req)
+                else:
+                    self.tree_cache.cache_unfinished_req(req)
                 if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get() and getattr(req, "mamba_pool_idx", None) is not None:
                     from sglang.srt.disaggregation.agentic_hybrid_transfer import freeze_p2d_mamba_checkpoint_after_cache
                     freeze_p2d_mamba_checkpoint_after_cache(req, tracked, self.server_args.page_size)
@@ -1651,9 +1717,11 @@ class SchedulerDisaggregationPrefillMixin:
                     custom = req.sampling_params.custom_params or {}
                     log_mamba_digest(self.req_to_token_pool, p2d_mamba_source_indices(req, self.server_args.page_size),
                                      phase="p2d_source", snapshot_id=f"{custom.get('agentic_request_id')}:{custom.get('agentic_generation')}")
-                self.disagg_prefill_inflight_queue.append(req)
-                p2d_host = getattr(self, "agentic_p2d_host_staging_manager", None)
-                if p2d_host is not None:
+                p2d_host = None
+                if not is_v2_memory:
+                    self.disagg_prefill_inflight_queue.append(req)
+                    p2d_host = getattr(self, "agentic_p2d_host_staging_manager", None)
+                if not is_v2_memory and p2d_host is not None:
                     # Register once at the producer boundary.  The manager's
                     # offer watcher starts D2H as soon as D advertises that
                     # direct admission failed, even while the scheduler is in
@@ -1685,7 +1753,12 @@ class SchedulerDisaggregationPrefillMixin:
                         logits_output,
                     )
                     logprob_pt += num_input_logprobs
-                if getattr(req, "disagg_p_ready_deferred", False):
+                if is_v2_memory:
+                    # The immutable workset stays owned by the authority.  A
+                    # P->D controller consumes the completion event; the
+                    # scheduler neither starts transport nor releases pages.
+                    pass
+                elif getattr(req, "disagg_p_ready_deferred", False):
                     async_progress = getattr(
                         self, "_prefill_transfer_async_enabled", False
                     )
@@ -1706,6 +1779,7 @@ class SchedulerDisaggregationPrefillMixin:
                     if getattr(self, "_prefill_transfer_async_enabled", False):
                         self._enqueue_deferred_prefill_transfer(req)
 
+                v2_prefill_aborted = False
                 if req.grammar is not None:
                     # FIXME: this try-except block is for handling unexpected xgrammar issue.
                     try:
@@ -1714,8 +1788,20 @@ class SchedulerDisaggregationPrefillMixin:
                         # Grammar accept_token can raise ValueError if the token is not in the grammar.
                         # This can happen if the grammar is not set correctly or the token is invalid.
                         error_message = f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-                        release_safe = p2d_host is None or p2d_host.cancel_watch(req)
-                        if release_safe:
+                        if is_v2_memory:
+                            if not memory_bridge.release_abort(
+                                req, reason="grammar_accept_failed"
+                            ):
+                                raise RuntimeError(
+                                    f"failed to release V2 Prefill grammar abort for {req.rid}"
+                                )
+                            prepare_abort(
+                                req,
+                                error_message,
+                                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                            )
+                            v2_prefill_aborted = True
+                        elif p2d_host is None or p2d_host.cancel_watch(req):
                             release_kv_cache(req, self.tree_cache)
                             prepare_abort(
                                 req,
@@ -1729,6 +1815,12 @@ class SchedulerDisaggregationPrefillMixin:
                             # the normal inflight cleanup path.
                             req._agentic_p2d_abort_after_copy = error_message
                     req.grammar.finished = req.finished()
+                if is_v2_memory and not v2_prefill_aborted:
+                    completion = memory_bridge.publish_prefill_complete(req)
+                    if completion is None:
+                        raise RuntimeError(
+                            f"failed to publish V2 Prefill completion for {req.rid}"
+                        )
             else:
                 # being chunked reqs' prefill is not finished
                 req.is_chunked -= 1
@@ -1750,7 +1842,9 @@ class SchedulerDisaggregationPrefillMixin:
                         logprob_pt += num_input_logprobs
 
                 if self.enable_overlap:
-                    self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
+                    self._send_legacy_prefill_chunk_if_needed(
+                        req, last_chunk=False, end_idx=req.tmp_end_idx
+                    )
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
         can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
@@ -2173,7 +2267,7 @@ class SchedulerDisaggregationPrefillMixin:
                     len(self.chunked_req.origin_input_ids),
                 )
             else:
-                self.send_kv_chunk(self.chunked_req)
+                self._send_legacy_prefill_chunk_if_needed(self.chunked_req)
             self.running_batch.batch_is_full = False
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():

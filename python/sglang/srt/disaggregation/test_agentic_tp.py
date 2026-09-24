@@ -11392,6 +11392,40 @@ def test_disagg_prefill_services_workset_broker_at_scheduler_boundary():
     assert scheduler.running_batch.batch_is_full is False
 
 
+def test_disagg_prefill_v2_ready_is_adopted_only_by_native_tp_broadcast():
+    events = []
+    scheduler = SimpleNamespace(
+        running_batch=SimpleNamespace(batch_is_full=True),
+        waiting_queue=[],
+        agentic_p_memory_v2_bridge=SimpleNamespace(
+            drain_prefill_ready=lambda **kwargs: (
+                events.append(("drain", kwargs["max_items"])) or ("ready",)
+            ),
+            native_guard=lambda owner: (
+                events.append(("guard", owner)) or nullcontext()
+            ),
+        ),
+        _merge_disagg_prefill_ready=lambda reqs: events.append(
+            ("merge", tuple(reqs))
+        ),
+        _agentic_service_p_workset_leases=lambda: events.append("legacy"),
+        process_prefill_chunk=lambda: events.append("chunk"),
+        _should_throttle_p_ready_compute_ahead=lambda: False,
+        get_new_batch_prefill=lambda: None,
+        maybe_prepare_mlp_sync_batch=lambda batch: batch,
+    )
+
+    batch = SchedulerDisaggregationPrefillMixin.get_next_disagg_prefill_batch_to_run(
+        scheduler
+    )
+
+    assert batch is None
+    assert events == [
+        ("guard", "p-scheduler-prepare"),
+        "chunk",
+    ]
+
+
 def test_tp_decode_release_uses_native_scheduler_control():
     """Decode release is broadcast at the existing scheduler boundary."""
 

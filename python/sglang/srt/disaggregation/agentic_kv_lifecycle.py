@@ -483,6 +483,34 @@ class AgenticRequestMetadata:
         return cls.from_custom_params(getattr(sampling_params, "custom_params", None))
 
 
+def agentic_finished_req_needs_parent_handoff(req: Any) -> bool:
+    """Whether a finished generation may have a subsequent agent turn.
+
+    This deliberately matches DecodeKVCacheOffloadManager: length/abort and
+    explicit terminal markers are final; TOOL and UNKNOWN retain the parent
+    provisionally until the application parser publishes its decision.
+    """
+
+    metadata = AgenticRequestMetadata.from_req(req)
+    if metadata is None:
+        return False
+    finish_reason = getattr(req, "finished_reason", None)
+    finish_type = None
+    if finish_reason is not None:
+        try:
+            finish_type = finish_reason.to_json().get("type")
+        except (AttributeError, TypeError):
+            finish_type = None
+    if finish_type in {"length", "abort"}:
+        return False
+    output_ids = getattr(req, "output_ids", ())
+    tokenizer = getattr(req, "tokenizer", None)
+    output_kind = metadata.classify_output(output_ids, tokenizer)
+    if output_kind is AgenticOutputKind.UNKNOWN and output_ids:
+        output_kind = metadata.classify_output(output_ids[:-1], tokenizer)
+    return output_kind is not AgenticOutputKind.TERMINAL
+
+
 @dataclass(frozen=True, slots=True)
 class SnapshotManifest:
     """Small logical manifest; KV bytes remain physically page-based."""

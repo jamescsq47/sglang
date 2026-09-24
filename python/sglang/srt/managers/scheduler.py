@@ -18,6 +18,7 @@ import faulthandler
 import json
 import logging
 import os
+import queue
 import signal
 import sys
 import threading
@@ -1689,6 +1690,16 @@ class Scheduler(
         )
         self.gpu_id = gpu_id
         self.page_size = server_args.page_size
+        # Detect V2 before cache/running-state construction.  Validation that
+        # needs the physical KV pool remains in init_disaggregation().
+        from sglang.srt.disaggregation.agentic_multinode import (
+            load_multinode_config,
+        )
+
+        self.agentic_multinode_config = load_multinode_config()
+        self.agentic_multinode_runtime_v2 = None
+        self.agentic_p_memory_v2_bridge = None
+        self.agentic_d_memory_v2_bridge = None
         custom_storage_only = envs.SGLANG_AGENTIC_KV_CUSTOM_STORAGE_ONLY.get()
         if custom_storage_only and server_args.enable_hierarchical_cache:
             raise ValueError(
@@ -2197,9 +2208,13 @@ class Scheduler(
             envs.SGLANG_AGENTIC_KV_LIFECYCLE.get()
             and envs.SGLANG_AGENTIC_KV_CUSTOM_STORAGE_ONLY.get()
         )
-        if server_args.disaggregation_mode == "decode" and (
-            server_args.disaggregation_decode_enable_offload_kvcache
-            or custom_agentic_decode
+        if (
+            self.agentic_multinode_config is None
+            and server_args.disaggregation_mode == "decode"
+            and (
+                server_args.disaggregation_decode_enable_offload_kvcache
+                or custom_agentic_decode
+            )
         ):
             self.decode_offload_manager = DecodeKVCacheOffloadManager(
                 req_to_token_pool=self.req_to_token_pool,
@@ -2215,12 +2230,35 @@ class Scheduler(
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
 
     def init_running_status(self):
-        if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get() and self.server_args.page_size < 64:
+        if (
+            self.agentic_multinode_config is None
+            and envs.SGLANG_AGENTIC_KV_LIFECYCLE.get()
+            and self.server_args.page_size < 64
+        ):
             raise ValueError(
                 "SGLANG_AGENTIC_KV_LIFECYCLE V1 requires --page-size >= 64; "
                 "smaller pages make request-level manifests unnecessarily large"
             )
         self.waiting_queue: List[Req] = []
+        if self.agentic_multinode_config is not None:
+            # V2 owns request-generation state in its in-memory group runtime.
+            # Do not construct V1 brokers, tmpfs mailboxes, marker watchers or
+            # progress locks merely for compatibility with old methods.
+            self.agentic_kv_waiting_queue = []
+            self.agentic_p_workset_broker = None
+            self.agentic_tp_direct_mailbox = None
+            self.agentic_tp_direct_abort_mailbox = None
+            self.agentic_tp_host_mailbox = None
+            self.agentic_tp_workset_retire_mailbox = None
+            self.agentic_tp_p2d_sender_mailbox = None
+            self.agentic_tp_p2d_receiver_mailbox = None
+            self.agentic_tp_p2d_admission_mailbox = None
+            self.agentic_tp_p2d_cleanup_mailbox = None
+            self.agentic_early_direct_arrival_watcher = None
+            self.agentic_direct_abort_watcher = None
+            self.agentic_early_claim_store = None
+            self._init_common_running_status()
+            return
         # Requests whose parent D snapshot is not committed yet.  They carry
         # metadata only and consume neither P host cache nor P GPU KV memory.
         self.agentic_kv_waiting_queue: List[Tuple[Req, float]] = []
@@ -2357,6 +2395,11 @@ class Scheduler(
         self.agentic_early_direct_cycle_lock = threading.Lock()
         self.agentic_early_direct_progress_stop = threading.Event()
         self.agentic_early_direct_progress_thread = None
+        self._init_common_running_status()
+
+    def _init_common_running_status(self):
+        """State required by native scheduling in both V1 and V2."""
+
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
@@ -2490,6 +2533,15 @@ class Scheduler(
             configure_gc_logger()
 
     def init_disaggregation(self):
+        from sglang.srt.disaggregation.agentic_multinode import (
+            create_agentic_multinode_runtime,
+            validate_multinode_runtime,
+        )
+
+        config = validate_multinode_runtime(
+            self.server_args, self.token_to_kv_pool_allocator.get_kvcache()
+        )
+        self.agentic_multinode_config = config
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
@@ -2497,6 +2549,7 @@ class Scheduler(
             self.server_args.disaggregation_transfer_backend
         )
 
+        draft_model_config = None
         if self.draft_worker is None or self.spec_algorithm.is_ngram():
             draft_token_to_kv_pool = None
         elif self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
@@ -2510,6 +2563,29 @@ class Scheduler(
             # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
             draft_token_to_kv_pool = self.draft_worker.model_runner.token_to_kv_pool
             model_config = self.draft_worker.model_config
+
+        if self.draft_worker is not None and not self.spec_algorithm.is_ngram():
+            draft_model_config = model_config
+
+        if config is not None:
+            runtime = create_agentic_multinode_runtime(
+                self,
+                config,
+                draft_token_to_kv_pool=draft_token_to_kv_pool,
+                draft_model_config=draft_model_config,
+            )
+            self.agentic_multinode_runtime_v2 = runtime
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                if runtime.p_memory_bridge is None:
+                    raise RuntimeError("V2 Prefill runtime has no P memory bridge")
+                self.agentic_p_memory_v2_bridge = runtime.p_memory_bridge
+            elif self.disaggregation_mode == DisaggregationMode.DECODE:
+                if runtime.d_memory_bridge is None:
+                    raise RuntimeError("V2 Decode runtime has no D memory bridge")
+                self.agentic_d_memory_v2_bridge = runtime.d_memory_bridge
+            else:
+                raise ValueError("multi-node V2 requires prefill or decode mode")
+            return
 
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
@@ -3086,8 +3162,19 @@ class Scheduler(
         self.schedule_stream = self.device_module.Stream(priority=0)
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
-        with self.device_module.StreamContext(self.schedule_stream):
-            dispatch_event_loop(self)
+        try:
+            with self.device_module.StreamContext(self.schedule_stream):
+                dispatch_event_loop(self)
+        finally:
+            runtime = getattr(self, "agentic_multinode_runtime_v2", None)
+            if runtime is not None:
+                # Clear first so nested/error shutdown paths cannot close the
+                # transfer/control runtime twice.
+                self.agentic_multinode_runtime_v2 = None
+                try:
+                    runtime.close()
+                except Exception:
+                    logger.exception("Failed to close multi-node V2 runtime")
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -3261,7 +3348,12 @@ class Scheduler(
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
 
-        if self.tp_size > 1 and envs.SGLANG_AGENTIC_KV_LIFECYCLE.get():
+        multinode_v2 = getattr(self, "agentic_multinode_runtime_v2", None)
+        if (
+            multinode_v2 is None
+            and self.tp_size > 1
+            and envs.SGLANG_AGENTIC_KV_LIFECYCLE.get()
+        ):
             self._agentic_tp_reduce_direct_status()
             self._agentic_tp_reduce_host_status()
             if self.disaggregation_mode is DisaggregationMode.PREFILL:
@@ -3281,7 +3373,11 @@ class Scheduler(
         ):
             if recv_reqs is None:
                 recv_reqs = []
-            control = self._agentic_tp_prepare_admission_control()
+            control = (
+                self._agentic_v2_prepare_activation_control()
+                if multinode_v2 is not None
+                else self._agentic_tp_prepare_admission_control()
+            )
             if control is not None:
                 recv_reqs.append(control)
 
@@ -3325,6 +3421,11 @@ class Scheduler(
             )
 
         recv_reqs = self._agentic_tp_consume_admission_control(recv_reqs)
+
+        if multinode_v2 is not None and self.tp_size == 1:
+            control = self._agentic_v2_prepare_activation_control()
+            if control is not None:
+                self._agentic_v2_consume_activation_control(control)
 
         # Process MM requests under EPD-disaggregation mode
         if (
@@ -7206,6 +7307,94 @@ class Scheduler(
                         self.agentic_early_direct_completion_queue.append(snapshot_id)
 
     _AGENTIC_TP_CONTROL_KEY = "__sglang_agentic_tp_admission_v1__"
+    _AGENTIC_V2_ACTIVATION_KEY = "__sglang_agentic_multinode_activation_v2__"
+
+    def _agentic_v2_prepare_activation_control(self):
+        """Drain target tickets only on TP0 for the native TP broadcast.
+
+        TCP completion order is not a scheduler order.  The group controller
+        emits a ticket only after every target shard is staged; TP0 then puts
+        that immutable order on SGLang's existing request broadcast.  No
+        scheduler rank polls the network or independently selects ready work.
+        """
+
+        runtime = getattr(self, "agentic_multinode_runtime_v2", None)
+        if runtime is None or self.tp_rank != 0:
+            return None
+        tickets = []
+        while len(tickets) < 64:
+            try:
+                ticket = runtime.take_activation_ticket(timeout=0)
+            except queue.Empty:
+                break
+            tickets.append(
+                {
+                    "request_id": ticket.key.request_id,
+                    "generation": int(ticket.target_generation),
+                    "attempt": int(ticket.attempt),
+                    "lease_id": ticket.lease_id,
+                    "target_role": ticket.target_role,
+                    "source_generation": int(ticket.key.generation),
+                }
+            )
+        if not tickets:
+            return None
+        return {self._AGENTIC_V2_ACTIVATION_KEY: True, "tickets": tickets}
+
+    def _agentic_v2_consume_activation_control(self, control) -> None:
+        """Apply TP0's exact activation sequence on every local TP rank."""
+
+        from sglang.srt.disaggregation.agentic_group_protocol import GenerationKey
+        from sglang.srt.disaggregation.agentic_memory_authority import (
+            RequestGenerationAttempt,
+        )
+        from sglang.srt.disaggregation.agentic_multinode_runtime import (
+            EndpointActivationTicket,
+        )
+
+        runtime = getattr(self, "agentic_multinode_runtime_v2", None)
+        if runtime is None:
+            raise RuntimeError("received a V2 activation without a V2 runtime")
+        role = self.disaggregation_mode.value
+        attempts = []
+        tickets = []
+        for value in control.get("tickets", ()):
+            if value["target_role"] != role:
+                raise RuntimeError("V2 activation reached the wrong endpoint role")
+            key = GenerationKey(
+                runtime.config.run_id,
+                str(value["request_id"]),
+                int(value["source_generation"]),
+            )
+            ticket = EndpointActivationTicket(
+                key=key,
+                attempt=int(value["attempt"]),
+                lease_id=str(value["lease_id"]),
+                target_role=str(value["target_role"]),
+                target_generation=int(value["generation"]),
+            )
+            runtime.activate_staged(ticket)
+            tickets.append(ticket)
+            attempts.append(
+                RequestGenerationAttempt(
+                    str(value["request_id"]),
+                    int(value["generation"]),
+                    int(value["attempt"]),
+                )
+            )
+
+        if role == "prefill":
+            ready = runtime.p_memory_bridge.activate_prefill_attempts(attempts)
+            self._merge_disagg_prefill_ready(list(ready))
+        elif role == "decode":
+            ready = runtime.d_memory_bridge.activate_decode_attempts(attempts)
+            self.waiting_queue.extend(ready)
+        else:  # pragma: no cover - validated at startup
+            raise RuntimeError(f"unsupported V2 endpoint role {role!r}")
+        # ACTIVATED means the request is now owned by the native scheduler,
+        # not merely published in a rank-local ready queue.
+        for ticket in tickets:
+            runtime.confirm_scheduler_adopted(ticket)
 
     def _agentic_tp_reduce_direct_status(self) -> None:
         """Report local Direct progress; TP0 derives logical completion."""
@@ -7852,11 +8041,23 @@ class Scheduler(
             return recv_reqs
         ordinary = []
         control = None
+        v2_control = None
+        v1_key = Scheduler._AGENTIC_TP_CONTROL_KEY
+        v2_key = Scheduler._AGENTIC_V2_ACTIVATION_KEY
         for req in recv_reqs:
-            if isinstance(req, dict) and req.get(self._AGENTIC_TP_CONTROL_KEY):
-                control = req
-            else:
-                ordinary.append(req)
+            if isinstance(req, dict):
+                if req.get(v2_key):
+                    v2_control = req
+                    continue
+                if req.get(v1_key):
+                    control = req
+                    continue
+            ordinary.append(req)
+        if v2_control is not None:
+            if control is not None:
+                raise RuntimeError("V1 and V2 TP controls were mixed")
+            self._agentic_v2_consume_activation_control(v2_control)
+            return ordinary
         if control is None:
             return ordinary
         if self.disaggregation_mode is DisaggregationMode.PREFILL:
@@ -8877,6 +9078,13 @@ class Scheduler(
                 retry(snapshot_store, observed.request)
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
+        runtime = getattr(self, "agentic_multinode_runtime_v2", None)
+        if runtime is not None:
+            # V2 admission is event driven.  The runtime prepares a complete
+            # role-specific lease and publishes it through the ready bridge;
+            # this scheduler must not also touch V1 marker/bootstrap queues.
+            runtime.submit_request(req, is_retracted=is_retracted)
+            return
         if (
             self.disaggregation_mode == DisaggregationMode.PREFILL
             and not is_retracted
@@ -10462,6 +10670,24 @@ class Scheduler(
         raise NotImplementedError()
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
+        if recv_req.mode == "retract":
+            batches = (self.running_batch, self.last_batch)
+            configured_bridge = getattr(
+                self, "agentic_d_memory_v2_bridge", None
+            )
+            if any(
+                configured_bridge is not None
+                and getattr(req, "__dict__", {}).get(
+                    "_agentic_d_memory_bridge"
+                ) is configured_bridge
+                for batch in batches
+                if batch is not None
+                for req in batch.reqs
+            ):
+                raise RuntimeError(
+                    "pause(mode='retract') is not supported by multi-node V2; "
+                    "use in_place so the memory authority retains ownership"
+                )
         self._engine_paused = True
 
         if recv_req.mode == "in_place":
