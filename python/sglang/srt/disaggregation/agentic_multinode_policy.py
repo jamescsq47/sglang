@@ -156,7 +156,13 @@ class D2PPolicyActor:
 
         with self._changed:
             self._check_locked()
-            state = self._states[key]
+            # Abort/timeout delivery is asynchronous and may race a terminal
+            # commit or refer to an initial-prefill allocation, which is not
+            # owned by this parent policy.  Cleanup must therefore be
+            # idempotent for an unknown generation.
+            state = self._states.get(key)
+            if state is None:
+                return
             if state.phase is not ParentPolicyPhase.DIRECT_SUBMITTED:
                 return
             state.phase = ParentPolicyPhase.HOST_STORE_SUBMITTED
@@ -316,7 +322,11 @@ class P2DPolicyActor:
 
     def direct_rejected(self, key: GenerationKey) -> None:
         with self._lock:
-            state = self._states[key]
+            # Initial-prefill allocation and duplicate terminal callbacks do
+            # not have a P2D policy entry.  They require no Host fallback.
+            state = self._states.get(key)
+            if state is None:
+                return
             if state.phase is not P2DPolicyPhase.DIRECT_SUBMITTED:
                 return
             state.phase = P2DPolicyPhase.HOST_STORE_SUBMITTED

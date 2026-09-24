@@ -127,3 +127,26 @@ def test_p2d_host_restore_retries_only_on_capacity_edge():
     assert len(submitted) == 2
     actor.memory_available()
     assert [value.lease_id for value in submitted][-1] == "p2d-restore"
+
+
+def test_unknown_or_terminal_direct_rejection_is_idempotent():
+    key = GenerationKey("run", "unknown", 5)
+    submitted = []
+    d2p = D2PPolicyActor(
+        direct_window_seconds=1,
+        submit=submitted.append,
+        make_direct=lambda candidate, child: plan(key, "direct"),
+        make_host_store=lambda candidate: plan(key, "store"),
+        make_host_restore=lambda candidate, child, desc: plan(key, "restore"),
+    )
+    p2d = P2DPolicyActor(
+        submit=submitted.append,
+        make_host_store=lambda value: plan(value.key, "p2d-store"),
+        make_host_restore=lambda value, _desc: plan(value.key, "p2d-restore"),
+    )
+    try:
+        d2p.direct_rejected(key)
+        p2d.direct_rejected(key)
+        assert submitted == []
+    finally:
+        d2p.close()

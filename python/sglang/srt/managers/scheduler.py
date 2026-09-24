@@ -10636,8 +10636,10 @@ class Scheduler(
 
         # Delete requests not in the waiting queue when PD disaggregation is enabled
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            bootstrap_queue = getattr(self, "disagg_prefill_bootstrap_queue", None)
+            inflight_queue = getattr(self, "disagg_prefill_inflight_queue", ())
             # Abort requests that have not yet been bootstrapped
-            for req in self.disagg_prefill_bootstrap_queue.queue:
+            for req in (() if bootstrap_queue is None else bootstrap_queue.queue):
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
                     self._agentic_abort_cleanup(req)
@@ -10645,7 +10647,7 @@ class Scheduler(
                         req.disagg_kv_sender.abort()
 
             # Abort in-flight requests
-            for req in self.disagg_prefill_inflight_queue:
+            for req in inflight_queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort inflight queue request. {req.rid=}")
                     self._agentic_abort_cleanup(req)
@@ -10653,22 +10655,29 @@ class Scheduler(
                         req.disagg_kv_sender.abort()
 
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            # Abort requests that have not yet finished preallocation
-            for decode_req in self.disagg_decode_prealloc_queue.queue:
+            # V2 owns admission/transfer queues in its controller and returns
+            # before the legacy queues are constructed.  Abort only whichever
+            # legacy queues actually exist; the V2 request lifecycle receives
+            # the same abort through its normal request cleanup below.
+            prealloc_queue = getattr(self, "disagg_decode_prealloc_queue", None)
+            transfer_queue = getattr(self, "disagg_decode_transfer_queue", None)
+
+            # Abort requests that have not yet finished preallocation.
+            for decode_req in (() if prealloc_queue is None else prealloc_queue.queue):
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
 
-            # Abort requests waiting for kvcache to release tree cache
-            for decode_req in self.disagg_decode_transfer_queue.queue:
+            # Abort requests waiting for kvcache to release tree cache.
+            for decode_req in (() if transfer_queue is None else transfer_queue.queue):
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
 
-            # Abort requests already retracted to CPU cache
-            if self.disagg_decode_prealloc_queue.retracted_queue:
+            # Abort requests already retracted to CPU cache.
+            if prealloc_queue is not None and prealloc_queue.retracted_queue:
                 remaining_retracted = []
-                for decode_req in self.disagg_decode_prealloc_queue.retracted_queue:
+                for decode_req in prealloc_queue.retracted_queue:
                     if recv_req.abort_all or decode_req.rid.startswith(recv_req.rid):
                         assert hasattr(decode_req, "kv_cache_cpu")
                         del decode_req.kv_cache_cpu
@@ -10677,7 +10686,7 @@ class Scheduler(
                         )
                     else:
                         remaining_retracted.append(decode_req)
-                self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
+                prealloc_queue.retracted_queue = remaining_retracted
 
         # Delete requests in the running batch
         if self.cur_batch is self.running_batch or self.cur_batch is None:

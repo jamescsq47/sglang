@@ -14,6 +14,7 @@ from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers import scheduler as scheduler_module
+from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.scheduler import Scheduler
 
 
@@ -144,6 +145,26 @@ def test_v2_request_admission_never_touches_legacy_queues():
     Scheduler._add_request_to_queue(target, req, is_retracted=True)
 
     assert runtime.submitted == [(req, True)]
+
+
+@pytest.mark.parametrize(
+    "mode", [DisaggregationMode.PREFILL, DisaggregationMode.DECODE]
+)
+def test_v2_abort_never_reads_unconstructed_legacy_queues(mode):
+    empty_batch = SimpleNamespace(reqs=[])
+    target = SimpleNamespace(
+        agentic_kv_waiting_queue=[],
+        waiting_queue=[],
+        grammar_manager=SimpleNamespace(abort_requests=lambda _req: None),
+        disaggregation_mode=mode,
+        running_batch=empty_batch,
+        cur_batch=None,
+    )
+
+    Scheduler.abort_request(target, AbortReq(rid="missing"))
+
+    assert not hasattr(target, "disagg_prefill_bootstrap_queue")
+    assert not hasattr(target, "disagg_decode_prealloc_queue")
 
 
 def test_v2_idle_check_never_reads_legacy_pd_queues():
