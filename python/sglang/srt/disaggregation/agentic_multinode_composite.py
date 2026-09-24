@@ -15,6 +15,7 @@ No filesystem path, directory scan, or scheduler transport poll is used.
 
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 import time
@@ -48,6 +49,8 @@ from sglang.srt.disaggregation.agentic_multinode_runtime import (
     AgenticMultiNodeRuntime,
     EndpointActivationTicket,
 )
+
+logger = logging.getLogger(__name__)
 from sglang.srt.disaggregation.agentic_transfer_queues import (
     AgenticTransferQueues,
     TransferExecutor,
@@ -678,6 +681,15 @@ class SchedulerAgenticMultinodeRuntime:
     def _handle_aborted(
         self, plan: GroupTransferPlan, attempt: int, reason: str
     ) -> None:
+        logger.warning(
+            "Agentic V2 group attempt aborted: key=%s path=%s kind=%s "
+            "attempt=%s reason=%s",
+            plan.key.snapshot_id,
+            plan.path.value,
+            plan.payload.get("kind"),
+            attempt,
+            reason,
+        )
         self.provider.on_aborted(self.context, plan, attempt, reason)
         # An aborted Direct attempt may immediately fall back to Host.  It is
         # not an ownership handoff and must not terminalize the local record.
