@@ -200,6 +200,7 @@ class _TargetPrepared:
     lease: PhysicalMemoryLease
     req: Any
     io_payload: Any
+    sampled_token_id: Optional[int] = None
 
 
 class _TargetHandler(RankPathHandler):
@@ -224,8 +225,14 @@ class _TargetHandler(RankPathHandler):
             )
             self.provider._target_prepared.pop(lease.lease_id, None)
             raise
+        values = _values(command)
+        sampled_token_id = (
+            int(values["sampled_token_id"])
+            if lease.kind is LeaseKind.DECODE_RESERVATION
+            else None
+        )
         self.provider._target_prepared[lease.lease_id] = _TargetPrepared(
-            lease, req, payload
+            lease, req, payload, sampled_token_id
         )
         # Only the physical executor payload is allowed to enter a transport
         # queue.  The full target state is retained by lease id for the
@@ -661,9 +668,6 @@ class AgenticDefaultPhysicalProvider:
         operation = NixlDirectOperation(
             self._direct_target_runtime, DirectEndpoint.TARGET, shard
         )
-        self._target_prepared[lease.lease_id] = _TargetPrepared(
-            lease, self._target_req(command)[0], operation
-        )
         return operation
 
     def _host_target_payload(self, command, lease):
@@ -675,9 +679,6 @@ class AgenticDefaultPhysicalProvider:
             shard=shard.to_dict(),
             device_indices=lease.parent_indices[: shard.token_count],
             state_indices=state,
-        )
-        self._target_prepared[lease.lease_id] = _TargetPrepared(
-            lease, self._target_req(command)[0], payload
         )
         return payload
 
@@ -691,13 +692,27 @@ class AgenticDefaultPhysicalProvider:
                 release_unbound=self.adapter.release_prefill_unadopted,
             )
         else:
-            self.context.d_memory_bridge.bind_decode(
-                local.lease,
-                local.req,
-                bind_prompt=self.adapter.bind_decode_prompt,
-                release_bound=self.adapter.release_bound,
-                release_unbound=self.adapter.release_decode_unadopted,
-            )
+            token = local.sampled_token_id
+            if token is None:
+                raise RuntimeError("P2D handoff is missing the sampled Prefill token")
+            appended = False
+            if not local.req.output_ids:
+                local.req.output_ids.append(int(token))
+                appended = True
+            elif int(local.req.output_ids[-1]) != int(token):
+                raise RuntimeError("P2D sampled token disagrees with the target request")
+            try:
+                self.context.d_memory_bridge.bind_decode(
+                    local.lease,
+                    local.req,
+                    bind_prompt=self.adapter.bind_decode_prompt,
+                    release_bound=self.adapter.release_bound,
+                    release_unbound=self.adapter.release_decode_unadopted,
+                )
+            except BaseException:
+                if appended:
+                    local.req.output_ids.pop()
+                raise
 
     def _publish_target(self, local: _TargetPrepared) -> None:
         if local.lease.kind is LeaseKind.PREFILL_WORKSET:
@@ -793,6 +808,7 @@ class AgenticDefaultPhysicalProvider:
                 "target_generation": record.key.generation,
                 "prompt_tokens": snapshot.token_count,
                 "decode_growth_tokens": growth,
+                "sampled_token_id": int(item.req.output_ids[-1]),
                 "bootstrap_addr": runtime.bootstrap_addr,
                 "room": _room(record.key, TransferPath.P2D_DIRECT),
             }

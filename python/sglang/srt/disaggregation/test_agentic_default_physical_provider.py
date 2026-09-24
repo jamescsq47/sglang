@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 from sglang.srt.disaggregation.agentic_default_physical_provider import (
+    AgenticDefaultPhysicalProvider,
     _TargetHandler,
     _TargetPrepared,
     _reverse_bootstrap_port,
@@ -100,3 +101,38 @@ def test_reverse_direct_rejects_missing_dedicated_port(monkeypatch):
         assert "dedicated" in str(exc)
     else:
         raise AssertionError("missing reverse bootstrap port must fail closed")
+
+
+def test_decode_bind_installs_prefill_sampled_token_before_publish():
+    physical = PhysicalMemoryLease(
+        lease_id=9,
+        key=RequestGenerationAttempt("req", 0, 1),
+        owner="p2d",
+        kind=LeaseKind.DECODE_RESERVATION,
+        page_size=1,
+        parent_tokens=1,
+        parent_allocated_tokens=1,
+        prompt_tokens=1,
+        prompt_allocated_tokens=1,
+        growth_reserved_tokens=1,
+        device_indices=(11, 12),
+    )
+    req = SimpleNamespace(output_ids=[])
+
+    class Bridge:
+        def bind_decode(self, _lease, bound_req, **_kwargs):
+            assert bound_req.output_ids == [42]
+
+    provider = AgenticDefaultPhysicalProvider.__new__(
+        AgenticDefaultPhysicalProvider
+    )
+    provider.context = SimpleNamespace(d_memory_bridge=Bridge())
+    provider.adapter = SimpleNamespace(
+        bind_decode_prompt=None,
+        release_bound=None,
+        release_decode_unadopted=None,
+    )
+
+    provider._bind_target(_TargetPrepared(physical, req, object(), 42))
+
+    assert req.output_ids == [42]
