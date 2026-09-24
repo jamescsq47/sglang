@@ -93,6 +93,19 @@ class RegisteredHybridHostSnapshot:
     def _prepare_state_backing(self):
         if self._state_mapping is not None or self._state_bounce is not None:
             return
+        # Ampere exposes the CUDA 13 registration APIs through a new driver,
+        # but its recurrent-state registered-pointer D2H path is not a safe
+        # execution backend.  Use the existing bounded pinned bounce there;
+        # ownership and the final composite fence remain identical.
+        if torch.cuda.get_device_capability(self.device_pool.device)[0] < 9:
+            self._state_bounce = SharedMambaHostSnapshot(
+                path=self.path,
+                mamba_pool=self.device_pool.mamba_pool,
+                byte_size=self.layout.state_bytes,
+                file_offset=self.file_offset + self.layout.state_offset,
+                state_slots=self.state_slots,
+            )
+            return
         mapping = _registered_host_arena(self.path, self.device_pool.device)
         self._state_mapping = mapping
         if self.file_offset + self.layout.total_bytes > mapping.byte_size:
