@@ -3514,10 +3514,23 @@ class Scheduler(
             # V1 keeps the original behavior and executes a probe only while
             # completely idle.
             is_health = is_health_check_generate_req(recv_req)
-            if is_health and (
-                getattr(self, "agentic_multinode_runtime_v2", None) is not None
-                or not self.is_fully_idle(for_health_check=True)
-            ):
+            if is_health and getattr(
+                self, "agentic_multinode_runtime_v2", None
+            ) is not None:
+                # V2 has no legacy request path on which to run the synthetic
+                # one-token probe.  The scheduler loop itself is alive here,
+                # so reply immediately and keep the probe outside the
+                # request-generation lifecycle.
+                self.send_to_tokenizer.send_output(
+                    HealthCheckOutput(
+                        http_worker_ipc=getattr(
+                            recv_req, "http_worker_ipc", None
+                        )
+                    )
+                )
+                continue
+
+            if is_health and not self.is_fully_idle(for_health_check=True):
                 self.return_health_check_ipcs.append(
                     getattr(recv_req, "http_worker_ipc", None)
                 )
