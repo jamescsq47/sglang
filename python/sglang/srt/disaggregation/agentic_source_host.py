@@ -386,6 +386,7 @@ class CudaSourceHostCopyBackend:
             H2DLaunchFence,
             LayerFirstD2HStaging,
             PinnedMHAHostBounce,
+            _concrete_kv_pool_device,
         )
 
         snapshot = extent.snapshot
@@ -393,10 +394,11 @@ class CudaSourceHostCopyBackend:
         # ThreadPool workers do not inherit the scheduler thread's current
         # CUDA device.  Every CUDA object and launch in this rank-local copy
         # must therefore be created under the pool's explicit device context.
-        with torch.cuda.device(pool.device):
+        device = _concrete_kv_pool_device(pool)
+        with torch.cuda.device(device):
             if payload.state_indices is not None:
                 snapshot.set_state_indices(payload.state_indices)
-            stream = torch.cuda.Stream(device=pool.device)
+            stream = torch.cuda.Stream(device=device)
             staging = LayerFirstD2HStaging(pool, self.chunk_tokens)
             bounce = PinnedMHAHostBounce(pool, self.chunk_tokens)
             indices = payload.source_indices
