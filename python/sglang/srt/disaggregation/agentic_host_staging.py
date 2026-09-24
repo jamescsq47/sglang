@@ -3321,6 +3321,26 @@ class SharedHostStagingLedger:
                         pass
 
 
+def _concrete_kv_pool_device(device_pool) -> torch.device:
+    """Return the rank-local CUDA device, never the ambiguous ``cuda`` alias.
+
+    CUDA's current device is thread-local.  Agentic I/O runs outside the
+    scheduler thread, so ``device_pool.device == torch.device("cuda")`` may
+    resolve to cuda:0 on every TP rank.  The allocated KV tensors are the
+    authoritative physical owner and always carry the concrete rank index.
+    """
+
+    device_pool = getattr(device_pool, "full_kv_pool", device_pool)
+    for buffers_name in ("k_buffer", "v_buffer"):
+        buffers = getattr(device_pool, buffers_name, None)
+        if buffers is not None and len(buffers):
+            return torch.device(buffers[0].device)
+    device = torch.device(device_pool.device)
+    if device.type == "cuda" and device.index is None:
+        raise RuntimeError("KV pool does not expose a concrete rank-local CUDA device")
+    return device
+
+
 class LayerFirstD2HStaging:
     """Small reusable HBM gather buffer feeding contiguous PCIe D2H DMA."""
 
@@ -3332,7 +3352,7 @@ class LayerFirstD2HStaging:
         self.head_dim = int(device_pool.head_dim)
         self.v_head_dim = int(getattr(device_pool, "v_head_dim", self.head_dim))
         self.dtype = device_pool.store_dtype
-        self.device = device_pool.device
+        self.device = _concrete_kv_pool_device(device_pool)
         self.k_buffer = [
             torch.empty(
                 (self.token_capacity, self.head_num, self.head_dim),
@@ -3914,11 +3934,17 @@ class SharedMHAHostSnapshot:
         self.file_offset = int(file_offset)
         if self.file_offset < 0 or self.file_offset % mmap.ALLOCATIONGRANULARITY:
             raise ValueError("shared Host extent offset must be mmap-aligned")
-        self._registered_dma_enabled = os.getenv(
+        registered_dma_requested = os.getenv(
             "SGLANG_AGENTIC_KV_REGISTERED_EXTENT_DMA", "1"
-        ).strip().lower() not in {"0", "false", "no", "off"} and hasattr(
-            device_pool, "device"
-        ) and torch.cuda.get_device_capability(device_pool.device)[0] >= 9
+        ).strip().lower() not in {"0", "false", "no", "off"}
+        self._registered_dma_enabled = bool(
+            registered_dma_requested
+            and hasattr(device_pool, "device")
+            and torch.cuda.get_device_capability(
+                _concrete_kv_pool_device(device_pool)
+            )[0]
+            >= 9
+        )
         self._arena_mapping = None
         self._owns_mapping = True
         flags = os.O_RDWR | (os.O_CREAT | os.O_EXCL if create else 0)
@@ -3934,7 +3960,7 @@ class SharedMHAHostSnapshot:
             os.close(fd)
         if self._registered_dma_enabled and not create:
             self._arena_mapping = _registered_host_arena(
-                path, self.device_pool.device
+                path, _concrete_kv_pool_device(self.device_pool)
             )
             self.mapping = self._arena_mapping.mapping
             raw = self._arena_mapping.raw[
@@ -3998,10 +4024,10 @@ class SharedMHAHostSnapshot:
                     self._registered_windows = self._arena_mapping.acquire(
                         self.file_offset,
                         self.byte_size,
-                        self.device_pool.device,
+                        _concrete_kv_pool_device(self.device_pool),
                     )
                 else:
-                    with torch.cuda.device(self.device_pool.device):
+                    with torch.cuda.device(_concrete_kv_pool_device(self.device_pool)):
                         cudart = torch.cuda.cudart()
                         result = cudart.cudaHostRegister(
                             self._raw.data_ptr(), self.byte_size, 0
@@ -4161,14 +4187,17 @@ class SharedMHAHostSnapshot:
                     or source_indices.dtype != torch.int64
                 ):
                     source_indices = source_indices.to(
-                        device=self.device_pool.device,
+                        device=_concrete_kv_pool_device(self.device_pool),
                         dtype=torch.int64,
                         non_blocking=True,
                     )
                     copy_refs.append(source_indices)
                 if not batch_submitted:
                     safe_indexed_copy = (
-                        torch.cuda.get_device_capability(self.device_pool.device)[0] < 9
+                        torch.cuda.get_device_capability(
+                            _concrete_kv_pool_device(self.device_pool)
+                        )[0]
+                        < 9
                     )
                     for start in range(0, len(source_indices), staging.token_capacity):
                         count = min(staging.token_capacity, len(source_indices) - start)
@@ -4440,7 +4469,7 @@ class SharedMHAHostSnapshot:
                         return event, tuple(copy_refs)
                 if not device_indices.is_cuda or device_indices.dtype != torch.int64:
                     device_indices = device_indices.to(
-                        device=self.device_pool.device,
+                        device=_concrete_kv_pool_device(self.device_pool),
                         dtype=torch.int64,
                         non_blocking=True,
                     )
@@ -4492,7 +4521,9 @@ class SharedMHAHostSnapshot:
                             )
                         else:
                             destination_span.copy_(source_span, non_blocking=True)
-                if torch.cuda.get_device_capability(self.device_pool.device)[0] < 9:
+                if torch.cuda.get_device_capability(
+                    _concrete_kv_pool_device(self.device_pool)
+                )[0] < 9:
                     for layer_id in range(self.layer_num):
                         self.device_pool.k_buffer[layer_id].index_copy_(
                             0, device_indices,
@@ -4563,7 +4594,7 @@ class SharedMHAHostSnapshot:
                 self._arena_mapping.release(self._registered_windows)
                 self._registered_windows = ()
             else:
-                with torch.cuda.device(self.device_pool.device):
+                with torch.cuda.device(_concrete_kv_pool_device(self.device_pool)):
                     cudart = torch.cuda.cudart()
                     result = cudart.cudaHostUnregister(self._raw.data_ptr())
                     if result != cudart.cudaError.success:
