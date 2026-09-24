@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -28,6 +29,8 @@ from dataclasses import dataclass
 from enum import Enum
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Optional, Protocol
+
+logger = logging.getLogger(__name__)
 
 from sglang.srt.disaggregation.agentic_group_protocol import (
     AttemptOutcome,
@@ -575,6 +578,14 @@ class RankLocalCommandExecutor:
             if not isinstance(prepared, PreparedRankTransfer):
                 raise TypeError("path prepare hook returned an invalid result")
         except BaseException as error:
+            logger.exception(
+                "Agentic V2 rank-local PREPARE failed: participant=%s "
+                "key=%s path=%s operation=%s",
+                self.participant,
+                command.key.snapshot_id,
+                path.value,
+                operation.value,
+            )
             detail = f"prepare failed: {type(error).__name__}: {error}"
             with self._lock:
                 local.failure_detail = detail
