@@ -238,6 +238,26 @@ def test_ready_event_replay_is_idempotent_and_cancelled_event_is_skipped():
     assert authority.take_ready("prefill-ready", max_items=1) == ()
 
 
+def test_initial_no_io_workset_installs_cleanup_while_reserved():
+    allocator = FakeAllocator()
+    authority = AgenticMemoryAuthority(allocator)
+    lease = authority.reserve_prefill_workset(
+        key(), owner="initial_prefill", parent_tokens=0, prompt_tokens=128
+    )
+    released = []
+
+    def release_native(bound_lease):
+        released.append(bound_lease.lease_id)
+        allocator.free(bound_lease.device_indices)
+
+    assert authority.phase(lease.lease_id) is LeasePhase.RESERVED
+    assert authority.install_release_handler(lease.lease_id, release_native)
+    assert authority.request_release(lease.lease_id)
+    assert authority.commit_release(lease.lease_id, reason="initial_abort")
+    assert released == [lease.lease_id]
+    assert allocator.available_size() == 1024
+
+
 def test_attempt_identity_is_idempotent_but_shape_change_is_rejected():
     authority = AgenticMemoryAuthority(FakeAllocator())
     first = authority.reserve_prefill_workset(

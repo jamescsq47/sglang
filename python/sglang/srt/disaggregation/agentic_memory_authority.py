@@ -614,6 +614,9 @@ class AgenticMemoryAuthority:
             if record.release_handler is not None:
                 return record.release_handler is handler
             if record.phase not in {
+                # Initial Prefill admission has no physical I/O.  Its
+                # all-rank NO_IO_REQUIRED fence binds directly from RESERVED.
+                LeasePhase.RESERVED,
                 LeasePhase.IO_COMPLETE,
                 LeasePhase.READY,
                 LeasePhase.COMPUTE,
