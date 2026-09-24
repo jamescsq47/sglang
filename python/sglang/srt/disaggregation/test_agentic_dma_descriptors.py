@@ -52,3 +52,12 @@ def test_registered_descriptors_match_tensor_views(monkeypatch, host_to_device, 
                 expected.update((dst + j, src + j) for j in range(item_size))
     assert actual == expected
     assert sum(size for _, _, size in captured) == len(expected)
+
+
+def test_ampere_does_not_select_cuda13_batch_copy(monkeypatch):
+    monkeypatch.setattr(
+        host_module.torch.cuda, "get_device_capability", lambda: (8, 0)
+    )
+    monkeypatch.setattr(host_module.ctypes, "CDLL", lambda _name: None)
+
+    assert host_module._cuda_driver_batch_memcpy() is None

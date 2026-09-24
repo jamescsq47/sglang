@@ -162,7 +162,16 @@ def _cuda_memcpy_async(
 
 
 def _cuda_driver_batch_memcpy():
-    """Return CUDA 13's SM-free batched pointer-copy entry point if present."""
+    """Return Hopper's SM-free batched pointer-copy entry point if usable.
+
+    The CUDA 13 symbol can be exported by an A100 driver, but the disjoint
+    registered-Host batches used here do not execute safely on Ampere. Keep
+    the ordinary fenced copy/gather implementation there; this batch path is
+    an optimization and never part of the ownership protocol.
+    """
+
+    if torch.cuda.get_device_capability()[0] < 9:
+        return None
 
     global _CUDA_DRIVER_BATCH
     if _CUDA_DRIVER_BATCH is False:
