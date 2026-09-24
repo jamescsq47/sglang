@@ -1,3 +1,4 @@
+from collections import deque
 from contextlib import nullcontext
 import queue
 from types import SimpleNamespace
@@ -163,6 +164,23 @@ def test_v2_idle_check_never_reads_legacy_pd_queues():
 
     assert Scheduler.is_fully_idle(target)
     assert Scheduler.is_fully_idle(target, for_health_check=True)
+
+
+def test_v2_health_probe_never_enters_generation_lifecycle():
+    target = SimpleNamespace(
+        session_controller=SimpleNamespace(maybe_reap=lambda _now: None),
+        agentic_multinode_runtime_v2=FakeRuntime(),
+        return_health_check_ipcs=deque(),
+        _request_dispatcher=lambda _req: pytest.fail("health probe was dispatched"),
+        _check_pending_flush=lambda: None,
+        agentic_host_staging_manager=None,
+        _drain_agentic_kv_waiting_queue=lambda: None,
+    )
+    probe = SimpleNamespace(rid="HEALTH_CHECK_v2", http_worker_ipc="ipc")
+
+    Scheduler.process_input_requests(target, [probe])
+
+    assert list(target.return_health_check_ipcs) == ["ipc"]
 
 
 def test_disabled_v2_preserves_native_request_admission():

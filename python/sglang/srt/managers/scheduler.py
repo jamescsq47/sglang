@@ -3507,9 +3507,16 @@ class Scheduler(
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
         for recv_req in recv_reqs:
-            # Skip health check when server is busy — ongoing requests already carry health info.
-            if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
-                for_health_check=True
+            # V2 requests require request-generation metadata, which the
+            # internal one-token health probe intentionally does not carry.
+            # Its control runtime is health-checked every scheduler tick, so
+            # acknowledge the probe without admitting it as application work.
+            # V1 keeps the original behavior and executes a probe only while
+            # completely idle.
+            is_health = is_health_check_generate_req(recv_req)
+            if is_health and (
+                getattr(self, "agentic_multinode_runtime_v2", None) is not None
+                or not self.is_fully_idle(for_health_check=True)
             ):
                 self.return_health_check_ipcs.append(
                     getattr(recv_req, "http_worker_ipc", None)
