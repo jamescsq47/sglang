@@ -3918,7 +3918,7 @@ class SharedMHAHostSnapshot:
             "SGLANG_AGENTIC_KV_REGISTERED_EXTENT_DMA", "1"
         ).strip().lower() not in {"0", "false", "no", "off"} and hasattr(
             device_pool, "device"
-        )
+        ) and torch.cuda.get_device_capability(device_pool.device)[0] >= 9
         self._arena_mapping = None
         self._owns_mapping = True
         flags = os.O_RDWR | (os.O_CREAT | os.O_EXCL if create else 0)
