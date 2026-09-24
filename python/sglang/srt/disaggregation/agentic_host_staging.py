@@ -4167,22 +4167,38 @@ class SharedMHAHostSnapshot:
                     )
                     copy_refs.append(source_indices)
                 if not batch_submitted:
+                    safe_indexed_copy = (
+                        torch.cuda.get_device_capability(self.device_pool.device)[0] < 9
+                    )
                     for start in range(0, len(source_indices), staging.token_capacity):
                         count = min(staging.token_capacity, len(source_indices) - start)
                         source_chunk = source_indices[start : start + count]
                         local_indices = staging.local_indices[:count]
-                        transfer_kv_all_layer(
-                            src_k_layers=self.device_pool.k_data_ptrs,
-                            dst_k_layers=staging.k_data_ptrs,
-                            src_v_layers=self.device_pool.v_data_ptrs,
-                            dst_v_layers=staging.v_data_ptrs,
-                            src_indices=source_chunk,
-                            dst_indices=local_indices,
-                            item_size=self.item_size,
-                            num_layers=self.layer_num,
-                            block_quota=8,
-                            num_warps_per_block=32,
-                        )
+                        if safe_indexed_copy:
+                            for layer_id in range(self.layer_num):
+                                torch.index_select(
+                                    self.device_pool.k_buffer[layer_id], 0,
+                                    source_chunk,
+                                    out=staging.k_buffer[layer_id][:count],
+                                )
+                                torch.index_select(
+                                    self.device_pool.v_buffer[layer_id], 0,
+                                    source_chunk,
+                                    out=staging.v_buffer[layer_id][:count],
+                                )
+                        else:
+                            transfer_kv_all_layer(
+                                src_k_layers=self.device_pool.k_data_ptrs,
+                                dst_k_layers=staging.k_data_ptrs,
+                                src_v_layers=self.device_pool.v_data_ptrs,
+                                dst_v_layers=staging.v_data_ptrs,
+                                src_indices=source_chunk,
+                                dst_indices=local_indices,
+                                item_size=self.item_size,
+                                num_layers=self.layer_num,
+                                block_quota=8,
+                                num_warps_per_block=32,
+                            )
                         host_start = destination_start + start
                         host_end = host_start + count
                         for layer_id in range(self.layer_num):
@@ -4476,18 +4492,29 @@ class SharedMHAHostSnapshot:
                             )
                         else:
                             destination_span.copy_(source_span, non_blocking=True)
-                transfer_kv_all_layer(
-                    src_k_layers=staging.k_data_ptrs,
-                    dst_k_layers=self.device_pool.k_data_ptrs,
-                    src_v_layers=staging.v_data_ptrs,
-                    dst_v_layers=self.device_pool.v_data_ptrs,
-                    src_indices=source_indices,
-                    dst_indices=device_indices,
-                    item_size=self.item_size,
-                    num_layers=self.layer_num,
-                    block_quota=4,
-                    num_warps_per_block=32,
-                )
+                if torch.cuda.get_device_capability(self.device_pool.device)[0] < 9:
+                    for layer_id in range(self.layer_num):
+                        self.device_pool.k_buffer[layer_id].index_copy_(
+                            0, device_indices,
+                            staging.k_buffer[layer_id][:token_count],
+                        )
+                        self.device_pool.v_buffer[layer_id].index_copy_(
+                            0, device_indices,
+                            staging.v_buffer[layer_id][:token_count],
+                        )
+                else:
+                    transfer_kv_all_layer(
+                        src_k_layers=staging.k_data_ptrs,
+                        dst_k_layers=self.device_pool.k_data_ptrs,
+                        src_v_layers=staging.v_data_ptrs,
+                        dst_v_layers=self.device_pool.v_data_ptrs,
+                        src_indices=source_indices,
+                        dst_indices=device_indices,
+                        item_size=self.item_size,
+                        num_layers=self.layer_num,
+                        block_quota=4,
+                        num_warps_per_block=32,
+                    )
                 source_indices.record_stream(stream)
                 copy_refs.append(source_indices)
                 event.record(stream)
