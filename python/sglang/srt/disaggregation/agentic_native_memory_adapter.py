@@ -21,6 +21,8 @@ from dataclasses import dataclass
 import hashlib
 from typing import Any, Optional, Sequence
 
+import numpy as np
+
 from sglang.srt.disaggregation.agentic_memory_authority import PhysicalMemoryLease
 
 
@@ -194,7 +196,14 @@ class NativeRequestMemoryAdapter:
                 )
 
                 raw = p2d_mamba_source_indices(req, page_size)[0]
-            states = tuple(int(value) for value in raw.reshape(-1).tolist())
+            # Native hybrid helpers use a state-type-parallel nested layout
+            # (for Mamba: ``[[np.asarray(slot)]]``), while the P2D helper
+            # already returns an ndarray.  Normalize both representations at
+            # this adapter boundary before serializing the immutable shard.
+            states = tuple(
+                int(value)
+                for value in np.asarray(raw, dtype=np.int32).reshape(-1).tolist()
+            )
         if direction == "d2p":
             logical_tokens = (
                 list(req.origin_input_ids) + list(req.output_ids[:-1])
