@@ -401,7 +401,12 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         out_indices = (
             out_pages[:, None] * self.page_size
-            + torch.arange(self.page_size, device=self.device)
+            # ``alloc`` may be called by an agentic memory-controller thread.
+            # CUDA's current device is thread-local, so a generic ``"cuda"``
+            # device string can silently resolve to cuda:0 on every TP rank.
+            # The free-page tensor is the allocator's concrete rank-local
+            # device and is therefore the only safe source of truth here.
+            + torch.arange(self.page_size, device=out_pages.device)
         ).reshape(-1)
 
         return out_indices

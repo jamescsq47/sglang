@@ -8,6 +8,21 @@ from sglang.srt.disaggregation.agentic_memory_authority import (
     LeasePhase,
     RequestGenerationAttempt,
 )
+from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
+
+
+def test_paged_allocator_uses_rank_local_free_page_device():
+    allocator = PagedTokenToKVPoolAllocator.__new__(PagedTokenToKVPoolAllocator)
+    allocator.page_size = 64
+    allocator.need_sort = False
+    allocator.debug_mode = False
+    allocator.device = "cuda"
+    allocator.free_pages = torch.arange(2, dtype=torch.int64, device="cpu")
+
+    indices = allocator.alloc(64)
+
+    assert indices.device == allocator.free_pages.device
+    assert indices.tolist() == list(range(64))
 
 
 class FakeAllocator:
