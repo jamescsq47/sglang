@@ -443,6 +443,13 @@ class SchedulerRuntimeCheckerMixin:
             self.tree_cache.sanity_check()
 
     def self_check_during_idle(self: Scheduler):
+        # V2 owns live transfer/workset pages outside the native PD queues.
+        # Its controller and memory authority perform their own invariant
+        # checks; the legacy idle checker neither has those queues nor can it
+        # classify those pages as live.  In particular, do not require V1's
+        # disagg_* queues after V2 deliberately bypassed their construction.
+        if getattr(self, "agentic_multinode_runtime_v2", None) is not None:
+            return
         if self.enable_hisparse and self.hisparse_coordinator.has_ongoing_staging():
             return
         if self.disaggregation_mode == DisaggregationMode.PREFILL:

@@ -283,6 +283,14 @@ def test_prefill_idle_resumes_after_hybrid_lease_release(monkeypatch, hybrid, ha
     assert calls == (["memory", "tree"] if checks else [])
 
 
+def test_v2_idle_checker_does_not_require_legacy_pd_queues():
+    from sglang.srt.managers.scheduler_runtime_checker_mixin import SchedulerRuntimeCheckerMixin
+
+    # V2 intentionally never constructs disagg_prefill/decode_* V1 queues.
+    scheduler = NS(agentic_multinode_runtime_v2=object())
+    SchedulerRuntimeCheckerMixin.self_check_during_idle(scheduler)
+
+
 @pytest.mark.parametrize("hybrid,enabled,retained,pending,expected", [
     (True, True, True, False, ["offload", "finish"]),
     (True, True, True, True, ["offload"]),
