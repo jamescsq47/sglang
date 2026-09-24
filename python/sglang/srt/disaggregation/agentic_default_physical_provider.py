@@ -77,6 +77,16 @@ from sglang.srt.disaggregation.agentic_transfer_queues import (
 from sglang.srt.disaggregation.utils import DisaggregationMode, kv_to_page_indices
 
 
+def _reverse_bootstrap_port() -> int:
+    port = int(os.getenv("SGLANG_AGENTIC_KV_DIRECT_BOOTSTRAP_PORT", "0"))
+    if port <= 0:
+        raise RuntimeError(
+            "multi-node Direct requires a dedicated "
+            "SGLANG_AGENTIC_KV_DIRECT_BOOTSTRAP_PORT"
+        )
+    return port
+
+
 def _values(command: GroupCommand) -> Mapping[str, Any]:
     value = command.payload.get("transfer", {})
     if not isinstance(value, Mapping):
@@ -371,7 +381,11 @@ class AgenticDefaultPhysicalProvider:
         )
         self._direct_source_runtime = create_agentic_direct_runtime(
             role=DisaggregationMode.PREFILL,
-            bootstrap_port=int(args.disaggregation_bootstrap_port),
+            # The stock PD bootstrap listener already owns
+            # disaggregation_bootstrap_port on a P node.  Both directions use
+            # an isolated Direct manager, so its sender must listen on the
+            # dedicated reverse port on every node.
+            bootstrap_port=_reverse_bootstrap_port(),
             **common,
         )
         self._direct_target_runtime = create_agentic_direct_runtime(

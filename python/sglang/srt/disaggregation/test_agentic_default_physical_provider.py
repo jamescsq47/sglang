@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from sglang.srt.disaggregation.agentic_default_physical_provider import (
     _TargetHandler,
     _TargetPrepared,
+    _reverse_bootstrap_port,
 )
 from sglang.srt.disaggregation.agentic_group_protocol import (
     CommandKind,
@@ -84,3 +85,18 @@ def test_target_prepare_keeps_local_state_out_of_transport_payload():
     )
     handler.begin_io(command(), prepared)
     assert authority.begun == [(physical.lease_id, "1")]
+
+
+def test_reverse_direct_uses_dedicated_bootstrap_port(monkeypatch):
+    monkeypatch.setenv("SGLANG_AGENTIC_KV_DIRECT_BOOTSTRAP_PORT", "62000")
+    assert _reverse_bootstrap_port() == 62000
+
+
+def test_reverse_direct_rejects_missing_dedicated_port(monkeypatch):
+    monkeypatch.delenv("SGLANG_AGENTIC_KV_DIRECT_BOOTSTRAP_PORT", raising=False)
+    try:
+        _reverse_bootstrap_port()
+    except RuntimeError as exc:
+        assert "dedicated" in str(exc)
+    else:
+        raise AssertionError("missing reverse bootstrap port must fail closed")
