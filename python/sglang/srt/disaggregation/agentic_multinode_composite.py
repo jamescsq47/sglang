@@ -142,6 +142,10 @@ class RequestGenerationRegistry:
         with self._lock:
             return self._records.get(key)
 
+    def is_empty(self) -> bool:
+        with self._lock:
+            return not self._records
+
     def child_of(self, key: GenerationKey) -> Optional[RuntimeRequestRecord]:
         with self._lock:
             child = self._children.get(key)
@@ -689,6 +693,16 @@ class SchedulerAgenticMultinodeRuntime:
         if closed:
             raise CompositeRuntimeError("V2 runtime is closed")
         self._low_level.check_health()
+
+    def is_idle(self) -> bool:
+        """Return whether V2 owns no request, memory lease, or queued DMA."""
+
+        if not self.registry.is_empty() or self.authority.active_lease_count():
+            return False
+        return all(
+            snapshot.pending == 0 and snapshot.active == 0
+            for snapshot in self.transfer_queues.snapshot().values()
+        )
 
     def take_activation_ticket(
         self, timeout: Optional[float] = None

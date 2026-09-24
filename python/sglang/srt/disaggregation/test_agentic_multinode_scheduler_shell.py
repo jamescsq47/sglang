@@ -34,6 +34,9 @@ class FakeRuntime:
     def progress_nonblocking(self):
         self.progress_count += 1
 
+    def is_idle(self):
+        return True
+
     def take_activation_ticket(self, timeout=None):
         raise NotImplementedError
 
@@ -140,6 +143,26 @@ def test_v2_request_admission_never_touches_legacy_queues():
     Scheduler._add_request_to_queue(target, req, is_retracted=True)
 
     assert runtime.submitted == [(req, True)]
+
+
+def test_v2_idle_check_never_reads_legacy_pd_queues():
+    runtime = FakeRuntime()
+    empty = SimpleNamespace(is_empty=lambda: True)
+    target = SimpleNamespace(
+        running_batch=empty,
+        chunked_req=None,
+        dllm_manager=SimpleNamespace(any_staging_reqs=lambda: False),
+        last_batch=None,
+        cur_batch=None,
+        enable_overlap=True,
+        result_queue=[],
+        pp_size=1,
+        waiting_queue=[],
+        agentic_multinode_runtime_v2=runtime,
+    )
+
+    assert Scheduler.is_fully_idle(target)
+    assert Scheduler.is_fully_idle(target, for_health_check=True)
 
 
 def test_disabled_v2_preserves_native_request_admission():

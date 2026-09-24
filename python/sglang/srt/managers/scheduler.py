@@ -10310,6 +10310,16 @@ class Scheduler(
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
         idle &= len(self.waiting_queue) == 0
+        runtime_v2 = getattr(self, "agentic_multinode_runtime_v2", None)
+        if runtime_v2 is not None:
+            # V2 deliberately does not construct any V1 marker/bootstrap
+            # queues.  A health probe must still be able to complete while a
+            # background transfer is stalled; destructive idle checks also
+            # require the V2 lifecycle and physical queues to be empty.
+            if not for_health_check:
+                idle &= runtime_v2.is_idle()
+            return idle
+
         idle &= len(self.agentic_kv_waiting_queue) == 0
         idle &= len(self.agentic_early_direct_receives) == 0
 
