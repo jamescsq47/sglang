@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.disaggregation.agentic_default_physical_provider import (
     AgenticDefaultPhysicalProvider,
     _TargetHandler,
@@ -136,3 +138,22 @@ def test_decode_bind_installs_prefill_sampled_token_before_publish():
     provider._bind_target(_TargetPrepared(physical, req, object(), 42))
 
     assert req.output_ids == [42]
+
+
+def test_host_source_payload_freezes_registered_dma_index_mirror():
+    provider = AgenticDefaultPhysicalProvider.__new__(
+        AgenticDefaultPhysicalProvider
+    )
+    snapshot = SimpleNamespace(
+        token_indices=torch.tensor([7, 8, 19, 20], dtype=torch.int32),
+        state_indices=(3,),
+    )
+    provider._source_entry = lambda _command: (object(), object(), snapshot)
+    cmd = command()
+    cmd.payload["transfer"]["token_count"] = 3
+
+    payload = provider._host_source_payload(cmd)
+
+    assert payload.source_indices.tolist() == [7, 8, 19]
+    assert payload.source_indices_host == (7, 8, 19)
+    assert payload.state_indices == (3,)

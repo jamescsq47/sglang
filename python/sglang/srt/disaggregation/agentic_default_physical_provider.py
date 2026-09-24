@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 import numpy as np
+import torch
 
 from sglang.srt.disaggregation.agentic_group_protocol import (
     GenerationKey,
@@ -737,6 +738,17 @@ class AgenticDefaultPhysicalProvider:
             extent_id=0,
             source_indices=snapshot.token_indices[:token_count],
             state_indices=state,
+            # The registered-extent backend can issue pure copy-engine DMA
+            # only when it has the physical token addresses on CPU.  Freeze
+            # this small immutable mirror during PREPARE; omitting it falls
+            # back to an SM gather kernel from a background controller thread.
+            source_indices_host=tuple(
+                int(value)
+                for value in snapshot.token_indices[:token_count]
+                .detach()
+                .to(device="cpu", dtype=torch.int64)
+                .tolist()
+            ),
         )
 
     def _host_source_release(self, command, _extent):

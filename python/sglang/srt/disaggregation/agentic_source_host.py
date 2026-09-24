@@ -389,53 +389,57 @@ class CudaSourceHostCopyBackend:
         )
 
         snapshot = extent.snapshot
-        if payload.state_indices is not None:
-            snapshot.set_state_indices(payload.state_indices)
         pool = getattr(self.device_pool, "full_kv_pool", self.device_pool)
-        stream = torch.cuda.Stream(device=pool.device)
-        staging = LayerFirstD2HStaging(pool, self.chunk_tokens)
-        bounce = PinnedMHAHostBounce(pool, self.chunk_tokens)
-        indices = payload.source_indices
-        if len(indices) != extent.token_count:
-            raise ValueError("source indices do not cover the complete snapshot")
-        for start in range(0, extent.token_count, self.chunk_tokens):
-            if cancel.is_set():
-                raise DrainedSourceHostCopy("cancelled between D2H chunks")
-            count = min(self.chunk_tokens, extent.token_count - start)
-            chunk = indices[start : start + count]
-            host_chunk = (
-                None
-                if payload.source_indices_host is None
-                else payload.source_indices_host[start : start + count]
-            )
-            fence = H2DLaunchFence(event=torch.cuda.Event(enable_timing=True))
-            try:
-                event, _refs = snapshot.start_backup_range_from_device(
-                    chunk,
-                    destination_start=start,
-                    stream=stream,
-                    staging=staging,
-                    host_bounce=bounce,
-                    launch_fence=fence,
-                    source_indices_host=host_chunk,
+        # ThreadPool workers do not inherit the scheduler thread's current
+        # CUDA device.  Every CUDA object and launch in this rank-local copy
+        # must therefore be created under the pool's explicit device context.
+        with torch.cuda.device(pool.device):
+            if payload.state_indices is not None:
+                snapshot.set_state_indices(payload.state_indices)
+            stream = torch.cuda.Stream(device=pool.device)
+            staging = LayerFirstD2HStaging(pool, self.chunk_tokens)
+            bounce = PinnedMHAHostBounce(pool, self.chunk_tokens)
+            indices = payload.source_indices
+            if len(indices) != extent.token_count:
+                raise ValueError("source indices do not cover the complete snapshot")
+            for start in range(0, extent.token_count, self.chunk_tokens):
+                if cancel.is_set():
+                    raise DrainedSourceHostCopy("cancelled between D2H chunks")
+                count = min(self.chunk_tokens, extent.token_count - start)
+                chunk = indices[start : start + count]
+                host_chunk = (
+                    None
+                    if payload.source_indices_host is None
+                    else payload.source_indices_host[start : start + count]
                 )
-                event.synchronize()
-            except BaseException as error:
-                if fence.submitted and (fence.unavailable or not fence.armed):
-                    raise UnfencedSourceHostCopy(
-                        "D2H launch has no usable CUDA fence"
-                    ) from error
-                if fence.submitted:
-                    try:
-                        fence.event.synchronize()
-                    except BaseException as fence_error:
+                fence = H2DLaunchFence(event=torch.cuda.Event(enable_timing=True))
+                try:
+                    event, _refs = snapshot.start_backup_range_from_device(
+                        chunk,
+                        destination_start=start,
+                        stream=stream,
+                        staging=staging,
+                        host_bounce=bounce,
+                        launch_fence=fence,
+                        source_indices_host=host_chunk,
+                    )
+                    event.synchronize()
+                except BaseException as error:
+                    if fence.submitted and (fence.unavailable or not fence.armed):
                         raise UnfencedSourceHostCopy(
-                            "D2H failure could not be drained"
-                        ) from fence_error
-                raise DrainedSourceHostCopy(str(error)) from error
-            snapshot.commit_backup_range_from_bounce(
-                bounce, destination_start=start, token_count=count
-            )
+                            "D2H launch has no usable CUDA fence"
+                        ) from error
+                    if fence.submitted:
+                        try:
+                            fence.event.synchronize()
+                        except BaseException as fence_error:
+                            raise UnfencedSourceHostCopy(
+                                "D2H failure could not be drained"
+                            ) from fence_error
+                    raise DrainedSourceHostCopy(str(error)) from error
+                snapshot.commit_backup_range_from_bounce(
+                    bounce, destination_start=start, token_count=count
+                )
 
 
 @dataclass(slots=True)
