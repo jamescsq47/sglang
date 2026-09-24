@@ -4,8 +4,11 @@ import os
 import tempfile
 import time
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
+
+from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 
 from sglang.srt.disaggregation.agentic_kv_lifecycle import (
     AgenticOutputKind,
@@ -24,6 +27,23 @@ from sglang.srt.disaggregation.agentic_kv_lifecycle import (
     namespace_page_keys,
     unpack_agentic_extra_key,
 )
+
+
+def test_chat_user_carries_agentic_envelope_through_strict_pd_router():
+    envelope = "agentic-v1e:stable:metadata"
+    request = SimpleNamespace(
+        cache_salt=None, extra_key=None, user=envelope
+    )
+    assert OpenAIServingBase._compute_extra_key(None, request) == envelope
+
+
+def test_explicit_extra_key_wins_over_chat_user_fallback():
+    request = SimpleNamespace(
+        cache_salt=None,
+        extra_key="explicit",
+        user="agentic-v1e:stable:metadata",
+    )
+    assert OpenAIServingBase._compute_extra_key(None, request) == "explicit"
 
 
 def test_agentic_request_metadata_parses_and_classifies_tool_output():

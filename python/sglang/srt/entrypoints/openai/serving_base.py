@@ -159,6 +159,16 @@ class OpenAIServingBase(ABC):
                         f"Value of {key} must be a string, but got {type(value).__name__}"
                     )
                 parts.append(value)
+        # The Rust PD router intentionally normalizes Chat requests to its
+        # OpenAI-compatible schema and does not currently retain SGLang's
+        # ``extra_key``/``custom_params`` extensions.  ``user`` is a standard
+        # Chat field and is preserved end-to-end.  Agentic clients mirror the
+        # validated lifecycle envelope there so both P and D can recover the
+        # same request-generation identity without filesystem control state.
+        if not parts:
+            user = getattr(request, "user", None)
+            if isinstance(user, str) and user.startswith("agentic-v1e:"):
+                parts.append(user)
         return "".join(parts) if parts else None
 
     @abstractmethod
