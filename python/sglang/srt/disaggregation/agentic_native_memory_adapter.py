@@ -24,6 +24,9 @@ from typing import Any, Optional, Sequence
 import numpy as np
 
 from sglang.srt.disaggregation.agentic_memory_authority import PhysicalMemoryLease
+from sglang.srt.disaggregation.agentic_hybrid_transfer import (
+    request_owned_mamba_enabled,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -349,7 +352,11 @@ class NativeRequestMemoryAdapter:
         )
 
     def bind_decode_prompt(
-        self, lease: PhysicalMemoryLease, req: Any
+        self,
+        lease: PhysicalMemoryLease,
+        req: Any,
+        *,
+        mamba_checkpoint_tokens: Optional[int] = None,
     ) -> NativeRequestBinding:
         """Attach an imported complete prompt to the native Decode request."""
 
@@ -382,6 +389,26 @@ class NativeRequestMemoryAdapter:
                 raise RuntimeError("Decode state lease has unused slots")
             req._agentic_v2_decode_state_attached = True
             req._agentic_mamba_runtime_reserved = True
+            if request_owned_mamba_enabled():
+                if mamba_checkpoint_tokens is None:
+                    raise RuntimeError(
+                        "request-owned Mamba decode bind is missing its checkpoint boundary"
+                    )
+                boundary = int(mamba_checkpoint_tokens)
+                if boundary < 0 or boundary > int(lease.prompt_tokens):
+                    raise RuntimeError(
+                        "request-owned Mamba checkpoint is outside the imported prompt: "
+                        f"checkpoint={boundary} prompt={lease.prompt_tokens}"
+                    )
+                page_size = int(self.scheduler.page_size)
+                if boundary % page_size:
+                    raise RuntimeError(
+                        "request-owned Mamba checkpoint is not page aligned: "
+                        f"checkpoint={boundary} page_size={page_size}"
+                    )
+                req._agentic_mamba_frozen_prompt_tokens = boundary
+                req._agentic_mamba_frozen_prompt_valid = True
+                req.mamba_last_track_seqlen = boundary if boundary else None
         indices = self.scheduler.req_to_token_pool.alloc([req])
         if indices is None or len(indices) != 1:
             raise MemoryError("request-to-token pool is full")

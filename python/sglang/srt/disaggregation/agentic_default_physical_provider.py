@@ -32,6 +32,9 @@ from sglang.srt.disaggregation.agentic_group_transfer import (
     RemoteHostLoadPayload,
     TransferOperation,
 )
+from sglang.srt.disaggregation.agentic_hybrid_transfer import (
+    p2d_mamba_checkpoint_tokens,
+)
 from sglang.srt.disaggregation.agentic_host_transfer import (
     HostDescriptorSet,
     build_host_restore_plan,
@@ -202,6 +205,7 @@ class _TargetPrepared:
     req: Any
     io_payload: Any
     sampled_token_id: Optional[int] = None
+    mamba_checkpoint_tokens: Optional[int] = None
 
 
 class _TargetHandler(RankPathHandler):
@@ -212,6 +216,18 @@ class _TargetHandler(RankPathHandler):
         self.direct = bool(direct)
 
     def prepare(self, command: GroupCommand) -> PreparedRankTransfer:
+        # Parse immutable wire metadata before reserving physical memory.  A
+        # malformed command must not create a lease that no prepared handler
+        # exists to release.
+        values = _values(command)
+        sampled_value = values.get("sampled_token_id")
+        sampled_token_id = (
+            int(sampled_value) if sampled_value is not None else None
+        )
+        checkpoint_value = values.get("mamba_checkpoint_tokens")
+        mamba_checkpoint_tokens = (
+            int(checkpoint_value) if checkpoint_value is not None else None
+        )
         lease, req = self.provider._reserve_target(command)
         try:
             payload = (
@@ -226,14 +242,21 @@ class _TargetHandler(RankPathHandler):
             )
             self.provider._target_prepared.pop(lease.lease_id, None)
             raise
-        values = _values(command)
-        sampled_token_id = (
-            int(values["sampled_token_id"])
-            if lease.kind is LeaseKind.DECODE_RESERVATION
-            else None
-        )
+        if lease.kind is LeaseKind.DECODE_RESERVATION and sampled_token_id is None:
+            self.provider.context.authority.request_release(lease.lease_id)
+            self.provider.context.authority.commit_release(
+                lease.lease_id, reason="target_prepare_missing_sampled_token"
+            )
+            self.provider._target_prepared.pop(lease.lease_id, None)
+            raise RuntimeError("P2D target is missing sampled_token_id")
+        if lease.kind is not LeaseKind.DECODE_RESERVATION:
+            sampled_token_id = None
         self.provider._target_prepared[lease.lease_id] = _TargetPrepared(
-            lease, req, payload, sampled_token_id
+            lease,
+            req,
+            payload,
+            sampled_token_id,
+            mamba_checkpoint_tokens,
         )
         # Only the physical executor payload is allowed to enter a transport
         # queue.  The full target state is retained by lease id for the
@@ -712,7 +735,11 @@ class AgenticDefaultPhysicalProvider:
                 self.context.d_memory_bridge.bind_decode(
                     local.lease,
                     local.req,
-                    bind_prompt=self.adapter.bind_decode_prompt,
+                    bind_prompt=lambda lease, req: self.adapter.bind_decode_prompt(
+                        lease,
+                        req,
+                        mamba_checkpoint_tokens=local.mamba_checkpoint_tokens,
+                    ),
                     release_bound=self.adapter.release_bound,
                     release_unbound=self.adapter.release_decode_unadopted,
                 )
@@ -842,6 +869,10 @@ class AgenticDefaultPhysicalProvider:
                 "room": _room(record.key, TransferPath.P2D_DIRECT),
             }
         )
+        if self.adapter.hybrid:
+            payload["mamba_checkpoint_tokens"] = p2d_mamba_checkpoint_tokens(
+                item.req, int(self.scheduler.page_size)
+            )
         plan = GroupTransferPlan(
             key=record.key,
             path=TransferPath.P2D_DIRECT,

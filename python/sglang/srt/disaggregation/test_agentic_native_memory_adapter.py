@@ -151,6 +151,36 @@ def test_decode_binding_uses_lease_state_in_real_hybrid_row_mapping():
     assert pool.req_to_token[0, :4].tolist() == [4, 5, 6, 7]
 
 
+def test_decode_binding_freezes_transferred_request_owned_checkpoint(monkeypatch):
+    adapter, _, _, req, lease = _hybrid_fixture()
+    adapter.scheduler.page_size = 1
+    monkeypatch.setattr(
+        native_adapter, "request_owned_mamba_enabled", lambda: True
+    )
+
+    adapter.bind_decode_prompt(lease, req, mamba_checkpoint_tokens=3)
+
+    assert req._agentic_mamba_frozen_prompt_tokens == 3
+    assert req._agentic_mamba_frozen_prompt_valid is True
+    assert req.mamba_last_track_seqlen == 3
+
+
+@pytest.mark.parametrize("checkpoint", [None, -1, 5, 3])
+def test_decode_binding_rejects_missing_or_invalid_request_owned_checkpoint(
+    monkeypatch, checkpoint
+):
+    adapter, _, _, req, lease = _hybrid_fixture()
+    adapter.scheduler.page_size = 2
+    monkeypatch.setattr(
+        native_adapter, "request_owned_mamba_enabled", lambda: True
+    )
+
+    with pytest.raises(RuntimeError):
+        adapter.bind_decode_prompt(
+            lease, req, mamba_checkpoint_tokens=checkpoint
+        )
+
+
 @pytest.mark.parametrize("failure", ["row_full", "write"])
 def test_decode_bind_failure_releases_exact_state_and_private_pages(failure):
     adapter, pool, allocator, req, lease = _hybrid_fixture(

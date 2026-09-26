@@ -96,6 +96,20 @@ def test_target_prepare_keeps_local_state_out_of_transport_payload():
     assert authority.begun == [(physical.lease_id, "1")]
 
 
+def test_target_prepare_rejects_bad_checkpoint_before_reserving_memory():
+    cmd = command()
+    cmd.payload["transfer"]["mamba_checkpoint_tokens"] = "not-an-integer"
+    reserved = []
+    provider = SimpleNamespace(
+        _reserve_target=lambda _command: reserved.append(_command),
+    )
+
+    with pytest.raises((TypeError, ValueError)):
+        _TargetHandler(provider, direct=True).prepare(cmd)
+
+    assert reserved == []
+
+
 def test_reverse_direct_uses_dedicated_bootstrap_port(monkeypatch):
     monkeypatch.setenv("SGLANG_AGENTIC_KV_DIRECT_BOOTSTRAP_PORT", "62000")
     assert _reverse_bootstrap_port() == 62000
