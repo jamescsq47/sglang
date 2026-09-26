@@ -393,3 +393,27 @@ def test_tp8_activation_order_is_chosen_once_and_applied_on_every_rank():
     assert [scheduler.waiting_queue for scheduler in schedulers] == [
         [f"req-r{rank}"] for rank in range(8)
     ]
+
+
+def test_agentic_forward_fence_is_recorded_before_bridge_publication():
+    order = []
+
+    class Event:
+        def record(self):
+            order.append("record")
+
+    bridge = SimpleNamespace(
+        record_forward_fence=lambda reqs, event: order.append(
+            ("publish", tuple(reqs), event)
+        )
+    )
+    target = SimpleNamespace(
+        device_module=SimpleNamespace(Event=Event),
+        agentic_p_memory_v2_bridge=bridge,
+    )
+    batch = SimpleNamespace(reqs=["a", "b"])
+
+    Scheduler._record_agentic_forward_read_fence(target, batch)
+
+    assert order[0] == "record"
+    assert order[1][0:2] == ("publish", ("a", "b"))

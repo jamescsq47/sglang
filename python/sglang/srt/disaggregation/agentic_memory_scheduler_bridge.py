@@ -47,6 +47,14 @@ class PrefillCompleteItem:
     req: Any
 
 
+@dataclass(frozen=True)
+class PrefillHandoffCompleteItem:
+    """P request whose KV ownership has left HBM after a group fence."""
+
+    req: Any
+    reason: str
+
+
 @dataclass
 class _BoundWorkset:
     req: Any
@@ -74,11 +82,13 @@ class AgenticPMemorySchedulerBridge:
         self._bound: Dict[int, _BoundWorkset] = {}
         self._complete: Deque[PrefillCompleteItem] = deque()
         self._complete_by_lease: Dict[int, PrefillCompleteItem] = {}
+        self._handoff_complete: Deque[PrefillHandoffCompleteItem] = deque()
         self._next_complete_sequence = itertools.count(1)
         self._completion_sink: Optional[Callable[[PrefillCompleteItem], None]] = None
         self._final_release_sink: Optional[
             Callable[[RequestGenerationAttempt, str], None]
         ] = None
+        self._forward_fences: Dict[int, Any] = {}
 
     def install_completion_sink(
         self, sink: Optional[Callable[[PrefillCompleteItem], None]]
@@ -107,6 +117,27 @@ class AgenticPMemorySchedulerBridge:
 
     def native_guard(self, owner: str):
         return self.authority.native_guard(owner)
+
+    def record_forward_fence(self, reqs: Sequence[Any], event: Any) -> None:
+        """Fence background egress behind the latest overlapped P Forward."""
+
+        if event is None:
+            return
+        with self._lock:
+            for req in reqs:
+                if getattr(req, "_agentic_p_workset_broker", None) is not self:
+                    continue
+                lease = getattr(req, "_agentic_p_workset_lease", None)
+                if lease is not None:
+                    self._forward_fences[int(lease.lease_id)] = event
+
+    def wait_forward_fence(self, lease_id: int) -> None:
+        """Wait in the path worker, never in the scheduler/Forward thread."""
+
+        with self._lock:
+            event = self._forward_fences.get(int(lease_id))
+        if event is not None:
+            event.synchronize()
 
     def reserve_workset(
         self,
@@ -415,6 +446,7 @@ class AgenticPMemorySchedulerBridge:
             with self._lock:
                 self._bound.pop(lease.lease_id, None)
                 self._complete_by_lease.pop(lease.lease_id, None)
+                self._forward_fences.pop(int(lease.lease_id), None)
                 sink = self._final_release_sink
             for name in (
                 "_agentic_p_workset_lease",
@@ -431,11 +463,30 @@ class AgenticPMemorySchedulerBridge:
     def release_after_group_fence(self, lease_id: int, *, reason: str) -> bool:
         """Release only after rank 0 observed every rank's terminal fence."""
 
+        with self._lock:
+            bound = self._bound.get(int(lease_id))
         if not self.authority.request_release(lease_id):
             return False
         released = self.authority.commit_release(lease_id, reason=reason)
         if released:
-            with self._lock:
+            with self._complete_condition:
                 self._bound.pop(int(lease_id), None)
                 self._complete_by_lease.pop(int(lease_id), None)
+                self._forward_fences.pop(int(lease_id), None)
+                if bound is not None:
+                    self._handoff_complete.append(
+                        PrefillHandoffCompleteItem(bound.req, str(reason))
+                    )
+                    self._complete_condition.notify_all()
         return released
+
+    def take_handoff_complete(
+        self, *, max_items: int = 64
+    ) -> Tuple[PrefillHandoffCompleteItem, ...]:
+        """Drain HTTP-visible completions; no transport work happens here."""
+
+        out = []
+        with self._complete_condition:
+            while self._handoff_complete and len(out) < int(max_items):
+                out.append(self._handoff_complete.popleft())
+        return tuple(out)

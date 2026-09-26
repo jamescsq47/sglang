@@ -60,6 +60,7 @@ from sglang.srt.disaggregation.agentic_tp import request_generation_key
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
+from sglang.srt.utils.common import DynamicGradMode
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -418,6 +419,46 @@ class PrefillBootstrapQueue:
 
 
 class SchedulerDisaggregationPrefillMixin:
+    def _finish_v2_prefill_handoffs(self: Scheduler) -> None:
+        """Emit responses whose P HBM ownership already left in background.
+
+        This is deliberately output bookkeeping only.  Allocation, transfer,
+        TP fencing and page release all completed before an item enters this
+        queue, so the Prefill scheduler never advances the P->D data plane.
+        """
+
+        bridge = getattr(self, "agentic_p_memory_v2_bridge", None)
+        if bridge is None:
+            return
+        items = bridge.take_handoff_complete(max_items=64)
+        if not items:
+            return
+        reqs = []
+        for item in items:
+            req = item.req
+            req.finished_reason = FINISH_LENGTH(length=0)
+            req.time_stats.set_prefill_kv_transfer_finish_time()
+            req.time_stats.set_completion_time()
+            for name in (
+                "_agentic_workset_backed",
+                "_agentic_p_workset_lease",
+                "_agentic_p_workset_broker",
+                "_agentic_workset_suffix_allocated_tokens",
+                "_agentic_workset_suffix_indices",
+            ):
+                if hasattr(req, name):
+                    delattr(req, name)
+            reqs.append(req)
+        self.stream_output(
+            reqs,
+            any(req.return_logprob for req in reqs),
+            None,
+        )
+        allocator = getattr(self, "req_to_metadata_buffer_idx_allocator", None)
+        if allocator is not None:
+            for req in reqs:
+                release_req_to_metadata_buffer(req, allocator)
+
     def _uses_v2_prefill_workset(self: Scheduler, req: Req) -> bool:
         """Return whether ``req`` is owned by the V2 P memory controller.
 
@@ -1579,6 +1620,7 @@ class SchedulerDisaggregationPrefillMixin:
             runtime = getattr(self, "agentic_multinode_runtime_v2", None)
             if runtime is not None:
                 runtime.progress_nonblocking()
+                SchedulerDisaggregationPrefillMixin._finish_v2_prefill_handoffs(self)
             else:
                 self._merge_disagg_prefill_ready(
                     self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
@@ -1599,16 +1641,21 @@ class SchedulerDisaggregationPrefillMixin:
 
             if runtime is not None:
                 runtime.progress_nonblocking()
+                SchedulerDisaggregationPrefillMixin._finish_v2_prefill_handoffs(self)
             else:
                 self.process_disagg_prefill_inflight_queue()
 
             # Update last_batch
             self.last_batch = batch
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
         self.result_queue = deque()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+
+        def pop_and_process():
+            tmp_batch, tmp_result = self.result_queue.popleft()
+            self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
             # Receive requests
@@ -1617,6 +1664,7 @@ class SchedulerDisaggregationPrefillMixin:
             runtime = getattr(self, "agentic_multinode_runtime_v2", None)
             if runtime is not None:
                 runtime.progress_nonblocking()
+                SchedulerDisaggregationPrefillMixin._finish_v2_prefill_handoffs(self)
             else:
                 self._merge_disagg_prefill_ready(
                     self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
@@ -1625,6 +1673,10 @@ class SchedulerDisaggregationPrefillMixin:
             # Get the next batch to run
             batch = self.get_next_disagg_prefill_batch_to_run()
             self.cur_batch = batch
+            disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
+
+            if disable_overlap_for_batch:
+                pop_and_process()
 
             # Launch the current batch
             if batch:
@@ -1634,17 +1686,19 @@ class SchedulerDisaggregationPrefillMixin:
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
+                self.cancel_bubble_timer()
 
             # Process the last batch
             if self.last_batch:
-                tmp_batch, tmp_result = self.result_queue.popleft()
-                self.process_batch_result(tmp_batch, tmp_result)
+                if not disable_overlap_for_batch:
+                    pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
 
             if runtime is not None:
                 runtime.progress_nonblocking()
+                SchedulerDisaggregationPrefillMixin._finish_v2_prefill_handoffs(self)
             else:
                 self.process_disagg_prefill_inflight_queue()
 
@@ -1654,6 +1708,8 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Update last_batch
             self.last_batch = batch
+            if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
+                self.self_check_during_busy()
 
     def process_batch_result_disagg_prefill(
         self: Scheduler,

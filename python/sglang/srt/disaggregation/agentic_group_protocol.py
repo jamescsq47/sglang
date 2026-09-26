@@ -1111,14 +1111,21 @@ class GroupLifecycleCoordinator:
         attempt_id: int,
         payload: Optional[Mapping[str, Any]] = None,
     ) -> GroupCommand:
-        """Release the old owner only after target scheduler adoption succeeded."""
+        """Retire a data-plane attempt after its ownership handoff committed.
+
+        Scheduler adoption is deliberately outside the transfer transaction.
+        At this point every TP shard has acknowledged ``RELEASED``: the target
+        owns a published ready lease and the source no longer owns live HBM.
+        Waiting for a later scheduler iteration here would retain short-lived
+        control state without adding a data-safety fence.
+        """
 
         with self._changed:
             attempt = self._require_active(key, attempt_id)
             if attempt.outcome is not AttemptOutcome.COMMITTED:
                 raise GroupNotReadyError("finalization requires group commit")
-            if not self._all_at_least(attempt, RankPhase.ACTIVATED):
-                raise GroupNotReadyError("not every rank passed scheduler activation")
+            if not self._all_at_least(attempt, attempt.required_commit_phase):
+                raise GroupNotReadyError("not every rank committed the ownership handoff")
             command = attempt.command(CommandKind.FINALIZE, payload)
             self._changed.notify_all()
             return command
@@ -1255,9 +1262,12 @@ class GroupLifecycleCoordinator:
                 elif ack.phase is RankPhase.FINALIZED:
                     if attempt.outcome is not AttemptOutcome.COMMITTED:
                         raise GroupProtocolError("finalize ACK arrived before group commit")
-                    if previous is not RankPhase.ACTIVATED:
+                    if previous not in {
+                        attempt.required_commit_phase,
+                        RankPhase.ACTIVATED,
+                    }:
                         raise GroupProtocolError(
-                            "rank finalized before scheduler activation"
+                            "rank finalized before its ownership commit fence"
                         )
                 elif expected is None or previous is not expected:
                     raise GroupProtocolError(

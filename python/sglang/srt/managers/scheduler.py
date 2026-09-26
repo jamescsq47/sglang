@@ -10024,6 +10024,27 @@ class Scheduler(
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
         self.batch_record_buf[self.batch_record_ct] = model_worker_batch
 
+    def _record_agentic_forward_read_fence(self, batch: ScheduleBatch) -> None:
+        """Fence background KV readers at the actual Forward submit point.
+
+        ``GenerationBatchResult.copy_done`` is intentionally recorded only
+        after delayed sampling/copy-to-CPU.  In structured-tool workloads that
+        event can therefore still be unrecorded when the previous batch is
+        retired.  Agentic egress needs a different boundary: the Forward that
+        last read the request pages has been submitted on the current stream.
+        Recording a dedicated event here preserves overlap without letting a
+        transport worker read or release pages behind an unrecorded event.
+        """
+
+        bridge = getattr(self, "agentic_p_memory_v2_bridge", None)
+        if bridge is None:
+            bridge = getattr(self, "agentic_d_memory_v2_bridge", None)
+        if bridge is None:
+            return
+        event = self.device_module.Event()
+        event.record()
+        bridge.record_forward_fence(batch.reqs, event)
+
     def run_batch(
         self,
         batch: ScheduleBatch,
@@ -10092,6 +10113,7 @@ class Scheduler(
                             model_worker_batch
                             # here pp is not compatible with overlap
                         )
+                    self._record_agentic_forward_read_fence(batch)
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = self.device_module.Event()
                     if batch_result.delay_sample_func is None:
@@ -10131,6 +10153,7 @@ class Scheduler(
                     batch_result = self.model_worker.forward_batch_generation(
                         worker_batch_or_batch, **kwargs
                     )
+                self._record_agentic_forward_read_fence(batch)
                 if agentic_tp_debug:
                     logger.info(
                         "AgenticTP batch_exit ct=%d mode=%s rids=%s",

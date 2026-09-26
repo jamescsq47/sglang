@@ -164,17 +164,8 @@ def test_rank_executor_releases_source_only_after_group_handoff():
     assert released == []
     rank.handle(command(CommandKind.HANDOFF, 4))
     wait_phase(acks, RankPhase.RELEASED)
-    assert released == []
-    rank.handle(command(CommandKind.ACTIVATE, 5))
-    wait_phase(acks, RankPhase.STAGED)
     assert released == [(1, FenceKind.DMA_COMPLETE)]
-    rank.handle(command(CommandKind.SCHEDULER_ACTIVATE, 6))
-    wait_phase(acks, RankPhase.ACTIVATION_ARMED)
-    rank.handle(command(CommandKind.PUBLISH_ACTIVATION, 7))
-    wait_phase(acks, RankPhase.ACTIVATION_READY)
-    rank.handle(command(CommandKind.ISSUE_ACTIVATION_TICKET, 8))
-    wait_phase(acks, RankPhase.ACTIVATED)
-    rank.handle(command(CommandKind.FINALIZE, 9))
+    rank.handle(command(CommandKind.FINALIZE, 5))
     wait_phase(acks, RankPhase.FINALIZED)
     assert released == [(1, FenceKind.DMA_COMPLETE)]
     assert failures == []
@@ -256,27 +247,11 @@ def drive_attempt(orchestrator, coordinator, commands, plan):
     release = commands[-1]
     for participant in coordinator.participants:
         send_ack(orchestrator, participant, release, RankPhase.BOUND)
-    handoff = commands[-1]
-    for participant in coordinator.participants:
-        send_ack(orchestrator, participant, handoff, RankPhase.RELEASED)
-    activate = commands[-1]
-    assert activate.kind is CommandKind.ACTIVATE
-    for participant in coordinator.participants:
-        send_ack(orchestrator, participant, activate, RankPhase.STAGED)
-    scheduler_activate = commands[-1]
-    assert scheduler_activate.kind is CommandKind.SCHEDULER_ACTIVATE
-    for participant in coordinator.participants:
-        send_ack(
-            orchestrator, participant, scheduler_activate, RankPhase.ACTIVATION_ARMED
-        )
-    publish = commands[-1]
-    assert publish.kind is CommandKind.PUBLISH_ACTIVATION
-    for participant in coordinator.participants:
-        send_ack(orchestrator, participant, publish, RankPhase.ACTIVATION_READY)
-    ticket = commands[-1]
-    assert ticket.kind is CommandKind.ISSUE_ACTIVATION_TICKET
-    for participant in coordinator.participants:
-        send_ack(orchestrator, participant, ticket, RankPhase.ACTIVATED)
+    if plan.operation is not TransferOperation.HOST_STORE:
+        handoff = commands[-1]
+        assert handoff.kind is CommandKind.HANDOFF
+        for participant in coordinator.participants:
+            send_ack(orchestrator, participant, handoff, RankPhase.RELEASED)
     finalize = commands[-1]
     assert finalize.kind is CommandKind.FINALIZE
     for participant in coordinator.participants:
@@ -327,26 +302,10 @@ def test_direct_commit_waits_for_source8_and_target8_fences():
         send_ack(orchestrator, participant, handoff, RankPhase.RELEASED)
     assert coordinator.record(plan.key).owner is Owner.D_GPU
     send_ack(orchestrator, coordinator.participants[-1], handoff, RankPhase.RELEASED)
-    assert coordinator.record(plan.key).owner is Owner.D_GPU
-    activate = commands[-1]
-    assert activate.kind is CommandKind.ACTIVATE
-    assert committed == []
-    for participant in coordinator.participants:
-        send_ack(orchestrator, participant, activate, RankPhase.STAGED)
-    scheduler_activate = commands[-1]
-    assert scheduler_activate.kind is CommandKind.SCHEDULER_ACTIVATE
-    for participant in coordinator.participants:
-        send_ack(
-            orchestrator, participant, scheduler_activate, RankPhase.ACTIVATION_ARMED
-        )
-    publish = commands[-1]
-    for participant in coordinator.participants:
-        send_ack(orchestrator, participant, publish, RankPhase.ACTIVATION_READY)
-    ticket = commands[-1]
-    for participant in coordinator.participants:
-        send_ack(orchestrator, participant, ticket, RankPhase.ACTIVATED)
     assert coordinator.record(plan.key).owner is Owner.PREFILL_READY
     finalize = commands[-1]
+    assert finalize.kind is CommandKind.FINALIZE
+    assert committed == []
     for participant in coordinator.participants:
         send_ack(orchestrator, participant, finalize, RankPhase.FINALIZED)
     assert committed == [1]
@@ -415,24 +374,8 @@ def test_tp8_host_store_collects_source_descriptors_only_for_active_attempt():
 
     for participant in coordinator.participants:
         send_ack(orchestrator, participant, release, RankPhase.BOUND)
-    handoff = commands[-1]
-    for participant in coordinator.participants:
-        send_ack(orchestrator, participant, handoff, RankPhase.RELEASED)
-    activate = commands[-1]
-    for participant in coordinator.participants:
-        send_ack(orchestrator, participant, activate, RankPhase.STAGED)
-    scheduler_activate = commands[-1]
-    for participant in coordinator.participants:
-        send_ack(
-            orchestrator, participant, scheduler_activate, RankPhase.ACTIVATION_ARMED
-        )
-    publish = commands[-1]
-    for participant in coordinator.participants:
-        send_ack(orchestrator, participant, publish, RankPhase.ACTIVATION_READY)
-    ticket = commands[-1]
-    for participant in coordinator.participants:
-        send_ack(orchestrator, participant, ticket, RankPhase.ACTIVATED)
     finalize = commands[-1]
+    assert finalize.kind is CommandKind.FINALIZE
     for participant in coordinator.participants:
         send_ack(orchestrator, participant, finalize, RankPhase.FINALIZED)
     assert orchestrator.active_count == 0
@@ -568,27 +511,6 @@ def test_authority_handler_publishes_only_on_group_handoff():
     assert authority.take_ready("prefill-ready", timeout=0.01) == ()
     rank.handle(command(CommandKind.HANDOFF, 4))
     wait_phase(acks, RankPhase.RELEASED)
-    assert authority.take_ready("prefill-ready", timeout=0.01) == ()
-    rank.handle(command(CommandKind.ACTIVATE, 5))
-    wait_phase(acks, RankPhase.STAGED)
-    assert authority.take_ready("prefill-ready", timeout=0.01) == ()
-    scheduler_activate = command(CommandKind.SCHEDULER_ACTIVATE, 6)
-    rank.handle(scheduler_activate)
-    assert authority.take_ready("prefill-ready", timeout=0.01) == ()
-    publish = command(CommandKind.PUBLISH_ACTIVATION, 7)
-    rank.handle(publish)
-    ticket = command(CommandKind.ISSUE_ACTIVATION_TICKET, 8)
-    rank.handle(ticket)
-    rank.activate_staged(
-        scheduler_activate.key,
-        scheduler_activate.attempt,
-        scheduler_activate.lease_id,
-    )
-    rank.confirm_scheduler_adopted(
-        scheduler_activate.key,
-        scheduler_activate.attempt,
-        scheduler_activate.lease_id,
-    )
     assert len(authority.take_ready("prefill-ready", timeout=0.2)) == 1
     queues.close()
 
@@ -657,45 +579,13 @@ def test_tp8_missing_bound_keeps_all_ready_and_source_release_invisible():
     assert released == []
     deliver(handoff, participants[:-1])
     assert commands[-1] is handoff
-    assert ready == []
-    assert released == []
+    assert len(ready) == 7
+    assert len(released) == 8
     deliver(handoff, participants[-1:])
-    activate = commands[-1]
-    assert activate.kind is CommandKind.ACTIVATE
-    assert ready == []
-    assert released == []
-    deliver(activate, participants)
-    scheduler_activate = commands[-1]
-    assert scheduler_activate.kind is CommandKind.SCHEDULER_ACTIVATE
-    assert ready == []
-    assert len(released) == 8
-    deliver(scheduler_activate, participants)
-    publish = commands[-1]
-    assert publish.kind is CommandKind.PUBLISH_ACTIVATION
-    deliver(publish, participants)
-    ticket = commands[-1]
-    assert ticket.kind is CommandKind.ISSUE_ACTIVATION_TICKET
-    deliver(ticket, participants)
-    assert ready == []
-    assert len(released) == 8
-    for participant in participants:
-        if participant.role == "target":
-            executors[participant].activate_staged(
-                scheduler_activate.key,
-                scheduler_activate.attempt,
-                scheduler_activate.lease_id,
-            )
-            executors[participant].confirm_scheduler_adopted(
-                scheduler_activate.key,
-                scheduler_activate.attempt,
-                scheduler_activate.lease_id,
-            )
-    staged_acks = tuple(emitted)
-    del emitted[:]
-    for ack in staged_acks:
-        orchestrator.on_ack(ack)
     finalize = commands[-1]
     assert finalize.kind is CommandKind.FINALIZE
+    assert len(ready) == 8
+    assert len(released) == 8
     deliver(finalize, participants)
     assert len(ready) == 8
     assert len(released) == 8

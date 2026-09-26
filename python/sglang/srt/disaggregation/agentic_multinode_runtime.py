@@ -11,6 +11,7 @@ import itertools
 import queue
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Mapping, Optional, Sequence
@@ -94,6 +95,202 @@ class _LocalSubmission:
 
 _STOP = object()
 _PLAN_INTENT = "group_transfer_v1"
+
+
+class _PathCommandDispatcher:
+    """Execute rank-zero commands without cross-path head-of-line blocking.
+
+    TCP receive order is preserved per ``(request-generation, attempt)``.  An
+    attempt is pinned to the path named by its PREPARE command and exactly one
+    worker may execute that attempt at a time.  Independent attempts use the
+    worker pool of their own physical path, so a slow Host preparation cannot
+    stop Direct control progress (or the opposite direction).
+
+    This is an execution detail only: workers never choose a path, route, lane
+    or owner.  Every command still originates at the fixed rank-zero
+    coordinator and every completed command still produces the ordinary TP
+    acknowledgement.
+    """
+
+    _TERMINAL = {CommandKind.FINALIZE, CommandKind.ABORT_FINALIZE}
+
+    def __init__(
+        self,
+        *,
+        executor: RankLocalCommandExecutor,
+        workers: Mapping[TransferPath, int],
+        after_command: Callable[[GroupCommand], None],
+        on_fatal: Callable[[BaseException], None],
+        cuda_device: Optional[int] = None,
+    ) -> None:
+        if set(workers) != set(TransferPath):
+            raise ValueError("command workers must cover all transfer paths")
+        self._executor = executor
+        self._after_command = after_command
+        self._on_fatal = on_fatal
+        self._cuda_device = cuda_device
+        self._condition = threading.Condition()
+        self._pending: dict[
+            tuple[GenerationKey, int], deque[GroupCommand]
+        ] = {}
+        self._path: dict[tuple[GenerationKey, int], TransferPath] = {}
+        self._ready = {path: deque() for path in TransferPath}
+        self._ready_set = {path: set() for path in TransferPath}
+        self._running: set[tuple[GenerationKey, int]] = set()
+        self._stop = False
+        self._threads: list[threading.Thread] = []
+        for path in TransferPath:
+            for worker_id in range(max(1, int(workers[path]))):
+                target: Callable[..., None] = self._worker
+                args: tuple[Any, ...] = (path,)
+                if cuda_device is not None:
+                    from sglang.srt.disaggregation.agentic_cuda_worker import (
+                        run_rank_bound_worker,
+                    )
+
+                    target = run_rank_bound_worker
+                    args = (int(cuda_device), self._worker, path)
+                self._threads.append(
+                    threading.Thread(
+                        target=target,
+                        args=args,
+                        name=f"agentic-command-{path.value}-{worker_id}",
+                        daemon=True,
+                    )
+                )
+
+    @staticmethod
+    def _identity(command: GroupCommand) -> tuple[GenerationKey, int]:
+        return command.key, int(command.attempt)
+
+    @staticmethod
+    def _command_path(command: GroupCommand) -> TransferPath:
+        header = command.payload.get("agentic_data_plane", {})
+        if not isinstance(header, Mapping) or int(header.get("version", 0)) != 1:
+            raise ValueError("missing agentic data-plane v1 command header")
+        return TransferPath(str(header["path"]))
+
+    def start(self) -> None:
+        for thread in self._threads:
+            thread.start()
+
+    def submit(self, command: GroupCommand) -> None:
+        identity = self._identity(command)
+        with self._condition:
+            if self._stop:
+                raise RuntimeError("command dispatcher is closed")
+            path = self._path.get(identity)
+            if command.kind is CommandKind.PREPARE:
+                command_path = self._command_path(command)
+                if path is not None:
+                    raise RuntimeError("duplicate PREPARE command")
+                self._path[identity] = command_path
+                path = command_path
+            elif path is None:
+                raise RuntimeError("command arrived before PREPARE")
+            pending = self._pending.setdefault(identity, deque())
+            pending.append(command)
+            self._make_ready_locked(identity, path)
+            self._condition.notify_all()
+
+    def _make_ready_locked(
+        self, identity: tuple[GenerationKey, int], path: TransferPath
+    ) -> None:
+        if identity in self._running or identity in self._ready_set[path]:
+            return
+        if not self._pending.get(identity):
+            return
+        self._ready[path].append(identity)
+        self._ready_set[path].add(identity)
+
+    def _take(self, path: TransferPath):
+        with self._condition:
+            self._condition.wait_for(lambda: self._stop or bool(self._ready[path]))
+            if self._stop and not self._ready[path]:
+                return None
+            identity = self._ready[path].popleft()
+            self._ready_set[path].remove(identity)
+            if identity in self._running:
+                raise RuntimeError("attempt was dispatched concurrently")
+            pending = self._pending.get(identity)
+            if not pending:
+                raise RuntimeError("ready attempt has no pending command")
+            command = pending.popleft()
+            self._running.add(identity)
+            return identity, command
+
+    def _worker(self, path: TransferPath) -> None:
+        while True:
+            item = self._take(path)
+            if item is None:
+                return
+            identity, command = item
+            terminal = command.kind in self._TERMINAL
+            try:
+                self._executor.handle(command)
+                self._after_command(command)
+            except BaseException as error:
+                self._on_fatal(error)
+                return
+            finally:
+                with self._condition:
+                    self._running.discard(identity)
+                    pending = self._pending.get(identity)
+                    if terminal:
+                        if pending:
+                            self._on_fatal(
+                                RuntimeError("command arrived after terminal command")
+                            )
+                        self._pending.pop(identity, None)
+                        self._path.pop(identity, None)
+                    elif pending:
+                        self._make_ready_locked(identity, path)
+                    self._condition.notify_all()
+
+    def wait_idle(self, timeout: Optional[float] = None) -> bool:
+        with self._condition:
+            return self._condition.wait_for(
+                lambda: not self._pending and not self._running, timeout=timeout
+            )
+
+    def pending_count(self) -> int:
+        with self._condition:
+            return sum(len(values) for values in self._pending.values())
+
+    def close(self, timeout: Optional[float]) -> None:
+        if not self.wait_idle(timeout):
+            raise RuntimeCloseBlocked("rank command dispatcher is not idle")
+        with self._condition:
+            self._stop = True
+            self._condition.notify_all()
+        deadline = None if timeout is None else time.monotonic() + timeout
+        for thread in self._threads:
+            thread.join(timeout=_remaining(deadline))
+        if any(thread.is_alive() for thread in self._threads):
+            raise RuntimeCloseBlocked("rank command workers did not stop")
+
+
+def _command_worker_counts(
+    snapshots: Mapping[TransferPath, Any],
+) -> dict[TransferPath, int]:
+    """Return a TP-deterministic control width for every data path.
+
+    Host PREPARE reserves source-local DRAM.  Serializing only that tiny
+    command stream gives every rank the same reservation order, so two
+    attempts cannot cross-reserve the last extents on different ranks.  START
+    merely submits asynchronous DMA and therefore retains the physical Host
+    queue's independent lane parallelism.  Direct control has no such shared
+    reservation and may use one worker per physical lane.
+    """
+
+    return {
+        path: (
+            1
+            if path in {TransferPath.D2P_HOST, TransferPath.P2D_HOST}
+            else max(1, int(snapshot.lanes))
+        )
+        for path, snapshot in snapshots.items()
+    }
 
 
 def _owner_role(owner: Owner) -> Optional[str]:
@@ -215,6 +412,7 @@ class AgenticMultiNodeRuntime:
         ] = None,
         on_capacity_edge: Optional[Callable[[LinkCapacityEdge], None]] = None,
         retain_terminals: bool = True,
+        cuda_device: Optional[int] = None,
     ) -> None:
         members = tuple(participants)
         if participant not in members or coordinator_participant not in members:
@@ -233,7 +431,6 @@ class AgenticMultiNodeRuntime:
         self._state_condition = threading.Condition()
         self._fatal: Optional[BaseException] = None
         self._stop = threading.Event()
-        self._command_queue: queue.Queue[object] = queue.Queue()
         self._control_queue: queue.Queue[object] = queue.Queue()
         self._proposal_sequence = itertools.count(1)
         self._terminals: queue.Queue[RuntimeTerminal] = queue.Queue()
@@ -266,6 +463,14 @@ class AgenticMultiNodeRuntime:
             emit_ack=self._emit_ack,
             report_failure=self._report_failure,
         )
+        command_workers = _command_worker_counts(queues.snapshot())
+        self._command_dispatcher = _PathCommandDispatcher(
+            executor=self.executor,
+            workers=command_workers,
+            after_command=self._after_command,
+            on_fatal=self._record_fatal,
+            cuda_device=cuda_device,
+        )
 
         self.coordinator: Optional[LinkLifecycleCoordinator] = None
         self.orchestrator: Optional[RankZeroLinkOrchestrator] = None
@@ -288,11 +493,6 @@ class AgenticMultiNodeRuntime:
         self._control_thread = threading.Thread(
             target=self._control_loop,
             name=f"agentic-control-owner-{label}",
-            daemon=True,
-        )
-        self._command_thread = threading.Thread(
-            target=self._command_loop,
-            name=f"agentic-control-command-{label}",
             daemon=True,
         )
 
@@ -327,7 +527,7 @@ class AgenticMultiNodeRuntime:
                 raise RuntimeError(f"runtime cannot start from {self._state.value}")
             self._state = RuntimeState.RUNNING
             self._accepting = True
-        self._command_thread.start()
+        self._command_dispatcher.start()
         self._control_thread.start()
         self._receive_thread.start()
 
@@ -351,7 +551,7 @@ class AgenticMultiNodeRuntime:
             while not self._stop.is_set():
                 event = self.agent.receive_event()
                 if isinstance(event, GroupCommand):
-                    self._command_queue.put(event)
+                    self._command_dispatcher.submit(event)
                 elif self.orchestrator is not None and isinstance(
                     event,
                     (
@@ -374,37 +574,26 @@ class AgenticMultiNodeRuntime:
         except BaseException as error:
             self._record_fatal(error)
 
-    def _command_loop(self) -> None:
-        while True:
-            value = self._command_queue.get()
-            if value is _STOP:
-                return
-            try:
-                self.executor.handle(value)
-                if (
-                    value.kind is CommandKind.ISSUE_ACTIVATION_TICKET
-                    and self.participant.rank == 0
-                    and _scheduler_target(value.target_owner)
-                    and self.participant.role == _owner_role(value.target_owner)
-                ):
-                    self._activation_tickets.put_nowait(
-                        EndpointActivationTicket(
-                            value.key,
-                            value.attempt,
-                            value.lease_id,
-                            self.participant.role,
-                            int(
-                                value.payload.get("transfer", {}).get(
-                                    "target_generation", value.key.generation
-                                )
-                            ),
+    def _after_command(self, value: GroupCommand) -> None:
+        if (
+            value.kind is CommandKind.FINALIZE
+            and self.participant.rank == 0
+            and _scheduler_target(value.target_owner)
+            and self.participant.role == _owner_role(value.target_owner)
+        ):
+            self._activation_tickets.put_nowait(
+                EndpointActivationTicket(
+                    value.key,
+                    value.attempt,
+                    value.lease_id,
+                    self.participant.role,
+                    int(
+                        value.payload.get("transfer", {}).get(
+                            "target_generation", value.key.generation
                         )
-                    )
-            except BaseException as error:
-                # The executor itself reports ordinary PREPARE/START failures.
-                # Reaching here means lifecycle state is uncertain; retain all
-                # ownership and fail the runtime rather than fabricating a fence.
-                self._record_fatal(error)
+                    ),
+                )
+            )
 
     def _decide_intent(self, intent: LinkIntent) -> Optional[GroupTransferPlan]:
         candidate = _plan_from_intent(intent)
@@ -576,22 +765,26 @@ class AgenticMultiNodeRuntime:
         return self._activation_tickets.get(timeout=timeout)
 
     def activate_staged(self, ticket: EndpointActivationTicket) -> None:
-        """Publish a ticket already broadcast by this endpoint's TP0 scheduler."""
+        """Validate a ready ticket carried by the endpoint TP0 broadcast.
+
+        Target publication already committed in the background HANDOFF command
+        after the all-rank bind fence.  The scheduler therefore performs no
+        transport or ownership mutation here; it only consumes the matching
+        ready lease through its memory bridge.
+        """
 
         if ticket.target_role != self.participant.role:
             raise ValueError("activation ticket belongs to another endpoint role")
-        self.executor.activate_staged(
-            ticket.key, ticket.attempt, ticket.lease_id
-        )
 
     def confirm_scheduler_adopted(self, ticket: EndpointActivationTicket) -> None:
-        """Report success only after this rank inserted the request for compute."""
+        """Validate the endpoint role after native scheduler adoption.
+
+        The data-plane attempt is retired before this edge.  Ready-queue
+        ownership, rather than a live network transaction, protects the lease.
+        """
 
         if ticket.target_role != self.participant.role:
             raise ValueError("activation ticket belongs to another endpoint role")
-        self.executor.confirm_scheduler_adopted(
-            ticket.key, ticket.attempt, ticket.lease_id
-        )
 
     def take_terminal(self, timeout: Optional[float] = None) -> RuntimeTerminal:
         return self._terminals.get(timeout=timeout)
@@ -601,6 +794,8 @@ class AgenticMultiNodeRuntime:
         if self.orchestrator is not None and not self.orchestrator.wait_idle(
             _remaining(deadline)
         ):
+            return False
+        if not self._command_dispatcher.wait_idle(_remaining(deadline)):
             return False
         return self.executor.wait_idle(_remaining(deadline))
 
@@ -638,22 +833,14 @@ class AgenticMultiNodeRuntime:
 
         self._stop.set()
         self.agent.close()
-        self._command_queue.put(_STOP)
         self._control_queue.put(_STOP)
-        for thread in (
-            self._receive_thread,
-            self._command_thread,
-            self._control_thread,
-        ):
+        self._command_dispatcher.close(_remaining(deadline))
+        for thread in (self._receive_thread, self._control_thread):
             if thread.ident is not None:
                 thread.join(timeout=_remaining(deadline))
         if any(
             thread.ident is not None and thread.is_alive()
-            for thread in (
-                self._receive_thread,
-                self._command_thread,
-                self._control_thread,
-            )
+            for thread in (self._receive_thread, self._control_thread)
         ):
             raise RuntimeCloseBlocked("control threads did not stop")
         with self._state_condition:

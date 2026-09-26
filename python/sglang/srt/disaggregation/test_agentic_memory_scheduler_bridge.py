@@ -101,6 +101,11 @@ def test_controller_binds_then_scheduler_only_adopts_ready_lease():
     assert bridge.release_after_group_fence(
         lease.lease_id, reason="p2d_complete"
     )
+    handed = bridge.take_handoff_complete()
+    assert len(handed) == 1
+    assert handed[0].req is req
+    assert handed[0].reason == "p2d_complete"
+    assert bridge.take_handoff_complete() == ()
     assert calls[-1] == ("release", lease.lease_id, 7)
     assert allocator.available_size() == 1024
 

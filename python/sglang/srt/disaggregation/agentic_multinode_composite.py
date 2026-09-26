@@ -78,6 +78,7 @@ class RuntimeRequestRecord:
     parent_key: Optional[GenerationKey]
     phase: RequestPhase = RequestPhase.ARRIVED
     submitted_attempt: Optional[int] = None
+    initial_admission_pending: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,8 +102,8 @@ class _AbortedEvent:
 
 
 @dataclass(frozen=True, slots=True)
-class _CapacityEdgeEvent:
-    edge: LinkCapacityEdge
+class _CapacityAvailableEvent:
+    remote_role: str
 
 
 class RequestGenerationRegistry:
@@ -175,20 +176,35 @@ class RequestGenerationRegistry:
                 raise RuntimeError("initial admission has an invalid request phase")
             record.phase = RequestPhase.INIT_SUBMITTED
             record.submitted_attempt = attempt
+            record.initial_admission_pending = True
 
     def mark_init_ready(self, key: GenerationKey) -> None:
         with self._lock:
             record = self._records.get(key)
-            if record is None or record.phase is not RequestPhase.INIT_SUBMITTED:
+            if record is None:
+                raise RuntimeError("initial admission committed for an unknown request")
+            record.initial_admission_pending = False
+            if record.phase is RequestPhase.INIT_SUBMITTED:
+                record.phase = RequestPhase.READY
+                return
+            if record.phase not in {
+                RequestPhase.READY,
+                RequestPhase.COMPUTE_COMPLETE,
+                RequestPhase.TRANSFER_SUBMITTED,
+                RequestPhase.HANDOFF_COMPLETE,
+            }:
                 raise RuntimeError("initial admission committed in an invalid phase")
-            record.phase = RequestPhase.READY
 
     def mark_compute_complete(self, key: GenerationKey) -> RuntimeRequestRecord:
         with self._lock:
             record = self._records.get(key)
             if record is None:
                 raise RuntimeError("completion belongs to an unknown request-generation")
-            if record.phase in {RequestPhase.ARRIVED, RequestPhase.READY}:
+            if record.phase in {
+                RequestPhase.ARRIVED,
+                RequestPhase.INIT_SUBMITTED,
+                RequestPhase.READY,
+            }:
                 record.phase = RequestPhase.COMPUTE_COMPLETE
             elif record.phase is not RequestPhase.COMPUTE_COMPLETE:
                 raise RuntimeError("request-generation completed in an invalid phase")
@@ -473,11 +489,17 @@ class SchedulerAgenticMultinodeRuntime:
             on_aborted=self._on_aborted,
             on_capacity_edge=self._on_capacity_edge,
             retain_terminals=False,
+            cuda_device=(
+                None
+                if getattr(scheduler, "gpu_id", None) is None
+                else int(scheduler.gpu_id)
+            ),
         )
         self._events: queue.Queue[Any] = queue.Queue()
         self._fatal: Optional[BaseException] = None
         self._closed = False
-        self._capacity_edge_pending = False
+        self._capacity_edge_pending: set[str] = set()
+        self._pending_after_initial: dict[GenerationKey, GroupTransferPlan] = {}
         self._lock = threading.RLock()
         self._controller = threading.Thread(
             target=self._controller_loop,
@@ -495,9 +517,11 @@ class SchedulerAgenticMultinodeRuntime:
                 self._on_final_release
             )
         self._low_level.start()
-        if role == "decode" and int(scheduler.tp_rank) == 0:
+        if int(scheduler.tp_rank) == 0:
             self.authority.install_capacity_available_sink(
                 self._notify_d_capacity_available
+                if role == "decode"
+                else self._notify_p_capacity_available
             )
         install_submitter = getattr(provider, "install_submitter", None)
         if install_submitter is not None:
@@ -531,6 +555,12 @@ class SchedulerAgenticMultinodeRuntime:
     def _submit_plan(self, record: RuntimeRequestRecord, plan: GroupTransferPlan) -> None:
         if plan.key != record.key:
             raise RuntimeError("provider changed completion request-generation")
+        if record.initial_admission_pending:
+            existing = self._pending_after_initial.get(record.key)
+            if existing is not None and existing != plan:
+                raise RuntimeError("multiple transfers waited on initial admission")
+            self._pending_after_initial[record.key] = plan
+            return
         attempt = self._low_level.submit(plan)
         self.registry.mark_submitted(record.key, attempt)
 
@@ -613,12 +643,12 @@ class SchedulerAgenticMultinodeRuntime:
                     self._handle_aborted(
                         event.plan, event.attempt, event.reason
                     )
-                elif isinstance(event, _CapacityEdgeEvent):
+                elif isinstance(event, _CapacityAvailableEvent):
                     with self._lock:
-                        self._capacity_edge_pending = False
+                        self._capacity_edge_pending.discard(event.remote_role)
                     callback = getattr(self.provider, "memory_available", None)
                     if callback is not None:
-                        callback(remote_role=event.edge.participant.role)
+                        callback(remote_role=event.remote_role)
                 else:
                     raise TypeError(f"unsupported controller event {event!r}")
             except BaseException as error:
@@ -641,6 +671,9 @@ class SchedulerAgenticMultinodeRuntime:
         record = self.registry.get(plan.key)
         if record is not None and plan.payload.get("kind") == "initial_prefill":
             self.registry.mark_init_ready(plan.key)
+            pending = self._pending_after_initial.pop(plan.key, None)
+            if pending is not None:
+                self._submit_plan(record, pending)
 
     def _on_committed_results(
         self,
@@ -660,11 +693,24 @@ class SchedulerAgenticMultinodeRuntime:
     def _on_capacity_edge(self, edge: LinkCapacityEdge) -> None:
         """Coalesce transient D-capacity hints before entering policy code."""
 
+        self._enqueue_capacity_available(edge.participant.role)
+
+    def _enqueue_capacity_available(self, remote_role: str) -> None:
+        remote_role = str(remote_role)
         with self._lock:
-            if self._closed or self._fatal is not None or self._capacity_edge_pending:
+            if (
+                self._closed
+                or self._fatal is not None
+                or remote_role in self._capacity_edge_pending
+            ):
                 return
-            self._capacity_edge_pending = True
-        self._events.put_nowait(_CapacityEdgeEvent(edge))
+            self._capacity_edge_pending.add(remote_role)
+        self._events.put_nowait(_CapacityAvailableEvent(remote_role))
+
+    def _notify_p_capacity_available(self, _available_tokens: int) -> None:
+        """Wake retained Host→P work on a real local P release edge."""
+
+        self._enqueue_capacity_available("prefill")
 
     def _notify_d_capacity_available(self, available_tokens: int) -> None:
         """Allocator edge sink; ownership release never depends on this hint."""

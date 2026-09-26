@@ -78,6 +78,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.utils.common import DynamicGradMode
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
@@ -2063,8 +2064,11 @@ class SchedulerDisaggregationDecodeMixin:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             runtime = getattr(self, "agentic_multinode_runtime_v2", None)
+            memory_bridge = getattr(self, "agentic_d_memory_v2_bridge", None)
             if runtime is not None:
                 runtime.progress_nonblocking()
+            if memory_bridge is not None:
+                memory_bridge.progress_forward_releases()
             # polling and allocating kv cache
             self.process_decode_queue()
 
@@ -2082,28 +2086,41 @@ class SchedulerDisaggregationDecodeMixin:
 
             if runtime is not None:
                 runtime.progress_nonblocking()
+            if memory_bridge is not None:
+                memory_bridge.progress_forward_releases()
 
             # Update last_batch
             self.last_batch = batch
 
-    @torch.no_grad()
+    @DynamicGradMode()
     def event_loop_overlap_disagg_decode(self: Scheduler):
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
+
+        def pop_and_process():
+            tmp_batch, tmp_result = self.result_queue.popleft()
+            self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             runtime = getattr(self, "agentic_multinode_runtime_v2", None)
+            memory_bridge = getattr(self, "agentic_d_memory_v2_bridge", None)
             if runtime is not None:
                 runtime.progress_nonblocking()
+            if memory_bridge is not None:
+                memory_bridge.progress_forward_releases()
             # polling and allocating kv cache
             self.process_decode_queue()
 
             # Get the next batch to run
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
+            disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
+
+            if disable_overlap_for_batch:
+                pop_and_process()
 
             # Launch the current batch
             if batch:
@@ -2111,16 +2128,19 @@ class SchedulerDisaggregationDecodeMixin:
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
+                self.cancel_bubble_timer()
 
             # Process the last batch
             if self.last_batch:
-                tmp_batch, tmp_result = self.result_queue.popleft()
-                self.process_batch_result(tmp_batch, tmp_result)
+                if not disable_overlap_for_batch:
+                    pop_and_process()
             elif batch is None:
                 self.self_check_during_idle()
 
             if runtime is not None:
                 runtime.progress_nonblocking()
+            if memory_bridge is not None:
+                memory_bridge.progress_forward_releases()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -2128,6 +2148,8 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Update last_batch
             self.last_batch = batch
+            if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
+                self.self_check_during_busy()
 
     def _run_batch_prebuilt(
         self: Scheduler, batch: ScheduleBatch

@@ -7,7 +7,9 @@ import queue
 import pytest
 
 from sglang.srt.disaggregation.agentic_group_protocol import (
+    CommandKind,
     GenerationKey,
+    GroupCommand,
     LinkCapacityEdge,
     LinkParticipant,
     Owner,
@@ -22,6 +24,8 @@ from sglang.srt.disaggregation.agentic_group_transfer import (
 from sglang.srt.disaggregation.agentic_multinode_runtime import (
     AgenticMultiNodeRuntime,
     RuntimeCloseBlocked,
+    _PathCommandDispatcher,
+    _command_worker_counts,
 )
 from sglang.srt.disaggregation.agentic_transfer_queues import (
     AgenticTransferQueues,
@@ -53,6 +57,117 @@ class _ImmediateExecutor:
         with self._lock:
             self._cancelled.add(handle.key)
         notify()
+
+
+def _dispatcher_command(request_id, path, kind, seq=1):
+    return GroupCommand(
+        key=GenerationKey("run", request_id, 0),
+        attempt=1,
+        command_seq=seq,
+        kind=kind,
+        source_owner=Owner.D_GPU,
+        target_owner=Owner.P_GPU,
+        lease_id=f"lease-{request_id}",
+        payload={
+            "agentic_data_plane": {
+                "version": 1,
+                "path": path.value,
+                "operation": "direct",
+            }
+        },
+    )
+
+
+def test_path_dispatcher_has_no_cross_path_head_of_line_blocking():
+    host_entered = threading.Event()
+    host_release = threading.Event()
+    direct_done = threading.Event()
+    errors = []
+
+    class Executor:
+        def handle(self, command):
+            path = command.payload.get("agentic_data_plane", {}).get("path")
+            if command.kind is CommandKind.PREPARE and path == "d2p_host":
+                host_entered.set()
+                assert host_release.wait(2)
+            if command.kind is CommandKind.PREPARE and path == "d2p_direct":
+                direct_done.set()
+
+    dispatcher = _PathCommandDispatcher(
+        executor=Executor(),
+        workers={path: 1 for path in TransferPath},
+        after_command=lambda _command: None,
+        on_fatal=errors.append,
+    )
+    dispatcher.start()
+    host = _dispatcher_command("host", TransferPath.D2P_HOST, CommandKind.PREPARE)
+    direct = _dispatcher_command(
+        "direct", TransferPath.D2P_DIRECT, CommandKind.PREPARE
+    )
+    dispatcher.submit(host)
+    assert host_entered.wait(1)
+    dispatcher.submit(direct)
+    assert direct_done.wait(1)
+    host_release.set()
+    dispatcher.submit(
+        _dispatcher_command("host", TransferPath.D2P_HOST, CommandKind.FINALIZE, 2)
+    )
+    dispatcher.submit(
+        _dispatcher_command(
+            "direct", TransferPath.D2P_DIRECT, CommandKind.FINALIZE, 2
+        )
+    )
+    dispatcher.close(2)
+    assert errors == []
+
+
+def test_host_prepare_order_is_serial_but_direct_uses_all_control_lanes():
+    counts = _command_worker_counts(_queues().snapshot())
+    assert counts == {
+        TransferPath.D2P_DIRECT: 4,
+        TransferPath.D2P_HOST: 1,
+        TransferPath.P2D_DIRECT: 4,
+        TransferPath.P2D_HOST: 1,
+    }
+
+    first_entered = threading.Event()
+    first_release = threading.Event()
+    second_entered = threading.Event()
+    errors = []
+
+    class Executor:
+        def handle(self, command):
+            if command.kind is not CommandKind.PREPARE:
+                return
+            if command.key.request_id == "first":
+                first_entered.set()
+                assert first_release.wait(2)
+            else:
+                second_entered.set()
+
+    dispatcher = _PathCommandDispatcher(
+        executor=Executor(),
+        workers=counts,
+        after_command=lambda _command: None,
+        on_fatal=errors.append,
+    )
+    dispatcher.start()
+    dispatcher.submit(
+        _dispatcher_command("first", TransferPath.D2P_HOST, CommandKind.PREPARE)
+    )
+    assert first_entered.wait(1)
+    dispatcher.submit(
+        _dispatcher_command("second", TransferPath.D2P_HOST, CommandKind.PREPARE)
+    )
+    assert not second_entered.wait(0.05)
+    first_release.set()
+    assert second_entered.wait(1)
+    for name in ("first", "second"):
+        dispatcher.submit(
+            _dispatcher_command(name, TransferPath.D2P_HOST, CommandKind.FINALIZE, 2)
+        )
+    dispatcher.close(2)
+    assert errors == []
 
 
 class _ManualDrainExecutor:
@@ -375,14 +490,16 @@ def test_tp8_out_of_order_readiness_gates_prepare_and_target_scheduler_ticket():
             runtime.activate_staged(ticket)
             runtime.confirm_scheduler_adopted(ticket)
         time.sleep(0.05)
-        assert p0.orchestrator.active_count == 1
-        assert committed == []
-
-        target_runtimes[-1].activate_staged(ticket)
-        target_runtimes[-1].confirm_scheduler_adopted(ticket)
+        # The data-plane transaction retires after every target shard is
+        # published ready; scheduler adoption is an independent consumption
+        # edge and cannot retain source HBM or controller slots.
+        assert p0.orchestrator.active_count == 0
         terminal = p0.take_terminal(timeout=10)
         assert terminal.committed
         assert committed == [(plan.key, terminal.attempt)]
+
+        target_runtimes[-1].activate_staged(ticket)
+        target_runtimes[-1].confirm_scheduler_adopted(ticket)
         assert aborted == []
     finally:
         _close(relay, runtimes, coordinator)

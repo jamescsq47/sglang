@@ -23,6 +23,7 @@ class ParentPolicyPhase(str, Enum):
     WAIT_CHILD = "wait_child"
     DIRECT_SUBMITTED = "direct_submitted"
     HOST_STORE_SUBMITTED = "host_store_submitted"
+    HOST_CAPACITY_WAIT = "host_capacity_wait"
     HOST_DURABLE = "host_durable"
     HOST_RESTORE_SUBMITTED = "host_restore_submitted"
     COMPLETE = "complete"
@@ -38,6 +39,7 @@ class _ParentState:
     phase: ParentPolicyPhase = ParentPolicyPhase.WAIT_CHILD
     waiting_capacity: bool = False
     deadline_epoch: int = 0
+    host_submit_epoch: int = 0
 
 
 class D2PPolicyActor:
@@ -65,6 +67,7 @@ class D2PPolicyActor:
         self._deadlines: list[tuple[float, int, GenerationKey]] = []
         self._submissions: list[GroupTransferPlan] = []
         self._next_epoch = 1
+        self._host_capacity_epoch = 0
         self._closed = False
         self._fatal: Optional[BaseException] = None
         self._changed = threading.Condition()
@@ -81,6 +84,11 @@ class D2PPolicyActor:
         # Serialize the decision here and let the actor thread submit later.
         self._submissions.append(plan)
         self._changed.notify_all()
+
+    def _submit_host_store_locked(self, state: _ParentState) -> None:
+        state.phase = ParentPolicyPhase.HOST_STORE_SUBMITTED
+        state.host_submit_epoch = self._host_capacity_epoch
+        self._submit_locked(state, self._make_host_store(state.candidate))
 
     def _check_locked(self) -> None:
         if self._closed:
@@ -165,8 +173,7 @@ class D2PPolicyActor:
                 return
             if state.phase is not ParentPolicyPhase.DIRECT_SUBMITTED:
                 return
-            state.phase = ParentPolicyPhase.HOST_STORE_SUBMITTED
-            self._submit_locked(state, self._make_host_store(state.candidate))
+            self._submit_host_store_locked(state)
 
     def host_durable(self, key: GenerationKey, descriptors: Any) -> None:
         with self._changed:
@@ -184,6 +191,31 @@ class D2PPolicyActor:
                         state.candidate, state.child, descriptors
                     ),
                 )
+
+    def host_store_rejected(self, key: GenerationKey) -> None:
+        """Retain source HBM until a source-Host extent becomes available."""
+
+        with self._changed:
+            self._check_locked()
+            state = self._states.get(key)
+            if state is None or state.phase is not ParentPolicyPhase.HOST_STORE_SUBMITTED:
+                return
+            state.phase = ParentPolicyPhase.HOST_CAPACITY_WAIT
+            if state.host_submit_epoch < self._host_capacity_epoch:
+                self._submit_host_store_locked(state)
+
+    def host_memory_available(self) -> None:
+        """Retry Host stores only on a real source-arena release edge."""
+
+        with self._changed:
+            self._check_locked()
+            self._host_capacity_epoch += 1
+            for state in tuple(self._states.values()):
+                if (
+                    state.phase is ParentPolicyPhase.HOST_CAPACITY_WAIT
+                    and state.host_submit_epoch < self._host_capacity_epoch
+                ):
+                    self._submit_host_store_locked(state)
 
     def restore_capacity_rejected(self, key: GenerationKey) -> None:
         with self._changed:
@@ -248,10 +280,7 @@ class D2PPolicyActor:
                         continue
                     self._join_early_child_locked(state)
                     if state.phase is ParentPolicyPhase.WAIT_CHILD:
-                        state.phase = ParentPolicyPhase.HOST_STORE_SUBMITTED
-                        self._submit_locked(
-                            state, self._make_host_store(state.candidate)
-                        )
+                        self._submit_host_store_locked(state)
                 if self._closed:
                     return
             try:
@@ -274,6 +303,7 @@ class D2PPolicyActor:
 class P2DPolicyPhase(str, Enum):
     DIRECT_SUBMITTED = "direct_submitted"
     HOST_STORE_SUBMITTED = "host_store_submitted"
+    HOST_CAPACITY_WAIT = "host_capacity_wait"
     HOST_DURABLE = "host_durable"
     HOST_RESTORE_SUBMITTED = "host_restore_submitted"
     COMPLETE = "complete"
@@ -285,6 +315,7 @@ class _P2DState:
     phase: P2DPolicyPhase = P2DPolicyPhase.DIRECT_SUBMITTED
     host_descriptors: Any = None
     waiting_capacity: bool = False
+    host_submit_epoch: int = 0
 
 
 class P2DPolicyActor:
@@ -309,7 +340,13 @@ class P2DPolicyActor:
         self._make_host_store = make_host_store
         self._make_host_restore = make_host_restore
         self._states: dict[GenerationKey, _P2DState] = {}
+        self._host_capacity_epoch = 0
         self._lock = threading.RLock()
+
+    def _make_host_store_locked(self, state: _P2DState) -> GroupTransferPlan:
+        state.phase = P2DPolicyPhase.HOST_STORE_SUBMITTED
+        state.host_submit_epoch = self._host_capacity_epoch
+        return self._make_host_store(state.direct)
 
     def direct_submitted(self, plan: GroupTransferPlan) -> None:
         with self._lock:
@@ -329,8 +366,7 @@ class P2DPolicyActor:
                 return
             if state.phase is not P2DPolicyPhase.DIRECT_SUBMITTED:
                 return
-            state.phase = P2DPolicyPhase.HOST_STORE_SUBMITTED
-            plan = self._make_host_store(state.direct)
+            plan = self._make_host_store_locked(state)
         self._submit(plan)
 
     def host_durable(self, key: GenerationKey, descriptors: Any) -> None:
@@ -342,6 +378,33 @@ class P2DPolicyActor:
             state.phase = P2DPolicyPhase.HOST_RESTORE_SUBMITTED
             plan = self._make_host_restore(state.direct, descriptors)
         self._submit(plan)
+
+    def host_store_rejected(self, key: GenerationKey) -> None:
+        with self._lock:
+            state = self._states.get(key)
+            if state is None or state.phase is not P2DPolicyPhase.HOST_STORE_SUBMITTED:
+                return
+            state.phase = P2DPolicyPhase.HOST_CAPACITY_WAIT
+            plan = (
+                self._make_host_store_locked(state)
+                if state.host_submit_epoch < self._host_capacity_epoch
+                else None
+            )
+        if plan is not None:
+            self._submit(plan)
+
+    def host_memory_available(self) -> None:
+        plans = []
+        with self._lock:
+            self._host_capacity_epoch += 1
+            for state in self._states.values():
+                if (
+                    state.phase is P2DPolicyPhase.HOST_CAPACITY_WAIT
+                    and state.host_submit_epoch < self._host_capacity_epoch
+                ):
+                    plans.append(self._make_host_store_locked(state))
+        for plan in plans:
+            self._submit(plan)
 
     def restore_capacity_rejected(self, key: GenerationKey) -> None:
         with self._lock:

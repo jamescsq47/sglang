@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from sglang.srt.disaggregation.agentic_default_physical_provider import (
@@ -14,11 +15,16 @@ from sglang.srt.disaggregation.agentic_group_protocol import (
     GroupCommand,
     Owner,
 )
+from sglang.srt.disaggregation.agentic_group_transfer import (
+    GroupTransferPlan,
+    TransferOperation,
+)
 from sglang.srt.disaggregation.agentic_memory_authority import (
     LeaseKind,
     PhysicalMemoryLease,
     RequestGenerationAttempt,
 )
+from sglang.srt.disaggregation.agentic_transfer_queues import TransferPath
 
 
 def command():
@@ -157,3 +163,65 @@ def test_host_source_payload_freezes_registered_dma_index_mirror():
     assert payload.source_indices.tolist() == [7, 8, 19]
     assert payload.source_indices_host == (7, 8, 19)
     assert payload.state_indices == (3,)
+
+
+def test_group_host_restore_commit_advances_capacity_epoch():
+    calls = []
+
+    class Policy:
+        def committed(self, key):
+            calls.append(("committed", key))
+
+        def host_memory_available(self):
+            calls.append(("capacity", None))
+
+    key = GenerationKey("run", "host", 2)
+    provider = AgenticDefaultPhysicalProvider.__new__(
+        AgenticDefaultPhysicalProvider
+    )
+    provider._policy = Policy()
+    provider._p2d_policy = None
+    provider._pending_candidates = {}
+    provider._host_results = {}
+    group_restore = GroupTransferPlan(
+        key=key,
+        path=TransferPath.D2P_HOST,
+        operation=TransferOperation.HOST_RESTORE,
+        source_owner=Owner.D_HOST,
+        target_owner=Owner.PREFILL_READY,
+        lease_id="restore",
+        payload={"kind": "d2p_host_restore"},
+    )
+
+    provider.on_committed(None, group_restore, 4)
+
+    assert calls == [("committed", key), ("capacity", None)]
+
+
+def test_host_store_capacity_abort_waits_but_other_failure_is_fatal():
+    calls = []
+    policy = SimpleNamespace(
+        host_store_rejected=lambda key: calls.append(key),
+    )
+    key = GenerationKey("run", "host-full", 3)
+    provider = AgenticDefaultPhysicalProvider.__new__(
+        AgenticDefaultPhysicalProvider
+    )
+    provider._policy = policy
+    provider._p2d_policy = None
+    host_store = GroupTransferPlan(
+        key=key,
+        path=TransferPath.D2P_HOST,
+        operation=TransferOperation.HOST_STORE,
+        source_owner=Owner.D_GPU,
+        target_owner=Owner.D_HOST,
+        lease_id="store",
+        payload={"kind": "d2p_host_store"},
+    )
+
+    provider.on_aborted(
+        None, host_store, 5, "decode:d0:r3: source-local Host arena is full"
+    )
+    assert calls == [key]
+    with pytest.raises(RuntimeError, match="non-capacity Host-store failure"):
+        provider.on_aborted(None, host_store, 6, "CUDA copy failed")

@@ -69,6 +69,10 @@ class AgenticDMemorySchedulerBridge:
         self._final_release_sink: Optional[
             Callable[[RequestGenerationAttempt, str], None]
         ] = None
+        self._forward_fences: Dict[int, Any] = {}
+        self._deferred_final_releases: Dict[
+            int, Tuple[Any, str, RequestGenerationAttempt]
+        ] = {}
 
     def install_completion_sink(
         self, sink: Optional[Callable[[DecodeCompleteItem], None]]
@@ -99,6 +103,61 @@ class AgenticDMemorySchedulerBridge:
 
     def native_guard(self, owner: str):
         return self.authority.native_guard(owner)
+
+    def record_forward_fence(self, reqs: Sequence[Any], event: Any) -> None:
+        """Associate a submitted overlapped Decode Forward with its leases."""
+
+        if event is None:
+            return
+        with self._lock:
+            for req in reqs:
+                if getattr(req, "_agentic_d_memory_bridge", None) is not self:
+                    continue
+                lease = getattr(req, "_agentic_d_memory_lease", None)
+                if lease is not None:
+                    self._forward_fences[int(lease.lease_id)] = event
+
+    def wait_forward_fence(self, lease_id: int) -> None:
+        """Wait in the path worker before reading source pages."""
+
+        with self._lock:
+            event = self._forward_fences.get(int(lease_id))
+        if event is not None:
+            event.synchronize()
+
+    @staticmethod
+    def _event_complete(event: Any) -> bool:
+        if event is None:
+            return True
+        query = getattr(event, "query", None)
+        return bool(query()) if callable(query) else False
+
+    def progress_forward_releases(self, *, max_items: int = 64) -> int:
+        """Finish application-terminal releases without blocking overlap."""
+
+        ready = []
+        with self._lock:
+            for lease_id, item in self._deferred_final_releases.items():
+                if len(ready) >= int(max_items):
+                    break
+                if self._event_complete(self._forward_fences.get(lease_id)):
+                    ready.append((lease_id, *item))
+        released = 0
+        for lease_id, req, reason, key in ready:
+            if not self.authority.commit_release(lease_id, reason=reason):
+                continue
+            with self._lock:
+                self._deferred_final_releases.pop(lease_id, None)
+                self._forward_fences.pop(lease_id, None)
+                self._bound.pop(lease_id, None)
+                sink = self._final_release_sink
+            for name in ("_agentic_d_memory_lease", "_agentic_d_memory_bridge"):
+                if hasattr(req, name):
+                    delattr(req, name)
+            if sink is not None:
+                sink(key, reason)
+            released += 1
+        return released
 
     def reserve_decode(
         self,
@@ -400,6 +459,16 @@ class AgenticDMemorySchedulerBridge:
                 return False
             if not self.authority.request_release(lease.lease_id):
                 return False
+            with self._lock:
+                fence = self._forward_fences.get(int(lease.lease_id))
+            if not self._event_complete(fence):
+                with self._lock:
+                    self._deferred_final_releases[int(lease.lease_id)] = (
+                        req,
+                        str(reason),
+                        lease.key,
+                    )
+                return True
             released = self.authority.commit_release(
                 lease.lease_id, reason=reason
             )
@@ -407,6 +476,7 @@ class AgenticDMemorySchedulerBridge:
             with self._lock:
                 self._bound.pop(lease.lease_id, None)
                 self._complete_by_lease.pop(lease.lease_id, None)
+                self._forward_fences.pop(int(lease.lease_id), None)
                 sink = self._final_release_sink
             for name in ("_agentic_d_memory_lease", "_agentic_d_memory_bridge"):
                 if hasattr(req, name):
@@ -443,4 +513,5 @@ class AgenticDMemorySchedulerBridge:
             with self._lock:
                 self._bound.pop(int(lease_id), None)
                 self._complete_by_lease.pop(int(lease_id), None)
+                self._forward_fences.pop(int(lease_id), None)
         return released

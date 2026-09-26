@@ -434,6 +434,7 @@ class _LocalAttempt:
     activation_ticket_command: Optional[GroupCommand] = None
     activation_published: bool = False
     scheduler_activated: bool = False
+    source_released: bool = False
 
 
 class RankLocalCommandExecutor:
@@ -824,6 +825,17 @@ class RankLocalCommandExecutor:
             return
         with self._lock:
             local.handoff_prepared = True
+        # A Host-store RELEASE command exists only after rank zero observed a
+        # durable DMA fence from every source shard.  There is no target GPU
+        # binding to wait for, so retaining the completed request in source
+        # HBM through the later scheduler activation protocol is unnecessary
+        # and directly reduces useful Decode/Prefill concurrency.
+        if local.operation is TransferOperation.HOST_STORE:
+            source_role = self._owner_role(command.source_owner)
+            if self.participant.role in {source_role, "source"}:
+                local.handler.commit(command, local.prepared, local.completion)
+                with self._lock:
+                    local.source_released = True
         self._ack(command, RankPhase.BOUND)
 
     def _handoff(self, command: GroupCommand) -> None:
@@ -839,6 +851,25 @@ class RankLocalCommandExecutor:
                 raise RuntimeError("HANDOFF arrived before local bind preparation")
             if local.completion.state is not PhysicalState.SUCCEEDED:
                 raise RuntimeError("failed physical attempt cannot hand off")
+        # HANDOFF is broadcast only after every target shard reported BOUND.
+        # Commit both halves now: publish the immutable target lease to its
+        # ready queue and release the old source.  Scheduler adoption is a
+        # later, one-way consumption edge and is not part of data ownership.
+        source_role = self._owner_role(command.source_owner)
+        target_role = self._owner_role(command.target_owner)
+        if (
+            self.participant.role in {source_role, "source"}
+            and not local.source_released
+        ):
+            local.handler.commit(command, local.prepared, local.completion)
+        if self.participant.role in {target_role, "target"}:
+            local.handler.commit(command, local.prepared, local.completion)
+        with self._lock:
+            if self.participant.role in {source_role, "source"}:
+                local.source_released = True
+            if self.participant.role in {target_role, "target"}:
+                local.activation_published = True
+            local.activation_staged = True
         self._ack(command, RankPhase.RELEASED)
 
     def _activate(self, command: GroupCommand) -> None:
@@ -859,9 +890,14 @@ class RankLocalCommandExecutor:
         # invisible until their endpoint TP0 carries SCHEDULER_ACTIVATE on the
         # native scheduler broadcast.
         source_role = self._owner_role(command.source_owner)
-        if self.participant.role in {source_role, "source"}:
+        if (
+            self.participant.role in {source_role, "source"}
+            and not local.source_released
+        ):
             local.handler.commit(command, local.prepared, local.completion)
         with self._lock:
+            if self.participant.role in {source_role, "source"}:
+                local.source_released = True
             local.activation_staged = True
         self._ack(command, RankPhase.STAGED)
 
@@ -982,11 +1018,17 @@ class RankLocalCommandExecutor:
         identity = self._identity(command)
         with self._lock:
             local = self._attempts.get(identity)
-            if local is None or not local.activation_staged:
+            if local is None or not (
+                local.activation_staged
+                or (
+                    local.operation is TransferOperation.HOST_STORE
+                    and local.handoff_prepared
+                )
+            ):
                 raise RuntimeError("FINALIZE arrived before local staging")
-        # Source release happened at ACTIVATE and target publication happened
-        # through the endpoint scheduler broadcast.  FINALIZE only retires the
-        # short-lived physical attempt after both facts are fenced.
+        # The transfer transaction is already complete.  FINALIZE only retires
+        # short-lived attempt state; ready leases remain owned by the memory
+        # authority until the scheduler consumes them.
         self._ack(command, RankPhase.FINALIZED)
         with self._changed:
             self._attempts.pop(identity, None)
@@ -1058,18 +1100,21 @@ class RankZeroLinkOrchestrator:
         with self._changed:
             return self._changed.wait_for(lambda: not self._active, timeout)
 
+    @staticmethod
+    def _abortable(state: _LinkAttempt) -> bool:
+        # RELEASE is issued only after every shard has a real DMA completion.
+        # From that point onward some ranks may already have bound/published
+        # the destination or released the source, so rollback would fabricate
+        # a globally consistent owner.  Retain ownership and fail loudly.
+        return state.phase in {CommandKind.PREPARE, CommandKind.START}
+
     def cancel_active(self, reason: str) -> int:
-        """Cancel uncommitted attempts; committed RELEASE attempts only drain."""
+        """Cancel attempts only before the all-rank DMA completion fence."""
 
         commands = []
         with self._changed:
             for (key, attempt_id), state in tuple(self._active.items()):
-                if state.phase not in {
-                    CommandKind.PREPARE,
-                    CommandKind.START,
-                    CommandKind.RELEASE,
-                    CommandKind.HANDOFF,
-                }:
+                if not self._abortable(state):
                     continue
                 if self._coordinator.outcome(key, attempt_id) is not AttemptOutcome.ACTIVE:
                     continue
@@ -1089,7 +1134,11 @@ class RankZeroLinkOrchestrator:
                 source_owner=plan.source_owner,
                 target_owner=plan.target_owner,
                 lease_id=plan.lease_id,
-                required_commit_phase=RankPhase.RELEASED,
+                required_commit_phase=(
+                    RankPhase.BOUND
+                    if plan.operation is TransferOperation.HOST_STORE
+                    else RankPhase.RELEASED
+                ),
                 payload=plan.command_payload(),
             )
             identity = (plan.key, command.attempt)
@@ -1180,6 +1229,16 @@ class RankZeroLinkOrchestrator:
             if state.phase is CommandKind.RELEASE and self._coordinator.group_reached(
                 ack.key, ack.attempt, RankPhase.BOUND
             ):
+                if state.plan.operation is TransferOperation.HOST_STORE:
+                    self._coordinator.commit(ack.key, ack.attempt)
+                    command = self._coordinator.issue_finalize(
+                        ack.key,
+                        ack.attempt,
+                        payload=state.handoff_payload,
+                    )
+                    state.phase = CommandKind.FINALIZE
+                    self._broadcast(command)
+                    return
                 command = self._coordinator.issue_handoff(
                     ack.key,
                     ack.attempt,
@@ -1191,12 +1250,13 @@ class RankZeroLinkOrchestrator:
             if state.phase is CommandKind.HANDOFF and self._coordinator.group_reached(
                 ack.key, ack.attempt, RankPhase.RELEASED
             ):
-                command = self._coordinator.issue_activate(
+                self._coordinator.commit(ack.key, ack.attempt)
+                command = self._coordinator.issue_finalize(
                     ack.key,
                     ack.attempt,
                     payload=state.handoff_payload,
                 )
-                state.phase = CommandKind.ACTIVATE
+                state.phase = CommandKind.FINALIZE
                 self._broadcast(command)
                 return
             if state.phase is CommandKind.ACTIVATE and self._coordinator.group_reached(
@@ -1322,6 +1382,12 @@ class RankZeroLinkOrchestrator:
             ) is not AttemptOutcome.ACTIVE:
                 return
             reason = f"{failure.participant}: {failure.detail}"
+            if not self._abortable(state):
+                raise RuntimeError(
+                    reason
+                    + "; failure followed the all-rank DMA fence, so ownership "
+                    "was retained instead of attempting an unsafe rollback"
+                )
             command = self._coordinator.request_abort(
                 failure.key,
                 failure.attempt,

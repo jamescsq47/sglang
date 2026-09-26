@@ -533,6 +533,12 @@ class AgenticDefaultPhysicalProvider:
     def _make_source_direct_handler(self):
         def prepare(command: GroupCommand):
             _req, lease, snapshot = self._source_entry(command)
+            bridge = (
+                self.context.p_memory_bridge
+                if self.role == "prefill"
+                else self.context.d_memory_bridge
+            )
+            bridge.wait_forward_fence(lease.lease_id)
             values = _values(command)
             token_count = int(values["token_count"])
             state = snapshot.state_indices or None
@@ -728,7 +734,18 @@ class AgenticDefaultPhysicalProvider:
             raise RuntimeError("group handoff failed to publish target ready")
 
     def _host_source_payload(self, command: GroupCommand):
-        _req, _lease, snapshot = self._source_entry(command)
+        _req, lease, snapshot = self._source_entry(command)
+        context = getattr(self, "context", None)
+        role = getattr(self, "role", None)
+        bridge = None
+        if context is not None and role in {"prefill", "decode"}:
+            bridge = (
+                context.p_memory_bridge
+                if role == "prefill"
+                else context.d_memory_bridge
+            )
+        if bridge is not None:
+            bridge.wait_forward_fence(lease.lease_id)
         values = _values(command)
         token_count = int(values["token_count"])
         state = None
@@ -974,6 +991,10 @@ class AgenticDefaultPhysicalProvider:
             and plan.path is TransferPath.D2P_HOST
         ):
             self._policy.committed(plan.key)
+            # This group commit follows all target READ receipts and all
+            # source-shard Host releases, so it is the authoritative TP-wide
+            # capacity epoch (not a rank-local allocator callback).
+            self._policy.host_memory_available()
         elif (
             self._p2d_policy is not None
             and plan.path is TransferPath.P2D_DIRECT
@@ -984,6 +1005,11 @@ class AgenticDefaultPhysicalProvider:
             and plan.operation is TransferOperation.HOST_RESTORE
         ):
             self._p2d_policy.committed(plan.key)
+            if (
+                plan.path is TransferPath.P2D_HOST
+                and plan.operation is TransferOperation.HOST_RESTORE
+            ):
+                self._p2d_policy.host_memory_available()
         # These are transient physical-attempt inputs, not lifecycle history.
         # Retaining them would grow memory with every agent turn.
         self._pending_candidates.pop(plan.key, None)
@@ -1016,8 +1042,7 @@ class AgenticDefaultPhysicalProvider:
             self._policy.direct_rejected(plan.key)
         elif (
             self._policy is not None
-            and
-            plan.path is TransferPath.D2P_HOST
+            and plan.path is TransferPath.D2P_HOST
             and plan.operation is TransferOperation.HOST_RESTORE
         ):
             self._policy.restore_capacity_rejected(plan.key)
@@ -1033,6 +1058,19 @@ class AgenticDefaultPhysicalProvider:
             and plan.operation is TransferOperation.HOST_RESTORE
         ):
             self._p2d_policy.restore_capacity_rejected(plan.key)
+        elif plan.operation is TransferOperation.HOST_STORE:
+            # Host-full is ordinary backpressure: the source remains the sole
+            # owner and retries on an arena-release edge.  Other Host-store
+            # failures are engineering/correctness failures and must stop the
+            # runtime instead of being disguised as capacity pressure.
+            if "source-local Host arena is full" not in str(reason):
+                raise RuntimeError(
+                    f"non-capacity Host-store failure for {plan.key}: {reason}"
+                )
+            if plan.path is TransferPath.D2P_HOST and self._policy is not None:
+                self._policy.host_store_rejected(plan.key)
+            elif plan.path is TransferPath.P2D_HOST and self._p2d_policy is not None:
+                self._p2d_policy.host_store_rejected(plan.key)
 
     def memory_available(self, *, remote_role: str) -> None:
         """Consume a TCP capacity edge; never called from a scheduler poll."""
