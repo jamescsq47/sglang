@@ -71,7 +71,7 @@ class FakeNixl:
         self.released.append(handle)
 
 
-def test_peer_metadata_not_removed_under_another_live_read():
+def test_peer_connection_stays_live_across_sequential_reads():
     agent = FakeNixl()
     transport = RemoteHostTransport(agent)
     sources = [export(transport, rank, 2) for rank in range(2)]
@@ -84,7 +84,7 @@ def test_peer_metadata_not_removed_under_another_live_read():
     assert not agent.removed_peers
     transfers[1].poll()
     transport.retire_read(sources[1].shard.export_id, "read-epoch")
-    assert agent.removed_peers == ["source-agent"]
+    assert not agent.removed_peers
 
 
 def export(transport, rank=0, size=1):

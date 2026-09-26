@@ -398,14 +398,6 @@ class RemoteHostTransport:
         self.reads = {}
         self._remote_peers = set()
 
-    def _retire_unused_peers(self):
-        active = {getattr(record[1], "peer", None) for record in self.reads.values()}
-        for peer in self._remote_peers - active:
-            # Called only under the agent lock after all handles for this peer
-            # are fenced. Future reads reload fresh partial metadata.
-            self.agent.remove_remote_agent(peer)
-            self._remote_peers.remove(peer)
-
     def retire_read(self, export_id: str, read_id: str) -> bool:
         """Forget a physically fenced attempt after control-plane retirement.
 
@@ -416,7 +408,6 @@ class RemoteHostTransport:
         with self.lock:
             record = self.reads.get(key)
             if record is None:
-                self._retire_unused_peers()
                 return False
             pending = record[1]
             if pending.handle is not None or (
@@ -424,7 +415,11 @@ class RemoteHostTransport:
             ):
                 raise RuntimeError("cannot retire an unfenced READ handle")
             self.reads.pop(key)
-            self._retire_unused_peers()
+            # A TP rank reuses the same source agent for many Host snapshots.
+            # NIXL's remove_remote_agent disconnects that agent, not merely
+            # this snapshot's registration; repeatedly disconnecting during
+            # concurrent READs can invalidate another transfer. Keep the
+            # peer connection until this dedicated I/O agent exits.
             return True
 
     def export(self, *, snapshot_id, tp_rank, tp_size, layout, token_count, address,
@@ -606,9 +601,8 @@ class RemoteHostTransport:
                 if handle is None:
                     raise RuntimeError("NIXL returned no READ handle")
             except Exception:
-                # No transfer is posted by initialize. Do not retain imported
-                # source registrations after a rejected descriptor/handle.
-                self._retire_unused_peers()
+                # No transfer is posted by initialize. Keep the shared peer
+                # connection live for other READs even if this attempt fails.
                 raise
             pending = RemoteHostRead(self, shard, str(read_id), handle)
             pending.peer = peer
