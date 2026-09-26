@@ -332,6 +332,32 @@ def test_first_sample_snapshot_excludes_uncomputed_token(monkeypatch, prompt_tok
     assert int(state_indices_for_req(req, ("mamba",), checkpoint_tokens=896, page_size=64)[0][0]) == 2
 
 
+@pytest.mark.parametrize(
+    "tracked,requested,expected", [(1792, 1787, 1728), (832, 778, 768)]
+)
+def test_snapshot_uses_previous_checkpoint_for_partial_tracked_page(
+    monkeypatch, tracked, requested, expected
+):
+    from sglang.srt.disaggregation.agentic_hybrid_transfer import (
+        snapshot_token_count_for_req,
+        state_indices_for_req,
+    )
+
+    monkeypatch.setenv("SGLANG_AGENTIC_KV_MAMBA_PROMPT_CHECKPOINT", "false")
+    req = NS(
+        mamba_pool_idx=1,
+        mamba_last_track_seqlen=tracked,
+        mamba_next_track_idx=1,
+        mamba_ping_pong_track_buffer=[2, 3],
+    )
+    assert snapshot_token_count_for_req(req, requested, ("mamba",), 64) == expected
+    assert int(
+        state_indices_for_req(
+            req, ("mamba",), checkpoint_tokens=expected, page_size=64
+        )[0][0]
+    ) == 3
+
+
 def adapter():
     obj = object.__new__(dma.RegisteredHybridHostSnapshot)
     obj.attention = NS(path="unused", file_offset=0)

@@ -462,12 +462,14 @@ def snapshot_token_count_for_req(
         return requested_tokens
     tracked = int(tracked)
     if tracked > requested_tokens:
-        # Decode accounts a sampled stop token in its committed recurrent
-        # state, while the reusable logical prefix intentionally excludes that
-        # token.  If the stop lands exactly on a tracking boundary, retain the
-        # preceding ping-pong checkpoint and let P recompute at most one page.
+        # The recurrent tracker advances at page boundaries while the logical
+        # reusable prefix excludes the sampled stop/tool token.  The request
+        # may therefore finish anywhere inside the just-tracked page, not only
+        # one token before its boundary.  Pair the preceding retained Mamba
+        # checkpoint with the same page-aligned Attention prefix; P recomputes
+        # only that final partial page.
         previous = tracked - int(page_size)
-        if tracked == requested_tokens + 1 and previous >= 0:
+        if previous <= requested_tokens < tracked and previous >= 0:
             if previous > 0:
                 # Validate now, before publishing a Direct/Host candidate.
                 # Lazy mode does not retain this older checkpoint and must
