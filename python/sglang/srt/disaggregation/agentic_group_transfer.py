@@ -1200,8 +1200,14 @@ class RankZeroLinkOrchestrator:
                     }
                     for participant in self._coordinator.participants
                 ]
+                # Later activation commands still need the immutable target
+                # generation from the original plan.  The source and target
+                # generations differ on D→P returns.
                 state.handoff_payload = MappingProxyType(
-                    {"rank_results": rank_results}
+                    {
+                        "rank_results": rank_results,
+                        "transfer": dict(state.plan.payload),
+                    }
                 )
                 command = self._coordinator.issue_release(
                     ack.key,

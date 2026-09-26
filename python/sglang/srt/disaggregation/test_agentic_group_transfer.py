@@ -254,6 +254,7 @@ def drive_attempt(orchestrator, coordinator, commands, plan):
         for participant in coordinator.participants:
             send_ack(orchestrator, participant, start, phase)
     release = commands[-1]
+    assert release.payload["transfer"] == dict(plan.payload)
     for participant in coordinator.participants:
         send_ack(orchestrator, participant, release, RankPhase.BOUND)
     if plan.operation is not TransferOperation.HOST_STORE:
@@ -280,6 +281,7 @@ def drive_attempt(orchestrator, coordinator, commands, plan):
             send_ack(orchestrator, participant, publish, RankPhase.ACTIVATION_READY)
         ticket = commands[-1]
         assert ticket.kind is CommandKind.ISSUE_ACTIVATION_TICKET
+        assert ticket.payload["transfer"] == dict(plan.payload)
         for participant in coordinator.participants:
             send_ack(orchestrator, participant, ticket, RankPhase.ACTIVATED)
     finalize = commands[-1]
@@ -287,6 +289,33 @@ def drive_attempt(orchestrator, coordinator, commands, plan):
     for participant in coordinator.participants:
         send_ack(orchestrator, participant, finalize, RankPhase.FINALIZED)
     return attempt
+
+
+def test_activation_ticket_retains_next_generation_for_d2p():
+    coordinator = LinkLifecycleCoordinator.from_endpoint_sizes(
+        "run", "d-p", [("source", "d", 2), ("target", "p", 2)]
+    )
+    commands = []
+    orchestrator = RankZeroLinkOrchestrator(
+        coordinator, broadcast=commands.append
+    )
+    plan = GroupTransferPlan(
+        GenerationKey("run", "next-turn", 0),
+        TransferPath.D2P_DIRECT,
+        TransferOperation.DIRECT,
+        Owner.D_GPU,
+        Owner.P_GPU,
+        "next-turn-lease",
+        {"parent_tokens": 64, "prompt_tokens": 128, "target_generation": 1},
+    )
+    drive_attempt(orchestrator, coordinator, commands, plan)
+    ticket = next(
+        command
+        for command in commands
+        if command.kind is CommandKind.ISSUE_ACTIVATION_TICKET
+    )
+    assert ticket.key.generation == 0
+    assert ticket.payload["transfer"]["target_generation"] == 1
 
 
 def test_direct_commit_waits_for_source8_and_target8_fences():
