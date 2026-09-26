@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import os
 import threading
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional, Sequence
 
@@ -148,10 +149,20 @@ class _DispatchExecutor(TransferExecutor):
 
 
 class _DispatchHandler(RankPathHandler):
-    def __init__(self, select: Callable[[GroupCommand], RankPathHandler]) -> None:
+    def __init__(
+        self,
+        select: Callable[[GroupCommand], RankPathHandler],
+        native_stream: Optional[Callable[[], Any]] = None,
+    ) -> None:
         self._select = select
+        self._native_stream = native_stream
         self._chosen: dict[tuple[GenerationKey, int], RankPathHandler] = {}
         self._lock = threading.Lock()
+
+    def _native_context(self):
+        if self._native_stream is None:
+            return nullcontext()
+        return torch.cuda.stream(self._native_stream())
 
     @staticmethod
     def _key(command: GroupCommand):
@@ -165,7 +176,8 @@ class _DispatchHandler(RankPathHandler):
                 raise RuntimeError("duplicate handler prepare for one attempt")
             self._chosen[key] = handler
         try:
-            return handler.prepare(command)
+            with self._native_context():
+                return handler.prepare(command)
         except BaseException:
             with self._lock:
                 self._chosen.pop(key, None)
@@ -182,18 +194,21 @@ class _DispatchHandler(RankPathHandler):
         self._handler(command).finish_io(command, prepared, completion)
 
     def prepare_handoff(self, command, prepared, completion):
-        self._handler(command).prepare_handoff(command, prepared, completion)
+        with self._native_context():
+            self._handler(command).prepare_handoff(command, prepared, completion)
 
     def commit(self, command, prepared, completion):
         try:
-            self._handler(command).commit(command, prepared, completion)
+            with self._native_context():
+                self._handler(command).commit(command, prepared, completion)
         finally:
             with self._lock:
                 self._chosen.pop(self._key(command), None)
 
     def abort(self, command, prepared, completion):
         try:
-            self._handler(command).abort(command, prepared, completion)
+            with self._native_context():
+                self._handler(command).abort(command, prepared, completion)
         finally:
             with self._lock:
                 self._chosen.pop(self._key(command), None)
@@ -469,7 +484,8 @@ class AgenticDefaultPhysicalProvider:
         self._source_direct = self._make_source_direct_handler()
         self._handlers = {
             path: _DispatchHandler(
-                lambda command, path=path: self._select_handler(path, command)
+                lambda command, path=path: self._select_handler(path, command),
+                native_stream=lambda: self.scheduler.schedule_stream,
             )
             for path in TransferPath
         }
