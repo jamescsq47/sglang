@@ -237,10 +237,11 @@ def mha_page_read_spans(
 class RemoteHostExport:
     """One source rank's pinned, durable extent. No automatic expiry/free."""
 
-    def __init__(self, transport, shard, registration, keepalive):
+    def __init__(self, transport, shard, registration, keepalive, *, owns_registration=True):
         self.transport = transport
         self.shard = shard
         self.registration = registration
+        self.owns_registration = bool(owns_registration)
         # Holding the Python object does NOT replace a ledger eviction pin.
         self.keepalive = keepalive
         self.reader_id = None
@@ -263,9 +264,10 @@ class RemoteHostExport:
                 return True
             if self.reader_id is not None:
                 return False
-            self.transport.agent.deregister_memory(
-                self.registration, backends=self.transport.backends
-            )
+            if self.owns_registration:
+                self.transport.agent.deregister_memory(
+                    self.registration, backends=self.transport.backends
+                )
             self.closed = True
             self.keepalive = None
             self.transport.exports.pop(self.shard.export_id, None)
@@ -288,9 +290,10 @@ class RemoteHostExport:
                 raise ValueError("ACK does not match this export/read lease")
             if self.closed:
                 return False
-            self.transport.agent.deregister_memory(
-                self.registration, backends=self.transport.backends
-            )
+            if self.owns_registration:
+                self.transport.agent.deregister_memory(
+                    self.registration, backends=self.transport.backends
+                )
             self.closed = True
             self.keepalive = None
             self.transport.exports.pop(self.shard.export_id, None)
@@ -397,6 +400,30 @@ class RemoteHostTransport:
         # suppress duplicate posts until the authoritative attempt is retired.
         self.reads = {}
         self._remote_peers = set()
+        self._shared_registrations = []
+
+    def register_shared_arena(self, address: int, byte_size: int, keepalive: Any):
+        """Publish one stable registration for a recyclable Host arena.
+
+        A per-snapshot registration cannot safely reuse the same virtual
+        address: NIXL retains remote metadata by address and rejects a new
+        rkey at that address. The arena registration lives with this transport.
+        """
+        if address <= 0 or byte_size <= 0 or keepalive is None:
+            raise ValueError("invalid shared Host arena registration")
+        with self.lock:
+            registration = self.agent.register_memory(
+                [(int(address), int(byte_size), 0, "")], "DRAM", backends=self.backends
+            )
+            try:
+                metadata = self.agent.get_partial_agent_metadata(
+                    registration, inc_conn_info=True, backends=self.backends
+                )
+            except Exception:
+                self.agent.deregister_memory(registration, backends=self.backends)
+                raise
+            self._shared_registrations.append((registration, keepalive))
+            return registration, metadata
 
     def retire_read(self, export_id: str, read_id: str) -> bool:
         """Forget a physically fenced attempt after control-plane retirement.
@@ -423,7 +450,8 @@ class RemoteHostTransport:
             return True
 
     def export(self, *, snapshot_id, tp_rank, tp_size, layout, token_count, address,
-               byte_size, keepalive) -> RemoteHostExport:
+               byte_size, keepalive, shared_registration=None,
+               shared_metadata=None) -> RemoteHostExport:
         """Call ONLY after local D2H fence + authoritative eviction pin."""
         shard = HostShard(
             str(snapshot_id),
@@ -441,31 +469,38 @@ class RemoteHostTransport:
         if keepalive is None:
             raise ValueError("a live source mapping reference is required")
         with self.lock:
-            registration = None
-            try:
-                registration = self.agent.register_memory(
-                    [(shard.address, shard.byte_size, 0, "")], "DRAM", backends=self.backends
-                )
-                metadata = self.agent.get_partial_agent_metadata(
-                    registration, inc_conn_info=True, backends=self.backends
-                )
-            except Exception as error:
-                # Registration itself may partially succeed before raising. A
-                # failed cleanup must never drop the last mapping reference.
-                record = {"registration": registration, "keepalive": keepalive,
-                          "error": repr(error)}
-                self.quarantined[shard.export_id] = record
-                if registration is not None:
-                    try:
-                        self.agent.deregister_memory(registration, backends=self.backends)
-                    except Exception as cleanup_error:
-                        record["cleanup_error"] = repr(cleanup_error)
-                    else:
-                        self.quarantined.pop(shard.export_id)
-                raise
+            if (shared_registration is None) != (shared_metadata is None):
+                raise ValueError("shared registration and metadata must be paired")
+            if shared_registration is not None:
+                registration, metadata = shared_registration, shared_metadata
+            else:
+                registration = None
+                try:
+                    registration = self.agent.register_memory(
+                        [(shard.address, shard.byte_size, 0, "")], "DRAM", backends=self.backends
+                    )
+                    metadata = self.agent.get_partial_agent_metadata(
+                        registration, inc_conn_info=True, backends=self.backends
+                    )
+                except Exception as error:
+                    # Registration itself may partially succeed before raising.
+                    record = {"registration": registration, "keepalive": keepalive,
+                              "error": repr(error)}
+                    self.quarantined[shard.export_id] = record
+                    if registration is not None:
+                        try:
+                            self.agent.deregister_memory(registration, backends=self.backends)
+                        except Exception as cleanup_error:
+                            record["cleanup_error"] = repr(cleanup_error)
+                        else:
+                            self.quarantined.pop(shard.export_id)
+                    raise
             shard = HostShard(**dict(shard.to_dict(), metadata_b64=
                                     base64.b64encode(metadata).decode("ascii")))
-            exported = RemoteHostExport(self, shard, registration, keepalive)
+            exported = RemoteHostExport(
+                self, shard, registration, keepalive,
+                owns_registration=shared_registration is None,
+            )
             self.exports[shard.export_id] = exported
             return exported
 

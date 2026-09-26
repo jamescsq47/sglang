@@ -443,22 +443,24 @@ class AgenticDefaultPhysicalProvider:
             TransferPath.P2D_DIRECT: NixlDirectIOExecutor(max_workers=4),
         }
 
+        self._host_arena = SourceLocalHostArena(
+            direction=HostDirection(source_direction), device_pool=kv_pool
+        )
         self._source_host_worker = RemoteHostRankWorker(
             kv_pool,
             int(scheduler.token_to_kv_pool_allocator.page_size),
             tp_rank,
             tp_size,
             source_direction,
+            source_arena=self._host_arena,
         )
+        self._source_host_worker.prewarm_source_arena()
         self._target_host_worker = RemoteHostRankWorker(
             kv_pool,
             int(scheduler.token_to_kv_pool_allocator.page_size),
             tp_rank,
             tp_size,
             target_direction,
-        )
-        self._host_arena = SourceLocalHostArena(
-            direction=HostDirection(source_direction), device_pool=kv_pool
         )
         self._host_store_path = make_source_host_store_path(
             self._host_arena,

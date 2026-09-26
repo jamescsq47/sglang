@@ -6,6 +6,9 @@ real NIXL fence.  It never scans a directory or makes a scheduling decision.
 """
 from __future__ import annotations
 
+import ctypes
+import mmap
+import os
 import threading
 import time
 import uuid
@@ -49,6 +52,7 @@ class RemoteHostRankWorker:
         direction: str,
         *,
         transport_factory=None,
+        source_arena=None,
     ):
         if direction not in {"p2d", "d2p"}:
             raise ValueError("invalid Host transfer direction")
@@ -90,6 +94,11 @@ class RemoteHostRankWorker:
             * int(full_pool.store_dtype.itemsize)
         )
         self._factory = transport_factory
+        self._source_arena = source_arena
+        self._arena_mapping = None
+        self._arena_base = 0
+        self._arena_registration = None
+        self._arena_metadata = None
         self._transport = None
         self._destination_registered = False
         self._init_lock = threading.RLock()
@@ -136,6 +145,36 @@ class RemoteHostRankWorker:
                 self._destination_registered = True
             return self._transport
 
+    def prewarm_source_arena(self) -> None:
+        """Register a recyclable source arena once, before serving requests."""
+        if self._source_arena is None:
+            return
+        with self._init_lock:
+            if self._arena_registration is not None:
+                return
+            arena = self._source_arena
+            fd = os.open(arena.path, os.O_RDWR)
+            try:
+                mapping = mmap.mmap(
+                    fd, int(arena.capacity_bytes), access=mmap.ACCESS_WRITE
+                )
+            finally:
+                os.close(fd)
+            try:
+                base = ctypes.addressof(ctypes.c_char.from_buffer(mapping))
+                # Retain the mapping even if NIXL reports an ambiguous partial
+                # registration failure; only process teardown may then unmap it.
+                self._arena_mapping = mapping
+                transport = self._transport_for_worker(destination=False)
+                registration, metadata = transport.register_shared_arena(
+                    base, int(arena.capacity_bytes), mapping
+                )
+            except Exception:
+                raise
+            self._arena_base = base
+            self._arena_registration = registration
+            self._arena_metadata = metadata
+
     def export_snapshot(self, snapshot_id: str, snapshot) -> HostShard:
         """Export after the source-local D2H event has completed."""
         with self._init_lock:
@@ -147,8 +186,20 @@ class RemoteHostRankWorker:
                     f"previous Host export is still quarantined: {snapshot_id}"
                 )
             keepalive = snapshot
-            address = int(snapshot.kv_buffer.data_ptr())
-            if self.hybrid is not None:
+            address = int(snapshot.kv_buffer.data_ptr()) if self._source_arena is None and self.hybrid is None else 0
+            shared = self._source_arena is not None
+            if shared:
+                self.prewarm_source_arena()
+                offset = int(snapshot.file_offset)
+                if (
+                    snapshot.path != self._source_arena.path
+                    or offset < 0
+                    or offset + int(snapshot.byte_size)
+                    > int(self._source_arena.capacity_bytes)
+                ):
+                    raise ValueError("snapshot is outside its registered Host arena")
+                address = self._arena_base + offset
+            elif self.hybrid is not None:
                 expected = self.hybrid.layout(snapshot.token_count).total_bytes
                 if int(snapshot.byte_size) != expected:
                     raise ValueError("incomplete hybrid Host snapshot")
@@ -166,6 +217,8 @@ class RemoteHostRankWorker:
                 address=address,
                 byte_size=int(snapshot.byte_size),
                 keepalive=keepalive,
+                shared_registration=(self._arena_registration if shared else None),
+                shared_metadata=(self._arena_metadata if shared else None),
             )
             self._exports[snapshot_id] = exported
             return exported.shard

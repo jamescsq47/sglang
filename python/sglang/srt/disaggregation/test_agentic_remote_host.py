@@ -87,6 +87,26 @@ def test_peer_connection_stays_live_across_sequential_reads():
     assert not agent.removed_peers
 
 
+def test_shared_arena_registration_survives_extent_reuse():
+    agent = FakeNixl()
+    transport = RemoteHostTransport(agent)
+    backing = object()
+    registration, metadata = transport.register_shared_arena(1000, 4096, backing)
+    layout = layout_fingerprint({"dtype": "fp16", "heads": 1, "dim": 2, "layers": 1})
+    kwargs = dict(
+        tp_rank=0, tp_size=1, layout=layout, token_count=3,
+        address=1000, byte_size=24, keepalive=backing,
+        shared_registration=registration, shared_metadata=metadata,
+    )
+    first = transport.export(snapshot_id="first:0", **kwargs)
+    assert first.discard_unclaimed()
+    second = transport.export(snapshot_id="second:0", **kwargs)
+    assert second.shard.metadata_b64 == first.shard.metadata_b64
+    assert second.shard.address == first.shard.address
+    assert second.discard_unclaimed()
+    assert not agent.deregistered
+
+
 def export(transport, rank=0, size=1):
     return transport.export(snapshot_id="request:turn:epoch", tp_rank=rank,
         tp_size=size, layout=layout_fingerprint({"dtype": "fp16", "heads": 1,
