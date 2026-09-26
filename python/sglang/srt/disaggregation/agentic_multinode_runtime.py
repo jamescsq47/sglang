@@ -576,7 +576,7 @@ class AgenticMultiNodeRuntime:
 
     def _after_command(self, value: GroupCommand) -> None:
         if (
-            value.kind is CommandKind.FINALIZE
+            value.kind is CommandKind.ISSUE_ACTIVATION_TICKET
             and self.participant.rank == 0
             and _scheduler_target(value.target_owner)
             and self.participant.role == _owner_role(value.target_owner)
@@ -765,26 +765,22 @@ class AgenticMultiNodeRuntime:
         return self._activation_tickets.get(timeout=timeout)
 
     def activate_staged(self, ticket: EndpointActivationTicket) -> None:
-        """Validate a ready ticket carried by the endpoint TP0 broadcast.
-
-        Target publication already committed in the background HANDOFF command
-        after the all-rank bind fence.  The scheduler therefore performs no
-        transport or ownership mutation here; it only consumes the matching
-        ready lease through its memory bridge.
-        """
+        """Publish the locally staged lease in endpoint-TP0 broadcast order."""
 
         if ticket.target_role != self.participant.role:
             raise ValueError("activation ticket belongs to another endpoint role")
+        self.executor.activate_staged(
+            ticket.key, ticket.attempt, ticket.lease_id
+        )
 
     def confirm_scheduler_adopted(self, ticket: EndpointActivationTicket) -> None:
-        """Validate the endpoint role after native scheduler adoption.
-
-        The data-plane attempt is retired before this edge.  Ready-queue
-        ownership, rather than a live network transaction, protects the lease.
-        """
+        """ACK only after this rank inserted the request for compute."""
 
         if ticket.target_role != self.participant.role:
             raise ValueError("activation ticket belongs to another endpoint role")
+        self.executor.confirm_scheduler_adopted(
+            ticket.key, ticket.attempt, ticket.lease_id
+        )
 
     def take_terminal(self, timeout: Optional[float] = None) -> RuntimeTerminal:
         return self._terminals.get(timeout=timeout)

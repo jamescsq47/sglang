@@ -490,16 +490,14 @@ def test_tp8_out_of_order_readiness_gates_prepare_and_target_scheduler_ticket():
             runtime.activate_staged(ticket)
             runtime.confirm_scheduler_adopted(ticket)
         time.sleep(0.05)
-        # The data-plane transaction retires after every target shard is
-        # published ready; scheduler adoption is an independent consumption
-        # edge and cannot retain source HBM or controller slots.
-        assert p0.orchestrator.active_count == 0
+        # Source HBM was released at ACTIVATE, but the control attempt remains
+        # live until every target rank confirms native scheduler adoption.
+        assert p0.orchestrator.active_count == 1
+        target_runtimes[-1].activate_staged(ticket)
+        target_runtimes[-1].confirm_scheduler_adopted(ticket)
         terminal = p0.take_terminal(timeout=10)
         assert terminal.committed
         assert committed == [(plan.key, terminal.attempt)]
-
-        target_runtimes[-1].activate_staged(ticket)
-        target_runtimes[-1].confirm_scheduler_adopted(ticket)
         assert aborted == []
     finally:
         _close(relay, runtimes, coordinator)

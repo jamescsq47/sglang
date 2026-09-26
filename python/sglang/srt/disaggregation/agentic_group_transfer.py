@@ -851,25 +851,10 @@ class RankLocalCommandExecutor:
                 raise RuntimeError("HANDOFF arrived before local bind preparation")
             if local.completion.state is not PhysicalState.SUCCEEDED:
                 raise RuntimeError("failed physical attempt cannot hand off")
-        # HANDOFF is broadcast only after every target shard reported BOUND.
-        # Commit both halves now: publish the immutable target lease to its
-        # ready queue and release the old source.  Scheduler adoption is a
-        # later, one-way consumption edge and is not part of data ownership.
-        source_role = self._owner_role(command.source_owner)
-        target_role = self._owner_role(command.target_owner)
-        if (
-            self.participant.role in {source_role, "source"}
-            and not local.source_released
-        ):
-            local.handler.commit(command, local.prepared, local.completion)
-        if self.participant.role in {target_role, "target"}:
-            local.handler.commit(command, local.prepared, local.completion)
-        with self._lock:
-            if self.participant.role in {source_role, "source"}:
-                local.source_released = True
-            if self.participant.role in {target_role, "target"}:
-                local.activation_published = True
-            local.activation_staged = True
+        # No rank publishes scheduler-visible work here.  HANDOFF only proves
+        # that every target shard is locally bound; the following ACTIVATE
+        # command releases source HBM, and the native TP activation ticket
+        # publishes all target shards in one rank-consistent transaction.
         self._ack(command, RankPhase.RELEASED)
 
     def _activate(self, command: GroupCommand) -> None:
@@ -1250,13 +1235,12 @@ class RankZeroLinkOrchestrator:
             if state.phase is CommandKind.HANDOFF and self._coordinator.group_reached(
                 ack.key, ack.attempt, RankPhase.RELEASED
             ):
-                self._coordinator.commit(ack.key, ack.attempt)
-                command = self._coordinator.issue_finalize(
+                command = self._coordinator.issue_activate(
                     ack.key,
                     ack.attempt,
                     payload=state.handoff_payload,
                 )
-                state.phase = CommandKind.FINALIZE
+                state.phase = CommandKind.ACTIVATE
                 self._broadcast(command)
                 return
             if state.phase is CommandKind.ACTIVATE and self._coordinator.group_reached(
