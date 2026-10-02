@@ -9032,9 +9032,20 @@ class Scheduler(
 
         workset_lease = getattr(req, "_agentic_p_workset_lease", None)
         if workset_lease is not None:
-            self.agentic_p_workset_broker.release_handed(
-                workset_lease.snapshot_id, workset_lease, req=req
-            )
+            workset_owner = getattr(req, "_agentic_p_workset_broker", None)
+            release_abort = getattr(workset_owner, "release_abort", None)
+            if release_abort is not None:
+                # Multi-node V2 owns physical pages through its sole memory
+                # authority; the legacy scheduler broker is intentionally
+                # absent and must not be used for this lease.
+                release_abort(req, reason="request_aborted")
+            else:
+                legacy_broker = workset_owner or self.agentic_p_workset_broker
+                if legacy_broker is None:
+                    raise RuntimeError("workset lease has no releasing authority")
+                legacy_broker.release_handed(
+                    workset_lease.snapshot_id, workset_lease, req=req
+                )
         for name in (
             "_agentic_workset_backed",
             "_agentic_p_workset_lease",

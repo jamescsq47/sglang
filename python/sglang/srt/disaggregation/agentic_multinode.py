@@ -92,6 +92,7 @@ class MultiNodeConfig:
     peer_tp_size: int
     control_endpoint: str
     control_token: str
+    endpoint_specs: tuple[tuple[str, str, int], ...] = ()
 
     @property
     def endpoint(self) -> tuple[str, int]:
@@ -263,14 +264,61 @@ def load_multinode_config(
         raise ValueError("control endpoint group must equal this engine ID")
     if endpoint_role != role:
         raise ValueError("control endpoint role must equal this engine role")
-    peer_group = _identity(env, GROUP_PREFIX + "PEER_GROUP")
-    peer_role = _required(env, GROUP_PREFIX + "PEER_ROLE")
-    if peer_group == endpoint_group or peer_role not in {"prefill", "decode"}:
-        raise ValueError("control peer identity is invalid")
-    if {endpoint_role, peer_role} != {"prefill", "decode"}:
-        raise ValueError("one Prefill and one Decode endpoint are required")
+    raw_endpoints = env.get(GROUP_PREFIX + "ENDPOINTS", "").strip()
+    endpoint_specs: tuple[tuple[str, str, int], ...]
+    if raw_endpoints:
+        try:
+            values = json.loads(raw_endpoints)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("ENDPOINTS must be valid JSON") from exc
+        if not isinstance(values, list):
+            raise ValueError("ENDPOINTS must be a JSON list")
+        parsed = []
+        for item in values:
+            if not isinstance(item, Mapping):
+                raise ValueError("each ENDPOINTS entry must be an object")
+            group = str(item.get("endpoint_group", ""))
+            item_role = str(item.get("role", ""))
+            size = int(item.get("size", 0))
+            if (
+                not _IDENTITY.fullmatch(group)
+                or item_role not in {"prefill", "decode"}
+                or not 1 <= size <= 8
+            ):
+                raise ValueError("invalid ENDPOINTS entry")
+            parsed.append((item_role, group, size))
+        endpoint_specs = tuple(parsed)
+        groups = [group for _role, group, _size in endpoint_specs]
+        if len(set(groups)) != len(groups):
+            raise ValueError("ENDPOINTS groups must be unique")
+        if (endpoint_role, endpoint_group, tp_size) not in endpoint_specs:
+            raise ValueError("local endpoint is absent from ENDPOINTS")
+        if {role for role, _group, _size in endpoint_specs} != {
+            "prefill",
+            "decode",
+        }:
+            raise ValueError("ENDPOINTS requires Prefill and Decode groups")
+        opposite = next(
+            (entry for entry in endpoint_specs if entry[0] != endpoint_role),
+            None,
+        )
+        assert opposite is not None
+        peer_role, peer_group, peer_tp_size = opposite
+    else:
+        peer_group = _identity(env, GROUP_PREFIX + "PEER_GROUP")
+        peer_role = _required(env, GROUP_PREFIX + "PEER_ROLE")
+        if peer_group == endpoint_group or peer_role not in {"prefill", "decode"}:
+            raise ValueError("control peer identity is invalid")
+        if {endpoint_role, peer_role} != {"prefill", "decode"}:
+            raise ValueError("one Prefill and one Decode endpoint are required")
+        endpoint_specs = (
+            (endpoint_role, endpoint_group, tp_size),
+            (peer_role, peer_group, peer_tp_size),
+        )
     coordinator_group = _identity(env, GROUP_PREFIX + "COORDINATOR_GROUP")
-    if coordinator_group not in {endpoint_group, peer_group}:
+    if coordinator_group not in {
+        group for _role, group, _size in endpoint_specs
+    }:
         raise ValueError("control coordinator must be one link endpoint")
 
     forbidden = (
@@ -315,6 +363,7 @@ def load_multinode_config(
         peer_tp_size=peer_tp_size,
         control_endpoint=endpoint,
         control_token=token,
+        endpoint_specs=endpoint_specs,
     )
 
 

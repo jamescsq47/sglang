@@ -17,8 +17,9 @@ Two ownership rules are intentionally explicit:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
+import threading
 from typing import Any, Optional, Sequence
 
 import numpy as np
@@ -38,13 +39,42 @@ class NativeRequestBinding:
     state_runtime_indices: Any = None
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class NativeSourceSnapshot:
     token_count: int
     token_indices: Any
-    page_indices: tuple[int, ...]
-    state_indices: tuple[int, ...]
+    page_size: int
     page_chain_hashes: tuple[str, ...]
+    state_slot_count: int = 0
+    _state_factory: Any = None
+    _page_indices: Optional[tuple[int, ...]] = None
+    _state_indices: Optional[tuple[int, ...]] = None
+    _lock: Any = field(default_factory=threading.Lock, repr=False)
+
+    @property
+    def page_indices(self) -> tuple[int, ...]:
+        """Materialize the device mapping only from an I/O worker."""
+
+        with self._lock:
+            if self._page_indices is None:
+                from sglang.srt.disaggregation.utils import kv_to_page_indices
+
+                values = self.token_indices.detach().cpu().numpy()
+                self._page_indices = tuple(
+                    int(value)
+                    for value in kv_to_page_indices(values, self.page_size).tolist()
+                )
+            return self._page_indices
+
+    @property
+    def state_indices(self) -> tuple[int, ...]:
+        """Resolve request-owned recurrent slots after the Forward fence."""
+
+        with self._lock:
+            if self._state_indices is None:
+                values = () if self._state_factory is None else self._state_factory()
+                self._state_indices = tuple(int(value) for value in values)
+            return self._state_indices
 
 
 def token_page_chain_hashes(
@@ -165,60 +195,74 @@ class NativeRequestMemoryAdapter:
             else:
                 committed = committed // page_size * page_size
         else:
-            committed = committed // page_size * page_size
+            # P->D must preserve the complete computed prompt, including a
+            # partially filled final page.  NIXL transfers that physical page
+            # as a page, while ``token_count`` remains the exact logical KV
+            # length.  Rounding this down leaves the imported Req's full
+            # prompt one to ``page_size - 1`` tokens ahead of its page table;
+            # the first Decode allocation then observes an impossible
+            # ``seq_len``/``last_loc`` pair (and can later alias pages when
+            # debug checks are disabled).
+            committed = min(
+                committed,
+                len(getattr(req, "fill_ids", ())),
+            )
         if committed <= 0:
             raise RuntimeError("computed request has no page-aligned KV snapshot")
         if getattr(req, "req_pool_idx", None) is None:
             raise RuntimeError("computed request has no request-to-token row")
+        # This view remains protected by the source lease until the group
+        # handoff.  Do not clone or copy it to CPU on the controller thread;
+        # the path worker first waits the request Forward fence and only then
+        # materializes page/state indices.
         token_indices = self.scheduler.req_to_token_pool.req_to_token[
             req.req_pool_idx, :committed
-        ].clone()
-        from sglang.srt.disaggregation.utils import kv_to_page_indices
-
-        values = token_indices.detach().cpu().numpy()
-        pages = tuple(
-            int(value) for value in kv_to_page_indices(values, page_size).tolist()
-        )
-        states: tuple[int, ...] = ()
+        ]
+        state_factory = None
+        state_slot_count = 0
         if self.hybrid:
-            if direction == "d2p":
-                from sglang.srt.disaggregation.agentic_hybrid_transfer import (
-                    StateType,
-                    state_indices_for_req,
+            state_slot_count = 1 if direction == "d2p" else 2
+
+            def state_factory():
+                if direction == "d2p":
+                    from sglang.srt.disaggregation.agentic_hybrid_transfer import (
+                        StateType,
+                        state_indices_for_req,
+                    )
+
+                    raw = state_indices_for_req(
+                        req,
+                        (StateType.MAMBA,),
+                        checkpoint_tokens=committed,
+                        page_size=page_size,
+                    )[0]
+                else:
+                    from sglang.srt.disaggregation.agentic_hybrid_transfer import (
+                        p2d_mamba_source_indices,
+                    )
+
+                    raw = p2d_mamba_source_indices(req, page_size)[0]
+                return tuple(
+                    int(value)
+                    for value in np.asarray(raw, dtype=np.int32)
+                    .reshape(-1)
+                    .tolist()
                 )
 
-                raw = state_indices_for_req(
-                    req,
-                    (StateType.MAMBA,),
-                    checkpoint_tokens=committed,
-                    page_size=page_size,
-                )[0]
-            else:
-                from sglang.srt.disaggregation.agentic_hybrid_transfer import (
-                    p2d_mamba_source_indices,
-                )
-
-                raw = p2d_mamba_source_indices(req, page_size)[0]
-            # Native hybrid helpers use a state-type-parallel nested layout
-            # (for Mamba: ``[[np.asarray(slot)]]``), while the P2D helper
-            # already returns an ndarray.  Normalize both representations at
-            # this adapter boundary before serializing the immutable shard.
-            states = tuple(
-                int(value)
-                for value in np.asarray(raw, dtype=np.int32).reshape(-1).tolist()
-            )
         if direction == "d2p":
             logical_tokens = (
                 list(req.origin_input_ids) + list(req.output_ids[:-1])
             )[:committed]
         else:
             logical_tokens = list(getattr(req, "fill_ids", ()))[:committed]
+        hash_tokens = logical_tokens[: len(logical_tokens) // page_size * page_size]
         return NativeSourceSnapshot(
             committed,
             token_indices,
-            pages,
-            states,
-            token_page_chain_hashes(logical_tokens, page_size),
+            page_size,
+            token_page_chain_hashes(hash_tokens, page_size),
+            state_slot_count,
+            state_factory,
         )
 
     def _attach_prefill_runtime_state(

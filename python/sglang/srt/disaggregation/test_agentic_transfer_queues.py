@@ -88,6 +88,11 @@ def attempt(path, suffix="one"):
         lease_id=f"lease:{suffix}",
         path=path,
         payload=("rank-local-descriptor", suffix),
+        channel=(
+            "host_store"
+            if path in {TransferPath.D2P_HOST, TransferPath.P2D_HOST}
+            else "default"
+        ),
     )
 
 
@@ -255,6 +260,35 @@ def test_four_paths_have_independent_lanes_and_global_live_guard():
     )
     for transfer_queue in queues.queues.values():
         assert transfer_queue.wait_idle(2.0)
+    queues.close()
+
+
+def test_host_store_and_restore_have_independent_physical_lanes():
+    executors = {path: ManualExecutor() for path in TransferPath}
+    queues = AgenticTransferQueues(
+        executors,
+        lanes={path: 1 for path in TransferPath},
+        pending_capacity={path: 4 for path in TransferPath},
+    )
+    store = dataclasses.replace(
+        attempt(TransferPath.D2P_HOST, "store"), channel="host_store"
+    )
+    restore = dataclasses.replace(
+        attempt(TransferPath.D2P_HOST, "restore"), channel="host_restore"
+    )
+
+    queues.submit(store, lambda _value: None)
+    queues.submit(restore, lambda _value: None)
+
+    assert len(executors[TransferPath.D2P_HOST].wait_handles(2)) == 2
+    assert queues.snapshot()[TransferPath.D2P_HOST].active == 2
+    queues.cancel(store)
+    queues.cancel(restore)
+    for handle in tuple(executors[TransferPath.D2P_HOST].records):
+        executors[TransferPath.D2P_HOST].set_progress(
+            handle,
+            PhysicalProgress(PhysicalState.CANCELLED, FenceKind.CANCEL_DRAINED),
+        )
     queues.close()
 
 

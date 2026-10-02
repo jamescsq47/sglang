@@ -41,6 +41,10 @@ class TransferPath(str, Enum):
     P2D_HOST = "p2d_host"
 
 
+HOST_STORE_CHANNEL = "host_store"
+HOST_RESTORE_CHANNEL = "host_restore"
+
+
 class PhysicalState(str, Enum):
     INFLIGHT = "inflight"
     SUCCEEDED = "succeeded"
@@ -72,6 +76,7 @@ class TransferAttempt:
     lease_id: str
     path: TransferPath
     payload: Any = None
+    channel: str = "default"
 
     def __post_init__(self) -> None:
         for name in ("snapshot_id", "attempt_id", "lease_id"):
@@ -80,6 +85,8 @@ class TransferAttempt:
                 raise ValueError(f"{name} must be a non-empty string")
         if not isinstance(self.path, TransferPath):
             raise TypeError("path must be a TransferPath")
+        if not isinstance(self.channel, str) or not self.channel:
+            raise ValueError("channel must be a non-empty string")
 
     @property
     def key(self) -> tuple[str, str, str]:
@@ -185,6 +192,7 @@ class _Item:
     attempt: TransferAttempt
     callback: Callable[[TransferCompletion], None]
     submitted_at: float
+    started_callback: Optional[Callable[[], None]] = None
     handle: Any = None
     starting: bool = False
     cancel_requested: bool = False
@@ -273,11 +281,14 @@ class EventDrivenTransferQueue:
         self,
         attempt: TransferAttempt,
         callback: Callable[[TransferCompletion], None],
+        started_callback: Optional[Callable[[], None]] = None,
     ) -> bool:
         if attempt.path is not self.path:
             raise ValueError(f"attempt path {attempt.path.value} does not match queue {self.path.value}")
         if not callable(callback):
             raise TypeError("completion callback must be callable")
+        if started_callback is not None and not callable(started_callback):
+            raise TypeError("started callback must be callable")
         with self._condition:
             self._check_health_locked()
             if len(self._pending) >= self.pending_capacity:
@@ -285,7 +296,14 @@ class EventDrivenTransferQueue:
             acquired = self._registry.acquire(attempt)
             if not acquired:
                 return False
-            self._pending.append(_Item(attempt, callback, time.monotonic()))
+            self._pending.append(
+                _Item(
+                    attempt,
+                    callback,
+                    time.monotonic(),
+                    started_callback=started_callback,
+                )
+            )
             self._condition.notify()
             return True
 
@@ -401,7 +419,14 @@ class EventDrivenTransferQueue:
                 raise RuntimeError("active transfer changed during submit")
             item.handle = handle
             item.starting = False
+            started_callback = item.started_callback
             self._signal_locked(key)
+        if started_callback is not None:
+            install = getattr(self.executor, "install_started_callback", None)
+            if callable(install):
+                install(handle, started_callback)
+            else:
+                started_callback()
 
     def _progress(self, item: _Item) -> None:
         key = item.attempt.key
@@ -501,6 +526,85 @@ class EventDrivenTransferQueue:
             raise TransferQueueError(f"{self.path.value} queue worker did not stop")
 
 
+class OperationSplitTransferQueue:
+    """Independent physical lanes for Host STORE and Host RESTORE.
+
+    Both operations remain one logical directional Slow path and share the
+    live-snapshot ownership guard.  They do not share lane admission: a remote
+    Host restore can therefore never delay a source-local Host store that is
+    needed to release Decode/Prefill HBM.
+    """
+
+    def __init__(
+        self,
+        path: TransferPath,
+        executor: TransferExecutor,
+        *,
+        lanes: int,
+        pending_capacity: int,
+        registry: _LiveRegistry,
+    ) -> None:
+        self.path = path
+        self.lanes = int(lanes) * 2
+        self.pending_capacity = int(pending_capacity) * 2
+        self._queues = {
+            channel: EventDrivenTransferQueue(
+                path,
+                executor,
+                lanes=lanes,
+                pending_capacity=pending_capacity,
+                registry=registry,
+                name=f"agentic-transfer-{path.value}-{channel}",
+            )
+            for channel in (HOST_STORE_CHANNEL, HOST_RESTORE_CHANNEL)
+        }
+
+    def submit(self, attempt, callback, started_callback=None) -> bool:
+        try:
+            target = self._queues[attempt.channel]
+        except KeyError as error:
+            raise ValueError(
+                f"Host attempt requires {HOST_STORE_CHANNEL!r} or "
+                f"{HOST_RESTORE_CHANNEL!r}, got {attempt.channel!r}"
+            ) from error
+        return target.submit(attempt, callback, started_callback)
+
+    def cancel(self, snapshot_id: str, attempt_id: str, lease_id: str) -> bool:
+        for target in self._queues.values():
+            if target.cancel(snapshot_id, attempt_id, lease_id):
+                return True
+        return False
+
+    def snapshot(self) -> QueueSnapshot:
+        values = tuple(target.snapshot() for target in self._queues.values())
+        errors = tuple(value.fatal_error for value in values if value.fatal_error)
+        return QueueSnapshot(
+            pending=sum(value.pending for value in values),
+            active=sum(value.active for value in values),
+            lanes=sum(value.lanes for value in values),
+            completed=sum(value.completed for value in values),
+            cancelled=sum(value.cancelled for value in values),
+            failed=sum(value.failed for value in values),
+            fatal_error="; ".join(errors) if errors else None,
+        )
+
+    def check_health(self) -> None:
+        for target in self._queues.values():
+            target.check_health()
+
+    def wait_idle(self, timeout: Optional[float] = None) -> bool:
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        for target in self._queues.values():
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            if not target.wait_idle(remaining):
+                return False
+        return True
+
+    def close(self, *, timeout: float = 5.0) -> None:
+        for target in self._queues.values():
+            target.close(timeout=timeout)
+
+
 class AgenticTransferQueues:
     """Four independent path queues sharing only a live-snapshot guard."""
 
@@ -515,23 +619,40 @@ class AgenticTransferQueues:
         if set(executors) != paths or set(lanes) != paths or set(pending_capacity) != paths:
             raise ValueError("executors, lanes and capacities must cover all four paths")
         registry = _LiveRegistry()
-        self.queues = {
-            path: EventDrivenTransferQueue(
+        self.queues = {}
+        for path in TransferPath:
+            cls = (
+                OperationSplitTransferQueue
+                if path in {TransferPath.D2P_HOST, TransferPath.P2D_HOST}
+                else EventDrivenTransferQueue
+            )
+            self.queues[path] = cls(
                 path,
                 executors[path],
                 lanes=lanes[path],
                 pending_capacity=pending_capacity[path],
                 registry=registry,
             )
-            for path in TransferPath
-        }
+
+    def admission_lanes(self) -> dict[tuple[TransferPath, str], int]:
+        result = {}
+        for path in TransferPath:
+            if path in {TransferPath.D2P_HOST, TransferPath.P2D_HOST}:
+                result[(path, HOST_STORE_CHANNEL)] = self.queues[path].lanes // 2
+                result[(path, HOST_RESTORE_CHANNEL)] = self.queues[path].lanes // 2
+            else:
+                result[(path, "direct")] = self.queues[path].lanes
+        return result
 
     def submit(
         self,
         attempt: TransferAttempt,
         callback: Callable[[TransferCompletion], None],
+        started_callback: Optional[Callable[[], None]] = None,
     ) -> bool:
-        return self.queues[attempt.path].submit(attempt, callback)
+        return self.queues[attempt.path].submit(
+            attempt, callback, started_callback
+        )
 
     def cancel(self, attempt: TransferAttempt) -> bool:
         return self.queues[attempt.path].cancel(*attempt.key)

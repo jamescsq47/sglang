@@ -8,6 +8,8 @@ reads a marker, ledger, directory, or shared filesystem path.
 from __future__ import annotations
 
 import itertools
+import logging
+import os
 import queue
 import threading
 import time
@@ -22,6 +24,7 @@ from sglang.srt.disaggregation.agentic_group_protocol import (
     GroupCommand,
     GroupDisconnectedError,
     LinkCapacityEdge,
+    LinkApplicationFinal,
     LinkDisconnected,
     LinkFailure,
     LinkIntent,
@@ -40,11 +43,14 @@ from sglang.srt.disaggregation.agentic_group_transfer import (
     RankPathHandler,
     RankZeroLinkOrchestrator,
     TransferOperation,
+    plan_endpoint_groups,
 )
 from sglang.srt.disaggregation.agentic_transfer_queues import (
     AgenticTransferQueues,
     TransferPath,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class RuntimeState(str, Enum):
@@ -93,6 +99,13 @@ class _LocalSubmission:
     error: Optional[BaseException] = None
 
 
+@dataclass(slots=True)
+class _CancelOutstanding:
+    reason: str
+    done: threading.Event
+    error: Optional[BaseException] = None
+
+
 _STOP = object()
 _PLAN_INTENT = "group_transfer_v1"
 
@@ -100,11 +113,12 @@ _PLAN_INTENT = "group_transfer_v1"
 class _PathCommandDispatcher:
     """Execute rank-zero commands without cross-path head-of-line blocking.
 
-    TCP receive order is preserved per ``(request-generation, attempt)``.  An
-    attempt is pinned to the path named by its PREPARE command and exactly one
-    worker may execute that attempt at a time.  Independent attempts use the
-    worker pool of their own physical path, so a slow Host preparation cannot
-    stop Direct control progress (or the opposite direction).
+    Every physical path has one strict FIFO control stream.  This preserves
+    rank zero's command order on every TP rank, including the important
+    ``ABORT_FINALIZE(A) -> PREPARE(B)`` cleanup boundary.  Paths remain
+    independent, so a slow Host command cannot stop Direct control progress.
+    Physical DMA parallelism belongs to the bounded transfer queues, not to
+    this control dispatcher.
 
     This is an execution detail only: workers never choose a path, route, lane
     or owner.  Every command still originates at the fixed rank-zero
@@ -125,39 +139,37 @@ class _PathCommandDispatcher:
     ) -> None:
         if set(workers) != set(TransferPath):
             raise ValueError("command workers must cover all transfer paths")
+        if any(int(value) != 1 for value in workers.values()):
+            raise ValueError("each path requires exactly one ordered control worker")
         self._executor = executor
         self._after_command = after_command
         self._on_fatal = on_fatal
         self._cuda_device = cuda_device
         self._condition = threading.Condition()
-        self._pending: dict[
-            tuple[GenerationKey, int], deque[GroupCommand]
-        ] = {}
         self._path: dict[tuple[GenerationKey, int], TransferPath] = {}
-        self._ready = {path: deque() for path in TransferPath}
-        self._ready_set = {path: set() for path in TransferPath}
+        self._terminal_seen: set[tuple[GenerationKey, int]] = set()
+        self._pending = {path: deque() for path in TransferPath}
         self._running: set[tuple[GenerationKey, int]] = set()
         self._stop = False
         self._threads: list[threading.Thread] = []
         for path in TransferPath:
-            for worker_id in range(max(1, int(workers[path]))):
-                target: Callable[..., None] = self._worker
-                args: tuple[Any, ...] = (path,)
-                if cuda_device is not None:
-                    from sglang.srt.disaggregation.agentic_cuda_worker import (
-                        run_rank_bound_worker,
-                    )
-
-                    target = run_rank_bound_worker
-                    args = (int(cuda_device), self._worker, path)
-                self._threads.append(
-                    threading.Thread(
-                        target=target,
-                        args=args,
-                        name=f"agentic-command-{path.value}-{worker_id}",
-                        daemon=True,
-                    )
+            target: Callable[..., None] = self._worker
+            args: tuple[Any, ...] = (path,)
+            if cuda_device is not None:
+                from sglang.srt.disaggregation.agentic_cuda_worker import (
+                    run_rank_bound_worker,
                 )
+
+                target = run_rank_bound_worker
+                args = (int(cuda_device), self._worker, path)
+            self._threads.append(
+                threading.Thread(
+                    target=target,
+                    args=args,
+                    name=f"agentic-command-{path.value}",
+                    daemon=True,
+                )
+            )
 
     @staticmethod
     def _identity(command: GroupCommand) -> tuple[GenerationKey, int]:
@@ -179,6 +191,8 @@ class _PathCommandDispatcher:
         with self._condition:
             if self._stop:
                 raise RuntimeError("command dispatcher is closed")
+            if identity in self._terminal_seen:
+                raise RuntimeError("command arrived after terminal command")
             path = self._path.get(identity)
             if command.kind is CommandKind.PREPARE:
                 command_path = self._command_path(command)
@@ -188,34 +202,20 @@ class _PathCommandDispatcher:
                 path = command_path
             elif path is None:
                 raise RuntimeError("command arrived before PREPARE")
-            pending = self._pending.setdefault(identity, deque())
-            pending.append(command)
-            self._make_ready_locked(identity, path)
+            if command.kind in self._TERMINAL:
+                self._terminal_seen.add(identity)
+            self._pending[path].append(command)
             self._condition.notify_all()
-
-    def _make_ready_locked(
-        self, identity: tuple[GenerationKey, int], path: TransferPath
-    ) -> None:
-        if identity in self._running or identity in self._ready_set[path]:
-            return
-        if not self._pending.get(identity):
-            return
-        self._ready[path].append(identity)
-        self._ready_set[path].add(identity)
 
     def _take(self, path: TransferPath):
         with self._condition:
-            self._condition.wait_for(lambda: self._stop or bool(self._ready[path]))
-            if self._stop and not self._ready[path]:
+            self._condition.wait_for(lambda: self._stop or bool(self._pending[path]))
+            if self._stop and not self._pending[path]:
                 return None
-            identity = self._ready[path].popleft()
-            self._ready_set[path].remove(identity)
+            command = self._pending[path].popleft()
+            identity = self._identity(command)
             if identity in self._running:
                 raise RuntimeError("attempt was dispatched concurrently")
-            pending = self._pending.get(identity)
-            if not pending:
-                raise RuntimeError("ready attempt has no pending command")
-            command = pending.popleft()
             self._running.add(identity)
             return identity, command
 
@@ -235,22 +235,16 @@ class _PathCommandDispatcher:
             finally:
                 with self._condition:
                     self._running.discard(identity)
-                    pending = self._pending.get(identity)
                     if terminal:
-                        if pending:
-                            self._on_fatal(
-                                RuntimeError("command arrived after terminal command")
-                            )
-                        self._pending.pop(identity, None)
                         self._path.pop(identity, None)
-                    elif pending:
-                        self._make_ready_locked(identity, path)
+                        self._terminal_seen.discard(identity)
                     self._condition.notify_all()
 
     def wait_idle(self, timeout: Optional[float] = None) -> bool:
         with self._condition:
             return self._condition.wait_for(
-                lambda: not self._pending and not self._running, timeout=timeout
+                lambda: not any(self._pending.values()) and not self._running,
+                timeout=timeout,
             )
 
     def pending_count(self) -> int:
@@ -273,24 +267,16 @@ class _PathCommandDispatcher:
 def _command_worker_counts(
     snapshots: Mapping[TransferPath, Any],
 ) -> dict[TransferPath, int]:
-    """Return a TP-deterministic control width for every data path.
+    """Serialize rank-local control while leaving physical DMA parallel.
 
-    Host PREPARE reserves source-local DRAM.  Serializing only that tiny
-    command stream gives every rank the same reservation order, so two
-    attempts cannot cross-reserve the last extents on different ranks.  START
-    merely submits asynchronous DMA and therefore retains the physical Host
-    queue's independent lane parallelism.  Direct control has no such shared
-    reservation and may use one worker per physical lane.
+    Rank zero admits at most ``snapshot.lanes`` group attempts per path.  A
+    single command worker then preserves that global order on every TP rank;
+    the bounded transfer queue still executes the admitted attempts on all of
+    its physical lanes.  Multiple control workers used to let ranks reserve
+    different attempts first when memory was tight.
     """
 
-    return {
-        path: (
-            1
-            if path in {TransferPath.D2P_HOST, TransferPath.P2D_HOST}
-            else max(1, int(snapshot.lanes))
-        )
-        for path, snapshot in snapshots.items()
-    }
+    return {path: 1 for path in snapshots}
 
 
 def _owner_role(owner: Owner) -> Optional[str]:
@@ -321,12 +307,14 @@ def _readiness_requirements(
     required: set[tuple[LinkParticipant, GenerationKey, ReadinessPhase]] = set()
     source_role = _owner_role(plan.source_owner)
     target_role = _owner_role(plan.target_owner)
+    selected_groups = set(plan_endpoint_groups(plan, participants))
     if plan.operation in {TransferOperation.DIRECT, TransferOperation.HOST_STORE}:
         if source_role is not None:
             required.update(
                 (participant, plan.key, ReadinessPhase.SOURCE_READY)
                 for participant in participants
                 if participant.role == source_role
+                and participant.endpoint_group in selected_groups
             )
     if plan.operation in {TransferOperation.DIRECT, TransferOperation.HOST_RESTORE}:
         if target_role is not None:
@@ -335,6 +323,7 @@ def _readiness_requirements(
                 (participant, key, ReadinessPhase.REGISTERED)
                 for participant in participants
                 if participant.role == target_role
+                and participant.endpoint_group in selected_groups
             )
     return frozenset(required)
 
@@ -346,13 +335,21 @@ def _remaining(deadline: Optional[float]) -> Optional[float]:
 
 
 def _plan_payload(plan: GroupTransferPlan) -> dict:
+    remaining = (
+        max(0.0, float(plan.admission_deadline) - time.monotonic())
+        if plan.admission_deadline
+        else 0.0
+    )
     return {
         "path": plan.path.value,
         "operation": plan.operation.value,
         "source_owner": plan.source_owner.value,
         "target_owner": plan.target_owner.value,
         "lease_id": plan.lease_id,
+        "source_group": plan.source_group,
+        "target_group": plan.target_group,
         "transfer": dict(plan.payload),
+        "admission_timeout_remaining": remaining,
     }
 
 
@@ -360,6 +357,7 @@ def _plan_from_intent(intent: LinkIntent) -> GroupTransferPlan:
     if intent.kind != _PLAN_INTENT:
         raise ValueError(f"unsupported link intent kind {intent.kind!r}")
     value = intent.payload
+    remaining = max(0.0, float(value.get("admission_timeout_remaining", 0.0)))
     return GroupTransferPlan(
         key=intent.key,
         path=TransferPath(str(value["path"])),
@@ -368,6 +366,9 @@ def _plan_from_intent(intent: LinkIntent) -> GroupTransferPlan:
         target_owner=Owner(str(value["target_owner"])),
         lease_id=str(value["lease_id"]),
         payload=value.get("transfer") or {},
+        source_group=str(value.get("source_group") or ""),
+        target_group=str(value.get("target_group") or ""),
+        admission_deadline=(time.monotonic() + remaining if remaining else 0.0),
     )
 
 
@@ -394,7 +395,7 @@ class AgenticMultiNodeRuntime:
         queues: AgenticTransferQueues,
         handlers: Mapping[object, RankPathHandler],
         decide_intent: Optional[
-            Callable[[LinkIntent, GroupTransferPlan], Optional[GroupTransferPlan]]
+            Callable[[LinkIntent, Optional[GroupTransferPlan]], Optional[GroupTransferPlan]]
         ] = None,
         on_committed: Optional[Callable[[GroupTransferPlan, int], None]] = None,
         on_committed_results: Optional[
@@ -410,7 +411,11 @@ class AgenticMultiNodeRuntime:
         on_aborted: Optional[
             Callable[[GroupTransferPlan, int, str], None]
         ] = None,
+        on_materialized: Optional[Callable[[GroupTransferPlan, int], None]] = None,
         on_capacity_edge: Optional[Callable[[LinkCapacityEdge], None]] = None,
+        on_application_final: Optional[
+            Callable[[LinkApplicationFinal], None]
+        ] = None,
         retain_terminals: bool = True,
         cuda_device: Optional[int] = None,
     ) -> None:
@@ -440,11 +445,14 @@ class AgenticMultiNodeRuntime:
             tuple[LinkParticipant, GenerationKey, ReadinessPhase]
         ] = set()
         self._pending_plans: dict[GenerationKey, GroupTransferPlan] = {}
+        self._pending_plan_since: dict[GenerationKey, float] = {}
         self._decide_intent_callback = decide_intent
         self._on_committed_callback = on_committed
         self._on_committed_results_callback = on_committed_results
         self._on_aborted_callback = on_aborted
+        self._on_materialized_callback = on_materialized
         self._on_capacity_edge_callback = on_capacity_edge
+        self._on_application_final_callback = on_application_final
 
         self.agent = TCPRankAgent(
             address,
@@ -479,7 +487,66 @@ class AgenticMultiNodeRuntime:
             self.orchestrator = RankZeroLinkOrchestrator(
                 self.coordinator,
                 broadcast=self.agent.publish,
+                path_lanes={
+                    path: max(1, int(snapshot.lanes))
+                    for path, snapshot in queues.snapshot().items()
+                },
+                operation_lanes=queues.admission_lanes(),
+                shared_network_lanes=int(
+                    os.getenv(
+                        "SGLANG_AGENTIC_MULTINODE_SHARED_NETWORK_LANES", "0"
+                    )
+                ),
+                shared_network_lanes_by_direction={
+                    "d2p": int(
+                        os.getenv(
+                            "SGLANG_AGENTIC_MULTINODE_D2P_SHARED_NETWORK_LANES",
+                            os.getenv(
+                                "SGLANG_AGENTIC_MULTINODE_SHARED_NETWORK_LANES",
+                                "0",
+                            ),
+                        )
+                    ),
+                    "p2d": int(
+                        os.getenv(
+                            "SGLANG_AGENTIC_MULTINODE_P2D_SHARED_NETWORK_LANES",
+                            os.getenv(
+                                "SGLANG_AGENTIC_MULTINODE_SHARED_NETWORK_LANES",
+                                "0",
+                            ),
+                        )
+                    ),
+                },
+                shared_network_direct_reserve_by_direction={
+                    "d2p": int(
+                        os.getenv(
+                            "SGLANG_AGENTIC_MULTINODE_D2P_DIRECT_NETWORK_RESERVE",
+                            "0",
+                        )
+                    ),
+                    "p2d": int(
+                        os.getenv(
+                            "SGLANG_AGENTIC_MULTINODE_P2D_DIRECT_NETWORK_RESERVE",
+                            "0",
+                        )
+                    ),
+                },
+                shared_network_host_reserve_by_direction={
+                    "d2p": int(
+                        os.getenv(
+                            "SGLANG_AGENTIC_MULTINODE_D2P_HOST_NETWORK_RESERVE",
+                            "0",
+                        )
+                    ),
+                    "p2d": int(
+                        os.getenv(
+                            "SGLANG_AGENTIC_MULTINODE_P2D_HOST_NETWORK_RESERVE",
+                            "0",
+                        )
+                    ),
+                },
                 decide_intent=self._decide_intent,
+                on_materialized=self._on_materialized,
                 on_committed_results=self._on_committed_with_results,
                 on_aborted=self._on_aborted,
             )
@@ -560,6 +627,7 @@ class AgenticMultiNodeRuntime:
                         LinkIntent,
                         LinkCapacityEdge,
                         LinkReadiness,
+                        LinkApplicationFinal,
                         LinkDisconnected,
                     ),
                 ):
@@ -596,8 +664,12 @@ class AgenticMultiNodeRuntime:
             )
 
     def _decide_intent(self, intent: LinkIntent) -> Optional[GroupTransferPlan]:
-        candidate = _plan_from_intent(intent)
+        candidate = (
+            _plan_from_intent(intent) if intent.kind == _PLAN_INTENT else None
+        )
         if self._decide_intent_callback is None:
+            if candidate is None:
+                raise ValueError(f"unsupported link intent kind {intent.kind!r}")
             return candidate
         return self._decide_intent_callback(intent, candidate)
 
@@ -625,9 +697,67 @@ class AgenticMultiNodeRuntime:
         if self._on_aborted_callback is not None:
             self._on_aborted_callback(plan, attempt, reason)
 
+    def _on_materialized(self, plan: GroupTransferPlan, attempt: int) -> None:
+        if self._on_materialized_callback is not None:
+            self._on_materialized_callback(plan, attempt)
+
     def _control_loop(self) -> None:
+        last_progress_log = time.monotonic()
         while True:
-            value = self._control_queue.get()
+            orchestrator = self.orchestrator
+            now = time.monotonic()
+            if orchestrator is not None and now - last_progress_log >= 10.0:
+                counts, oldest = orchestrator.progress_diagnostics()
+                pending_oldest = []
+                for key, plan in self._pending_plans.items():
+                    requirements = _readiness_requirements(plan, self._participants)
+                    missing = requirements - self._readiness
+                    age = max(
+                        0.0, now - self._pending_plan_since.get(key, now)
+                    )
+                    pending_oldest.append(
+                        (
+                            age,
+                            f"{key.snapshot_id}@{plan.path.value}/"
+                            f"{plan.source_group}->{plan.target_group}/"
+                            f"missing={len(missing)}["
+                            + ",".join(
+                                f"{item[0].endpoint_group}:r{item[0].rank}:"
+                                f"{item[2].value}"
+                                for item in sorted(
+                                    missing,
+                                    key=lambda item: (
+                                        item[0].endpoint_group,
+                                        item[0].rank,
+                                        item[2].value,
+                                    ),
+                                )
+                            )
+                            + "]",
+                        )
+                    )
+                pending_oldest.sort(reverse=True)
+                if pending_oldest:
+                    counts["readiness_pending"] = len(pending_oldest)
+                    oldest = tuple(oldest) + tuple(
+                        f"{label}:{age:.1f}s"
+                        for age, label in pending_oldest[:8]
+                    )
+                if counts:
+                    logger.info(
+                        "Agentic V2 coordinator progress states=%s oldest=%s",
+                        counts,
+                        oldest,
+                    )
+                last_progress_log = now
+            try:
+                value = self._control_queue.get(timeout=0.05)
+            except queue.Empty:
+                self._expire_pending_admissions()
+                orchestrator = self.orchestrator
+                if orchestrator is not None:
+                    orchestrator.expire_admissions()
+                continue
             if value is _STOP:
                 return
             try:
@@ -636,6 +766,14 @@ class AgenticMultiNodeRuntime:
                     raise RuntimeError("non-coordinator received an owner event")
                 if isinstance(value, _LocalSubmission):
                     value.attempt = self._offer_plan(value.plan)
+                    value.done.set()
+                elif isinstance(value, _CancelOutstanding):
+                    pending = tuple(self._pending_plans.values())
+                    self._pending_plans.clear()
+                    for plan in pending:
+                        self._on_aborted(plan, 0, value.reason)
+                        self._retire_readiness(plan)
+                    orchestrator.cancel_active(value.reason)
                     value.done.set()
                 elif isinstance(value, LinkRankAck):
                     orchestrator.on_ack(value)
@@ -658,6 +796,10 @@ class AgenticMultiNodeRuntime:
                     callback = self._on_capacity_edge_callback
                     if callback is not None:
                         callback(value)
+                elif isinstance(value, LinkApplicationFinal):
+                    callback = self._on_application_final_callback
+                    if callback is not None:
+                        callback(value)
                 elif isinstance(value, LinkDisconnected):
                     assert self.coordinator is not None
                     self.coordinator.apply_event(value)
@@ -666,11 +808,35 @@ class AgenticMultiNodeRuntime:
                     )
                 else:
                     raise RuntimeError(f"unsupported owner event {value!r}")
+                self._expire_pending_admissions()
+                orchestrator.expire_admissions()
             except BaseException as error:
-                if isinstance(value, _LocalSubmission):
+                if isinstance(value, (_LocalSubmission, _CancelOutstanding)):
                     value.error = error
                     value.done.set()
                 self._record_fatal(error)
+
+    def _expire_pending_admissions(self, now: Optional[float] = None) -> int:
+        """Expire Direct plans still waiting for all-rank readiness.
+
+        This closes the gap before ``RankZeroLinkOrchestrator.offer``: the
+        single Direct admission deadline includes readiness, lane queueing and
+        TP PREPARE.  No physical attempt exists here, so attempt zero denotes
+        a clean pre-PREPARE rejection to the policy actor.
+        """
+
+        now = time.monotonic() if now is None else float(now)
+        expired = []
+        for key, plan in tuple(self._pending_plans.items()):
+            if plan.admission_deadline and plan.admission_deadline <= now:
+                del self._pending_plans[key]
+                self._pending_plan_since.pop(key, None)
+                expired.append(plan)
+        for plan in expired:
+            self._on_aborted(
+                plan, 0, "direct admission deadline expired before readiness"
+            )
+        return len(expired)
 
     def _offer_plan(self, plan: GroupTransferPlan) -> Optional[int]:
         orchestrator = self.orchestrator
@@ -678,11 +844,12 @@ class AgenticMultiNodeRuntime:
             raise RuntimeError("only the link coordinator may offer a plan")
         requirements = _readiness_requirements(plan, self._participants)
         if requirements.issubset(self._readiness):
-            return orchestrator.begin(plan)
+            return orchestrator.offer(plan)
         current = self._pending_plans.get(plan.key)
         if current is not None and current != plan:
             raise RuntimeError("request-generation already has another pending plan")
         self._pending_plans[plan.key] = plan
+        self._pending_plan_since.setdefault(plan.key, time.monotonic())
         return None
 
     def _accept_readiness(self, value: LinkReadiness) -> None:
@@ -697,8 +864,9 @@ class AgenticMultiNodeRuntime:
             if not requirements.issubset(self._readiness):
                 continue
             del self._pending_plans[key]
+            self._pending_plan_since.pop(key, None)
             assert self.orchestrator is not None
-            self.orchestrator.begin(plan)
+            self.orchestrator.offer(plan)
 
     def _retire_readiness(self, plan: GroupTransferPlan) -> None:
         for item in _readiness_requirements(plan, self._participants):
@@ -737,16 +905,41 @@ class AgenticMultiNodeRuntime:
         )
         return None
 
+    def submit_control_intent(
+        self,
+        key: GenerationKey,
+        kind: str,
+        payload: Mapping[str, Any],
+    ) -> None:
+        """Forward one endpoint-rank0 routing fact to the global authority."""
+
+        if self.participant.rank != 0:
+            raise RuntimeError("only endpoint rank zero may submit control intents")
+        sequence = next(self._proposal_sequence)
+        if self.orchestrator is not None:
+            self._control_queue.put(
+                LinkIntent(
+                    self.agent.group_id,
+                    self.participant,
+                    key,
+                    sequence,
+                    str(kind),
+                    payload,
+                )
+            )
+            return
+        self.agent.propose_intent(key, sequence, str(kind), payload)
+
     def notify_capacity_available(self, available_tokens: int) -> int:
-        """Emit one ephemeral D-capacity wake-up from Decode rank zero."""
+        """Emit one ephemeral capacity snapshot from endpoint rank zero."""
 
         with self._state_condition:
             if self._state is not RuntimeState.RUNNING or not self._accepting:
                 raise RuntimeError("runtime is not accepting capacity edges")
             if self._fatal is not None:
                 raise RuntimeError("runtime failed") from self._fatal
-        if self.participant.role != "decode" or self.participant.rank != 0:
-            raise RuntimeError("only Decode endpoint rank zero reports capacity")
+        if self.participant.rank != 0:
+            raise RuntimeError("only endpoint rank zero reports capacity")
         return self.agent.send_capacity_edge(int(available_tokens))
 
     def report_registered(self, key: GenerationKey) -> None:
@@ -814,7 +1007,18 @@ class AgenticMultiNodeRuntime:
                 self._accepting = False
 
         if self.orchestrator is not None:
-            self.orchestrator.cancel_active("runtime_shutdown")
+            cancellation = _CancelOutstanding(
+                "runtime_shutdown", threading.Event()
+            )
+            self._control_queue.put(cancellation)
+            if not cancellation.done.wait(_remaining(deadline)):
+                raise RuntimeCloseBlocked(
+                    "coordinator did not cancel outstanding plans"
+                )
+            if cancellation.error is not None:
+                raise RuntimeCloseBlocked(
+                    "coordinator failed to cancel outstanding plans"
+                ) from cancellation.error
         if not self.wait_idle(_remaining(deadline)):
             raise RuntimeCloseBlocked(
                 "active link attempt has not reached RELEASED or FAILED_DRAINED"

@@ -42,6 +42,32 @@ def test_d2p_snapshot_reads_decode_growth_from_live_request_row():
     assert snapshot.page_indices == (25, 26, 27, 28, 29)
 
 
+def test_source_snapshot_defers_page_materialization_until_io_access(monkeypatch):
+    row = torch.arange(100, 124, dtype=torch.int64).reshape(1, -1)
+    adapter = NativeRequestMemoryAdapter(_scheduler(row))
+    req = SimpleNamespace(
+        req_pool_idx=0,
+        kv_committed_len=20,
+        origin_input_ids=list(range(8)),
+        output_ids=list(range(13)),
+        fill_ids=list(range(21)),
+    )
+    import sglang.srt.disaggregation.utils as utils
+
+    original = utils.kv_to_page_indices
+    calls = []
+
+    def tracked(values, page_size):
+        calls.append(True)
+        return original(values, page_size)
+
+    monkeypatch.setattr(utils, "kv_to_page_indices", tracked)
+    snapshot = adapter.source_snapshot(req, direction="d2p")
+    assert calls == []
+    assert snapshot.page_indices == (25, 26, 27, 28, 29)
+    assert calls == [True]
+
+
 def test_p2d_snapshot_uses_post_dedup_live_mapping_not_old_reservation():
     # Radix dedup can replace imported pages with shared pages.  P->D must use
     # the current request mapping, not the immutable allocation tensor.
@@ -60,6 +86,22 @@ def test_p2d_snapshot_uses_post_dedup_live_mapping_not_old_reservation():
     assert snapshot.token_indices.tolist()[:4] == [400, 401, 402, 403]
 
 
+def test_p2d_snapshot_preserves_partial_final_page_logical_length():
+    row = torch.arange(400, 412, dtype=torch.int64).reshape(1, -1)
+    adapter = NativeRequestMemoryAdapter(_scheduler(row, page_size=4))
+    req = SimpleNamespace(
+        req_pool_idx=0,
+        kv_committed_len=10,
+        fill_ids=list(range(10)),
+    )
+
+    snapshot = adapter.source_snapshot(req, direction="p2d")
+
+    assert snapshot.token_count == 10
+    assert snapshot.token_indices.tolist() == list(range(400, 410))
+    assert snapshot.page_indices == (100, 101, 102)
+
+
 def test_d2p_snapshot_flattens_native_nested_mamba_state(monkeypatch):
     row = torch.arange(100, 108, dtype=torch.int64).reshape(1, -1)
     adapter = NativeRequestMemoryAdapter(_scheduler(row))
@@ -74,15 +116,23 @@ def test_d2p_snapshot_flattens_native_nested_mamba_state(monkeypatch):
     monkeypatch.setattr(
         hybrid_transfer, "snapshot_token_count_for_req", lambda *_args: 8
     )
+    calls = []
+
+    def state_indices(*_args, **_kwargs):
+        calls.append(True)
+        return [[torch.tensor(17).numpy()]]
+
     monkeypatch.setattr(
         hybrid_transfer,
         "state_indices_for_req",
-        lambda *_args, **_kwargs: [[torch.tensor(17).numpy()]],
+        state_indices,
     )
 
     snapshot = adapter.source_snapshot(req, direction="d2p")
 
+    assert calls == []
     assert snapshot.state_indices == (17,)
+    assert calls == [True]
 
 
 class _StrictPool:

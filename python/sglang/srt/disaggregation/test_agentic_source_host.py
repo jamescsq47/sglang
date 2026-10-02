@@ -26,6 +26,7 @@ from sglang.srt.disaggregation.agentic_source_host import (
     SourceHostStorePayload,
     SourceLocalHostArena,
     complete_snapshot_bytes,
+    make_source_host_eviction_handler,
     make_source_host_store_handler,
     make_source_host_store_path,
 )
@@ -168,6 +169,25 @@ class ImmediateCopy:
         assert payload.extent_id == extent.extent_id
 
 
+class BlockingReadyFence:
+    def __init__(self):
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def synchronize(self):
+        self.entered.set()
+        assert self.release.wait(2)
+
+
+class RecordingCopy(ImmediateCopy):
+    def __init__(self):
+        self.entered = threading.Event()
+
+    def copy(self, extent, payload, cancel):
+        self.entered.set()
+        super().copy(extent, payload, cancel)
+
+
 class FakeRemoteWorker:
     def __init__(self):
         self.exports = []
@@ -190,6 +210,28 @@ class FakeRemoteWorker:
         return shard
 
     def discard_unclaimed_export(self, _snapshot_id):
+        return True
+
+
+class FakeEvictionWorker:
+    def __init__(self):
+        self.reserved = set()
+        self.finished = []
+
+    def reserve_export_eviction(self, snapshot_id, eviction_id):
+        self.reserved.add((snapshot_id, eviction_id))
+        return True
+
+    def cancel_export_eviction(self, snapshot_id, eviction_id):
+        self.reserved.discard((snapshot_id, eviction_id))
+        return True
+
+    def finish_export_eviction(self, snapshot_id, eviction_id):
+        identity = (snapshot_id, eviction_id)
+        if identity not in self.reserved:
+            return False
+        self.reserved.remove(identity)
+        self.finished.append(identity)
         return True
 
 
@@ -234,6 +276,103 @@ def test_store_executor_exports_only_after_durable_copy_fence():
     executor.close()
     assert arena.release(extent.extent_id)
     arena.close()
+
+
+def test_group_eviction_fences_then_releases_complete_extent():
+    arena = SourceLocalHostArena(
+        direction=HostDirection.D2P,
+        device_pool=MHAPool(),
+        capacity_bytes=2 * mmap.ALLOCATIONGRANULARITY,
+        snapshot_factory=fake_snapshot_factory,
+    )
+    extent = arena.allocate(snapshot_id="evict:0", token_count=10)
+    arena.begin_copy(extent.extent_id)
+    arena.mark_durable(extent.extent_id)
+    arena.mark_exported(extent.extent_id, ("shard",))
+    worker = FakeEvictionWorker()
+    handler = make_source_host_eviction_handler(arena, worker)
+    command = GroupCommand(
+        GenerationKey("run", "evict", 0),
+        2,
+        1,
+        CommandKind.PREPARE,
+        Owner.D_HOST,
+        Owner.NONE,
+        "evict:evict:0",
+        {
+            "agentic_data_plane": {
+                "version": 1,
+                "path": "d2p_host",
+                "operation": "host_evict",
+            },
+            "transfer": {"kind": "d2p_host_evict"},
+        },
+    )
+
+    prepared = handler.prepare(command)
+    assert arena.get(extent.extent_id).phase is HostExtentPhase.EVICTING
+    handler.commit(command, prepared, SimpleNamespace())
+    assert arena.used_bytes == 0
+    assert worker.finished == [("evict:0", "evict:evict:0")]
+    arena.close()
+
+
+def test_host_store_preserves_forward_fence_and_waits_only_in_io_worker():
+    arena = SourceLocalHostArena(
+        direction=HostDirection.D2P,
+        device_pool=MHAPool(),
+        capacity_bytes=2 * mmap.ALLOCATIONGRANULARITY,
+        snapshot_factory=fake_snapshot_factory,
+    )
+    fence = BlockingReadyFence()
+    backend = RecordingCopy()
+    handler = make_source_host_store_handler(
+        arena,
+        descriptor=lambda _command: SourceHostStorePayload(
+            0, tuple(range(10)), ready_event=fence
+        ),
+        source_hbm_release=lambda _command, _extent: None,
+        discard_durable_export=lambda extent: arena.release(extent.extent_id),
+    )
+    command = GroupCommand(
+        GenerationKey("run", "fenced", 0),
+        1,
+        1,
+        CommandKind.PREPARE,
+        Owner.D_GPU,
+        Owner.D_HOST,
+        "lease",
+        {
+            "agentic_data_plane": {
+                "version": 1,
+                "path": "d2p_host",
+                "operation": "host_store",
+            },
+            "transfer": {"token_count": 10, "state_slots": 1},
+        },
+    )
+    prepared = handler.prepare(command)
+    assert prepared.transfer_payload.ready_event is fence
+    executor = SourceHostStoreExecutor(arena, FakeRemoteWorker(), backend)
+    attempt = TransferAttempt(
+        "fenced:0",
+        "1",
+        "lease",
+        TransferPath.D2P_HOST,
+        prepared.transfer_payload,
+    )
+    try:
+        handle = executor.submit(attempt, lambda: None)
+        assert fence.entered.wait(1)
+        assert not backend.entered.is_set()
+        fence.release.set()
+        assert wait_terminal(executor, handle).state is PhysicalState.SUCCEEDED
+        assert backend.entered.is_set()
+    finally:
+        fence.release.set()
+        executor.close()
+        assert arena.release(prepared.transfer_payload.extent_id)
+        arena.close()
 
 
 def test_path_factory_pairs_direction_with_queue_executor_and_handler():

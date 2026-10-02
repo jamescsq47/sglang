@@ -46,6 +46,7 @@ class HostExtentPhase(str, Enum):
     COPYING = "copying"
     DURABLE = "durable"
     EXPORTED = "exported"
+    EVICTING = "evicting"
     RELEASED = "released"
 
 
@@ -147,7 +148,7 @@ class SourceLocalHostArena:
         self.device_pool = device_pool
         if capacity_bytes is None:
             if self.direction is HostDirection.D2P:
-                env_name, default = "SGLANG_AGENTIC_MULTINODE_D2P_HOST_GIB", 32
+                env_name, default = "SGLANG_AGENTIC_MULTINODE_D2P_HOST_GIB", 64
             else:
                 env_name, default = (
                     "SGLANG_AGENTIC_MULTINODE_P2D_HOST_GIB",
@@ -334,6 +335,28 @@ class SourceLocalHostArena:
                 return False
             return self.release(extent_id)
 
+    def begin_eviction(self, snapshot_id: str) -> SourceHostExtent:
+        with self._lock:
+            extent_id = self._by_snapshot.get(str(snapshot_id))
+            if extent_id is None or extent_id < 0:
+                raise KeyError(f"unknown Host snapshot {snapshot_id}")
+            extent = self.get(extent_id)
+            if extent.phase is not HostExtentPhase.EXPORTED:
+                raise RuntimeError("only an exported Host snapshot may be evicted")
+            extent.phase = HostExtentPhase.EVICTING
+            return extent
+
+    def cancel_eviction(self, snapshot_id: str) -> bool:
+        with self._lock:
+            extent_id = self._by_snapshot.get(str(snapshot_id))
+            if extent_id is None or extent_id < 0:
+                return False
+            extent = self.get(extent_id)
+            if extent.phase is not HostExtentPhase.EVICTING:
+                return False
+            extent.phase = HostExtentPhase.EXPORTED
+            return True
+
     @property
     def used_bytes(self) -> int:
         with self._lock:
@@ -356,6 +379,7 @@ class SourceHostStorePayload:
     source_indices: Any
     state_indices: Any = None
     source_indices_host: Any = None
+    ready_event: Any = None
 
 
 class SourceHostCopyBackend(Protocol):
@@ -478,17 +502,34 @@ class SourceHostStoreExecutor(TransferExecutor):
         cancel = threading.Event()
 
         def run():
-            extent = self.arena.begin_copy(payload.extent_id)
+            local_payload = payload
+            if local_payload.ready_event is not None:
+                local_payload.ready_event.synchronize()
+            if callable(local_payload.source_indices_host):
+                local_payload = SourceHostStorePayload(
+                    local_payload.extent_id,
+                    local_payload.source_indices,
+                    local_payload.state_indices,
+                    local_payload.source_indices_host(),
+                )
+            if callable(local_payload.state_indices):
+                local_payload = SourceHostStorePayload(
+                    local_payload.extent_id,
+                    local_payload.source_indices,
+                    local_payload.state_indices(),
+                    local_payload.source_indices_host,
+                )
+            extent = self.arena.begin_copy(local_payload.extent_id)
             try:
-                self.copy_backend.copy(extent, payload, cancel)
+                self.copy_backend.copy(extent, local_payload, cancel)
             except DrainedSourceHostCopy:
-                self.arena.copy_drained(payload.extent_id)
+                self.arena.copy_drained(local_payload.extent_id)
                 raise
-            extent = self.arena.mark_durable(payload.extent_id)
+            extent = self.arena.mark_durable(local_payload.extent_id)
             shard = self.remote_worker.export_snapshot(
                 extent.snapshot_id, extent.snapshot
             )
-            self.arena.mark_exported(payload.extent_id, shard)
+            self.arena.mark_exported(local_payload.extent_id, shard)
             return shard
 
         future = self._pool.submit(run)
@@ -562,6 +603,7 @@ def make_source_host_store_handler(
                 local.source_indices,
                 local.state_indices,
                 local.source_indices_host,
+                local.ready_event,
             )
             return PreparedRankTransfer(local)
         except BaseException:
@@ -609,6 +651,53 @@ def make_source_host_store_handler(
     # durable export and its complete extent can be reclaimed safely.  If an
     # export has somehow acquired a reader claim, discard returns false and we
     # deliberately retain the bytes (fail closed).
+    return CallbackPathHandler(prepare, commit=commit, abort=abort)
+
+
+def make_source_host_eviction_handler(
+    arena: SourceLocalHostArena,
+    remote_worker: Any,
+) -> CallbackPathHandler:
+    """Build a TP-coordinated, request-generation Host eviction handler.
+
+    PREPARE atomically fences this shard against a recovery reader.  Bytes are
+    released only after every source rank reached that fence and rank zero
+    advances the group transaction.  A partial prepare is reversible.
+    """
+
+    def prepare(command: GroupCommand) -> PreparedRankTransfer:
+        eviction_id = str(command.lease_id)
+        snapshot_id = command.key.snapshot_id
+        if not remote_worker.reserve_export_eviction(snapshot_id, eviction_id):
+            raise RuntimeError("Host snapshot is claimed or not evictable")
+        try:
+            extent = arena.begin_eviction(snapshot_id)
+        except BaseException:
+            remote_worker.cancel_export_eviction(snapshot_id, eviction_id)
+            raise
+        return PreparedRankTransfer(extent.extent_id, requires_io=False)
+
+    def commit(
+        command: GroupCommand,
+        prepared: PreparedRankTransfer,
+        _completion,
+    ) -> None:
+        snapshot_id = command.key.snapshot_id
+        eviction_id = str(command.lease_id)
+        extent = arena.get(int(prepared.transfer_payload))
+        if extent.phase is not HostExtentPhase.EVICTING:
+            raise RuntimeError("Host eviction lost its local extent fence")
+        if not remote_worker.finish_export_eviction(snapshot_id, eviction_id):
+            raise RuntimeError("Host eviction lost its export fence")
+        if not arena.release(extent.extent_id):
+            raise RuntimeError("evicted Host extent was not releasable")
+
+    def abort(command, prepared, _completion) -> None:
+        snapshot_id = command.key.snapshot_id
+        eviction_id = str(command.lease_id)
+        remote_worker.cancel_export_eviction(snapshot_id, eviction_id)
+        arena.cancel_eviction(snapshot_id)
+
     return CallbackPathHandler(prepare, commit=commit, abort=abort)
 
 

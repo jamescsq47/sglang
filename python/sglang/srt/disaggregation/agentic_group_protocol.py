@@ -167,14 +167,19 @@ class GroupCommand:
     target_owner: Owner
     lease_id: str
     payload: Mapping[str, Any] = field(default_factory=dict)
+    endpoint_groups: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if int(self.attempt) < 1 or int(self.command_seq) < 1:
             raise ValueError("attempt and command_seq must be positive")
         if not self.lease_id:
             raise ValueError("lease_id must be non-empty")
+        groups = tuple(str(value) for value in self.endpoint_groups)
+        if groups and (len(set(groups)) != len(groups) or any(not value for value in groups)):
+            raise ValueError("endpoint_groups must be unique non-empty identities")
         object.__setattr__(self, "attempt", int(self.attempt))
         object.__setattr__(self, "command_seq", int(self.command_seq))
+        object.__setattr__(self, "endpoint_groups", groups)
         object.__setattr__(self, "payload", _frozen_payload(self.payload))
 
     def to_dict(self) -> dict[str, Any]:
@@ -187,6 +192,7 @@ class GroupCommand:
             "source_owner": self.source_owner.value,
             "target_owner": self.target_owner.value,
             "lease_id": self.lease_id,
+            "endpoint_groups": list(self.endpoint_groups),
             "payload": dict(self.payload),
         }
 
@@ -202,6 +208,7 @@ class GroupCommand:
             source_owner=Owner(value["source_owner"]),
             target_owner=Owner(value["target_owner"]),
             lease_id=str(value["lease_id"]),
+            endpoint_groups=tuple(value.get("endpoint_groups") or ()),
             payload=value.get("payload") or {},
         )
 
@@ -329,7 +336,7 @@ class LinkIntent:
 
 @dataclass(frozen=True, slots=True)
 class LinkCapacityEdge:
-    """Ephemeral D-capacity notification forwarded to the link coordinator.
+    """Ephemeral endpoint-capacity snapshot forwarded to the coordinator.
 
     This is a wake-up hint, not request-generation state: it never enters the
     lifecycle ledger and may be coalesced.  ``session_id`` lets a freshly
@@ -346,8 +353,11 @@ class LinkCapacityEdge:
     def __post_init__(self) -> None:
         if not self.link_id or not self.session_id or int(self.edge_seq) < 1:
             raise ValueError("link, session and positive capacity sequence required")
-        if self.participant.rank != 0 or self.participant.role != "decode":
-            raise ValueError("only Decode endpoint rank zero may report capacity")
+        if self.participant.rank != 0 or self.participant.role not in {
+            "prefill",
+            "decode",
+        }:
+            raise ValueError("only endpoint rank zero may report capacity")
         if int(self.available_tokens) < 0:
             raise ValueError("available capacity must be non-negative")
         object.__setattr__(self, "edge_seq", int(self.edge_seq))
@@ -375,6 +385,18 @@ class LinkReadiness:
     participant: LinkParticipant
     key: GenerationKey
     phase: ReadinessPhase
+
+    def __post_init__(self) -> None:
+        if not self.link_id:
+            raise ValueError("link ID is required")
+
+
+@dataclass(frozen=True, slots=True)
+class LinkApplicationFinal:
+    """Application-level terminal edge delivered to the link coordinator."""
+
+    link_id: str
+    key: GenerationKey
 
     def __post_init__(self) -> None:
         if not self.link_id:
@@ -534,10 +556,24 @@ class TCPGroupRelayServer:
 
     def _broadcast(self, group_id: str, command: Mapping[str, Any]) -> None:
         spec = self.links[group_id]
+        parsed = GroupCommand.from_dict(command)
+        selected_groups = set(parsed.endpoint_groups)
+        members = tuple(
+            member
+            for member in spec["members"]
+            if not selected_groups or member.endpoint_group in selected_groups
+        )
+        unknown = selected_groups - set(spec["sizes"])
+        if unknown:
+            raise GroupProtocolError(
+                f"command selects unknown endpoints {sorted(unknown)}"
+            )
+        if not members:
+            raise GroupProtocolError("command selects no link participants")
         with self._condition:
             missing = [
                 member
-                for member in spec["members"]
+                for member in members
                 if (group_id, member.endpoint_group, member.rank)
                 not in self._sessions
             ]
@@ -545,7 +581,7 @@ class TCPGroupRelayServer:
             raise GroupDisconnectedError(
                 f"link {group_id} lacks participants {missing}"
             )
-        for member in spec["members"]:
+        for member in members:
             self._send((group_id, member.endpoint_group, member.rank), command)
 
     def _notify_rank0_disconnect(
@@ -568,6 +604,28 @@ class TCPGroupRelayServer:
         role = ""
         try:
             hello = _recv_frame(connection)
+            if hello.get("type") == "application_final":
+                group_id = str(hello.get("group_id", ""))
+                spec = self.links.get(group_id)
+                key = GenerationKey.from_dict(hello["key"])
+                if (
+                    hello.get("run_id") != self.run_id
+                    or hello.get("token") != self.token
+                    or spec is None
+                    or key.run_id != self.run_id
+                ):
+                    raise ValueError("application-final frame does not match relay")
+                coordinator_group, coordinator_rank = spec["coordinator"]
+                self._send(
+                    (group_id, coordinator_group, coordinator_rank),
+                    {
+                        "type": "application_final",
+                        "group_id": group_id,
+                        "key": key.to_dict(),
+                    },
+                )
+                connection.sendall(_encode_frame({"type": "application_final_ack"}))
+                return
             if hello.get("type") != "hello":
                 raise ValueError("first group protocol frame must be HELLO")
             group_id = str(hello.get("group_id", ""))
@@ -650,10 +708,8 @@ class TCPGroupRelayServer:
                         },
                     )
                 elif frame_type == "capacity_edge":
-                    if rank != 0 or role != "decode":
-                        raise ValueError(
-                            "only Decode endpoint rank zero may report capacity"
-                        )
+                    if rank != 0 or role not in {"prefill", "decode"}:
+                        raise ValueError("only endpoint rank zero may report capacity")
                     session_id = str(frame.get("session_id", ""))
                     edge_seq = int(frame.get("edge_seq", 0))
                     available_tokens = int(frame.get("available_tokens", -1))
@@ -817,6 +873,7 @@ class _Attempt:
     lease_id: str
     tp_size: int
     required_commit_phase: RankPhase
+    endpoint_groups: tuple[str, ...] = ()
     command_seq: int = 0
     last_command: Optional[CommandKind] = None
     outcome: AttemptOutcome = AttemptOutcome.ACTIVE
@@ -840,6 +897,7 @@ class _Attempt:
             source_owner=self.source_owner,
             target_owner=self.target_owner,
             lease_id=self.lease_id,
+            endpoint_groups=self.endpoint_groups,
             payload=payload or {},
         )
 
@@ -894,6 +952,8 @@ class GroupLifecycleCoordinator:
         target_owner: Owner,
         lease_id: str,
         required_commit_phase: RankPhase = RankPhase.DMA_DONE,
+        participant_count: Optional[int] = None,
+        endpoint_groups: tuple[str, ...] = (),
         payload: Optional[Mapping[str, Any]] = None,
     ) -> GroupCommand:
         if required_commit_phase not in {
@@ -913,14 +973,18 @@ class GroupLifecycleCoordinator:
             if key in self._active:
                 raise GroupProtocolError("generation already has an active attempt")
             next_attempt = record.attempt + 1
+            attempt_size = self.tp_size if participant_count is None else int(participant_count)
+            if not 1 <= attempt_size <= self.tp_size:
+                raise ValueError("attempt participant_count is outside the link")
             attempt = _Attempt(
                 key=key,
                 attempt=next_attempt,
                 source_owner=source_owner,
                 target_owner=target_owner,
                 lease_id=str(lease_id),
-                tp_size=self.tp_size,
+                tp_size=attempt_size,
                 required_commit_phase=required_commit_phase,
+                endpoint_groups=tuple(endpoint_groups),
             )
             self._records[key] = GenerationRecord(
                 key=key,
@@ -986,7 +1050,7 @@ class GroupLifecycleCoordinator:
                 raise GroupNotReadyError("abort finalization requires drained abort")
             if not all(
                 attempt.rank_phases.get(rank) is RankPhase.FAILED_DRAINED
-                for rank in range(self.tp_size)
+                for rank in range(attempt.tp_size)
             ):
                 raise GroupNotReadyError("not every rank drained its local transfer")
             command = attempt.command(CommandKind.ABORT_FINALIZE, payload)
@@ -1093,14 +1157,14 @@ class GroupLifecycleCoordinator:
         attempt_id: int,
         payload: Optional[Mapping[str, Any]] = None,
     ) -> GroupCommand:
-        """Release TP0's ticket after every rank can accept its broadcast."""
+        """Release TP0's ticket after every rank published its ready lease."""
 
         with self._changed:
             attempt = self._require_active(key, attempt_id)
             if attempt.outcome is not AttemptOutcome.ACTIVE:
                 raise GroupNotReadyError("ticket issue requires an active attempt")
-            if not self._all_at_least(attempt, RankPhase.ACTIVATION_READY):
-                raise GroupNotReadyError("not every rank is activation-ready")
+            if not self._all_at_least(attempt, RankPhase.STAGED):
+                raise GroupNotReadyError("not every rank published target ready")
             command = attempt.command(CommandKind.ISSUE_ACTIVATION_TICKET, payload)
             self._changed.notify_all()
             return command
@@ -1146,16 +1210,31 @@ class GroupLifecycleCoordinator:
             if phase is RankPhase.FAILED_DRAINED:
                 return all(
                     attempt.rank_phases.get(rank) is RankPhase.FAILED_DRAINED
-                    for rank in range(self.tp_size)
+                    for rank in range(attempt.tp_size)
                 )
             return self._all_at_least(attempt, phase)
+
+    def mark_attempt_disconnected(
+        self, key: GenerationKey, attempt_id: int, rank: int
+    ) -> None:
+        """Fail closed for one dynamically selected attempt participant."""
+
+        with self._changed:
+            attempt = self._require_active(key, attempt_id)
+            if not 0 <= int(rank) < attempt.tp_size:
+                raise ValueError("rank is outside this attempt")
+            attempt.disconnected.add(int(rank))
+            if attempt.outcome is AttemptOutcome.ACTIVE:
+                attempt.outcome = AttemptOutcome.ABORTING
+                attempt.abort_reason = "rank_disconnected"
+            self._changed.notify_all()
 
     def apply_ack(self, ack: RankAck) -> bool:
         """Apply one ACK; return ``False`` only for an exact duplicate."""
 
         with self._changed:
             attempt = self._require_active(ack.key, ack.attempt)
-            if not 0 <= ack.rank < self.tp_size:
+            if not 0 <= ack.rank < attempt.tp_size:
                 raise GroupProtocolError("ACK rank is outside this TP group")
             if ack.lease_id != attempt.lease_id:
                 raise GroupProtocolError("ACK lease does not match the attempt")
@@ -1245,7 +1324,10 @@ class GroupLifecycleCoordinator:
                             "rank staged before the all-rank release barrier"
                         )
                 elif ack.phase is RankPhase.ACTIVATED:
-                    if previous is not RankPhase.ACTIVATION_READY:
+                    if previous not in {
+                        RankPhase.STAGED,
+                        RankPhase.ACTIVATION_READY,
+                    }:
                         raise GroupProtocolError(
                             "rank activated before the all-rank ready barrier"
                         )
@@ -1309,7 +1391,7 @@ class GroupLifecycleCoordinator:
                 raise GroupDisconnectedError("disconnected rank has no drained fence")
             if not all(
                 attempt.rank_phases.get(rank) is RankPhase.FAILED_DRAINED
-                for rank in range(self.tp_size)
+                for rank in range(attempt.tp_size)
             ):
                 raise GroupNotReadyError("not every rank drained its local transfer")
             attempt.outcome = AttemptOutcome.ABORTED
@@ -1322,12 +1404,12 @@ class GroupLifecycleCoordinator:
             if attempt.outcome is AttemptOutcome.COMMITTED:
                 ready = all(
                     attempt.rank_phases.get(rank) is RankPhase.FINALIZED
-                    for rank in range(self.tp_size)
+                    for rank in range(attempt.tp_size)
                 )
             elif attempt.outcome is AttemptOutcome.ABORTED:
                 ready = all(
                     attempt.rank_phases.get(rank) is RankPhase.ABORTED
-                    for rank in range(self.tp_size)
+                    for rank in range(attempt.tp_size)
                 )
             else:
                 ready = False
@@ -1411,6 +1493,13 @@ class LinkLifecycleCoordinator:
         self._coordinator = GroupLifecycleCoordinator(
             run_id, link_id, len(ordered)
         )
+        self._attempt_participants: dict[
+            tuple[GenerationKey, int], tuple[LinkParticipant, ...]
+        ] = {}
+        self._attempt_slots: dict[
+            tuple[GenerationKey, int], dict[LinkParticipant, int]
+        ] = {}
+        self._lock = threading.RLock()
 
     @classmethod
     def from_endpoint_sizes(
@@ -1431,12 +1520,83 @@ class LinkLifecycleCoordinator:
         # implementation; only ACK/disconnect identity needs translation.
         return getattr(self._coordinator, name)
 
+    def begin_attempt(
+        self,
+        key: GenerationKey,
+        *,
+        source_owner: Owner,
+        target_owner: Owner,
+        lease_id: str,
+        required_commit_phase: RankPhase = RankPhase.DMA_DONE,
+        endpoint_groups: tuple[str, ...] = (),
+        payload: Optional[Mapping[str, Any]] = None,
+    ) -> GroupCommand:
+        """Begin one attempt over only its selected logical endpoints."""
+
+        selected_groups = tuple(str(value) for value in endpoint_groups)
+        if selected_groups:
+            if len(set(selected_groups)) != len(selected_groups):
+                raise ValueError("attempt endpoint groups must be unique")
+            known = {participant.endpoint_group for participant in self.participants}
+            unknown = set(selected_groups) - known
+            if unknown:
+                raise ValueError(
+                    f"attempt contains unknown endpoints: {sorted(unknown)}"
+                )
+            selected = tuple(
+                participant
+                for participant in self.participants
+                if participant.endpoint_group in selected_groups
+            )
+        else:
+            # Backward-compatible fixed-link behavior.
+            selected = self.participants
+            selected_groups = tuple(
+                dict.fromkeys(participant.endpoint_group for participant in selected)
+            )
+        if not selected:
+            raise ValueError("attempt must select at least one participant")
+        command = self._coordinator.begin_attempt(
+            key,
+            source_owner=source_owner,
+            target_owner=target_owner,
+            lease_id=lease_id,
+            required_commit_phase=required_commit_phase,
+            participant_count=len(selected),
+            endpoint_groups=selected_groups,
+            payload=payload,
+        )
+        identity = (key, command.attempt)
+        with self._lock:
+            self._attempt_participants[identity] = selected
+            self._attempt_slots[identity] = {
+                participant: slot for slot, participant in enumerate(selected)
+            }
+        return command
+
+    def participants_for(
+        self, key: GenerationKey, attempt: int
+    ) -> tuple[LinkParticipant, ...]:
+        with self._lock:
+            try:
+                return self._attempt_participants[(key, int(attempt))]
+            except KeyError as exc:
+                raise StaleAttemptError(
+                    "attempt participant set is unavailable"
+                ) from exc
+
     def apply_ack(self, event: LinkRankAck) -> bool:
-        try:
-            slot = self._slots[event.participant]
-        except KeyError as exc:
-            raise GroupProtocolError("ACK participant is outside this link") from exc
         ack = event.ack
+        with self._lock:
+            slots = self._attempt_slots.get((ack.key, ack.attempt))
+            if slots is None:
+                raise StaleAttemptError("ACK attempt is retired or unknown")
+            try:
+                slot = slots[event.participant]
+            except KeyError as exc:
+                raise GroupProtocolError(
+                    "ACK participant is outside the selected attempt endpoints"
+                ) from exc
         return self._coordinator.apply_ack(
             RankAck(
                 key=ack.key,
@@ -1456,12 +1616,24 @@ class LinkLifecycleCoordinator:
             return self.apply_ack(event)
         if event.link_id != self.link_id:
             raise GroupProtocolError("disconnect belongs to another link")
-        try:
-            slot = self._slots[event.participant]
-        except KeyError as exc:
-            raise GroupProtocolError("disconnect participant is outside this link") from exc
-        self._coordinator.mark_disconnected(slot)
+        if event.participant not in self._slots:
+            raise GroupProtocolError("disconnect participant is outside this link")
+        with self._lock:
+            affected = [
+                (identity, slots[event.participant])
+                for identity, slots in self._attempt_slots.items()
+                if event.participant in slots
+            ]
+        for (key, attempt), slot in affected:
+            self._coordinator.mark_attempt_disconnected(key, attempt, slot)
         return True
+
+    def retire(self, key: GenerationKey, attempt_id: int) -> None:
+        self._coordinator.retire(key, attempt_id)
+        identity = (key, int(attempt_id))
+        with self._lock:
+            self._attempt_participants.pop(identity, None)
+            self._attempt_slots.pop(identity, None)
 
 
 def _encode_frame(value: Mapping[str, Any]) -> bytes:
@@ -1496,6 +1668,36 @@ def _recv_frame(sock: socket.socket) -> dict[str, Any]:
 def _configure_socket(sock: socket.socket) -> None:
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
+
+def send_application_final(
+    address: tuple[str, int],
+    *,
+    run_id: str,
+    group_id: str,
+    token: str,
+    key: GenerationKey,
+    timeout: float = 2.0,
+) -> None:
+    """Send one authenticated terminal edge without joining a TP session."""
+
+    with socket.create_connection(address, timeout=float(timeout)) as sock:
+        _configure_socket(sock)
+        sock.settimeout(float(timeout))
+        sock.sendall(
+            _encode_frame(
+                {
+                    "type": "application_final",
+                    "run_id": str(run_id),
+                    "group_id": str(group_id),
+                    "token": str(token),
+                    "key": key.to_dict(),
+                }
+            )
+        )
+        reply = _recv_frame(sock)
+        if reply.get("type") != "application_final_ack":
+            raise GroupProtocolError("relay rejected application finality")
 
 
 class TCPRankZeroServer:
@@ -1757,7 +1959,7 @@ class TCPRankAgent:
 
     def receive_event(
         self,
-    ) -> GroupCommand | RankAck | RankDisconnected | LinkRankAck | LinkDisconnected | LinkIntent | LinkCapacityEdge | LinkReadiness | LinkFailure:
+    ) -> GroupCommand | RankAck | RankDisconnected | LinkRankAck | LinkDisconnected | LinkIntent | LinkCapacityEdge | LinkReadiness | LinkApplicationFinal | LinkFailure:
         """Receive a relay event; rank zero gets ACKs and disconnect notices."""
 
         frame = _recv_frame(self._socket)
@@ -1839,6 +2041,15 @@ class TCPRankAgent:
                 key=GenerationKey.from_dict(frame["key"]),
                 phase=ReadinessPhase(str(frame["phase"])),
             )
+        if frame_type == "application_final":
+            if self.rank != 0:
+                raise GroupProtocolError(
+                    "only link rank zero may receive application finality"
+                )
+            return LinkApplicationFinal(
+                link_id=str(frame["group_id"]),
+                key=GenerationKey.from_dict(frame["key"]),
+            )
         if frame_type == "failure":
             if self.rank != 0:
                 raise GroupProtocolError("only link rank zero may receive a failure")
@@ -1888,12 +2099,10 @@ class TCPRankAgent:
             )
 
     def send_capacity_edge(self, available_tokens: int) -> int:
-        """Wake P0 after D capacity becomes available; exact duplicates coalesce."""
+        """Publish an absolute endpoint capacity snapshot."""
 
-        if self.rank != 0 or self.endpoint_role != "decode":
-            raise GroupProtocolError(
-                "only Decode endpoint rank zero may report capacity"
-            )
+        if self.rank != 0 or self.endpoint_role not in {"prefill", "decode"}:
+            raise GroupProtocolError("only endpoint rank zero may report capacity")
         available_tokens = int(available_tokens)
         if available_tokens < 0:
             raise ValueError("available capacity must be non-negative")

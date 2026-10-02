@@ -245,16 +245,54 @@ class RemoteHostExport:
         # Holding the Python object does NOT replace a ledger eviction pin.
         self.keepalive = keepalive
         self.reader_id = None
+        self.eviction_id = None
         self.closed = False
 
     def claim(self, read_id: str) -> HostShard:
         with self.transport.lock:
-            if self.closed or not read_id:
+            if self.closed or self.eviction_id is not None or not read_id:
                 raise RuntimeError("export is closed or read lease is empty")
             if self.reader_id not in (None, read_id):
                 raise RuntimeError("Host export already has a reader")
             self.reader_id = read_id
             return self.shard
+
+    def reserve_eviction(self, eviction_id: str) -> bool:
+        """Fence a still-unclaimed export against future recovery readers."""
+
+        with self.transport.lock:
+            if self.closed or self.reader_id is not None or not eviction_id:
+                return False
+            if self.eviction_id not in (None, eviction_id):
+                return False
+            self.eviction_id = eviction_id
+            return True
+
+    def cancel_eviction(self, eviction_id: str) -> bool:
+        with self.transport.lock:
+            if self.closed:
+                return False
+            if self.eviction_id != eviction_id:
+                return False
+            self.eviction_id = None
+            return True
+
+    def finish_eviction(self, eviction_id: str) -> bool:
+        """Deregister after the all-rank eviction prepare barrier."""
+
+        with self.transport.lock:
+            if self.closed or self.reader_id is not None:
+                return False
+            if self.eviction_id != eviction_id:
+                return False
+            if self.owns_registration:
+                self.transport.agent.deregister_memory(
+                    self.registration, backends=self.transport.backends
+                )
+            self.closed = True
+            self.keepalive = None
+            self.transport.exports.pop(self.shard.export_id, None)
+            return True
 
     def discard_unclaimed(self) -> bool:
         """Deregister a durable export only if no remote reader can touch it."""
@@ -262,7 +300,7 @@ class RemoteHostExport:
         with self.transport.lock:
             if self.closed:
                 return True
-            if self.reader_id is not None:
+            if self.reader_id is not None or self.eviction_id is not None:
                 return False
             if self.owns_registration:
                 self.transport.agent.deregister_memory(

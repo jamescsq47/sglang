@@ -28,6 +28,31 @@ from sglang.srt.disaggregation.agentic_transfer_queues import (
     TransferPath,
 )
 from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.nixl.conn import _nixl_progress_thread_count
+from sglang.srt.disaggregation.utils import DisaggregationMode
+
+
+def test_agentic_reverse_direct_gets_background_nixl_progress(monkeypatch):
+    monkeypatch.delenv("SGLANG_AGENTIC_NIXL_PROGRESS_THREADS", raising=False)
+    assert (
+        _nixl_progress_thread_count(
+            DisaggregationMode.DECODE, agentic_lifecycle=True
+        )
+        == 8
+    )
+    assert (
+        _nixl_progress_thread_count(
+            DisaggregationMode.DECODE, agentic_lifecycle=False
+        )
+        == 0
+    )
+    monkeypatch.setenv("SGLANG_AGENTIC_NIXL_PROGRESS_THREADS", "12")
+    assert (
+        _nixl_progress_thread_count(
+            DisaggregationMode.DECODE, agentic_lifecycle=True
+        )
+        == 12
+    )
 
 
 class _Bus:
@@ -112,6 +137,7 @@ class _Receiver:
         self.bootstrap_room = bootstrap_room
         self.started_transfer = False
         self.cleared = False
+        self.clear_calls = 0
 
     def init(self, prefill_dp_rank):
         assert prefill_dp_rank == 0
@@ -135,6 +161,7 @@ class _Receiver:
 
     def clear(self):
         self.cleared = True
+        self.clear_calls += 1
 
 
 def _runtime(bus, *, source):
@@ -196,6 +223,125 @@ def _wait(executor, handle, timeout=3.0):
             return progress
         time.sleep(0.001)
     raise AssertionError("Direct executor did not become terminal")
+
+
+class _BlockingFence:
+    def __init__(self):
+        self.release = threading.Event()
+        self.entered = threading.Event()
+
+    def synchronize(self):
+        self.entered.set()
+        assert self.release.wait(3)
+
+    def query(self):
+        self.entered.set()
+        return self.release.is_set()
+
+
+def test_forward_fence_wait_runs_in_io_worker_not_prepare_control():
+    blocked_bus = _Bus(auto_complete=True)
+    blocked_bus.metadata = True
+    free_bus = _Bus(auto_complete=True)
+    free_bus.metadata = True
+    fence = _BlockingFence()
+    blocked = NixlDirectOperation(
+        _runtime(blocked_bus, source=True),
+        DirectEndpoint.SOURCE,
+        _shard(),
+        ready_event=fence,
+    )
+    free = NixlDirectOperation(
+        _runtime(free_bus, source=True), DirectEndpoint.SOURCE, _shard()
+    )
+    executor = NixlDirectIOExecutor(max_workers=2, poll_interval=0.0002)
+    started = threading.Event()
+    try:
+        first = executor.submit(
+            _attempt(TransferPath.D2P_DIRECT, blocked), lambda: None
+        )
+        executor.install_started_callback(first, started.set)
+        assert fence.entered.wait(1)
+        assert not started.is_set()
+        second = executor.submit(
+            _attempt(TransferPath.D2P_DIRECT, free), lambda: None
+        )
+        assert _wait(executor, second).state is PhysicalState.SUCCEEDED
+        assert executor.progress(first).state is PhysicalState.INFLIGHT
+        fence.release.set()
+        assert started.wait(1)
+        assert _wait(executor, first).state is PhysicalState.SUCCEEDED
+    finally:
+        fence.release.set()
+        executor.close()
+
+
+def test_cancel_before_forward_fence_is_ready_finishes_not_posted():
+    bus = _Bus(auto_complete=True)
+    bus.metadata = True
+    fence = _BlockingFence()
+    operation = NixlDirectOperation(
+        _runtime(bus, source=True),
+        DirectEndpoint.SOURCE,
+        _shard(),
+        ready_event=fence,
+    )
+    executor = NixlDirectIOExecutor(max_workers=1, poll_interval=0.0002)
+    completed = threading.Event()
+    started = threading.Event()
+    try:
+        handle = executor.submit(
+            _attempt(TransferPath.D2P_DIRECT, operation), completed.set
+        )
+        executor.install_started_callback(handle, started.set)
+        assert fence.entered.wait(1)
+        executor.request_cancel(handle, completed.set)
+        assert completed.wait(1)
+        progress = _wait(executor, handle)
+        assert progress.state is PhysicalState.CANCELLED
+        assert progress.fence is FenceKind.NOT_POSTED
+        assert not started.is_set()
+        assert not bus.sent
+    finally:
+        fence.release.set()
+        executor.close()
+
+
+def test_target_cleanup_clears_receiver_and_room_tables_once():
+    bus = _Bus(auto_complete=False)
+    runtime = _runtime(bus, source=False)
+    room = _shard().room
+    for name in (
+        "request_status",
+        "failure_records",
+        "required_prefill_response_num_table",
+        "prefill_response_tracker",
+        "transfer_infos",
+        "transfer_statuses",
+    ):
+        getattr(runtime.manager, name)[room] = object()
+    runtime.manager.addr_to_rooms_tracker[_shard().bootstrap_addr].add(room)
+    operation = NixlDirectOperation(
+        runtime, DirectEndpoint.TARGET, _shard()
+    )
+
+    assert operation.step() is KVPoll.Transferring
+    receiver = operation.receiver
+    assert receiver is not None and operation.posted
+    operation.cleanup()
+    operation.cleanup()
+
+    assert receiver.clear_calls == 1
+    for name in (
+        "request_status",
+        "failure_records",
+        "required_prefill_response_num_table",
+        "prefill_response_tracker",
+        "transfer_infos",
+        "transfer_statuses",
+    ):
+        assert room not in getattr(runtime.manager, name)
+    assert room not in runtime.manager.addr_to_rooms_tracker[_shard().bootstrap_addr]
 
 
 @pytest.mark.parametrize("direction", list(DirectDirection))

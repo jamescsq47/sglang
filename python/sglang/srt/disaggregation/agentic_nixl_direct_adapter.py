@@ -100,8 +100,13 @@ class NixlDirectOperation:
         self,
         runtime: AgenticDirectRuntime,
         endpoint: DirectEndpoint,
-        shard: NixlDirectShard,
+        shard: Optional[NixlDirectShard],
+        *,
+        ready_event: Any = None,
+        shard_factory: Optional[Callable[[], NixlDirectShard]] = None,
     ) -> None:
+        if shard is None and shard_factory is None:
+            raise ValueError("Direct operation requires a shard or shard factory")
         self.runtime = runtime
         self.endpoint = DirectEndpoint(endpoint)
         self.shard = shard
@@ -111,7 +116,45 @@ class NixlDirectOperation:
         self.posted = False
         self._launch_error: Optional[BaseException] = None
         self._cleaned = False
+        self._ready_event = ready_event
+        self._ready_waited = False
+        self._shard_factory = shard_factory
         self._lock = threading.Lock()
+
+    def wait_ready(
+        self,
+        cancel: Optional[threading.Event] = None,
+        poll_interval: float = 0.001,
+    ) -> bool:
+        """Fence source Forward without making pre-post cancellation block.
+
+        CUDA events expose ``query``; poll that edge from the I/O worker so a
+        Direct admission timeout can cancel an operation that has not posted
+        any transport access yet.  Once the event is ready, the immutable
+        source descriptor may be materialized and ordinary NIXL fencing takes
+        over.
+        """
+
+        if self._ready_waited:
+            return True
+        event = self._ready_event
+        if event is not None:
+            query = getattr(event, "query", None)
+            if callable(query):
+                while not bool(query()):
+                    if cancel is not None and cancel.wait(poll_interval):
+                        return False
+            else:
+                if cancel is not None and cancel.is_set():
+                    return False
+                event.synchronize()
+        if cancel is not None and cancel.is_set():
+            return False
+        if self.shard is None:
+            self.shard = self._shard_factory()
+            self._shard_factory = None
+        self._ready_waited = True
+        return True
 
     @staticmethod
     def _pages(values: tuple[int, ...]):
@@ -216,11 +259,12 @@ class NixlDirectOperation:
             receiver = self.receiver
             if receiver is not None:
                 receiver.clear()
-            _cleanup_room(
-                self.runtime.manager,
-                int(self.shard.room),
-                self.shard.bootstrap_addr,
-            )
+            if self.shard is not None:
+                _cleanup_room(
+                    self.runtime.manager,
+                    int(self.shard.room),
+                    self.shard.bootstrap_addr,
+                )
             self._cleaned = True
 
 
@@ -229,6 +273,36 @@ class _DirectHandle:
     future: Future
     cancel: threading.Event
     operation: NixlDirectOperation
+    start_signal: Any
+
+
+class _PhysicalStartSignal:
+    """Race-safe one-shot callback for the first real NIXL post."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._callback: Optional[Callable[[], None]] = None
+        self._fired = False
+
+    def install(self, callback: Callable[[], None]) -> None:
+        call = False
+        with self._lock:
+            if self._callback is not None:
+                raise RuntimeError("Direct start callback was installed twice")
+            self._callback = callback
+            call = self._fired
+        if call:
+            callback()
+
+    def fire(self) -> None:
+        callback = None
+        with self._lock:
+            if self._fired:
+                return
+            self._fired = True
+            callback = self._callback
+        if callback is not None:
+            callback()
 
 
 class NixlDirectIOExecutor(TransferExecutor):
@@ -242,8 +316,15 @@ class NixlDirectIOExecutor(TransferExecutor):
         )
 
     def _run(
-        self, operation: NixlDirectOperation, cancel: threading.Event
+        self,
+        operation: NixlDirectOperation,
+        cancel: threading.Event,
+        start_signal: _PhysicalStartSignal,
     ) -> PhysicalProgress:
+        if not operation.wait_ready(cancel, self.poll_interval):
+            return PhysicalProgress(
+                PhysicalState.CANCELLED, FenceKind.NOT_POSTED
+            )
         while True:
             if cancel.is_set() and not operation.posted:
                 return PhysicalProgress(
@@ -261,6 +342,8 @@ class NixlDirectIOExecutor(TransferExecutor):
                 return PhysicalProgress(
                     PhysicalState.FAILED, FenceKind.NOT_POSTED, str(error)
                 )
+            if operation.posted:
+                start_signal.fire()
             if status == KVPoll.Success:
                 if cancel.is_set():
                     return PhysicalProgress(
@@ -293,10 +376,16 @@ class NixlDirectIOExecutor(TransferExecutor):
         if not isinstance(operation, NixlDirectOperation):
             raise TypeError("NIXL Direct requires NixlDirectOperation payload")
         cancel = threading.Event()
-        future = self._pool.submit(self._run, operation, cancel)
-        handle = _DirectHandle(future, cancel, operation)
+        start_signal = _PhysicalStartSignal()
+        future = self._pool.submit(self._run, operation, cancel, start_signal)
+        handle = _DirectHandle(future, cancel, operation, start_signal)
         future.add_done_callback(lambda _future: notify())
         return handle
+
+    def install_started_callback(
+        self, handle: _DirectHandle, callback: Callable[[], None]
+    ) -> None:
+        handle.start_signal.install(callback)
 
     def progress(self, handle: _DirectHandle) -> PhysicalProgress:
         if not handle.future.done():

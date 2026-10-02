@@ -121,14 +121,9 @@ def test_path_dispatcher_has_no_cross_path_head_of_line_blocking():
     assert errors == []
 
 
-def test_host_prepare_order_is_serial_but_direct_uses_all_control_lanes():
+def test_all_prepare_control_is_serial_but_physical_queues_keep_four_lanes():
     counts = _command_worker_counts(_queues().snapshot())
-    assert counts == {
-        TransferPath.D2P_DIRECT: 4,
-        TransferPath.D2P_HOST: 1,
-        TransferPath.P2D_DIRECT: 4,
-        TransferPath.P2D_HOST: 1,
-    }
+    assert counts == {path: 1 for path in TransferPath}
 
     first_entered = threading.Event()
     first_release = threading.Event()
@@ -170,6 +165,70 @@ def test_host_prepare_order_is_serial_but_direct_uses_all_control_lanes():
     assert errors == []
 
 
+def test_path_dispatcher_preserves_abort_cleanup_before_next_prepare():
+    cancel_entered = threading.Event()
+    cancel_release = threading.Event()
+    abort_finalized = threading.Event()
+    next_prepare = threading.Event()
+    order = []
+    errors = []
+
+    class Executor:
+        def handle(self, command):
+            order.append((command.key.request_id, command.kind))
+            if command.key.request_id == "first" and command.kind is CommandKind.CANCEL:
+                cancel_entered.set()
+                assert cancel_release.wait(2)
+            if command.kind is CommandKind.ABORT_FINALIZE:
+                abort_finalized.set()
+            if (
+                command.key.request_id == "second"
+                and command.kind is CommandKind.PREPARE
+            ):
+                next_prepare.set()
+
+    dispatcher = _PathCommandDispatcher(
+        executor=Executor(),
+        workers={path: 1 for path in TransferPath},
+        after_command=lambda _command: None,
+        on_fatal=errors.append,
+    )
+    dispatcher.start()
+    dispatcher.submit(
+        _dispatcher_command("first", TransferPath.D2P_HOST, CommandKind.PREPARE)
+    )
+    dispatcher.submit(
+        _dispatcher_command("first", TransferPath.D2P_HOST, CommandKind.CANCEL, 2)
+    )
+    assert cancel_entered.wait(1)
+    dispatcher.submit(
+        _dispatcher_command(
+            "first", TransferPath.D2P_HOST, CommandKind.ABORT_FINALIZE, 3
+        )
+    )
+    dispatcher.submit(
+        _dispatcher_command("second", TransferPath.D2P_HOST, CommandKind.PREPARE)
+    )
+    assert not next_prepare.wait(0.05)
+    cancel_release.set()
+    assert abort_finalized.wait(1)
+    assert next_prepare.wait(1)
+    dispatcher.submit(
+        _dispatcher_command(
+            "second", TransferPath.D2P_HOST, CommandKind.FINALIZE, 2
+        )
+    )
+    dispatcher.close(2)
+    assert order == [
+        ("first", CommandKind.PREPARE),
+        ("first", CommandKind.CANCEL),
+        ("first", CommandKind.ABORT_FINALIZE),
+        ("second", CommandKind.PREPARE),
+        ("second", CommandKind.FINALIZE),
+    ]
+    assert errors == []
+
+
 class _ManualDrainExecutor:
     def __init__(self) -> None:
         self._condition = threading.Condition()
@@ -177,6 +236,7 @@ class _ManualDrainExecutor:
         self._notify = None
         self._cancelled = False
         self._drained = False
+        self._succeeded = False
 
     def submit(self, attempt, notify):
         with self._condition:
@@ -187,6 +247,10 @@ class _ManualDrainExecutor:
 
     def progress(self, _handle):
         with self._condition:
+            if self._succeeded:
+                return PhysicalProgress(
+                    PhysicalState.SUCCEEDED, FenceKind.DMA_COMPLETE
+                )
             if self._drained:
                 return PhysicalProgress(
                     PhysicalState.CANCELLED, FenceKind.CANCEL_DRAINED
@@ -209,6 +273,13 @@ class _ManualDrainExecutor:
     def drain(self):
         with self._condition:
             self._drained = True
+            notify = self._notify
+        assert notify is not None
+        notify()
+
+    def succeed(self):
+        with self._condition:
+            self._succeeded = True
             notify = self._notify
         assert notify is not None
         notify()
@@ -503,7 +574,7 @@ def test_tp8_out_of_order_readiness_gates_prepare_and_target_scheduler_ticket():
         _close(relay, runtimes, coordinator)
 
 
-def test_close_retains_active_dma_until_cancel_drained_fence():
+def test_close_does_not_cancel_a_partially_posted_start():
     manual = {}
 
     def queue_factory(participant):
@@ -525,14 +596,17 @@ def test_close_retains_active_dma_until_cancel_drained_fence():
 
         with pytest.raises(RuntimeCloseBlocked):
             p0.close(timeout=0.05)
-        assert all(executor.wait_cancelled(5) for executor in manual.values())
+        assert not any(executor.wait_cancelled(0) for executor in manual.values())
         assert all(runtime.executor.active_count == 1 for runtime in runtimes.values())
 
         for executor in manual.values():
-            executor.drain()
+            executor.succeed()
+        ticket = p0.take_activation_ticket(timeout=5)
+        p0.activate_staged(ticket)
+        p0.confirm_scheduler_adopted(ticket)
         terminal = p0.take_terminal(timeout=5)
-        assert not terminal.committed
-        assert committed == [] and len(aborted) == 1
+        assert terminal.committed
+        assert committed == [(plan.key, terminal.attempt)] and aborted == []
         assert all(runtime.wait_idle(5) for runtime in runtimes.values())
     finally:
         _close(relay, runtimes, coordinator)

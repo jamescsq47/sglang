@@ -134,10 +134,15 @@ class AgenticPMemorySchedulerBridge:
     def wait_forward_fence(self, lease_id: int) -> None:
         """Wait in the path worker, never in the scheduler/Forward thread."""
 
-        with self._lock:
-            event = self._forward_fences.get(int(lease_id))
+        event = self.forward_fence(lease_id)
         if event is not None:
             event.synchronize()
+
+    def forward_fence(self, lease_id: int) -> Any:
+        """Return the immutable CUDA fence without waiting on a control thread."""
+
+        with self._lock:
+            return self._forward_fences.get(int(lease_id))
 
     def reserve_workset(
         self,

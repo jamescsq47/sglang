@@ -16,6 +16,7 @@ No filesystem path, directory scan, or scheduler transport poll is used.
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import threading
 import time
@@ -29,6 +30,7 @@ from sglang.srt.disaggregation.agentic_decode_memory_bridge import (
 )
 from sglang.srt.disaggregation.agentic_group_protocol import (
     GenerationKey,
+    LinkApplicationFinal,
     LinkCapacityEdge,
     LinkIntent,
     LinkParticipant,
@@ -48,6 +50,7 @@ from sglang.srt.disaggregation.agentic_memory_scheduler_bridge import (
 from sglang.srt.disaggregation.agentic_multinode_runtime import (
     AgenticMultiNodeRuntime,
     EndpointActivationTicket,
+    RuntimeCloseBlocked,
 )
 
 logger = logging.getLogger(__name__)
@@ -104,6 +107,18 @@ class _AbortedEvent:
 @dataclass(frozen=True, slots=True)
 class _CapacityAvailableEvent:
     remote_role: str
+    endpoint_group: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class _ApplicationFinalEvent:
+    key: GenerationKey
+
+
+@dataclass(frozen=True, slots=True)
+class _MaterializedEvent:
+    plan: GroupTransferPlan
+    attempt: int
 
 
 class RequestGenerationRegistry:
@@ -172,7 +187,17 @@ class RequestGenerationRegistry:
     def mark_init_submitted(self, key: GenerationKey, attempt: Optional[int]) -> None:
         with self._lock:
             record = self._records.get(key)
-            if record is None or record.phase is not RequestPhase.ARRIVED:
+            if record is None:
+                raise RuntimeError("initial admission belongs to an unknown request")
+            if record.phase is RequestPhase.INIT_SUBMITTED:
+                if not record.initial_admission_pending:
+                    raise RuntimeError("initial admission retry has no pending gate")
+                # Capacity retries use a fresh group attempt after the prior
+                # attempt reached an aborted terminal state.  Track the newest
+                # attempt without reopening scheduler visibility.
+                record.submitted_attempt = attempt
+                return
+            if record.phase is not RequestPhase.ARRIVED:
                 raise RuntimeError("initial admission has an invalid request phase")
             record.phase = RequestPhase.INIT_SUBMITTED
             record.submitted_attempt = attempt
@@ -357,7 +382,13 @@ class RuntimePhysicalProvider(Protocol):
     ) -> None:
         ...
 
-    def memory_available(self, *, remote_role: str) -> None:
+    def memory_available(
+        self,
+        *,
+        remote_role: str,
+        endpoint_group: str = "",
+        available_tokens: Optional[int] = None,
+    ) -> None:
         """Consume a coalesced remote allocator-capacity edge."""
 
         ...
@@ -416,11 +447,21 @@ class SchedulerAgenticMultinodeRuntime:
         state_counts = tuple(provider.default_state_slot_counts(scheduler))
         if len(state_allocators) != len(state_counts):
             raise ValueError("state allocator/count descriptions differ")
+        role = str(config.role)
         self.authority = AgenticMemoryAuthority(
             scheduler.token_to_kv_pool_allocator,
             state_allocators=state_allocators,
+            decode_growth_reserve_tokens=(
+                int(
+                    os.getenv(
+                        "SGLANG_AGENTIC_MULTINODE_DECODE_GROWTH_TOKENS",
+                        "512",
+                    )
+                )
+                if role == "decode"
+                else 0
+            ),
         )
-        role = str(config.role)
         self.p_memory_bridge = (
             AgenticPMemorySchedulerBridge(
                 self.authority, default_state_slot_counts=state_counts
@@ -455,19 +496,24 @@ class SchedulerAgenticMultinodeRuntime:
             executors, lanes=lanes, pending_capacity=capacities
         )
 
+        endpoints = getattr(config, "endpoint_specs", ()) or (
+            (config.role, config.endpoint_group, int(config.tp_size)),
+            (
+                config.peer_role,
+                config.peer_group,
+                int(getattr(config, "peer_tp_size", config.tp_size)),
+            ),
+        )
         participants = tuple(
             LinkParticipant(endpoint_role, endpoint_group, rank)
-            for endpoint_role, endpoint_group in (
-                (config.role, config.endpoint_group),
-                (config.peer_role, config.peer_group),
-            )
-            for rank in range(int(config.tp_size))
+            for endpoint_role, endpoint_group, endpoint_size in endpoints
+            for rank in range(int(endpoint_size))
         )
         local = LinkParticipant(role, config.endpoint_group, scheduler.tp_rank)
-        coordinator_role = (
-            config.role
-            if config.coordinator_group == config.endpoint_group
-            else config.peer_role
+        coordinator_role = next(
+            endpoint_role
+            for endpoint_role, endpoint_group, _endpoint_size in endpoints
+            if endpoint_group == config.coordinator_group
         )
         coordinator = LinkParticipant(
             coordinator_role, config.coordinator_group, 0
@@ -484,10 +530,12 @@ class SchedulerAgenticMultinodeRuntime:
             queues=self.transfer_queues,
             handlers=handlers,
             decide_intent=self._decide_intent,
+            on_materialized=self._on_materialized,
             on_committed=self._on_committed,
             on_committed_results=self._on_committed_results,
             on_aborted=self._on_aborted,
             on_capacity_edge=self._on_capacity_edge,
+            on_application_final=self._on_application_final,
             retain_terminals=False,
             cuda_device=(
                 None
@@ -498,7 +546,8 @@ class SchedulerAgenticMultinodeRuntime:
         self._events: queue.Queue[Any] = queue.Queue()
         self._fatal: Optional[BaseException] = None
         self._closed = False
-        self._capacity_edge_pending: set[str] = set()
+        self._closing = False
+        self._capacity_edge_pending: dict[object, int] = {}
         self._pending_after_initial: dict[GenerationKey, GroupTransferPlan] = {}
         self._lock = threading.RLock()
         self._controller = threading.Thread(
@@ -519,9 +568,10 @@ class SchedulerAgenticMultinodeRuntime:
         self._low_level.start()
         if int(scheduler.tp_rank) == 0:
             self.authority.install_capacity_available_sink(
-                self._notify_d_capacity_available
-                if role == "decode"
-                else self._notify_p_capacity_available
+                self._notify_endpoint_capacity_available
+            )
+            self._notify_endpoint_capacity_available(
+                self.authority.available_tokens()
             )
         install_submitter = getattr(provider, "install_submitter", None)
         if install_submitter is not None:
@@ -584,16 +634,57 @@ class SchedulerAgenticMultinodeRuntime:
 
         if int(self.scheduler.tp_rank) != 0:
             raise RuntimeError("only endpoint rank zero may submit provider plans")
-        return self._low_level.submit(plan)
+        attempt = self._low_level.submit(plan)
+        # Host eviction may turn an already-arrived child into an explicit
+        # full-recompute admission.  That plan originates in the policy actor
+        # rather than ``on_request``, but it crosses the same scheduler gate
+        # as an ordinary initial admission.  Keep the local registry in step
+        # before the eventual COMMITTED callback is consumed.
+        if plan.payload.get("kind") == "initial_prefill":
+            record = self.registry.get(plan.key)
+            if record is not None:
+                self.registry.mark_init_submitted(plan.key, attempt)
+        return attempt
 
     def _controller_loop(self) -> None:
+        last_progress_log = time.monotonic()
         while True:
-            event = self._events.get()
+            try:
+                event = self._events.get(timeout=1.0)
+            except queue.Empty:
+                event = None
+            now = time.monotonic()
+            if now - last_progress_log >= 10.0:
+                diagnostics = getattr(self.provider, "progress_diagnostics", None)
+                if diagnostics is not None:
+                    values = diagnostics()
+                    if any(values.values()):
+                        logger.info("Agentic V2 policy progress %s", values)
+                last_progress_log = now
+            if event is None:
+                continue
             if event is _STOP:
                 return
             try:
                 if isinstance(event, RuntimeRequestRecord):
                     plan = self.provider.on_request(self.context, event)
+                    make_intent = getattr(self.provider, "request_control_intent", None)
+                    if make_intent is not None and int(self.scheduler.tp_rank) == 0:
+                        control_intent = make_intent(self.context, event)
+                        if control_intent is not None:
+                            if len(control_intent) == 3:
+                                intent_key, kind, payload = control_intent
+                            else:
+                                # Compatibility for external providers.  New
+                                # providers must make direction-specific key
+                                # selection explicit.
+                                kind, payload = control_intent
+                                intent_key = event.parent_key or event.key
+                            self._low_level.submit_control_intent(
+                                intent_key,
+                                kind,
+                                payload,
+                            )
                     if plan is not None:
                         if int(self.scheduler.tp_rank) != 0:
                             raise RuntimeError(
@@ -645,10 +736,34 @@ class SchedulerAgenticMultinodeRuntime:
                     )
                 elif isinstance(event, _CapacityAvailableEvent):
                     with self._lock:
-                        self._capacity_edge_pending.discard(event.remote_role)
+                        identity = (
+                            (event.remote_role, event.endpoint_group)
+                            if event.endpoint_group
+                            else event.remote_role
+                        )
+                        available_tokens = self._capacity_edge_pending.pop(identity, 0)
                     callback = getattr(self.provider, "memory_available", None)
+                    snapshot = getattr(self.provider, "capacity_snapshot", None)
+                    if snapshot is not None:
+                        snapshot(
+                            remote_role=event.remote_role,
+                            endpoint_group=event.endpoint_group,
+                            available_tokens=available_tokens,
+                        )
                     if callback is not None:
-                        callback(remote_role=event.remote_role)
+                        callback(
+                            remote_role=event.remote_role,
+                            endpoint_group=event.endpoint_group,
+                            available_tokens=available_tokens,
+                        )
+                elif isinstance(event, _ApplicationFinalEvent):
+                    callback = getattr(self.provider, "application_final", None)
+                    if callback is not None:
+                        callback(self.context, event.key)
+                elif isinstance(event, _MaterializedEvent):
+                    callback = getattr(self.provider, "on_materialized", None)
+                    if callback is not None:
+                        callback(self.context, event.plan, event.attempt)
                 else:
                     raise TypeError(f"unsupported controller event {event!r}")
             except BaseException as error:
@@ -657,7 +772,7 @@ class SchedulerAgenticMultinodeRuntime:
                         self._fatal = error
 
     def _decide_intent(
-        self, intent: LinkIntent, candidate: GroupTransferPlan
+        self, intent: LinkIntent, candidate: Optional[GroupTransferPlan]
     ) -> Optional[GroupTransferPlan]:
         return self.provider.decide_intent(self.context, intent, candidate)
 
@@ -665,6 +780,10 @@ class SchedulerAgenticMultinodeRuntime:
         # Low-level invokes this on its coordinator/control thread.  Never
         # call provider policy or submit a successor attempt from there.
         self._events.put_nowait(_CommittedEvent(plan, attempt))
+
+    def _on_materialized(self, plan: GroupTransferPlan, attempt: int) -> None:
+        # Keep HTTP/control notification out of the low-level TP ACK thread.
+        self._events.put_nowait(_MaterializedEvent(plan, attempt))
 
     def _handle_committed(self, plan: GroupTransferPlan, attempt: int) -> None:
         self.provider.on_committed(self.context, plan, attempt)
@@ -693,27 +812,46 @@ class SchedulerAgenticMultinodeRuntime:
     def _on_capacity_edge(self, edge: LinkCapacityEdge) -> None:
         """Coalesce transient D-capacity hints before entering policy code."""
 
-        self._enqueue_capacity_available(edge.participant.role)
+        self._enqueue_capacity_available(
+            edge.participant.role,
+            edge.available_tokens,
+            endpoint_group=edge.participant.endpoint_group,
+        )
 
-    def _enqueue_capacity_available(self, remote_role: str) -> None:
+    def _on_application_final(self, edge: LinkApplicationFinal) -> None:
+        self._events.put_nowait(_ApplicationFinalEvent(edge.key))
+
+    def _enqueue_capacity_available(
+        self,
+        remote_role: str,
+        available_tokens: int,
+        *,
+        endpoint_group: str = "",
+    ) -> None:
         remote_role = str(remote_role)
+        available_tokens = max(0, int(available_tokens))
         with self._lock:
-            if (
-                self._closed
-                or self._fatal is not None
-                or remote_role in self._capacity_edge_pending
-            ):
+            if self._closed or self._fatal is not None:
                 return
-            self._capacity_edge_pending.add(remote_role)
-        self._events.put_nowait(_CapacityAvailableEvent(remote_role))
+            identity = (
+                (remote_role, str(endpoint_group))
+                if endpoint_group
+                else remote_role
+            )
+            pending = identity in self._capacity_edge_pending
+            # Capacity is an absolute, causally ordered snapshot rather than
+            # an additive credit.  Keep the newest value while one wake-up is
+            # pending; retaining an older maximum can over-admit after another
+            # request consumed pages between two release notifications.
+            self._capacity_edge_pending[identity] = available_tokens
+            if pending:
+                return
+        self._events.put_nowait(
+            _CapacityAvailableEvent(remote_role, str(endpoint_group))
+        )
 
-    def _notify_p_capacity_available(self, _available_tokens: int) -> None:
-        """Wake retained Host→P work on a real local P release edge."""
-
-        self._enqueue_capacity_available("prefill")
-
-    def _notify_d_capacity_available(self, available_tokens: int) -> None:
-        """Allocator edge sink; ownership release never depends on this hint."""
+    def _notify_endpoint_capacity_available(self, available_tokens: int) -> None:
+        """Publish a causally ordered absolute capacity snapshot."""
 
         try:
             self._low_level.notify_capacity_available(int(available_tokens))
@@ -750,6 +888,9 @@ class SchedulerAgenticMultinodeRuntime:
             raise CompositeRuntimeError("V2 controller failed") from fatal
         if closed:
             raise CompositeRuntimeError("V2 runtime is closed")
+        provider_health = getattr(self.provider, "check_health", None)
+        if provider_health is not None:
+            provider_health()
         self._low_level.check_health()
 
     def is_idle(self) -> bool:
@@ -778,12 +919,33 @@ class SchedulerAgenticMultinodeRuntime:
         """Cross the lifecycle fence after native scheduler queue insertion."""
 
         self._low_level.confirm_scheduler_adopted(ticket)
+        # Global attempt completion is observed only by the fixed link
+        # coordinator.  Initial admission, however, is an endpoint-local
+        # scheduler fact: every target TP rank crosses this adopted fence.
+        # Clear the local gate here so a non-coordinator P can submit its
+        # subsequent Prefill-complete P->D plan instead of waiting forever
+        # for a coordinator-private terminal callback.
+        record = self.registry.get(ticket.key)
+        if record is not None and record.initial_admission_pending:
+            self.registry.mark_init_ready(ticket.key)
 
     def close(self) -> None:
         with self._lock:
             if self._closed:
                 return
-            self._closed = True
+            if self._closing:
+                raise CompositeRuntimeError("V2 runtime close is already in progress")
+            self._closing = True
+        # Keep the policy thread alive while the link runtime drains terminal
+        # callbacks and retain all event sinks until the low-level ownership
+        # graph is terminal.  RuntimeCloseBlocked is retryable: no local
+        # component is marked closed and no callback path is disconnected.
+        try:
+            self._low_level.close()
+        except RuntimeCloseBlocked:
+            with self._lock:
+                self._closing = False
+            raise
         if self.p_memory_bridge is not None:
             self.p_memory_bridge.install_completion_sink(None)
             self.p_memory_bridge.install_final_release_sink(None)
@@ -791,14 +953,14 @@ class SchedulerAgenticMultinodeRuntime:
             self.d_memory_bridge.install_completion_sink(None)
             self.d_memory_bridge.install_final_release_sink(None)
         self.authority.install_capacity_available_sink(None)
-        # Keep the policy thread alive while the link runtime drains terminal
-        # callbacks; otherwise an abort/commit callback can be silently lost.
-        self._low_level.close()
         self._events.put(_STOP)
         self._controller.join(timeout=5.0)
         if self._controller.is_alive():
             raise CompositeRuntimeError("V2 controller did not stop")
         self.provider.close()
+        with self._lock:
+            self._closed = True
+            self._closing = False
 
 
 def create_runtime(

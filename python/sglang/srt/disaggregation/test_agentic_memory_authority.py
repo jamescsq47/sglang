@@ -113,14 +113,16 @@ def test_state_failure_rolls_back_whole_workset():
     assert allocator.live == set()
 
 
-def test_decode_credit_is_capacity_not_a_second_free_list():
+def test_decode_growth_uses_one_allocator_wide_reserve():
     allocator = FakeAllocator()
-    authority = AgenticMemoryAuthority(allocator)
+    authority = AgenticMemoryAuthority(
+        allocator, decode_growth_reserve_tokens=64
+    )
     lease = authority.reserve_decode(
         key(), owner="p2d", prompt_tokens=65, decode_growth_tokens=64
     )
     assert len(allocator.live) == 128
-    assert lease.growth_reserved_tokens == 64
+    assert lease.growth_reserved_tokens == 0
     assert authority.available_tokens() == 1024 - 128 - 64
 
     assert authority.publish_ready(lease.lease_id, "decode-ready") is not None
@@ -142,12 +144,27 @@ def test_decode_credit_is_capacity_not_a_second_free_list():
 
     grown = authority.run_decode_growth(lease.lease_id, alloc_one_page)
     assert len(grown) == 64
-    assert authority.available_tokens() == 1024 - 192
+    assert authority.available_tokens() == 1024 - 192 - 64
 
     assert authority.finish_compute(lease.lease_id)
     assert authority.request_release(lease.lease_id)
     assert authority.commit_release(lease.lease_id)
     assert allocator.available_size() == 1024
+
+
+def test_decode_growth_reserve_is_not_multiplied_by_request_count():
+    allocator = FakeAllocator()
+    authority = AgenticMemoryAuthority(
+        allocator, decode_growth_reserve_tokens=64
+    )
+    first = authority.reserve_decode(
+        key(1), owner="p2d", prompt_tokens=64, decode_growth_tokens=512
+    )
+    second = authority.reserve_decode(
+        key(2), owner="p2d", prompt_tokens=64, decode_growth_tokens=8192
+    )
+    assert first is not None and second is not None
+    assert authority.available_tokens() == 1024 - 128 - 64
 
 
 def test_ready_queue_is_edge_driven_and_lease_is_adopted_without_allocation():

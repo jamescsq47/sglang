@@ -120,10 +120,15 @@ class AgenticDMemorySchedulerBridge:
     def wait_forward_fence(self, lease_id: int) -> None:
         """Wait in the path worker before reading source pages."""
 
-        with self._lock:
-            event = self._forward_fences.get(int(lease_id))
+        event = self.forward_fence(lease_id)
         if event is not None:
             event.synchronize()
+
+    def forward_fence(self, lease_id: int) -> Any:
+        """Return the immutable CUDA fence without blocking TP control."""
+
+        with self._lock:
+            return self._forward_fences.get(int(lease_id))
 
     @staticmethod
     def _event_complete(event: Any) -> bool:

@@ -8,14 +8,21 @@ policy, while every rank executes the immutable command for its shard.
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
 import os
 import threading
+import time
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 import numpy as np
 import torch
+
+logger = logging.getLogger(__name__)
 
 from sglang.srt.disaggregation.agentic_group_protocol import (
     GenerationKey,
@@ -55,10 +62,25 @@ from sglang.srt.disaggregation.agentic_native_memory_adapter import (
     NativeRequestMemoryAdapter,
     NativeSourceSnapshot,
     common_page_prefix_tokens,
+    token_page_chain_hashes,
     decode_state_slot_count,
     hybrid_state_allocator,
     prefill_state_slot_count,
 )
+
+
+_D2P_CHILD_ARRIVED = "d2p_child_arrived_v1"
+_P2D_CHILD_ARRIVED = "p2d_child_arrived_v1"
+
+
+@dataclass(slots=True)
+class _D2PHostEntry:
+    key: GenerationKey
+    source_group: str
+    token_count: int
+    rank_bytes: tuple[int, ...]
+    durable_at: float
+    evicting: bool = False
 from sglang.srt.disaggregation.agentic_nixl_direct_adapter import (
     DirectEndpoint,
     NixlDirectIOExecutor,
@@ -73,6 +95,7 @@ from sglang.srt.disaggregation.agentic_source_host import (
     HostDirection,
     SourceHostStorePayload,
     SourceLocalHostArena,
+    make_source_host_eviction_handler,
     make_source_host_store_path,
 )
 from sglang.srt.disaggregation.agentic_transfer_queues import (
@@ -106,8 +129,10 @@ def _operation(command: GroupCommand) -> TransferOperation:
     return TransferOperation(str(header["operation"]))
 
 
-def _room(key: GenerationKey, path: TransferPath) -> int:
-    raw = f"{key.run_id}:{key.snapshot_id}:{path.value}".encode()
+def _room(
+    key: GenerationKey, path: TransferPath, target_group: str = ""
+) -> int:
+    raw = f"{key.run_id}:{key.snapshot_id}:{path.value}:{target_group}".encode()
     return int.from_bytes(hashlib.sha256(raw).digest()[:8], "little") & (
         (1 << 63) - 1
     )
@@ -131,6 +156,7 @@ class _DispatchExecutor(TransferExecutor):
                 lease_id=attempt.lease_id,
                 path=attempt.path,
                 payload=payload,
+                channel=attempt.channel,
             )
         executor = self._select(payload)
         return executor, executor.submit(attempt, notify)
@@ -142,6 +168,14 @@ class _DispatchExecutor(TransferExecutor):
     def request_cancel(self, handle, notify):
         executor, local = handle
         executor.request_cancel(local, notify)
+
+    def install_started_callback(self, handle, callback):
+        executor, local = handle
+        install = getattr(executor, "install_started_callback", None)
+        if callable(install):
+            install(local, callback)
+        else:
+            callback()
 
     def close(self) -> None:
         # Concrete executors are closed by the provider exactly once.
@@ -212,6 +246,17 @@ class _DispatchHandler(RankPathHandler):
         finally:
             with self._lock:
                 self._chosen.pop(self._key(command), None)
+
+    def retire(self, command) -> None:
+        """Forget no-I/O participants that never execute commit/abort."""
+
+        with self._lock:
+            self._chosen.pop(self._key(command), None)
+
+    @property
+    def active_count(self) -> int:
+        with self._lock:
+            return len(self._chosen)
 
 
 @dataclass(slots=True)
@@ -303,6 +348,8 @@ class _TargetHandler(RankPathHandler):
     def commit(self, command, prepared, completion):
         local = self._local(prepared)
         self.provider._publish_target(local)
+        if self.direct:
+            prepared.transfer_payload.cleanup()
         self.provider._target_prepared.pop(local.lease.lease_id, None)
 
     def abort(self, command, prepared, completion):
@@ -311,6 +358,8 @@ class _TargetHandler(RankPathHandler):
         self.provider.context.authority.commit_release(
             lease_id, reason="target_attempt_aborted"
         )
+        if self.direct:
+            prepared.transfer_payload.cleanup()
         self.provider._target_prepared.pop(lease_id, None)
 
 
@@ -371,11 +420,59 @@ class AgenticDefaultPhysicalProvider:
         self._source: dict[GenerationKey, tuple[Any, PhysicalMemoryLease, NativeSourceSnapshot]] = {}
         self._target_prepared: dict[int, _TargetPrepared] = {}
         self._pending_candidates: dict[GenerationKey, GroupTransferPlan] = {}
+        self._pending_p2d_candidates: dict[GenerationKey, GroupTransferPlan] = {}
+        self._early_p2d_targets: dict[GenerationKey, Mapping[str, Any]] = {}
+        self._p2d_spill_timers: dict[GenerationKey, threading.Timer] = {}
+        self._initial_capacity_wait: dict[GenerationKey, GroupTransferPlan] = {}
+        self._p2d_route_lock = threading.RLock()
+        self._route_callback_error: Optional[BaseException] = None
         self._host_results: dict[GenerationKey, HostDescriptorSet] = {}
+        self._d2p_host_entries: dict[GenerationKey, _D2PHostEntry] = {}
+        self._terminal_d2p: set[GenerationKey] = set()
+        self._d2p_host_lock = threading.RLock()
+        self._d2p_host_evictions = 0
+        self._endpoint_capacity: dict[tuple[str, str], int] = {}
         self._policy: Optional[D2PPolicyActor] = None
         self._p2d_policy: Optional[P2DPolicyActor] = None
+        default_direct_lanes = max(
+            1, int(os.getenv("SGLANG_AGENTIC_MULTINODE_DIRECT_LANES", "4"))
+        )
+        self._direct_lanes = {
+            TransferPath.D2P_DIRECT: max(
+                1,
+                int(
+                    os.getenv(
+                        "SGLANG_AGENTIC_MULTINODE_D2P_DIRECT_LANES",
+                        str(default_direct_lanes),
+                    )
+                ),
+            ),
+            TransferPath.P2D_DIRECT: max(
+                1,
+                int(
+                    os.getenv(
+                        "SGLANG_AGENTIC_MULTINODE_P2D_DIRECT_LANES",
+                        str(default_direct_lanes),
+                    )
+                ),
+            ),
+        }
+        self._host_lanes = max(
+            1, int(os.getenv("SGLANG_AGENTIC_MULTINODE_HOST_LANES", "4"))
+        )
         self._paths_ready = False
         self._closers: list[Any] = []
+        self._route_notifier = (
+            ThreadPoolExecutor(max_workers=2, thread_name_prefix="dualpd-route-ready")
+            if int(self.scheduler.tp_rank) == 0
+            and (
+                os.getenv("SGLANG_AGENTIC_ROUTE_CALLBACK_URL", "")
+                or os.getenv(
+                    "SGLANG_AGENTIC_DECODE_RESERVATION_CALLBACK_URL", ""
+                )
+            )
+            else None
+        )
 
     def state_allocators(self, scheduler):
         return hybrid_state_allocator(scheduler)
@@ -385,7 +482,11 @@ class AgenticDefaultPhysicalProvider:
 
     def install_submitter(self, submitter):
         self._submitter = submitter
-        if self.role == "prefill" and int(self.scheduler.tp_rank) == 0:
+        if (
+            self.role == "prefill"
+            and int(self.scheduler.tp_rank) == 0
+            and self.config.endpoint_group == self.config.coordinator_group
+        ):
             self._policy = D2PPolicyActor(
                 direct_window_seconds=float(
                     os.getenv("SGLANG_AGENTIC_MULTINODE_DIRECT_WINDOW_SECONDS", "1")
@@ -394,6 +495,7 @@ class AgenticDefaultPhysicalProvider:
                 make_direct=self._make_d2p_direct,
                 make_host_store=self._make_d2p_host_store,
                 make_host_restore=self._make_d2p_host_restore,
+                make_recompute=self._make_d2p_recompute,
             )
             self._p2d_policy = P2DPolicyActor(
                 submit=submitter,
@@ -439,8 +541,12 @@ class AgenticDefaultPhysicalProvider:
             **common,
         )
         self._direct_executors = {
-            TransferPath.D2P_DIRECT: NixlDirectIOExecutor(max_workers=4),
-            TransferPath.P2D_DIRECT: NixlDirectIOExecutor(max_workers=4),
+            TransferPath.D2P_DIRECT: NixlDirectIOExecutor(
+                max_workers=self._direct_lanes[TransferPath.D2P_DIRECT]
+            ),
+            TransferPath.P2D_DIRECT: NixlDirectIOExecutor(
+                max_workers=self._direct_lanes[TransferPath.P2D_DIRECT]
+            ),
         }
 
         self._host_arena = SourceLocalHostArena(
@@ -468,16 +574,19 @@ class AgenticDefaultPhysicalProvider:
             CudaSourceHostCopyBackend(kv_pool),
             descriptor=self._host_source_payload,
             source_hbm_release=self._host_source_release,
-            max_workers=4,
+            max_workers=self._host_lanes,
         )
         self._host_load_executor = RemoteHostLoadExecutor(
-            self._target_host_worker, max_workers=4
+            self._target_host_worker, max_workers=self._host_lanes
         )
         self._host_restore_source = make_host_restore_source_handler(
             self._source_host_worker,
             source_group=self.config.endpoint_group,
-            target_group=self.config.peer_group,
             release_host_snapshot=self._host_arena.release_snapshot,
+        )
+        self._host_evict_source = make_source_host_eviction_handler(
+            self._host_arena,
+            self._source_host_worker,
         )
         self._no_io = make_no_io_host_endpoint_handler()
         self._target_direct = _TargetHandler(self, direct=True)
@@ -510,7 +619,14 @@ class AgenticDefaultPhysicalProvider:
         return self._handlers
 
     def lanes(self, context):
-        return {path: 4 for path in TransferPath}
+        return {
+            path: (
+                self._direct_lanes[path]
+                if path in {TransferPath.D2P_DIRECT, TransferPath.P2D_DIRECT}
+                else self._host_lanes
+            )
+            for path in TransferPath
+        }
 
     def pending_capacity(self, context):
         return {path: 256 for path in TransferPath}
@@ -556,6 +672,8 @@ class AgenticDefaultPhysicalProvider:
             return self._host_store_path.handler if source else self._no_io
         if operation is TransferOperation.HOST_RESTORE:
             return self._host_restore_source if source else self._target_host
+        if operation is TransferOperation.HOST_EVICT:
+            return self._host_evict_source if source else self._no_io
         raise ValueError("unsupported transfer operation")
 
     def _source_entry(self, command: GroupCommand):
@@ -579,21 +697,28 @@ class AgenticDefaultPhysicalProvider:
                 if self.role == "prefill"
                 else self.context.d_memory_bridge
             )
-            bridge.wait_forward_fence(lease.lease_id)
+            ready_event = bridge.forward_fence(lease.lease_id)
             values = _values(command)
             token_count = int(values["token_count"])
-            state = snapshot.state_indices or None
-            shard = NixlDirectShard(
-                bootstrap_addr=str(values["bootstrap_addr"]),
-                room=int(values["room"]),
-                page_indices=self._page_prefix(snapshot, token_count),
-                state_indices=state,
-                prefill_dp_rank=0,
-                destination_tp_ranks=(int(self.scheduler.tp_rank),),
-                pp_rank=int(self.scheduler.pp_rank),
-            )
+
+            def make_shard():
+                state = snapshot.state_indices or None
+                return NixlDirectShard(
+                    bootstrap_addr=str(values["bootstrap_addr"]),
+                    room=int(values["room"]),
+                    page_indices=self._page_prefix(snapshot, token_count),
+                    state_indices=state,
+                    prefill_dp_rank=0,
+                    destination_tp_ranks=(int(self.scheduler.tp_rank),),
+                    pp_rank=int(self.scheduler.pp_rank),
+                )
+
             operation = NixlDirectOperation(
-                self._direct_source_runtime, DirectEndpoint.SOURCE, shard
+                self._direct_source_runtime,
+                DirectEndpoint.SOURCE,
+                None,
+                ready_event=ready_event,
+                shard_factory=make_shard,
             )
             return PreparedRankTransfer(
                 operation, physical_lease_id=lease.lease_id
@@ -699,22 +824,33 @@ class AgenticDefaultPhysicalProvider:
     def _direct_target_payload(self, command, lease):
         values = _values(command)
         token_count = int(values["token_count"])
-        raw = lease.parent_indices[:token_count].detach().cpu().numpy()
-        pages = tuple(
-            int(value)
-            for value in kv_to_page_indices(raw, lease.page_size).tolist()
-        )
-        shard = NixlDirectShard(
-            bootstrap_addr=str(values["bootstrap_addr"]),
-            room=int(values["room"]),
-            page_indices=pages,
-            state_indices=self._direct_target_state(lease),
-            prefill_dp_rank=0,
-            destination_tp_ranks=(int(self.scheduler.tp_rank),),
-            pp_rank=int(self.scheduler.pp_rank),
-        )
+        ready_event = None
+        if bool(getattr(lease.parent_indices, "is_cuda", False)):
+            ready_event = torch.cuda.Event()
+            ready_event.record()
+
+        def make_shard():
+            raw = lease.parent_indices[:token_count].detach().cpu().numpy()
+            pages = tuple(
+                int(value)
+                for value in kv_to_page_indices(raw, lease.page_size).tolist()
+            )
+            return NixlDirectShard(
+                bootstrap_addr=str(values["bootstrap_addr"]),
+                room=int(values["room"]),
+                page_indices=pages,
+                state_indices=self._direct_target_state(lease),
+                prefill_dp_rank=0,
+                destination_tp_ranks=(int(self.scheduler.tp_rank),),
+                pp_rank=int(self.scheduler.pp_rank),
+            )
+
         operation = NixlDirectOperation(
-            self._direct_target_runtime, DirectEndpoint.TARGET, shard
+            self._direct_target_runtime,
+            DirectEndpoint.TARGET,
+            None,
+            ready_event=ready_event,
+            shard_factory=make_shard,
         )
         return operation
 
@@ -723,10 +859,30 @@ class AgenticDefaultPhysicalProvider:
         descriptors = HostDescriptorSet.from_payload(values["host_shards"])
         shard = descriptors.shards[int(self.scheduler.tp_rank)]
         state = self._direct_target_state(lease)
+        ready_event = None
+        if bool(getattr(lease.parent_indices, "is_cuda", False)):
+            ready_event = torch.cuda.Event()
+            ready_event.record()
+
+        def device_indices():
+            values = tuple(
+                int(value)
+                for value in lease.parent_indices[: shard.token_count]
+                .detach()
+                .to(device="cpu", dtype=torch.int64)
+                .tolist()
+            )
+            if len(values) != int(shard.token_count):
+                raise ValueError(
+                    "Host target lease does not cover the complete snapshot"
+                )
+            return values
+
         payload = RemoteHostLoadPayload(
             shard=shard.to_dict(),
-            device_indices=lease.parent_indices[: shard.token_count],
+            device_indices=device_indices,
             state_indices=state,
+            ready_event=ready_event,
         )
         return payload
 
@@ -789,28 +945,29 @@ class AgenticDefaultPhysicalProvider:
                 if role == "prefill"
                 else context.d_memory_bridge
             )
-        if bridge is not None:
-            bridge.wait_forward_fence(lease.lease_id)
+        ready_event = None if bridge is None else bridge.forward_fence(lease.lease_id)
         values = _values(command)
         token_count = int(values["token_count"])
-        state = None
-        if snapshot.state_indices:
-            state = tuple(snapshot.state_indices)
         return SourceHostStorePayload(
             extent_id=0,
             source_indices=snapshot.token_indices[:token_count],
-            state_indices=state,
-            # The registered-extent backend can issue pure copy-engine DMA
-            # only when it has the physical token addresses on CPU.  Freeze
-            # this small immutable mirror during PREPARE; omitting it falls
-            # back to an SM gather kernel from a background controller thread.
-            source_indices_host=tuple(
+            state_indices=(
+                (lambda: snapshot.state_indices or None)
+                if snapshot.state_slot_count
+                else None
+            ),
+            # The registered-extent backend needs a CPU address mirror for
+            # pure copy-engine DMA.  Materialize it only after the request's
+            # Forward fence, in the I/O worker, so PREPARE remains a short
+            # control transaction.
+            source_indices_host=lambda: tuple(
                 int(value)
                 for value in snapshot.token_indices[:token_count]
                 .detach()
                 .to(device="cpu", dtype=torch.int64)
                 .tolist()
             ),
+            ready_event=ready_event,
         )
 
     def _host_source_release(self, command, _extent):
@@ -832,7 +989,7 @@ class AgenticDefaultPhysicalProvider:
             "kind": kind,
             "token_count": snapshot.token_count,
             "page_chain_hashes": list(snapshot.page_chain_hashes),
-            "state_slots": len(snapshot.state_indices) or 1,
+            "state_slots": snapshot.state_slot_count or 1,
         }
 
     def on_request(self, context, record):
@@ -856,11 +1013,43 @@ class AgenticDefaultPhysicalProvider:
                     "prompt_tokens": prompt,
                     "token_count": prompt,
                 },
+                target_group=self.config.endpoint_group,
             )
-        if self.role == "prefill" and record.parent_key is not None:
-            if self._policy is not None:
-                self._policy.child_arrived(record.parent_key, record)
         return None
+
+    def request_control_intent(self, context, record):
+        if self.role == "decode":
+            metadata = (
+                getattr(record.req.sampling_params, "custom_params", None) or {}
+            )
+            return (
+                record.key,
+                _P2D_CHILD_ARRIVED,
+                {
+                    "target_group": self.config.endpoint_group,
+                    "target_generation": record.key.generation,
+                    "decode_reservation_id": str(
+                        metadata.get("agentic_decode_reservation_id", "")
+                    ),
+                },
+            )
+        if self.role != "prefill" or record.parent_key is None:
+            return None
+        tokens = tuple(int(value) for value in record.req.origin_input_ids)
+        page_size = int(context.authority.page_size)
+        complete_tokens = tokens[: len(tokens) // page_size * page_size]
+        return (
+            record.parent_key,
+            _D2P_CHILD_ARRIVED,
+            {
+                "target_group": self.config.endpoint_group,
+                "target_generation": record.key.generation,
+                "prompt_tokens": len(tokens),
+                "page_chain_hashes": list(
+                    token_page_chain_hashes(complete_tokens, page_size)
+                ),
+            },
+        )
 
     def plan_prefill_complete(self, context, record, item):
         snapshot = self.adapter.source_snapshot(item.req, direction="p2d")
@@ -879,12 +1068,12 @@ class AgenticDefaultPhysicalProvider:
         payload = self._base_payload(snapshot, kind="p2d")
         payload.update(
             {
+                "late_bind_pending": True,
                 "target_generation": record.key.generation,
                 "prompt_tokens": snapshot.token_count,
                 "decode_growth_tokens": growth,
                 "sampled_token_id": int(item.req.output_ids[-1]),
                 "bootstrap_addr": runtime.bootstrap_addr,
-                "room": _room(record.key, TransferPath.P2D_DIRECT),
             }
         )
         if self.adapter.hybrid:
@@ -899,10 +1088,200 @@ class AgenticDefaultPhysicalProvider:
             target_owner=Owner.D_GPU,
             lease_id=f"p2d:{record.key.snapshot_id}",
             payload=payload,
+            source_group=self.config.endpoint_group,
+            target_group="",
         )
-        if self._p2d_policy is not None:
-            self._p2d_policy.direct_submitted(plan)
+        self._notify_prefill_ready(record, snapshot.token_count, growth)
+        if self.config.endpoint_group == self.config.coordinator_group:
+            target = self._early_p2d_targets.pop(plan.key, None)
+            if target is None:
+                self._hold_p2d_until_target(plan)
+                return None
+            bound = self._bind_p2d_target(plan, target)
+            if self._p2d_policy is None:
+                raise RuntimeError("global coordinator has no P2D policy actor")
+            self._p2d_policy.direct_submitted(bound)
+            return bound
         return plan
+
+    def _notify_prefill_ready(
+        self, record, prompt_tokens: int, decode_growth_tokens: int
+    ) -> None:
+        """Notify Router after compute without blocking the P controller."""
+
+        if self._route_notifier is None:
+            return
+        callback = os.getenv("SGLANG_AGENTIC_ROUTE_CALLBACK_URL", "").strip()
+        room = getattr(record.req, "bootstrap_room", None)
+        if not callback or room is None:
+            raise RuntimeError("late-bound Prefill request lacks route callback metadata")
+        body = json.dumps(
+            {
+                "bootstrap_room": room,
+                "request_id": record.key.request_id,
+                "generation": record.key.generation,
+                "prompt_tokens": int(prompt_tokens),
+                # D endpoint capacity reports physical free pages after one
+                # allocator-wide growth floor.  Late binding therefore
+                # reserves only the imported prompt for this request.
+                "required_tokens": int(prompt_tokens),
+                "source_group": self.config.endpoint_group,
+            },
+            separators=(",", ":"),
+        ).encode()
+
+        def post() -> None:
+            error = None
+            for retry in range(8):
+                try:
+                    request = urllib.request.Request(
+                        callback,
+                        data=body,
+                        headers={"content-type": "application/json"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(request, timeout=5.0) as response:
+                        if response.status != 200:
+                            raise RuntimeError(
+                                "late-binding Router rejected Prefill ready: "
+                                f"{response.status}"
+                            )
+                    return
+                except BaseException as caught:
+                    error = caught
+                    if retry != 7:
+                        time.sleep(min(1.0, 0.05 * (2**retry)))
+            logger.error(
+                "Prefill-ready callback failed permanently key=%s error=%r",
+                record.key.snapshot_id,
+                error,
+            )
+            with self._p2d_route_lock:
+                if self._route_callback_error is None:
+                    self._route_callback_error = error
+
+        self._route_notifier.submit(post)
+
+    def _hold_p2d_until_target(self, candidate: GroupTransferPlan) -> None:
+        """Wait briefly for D selection, then spill without retaining P HBM."""
+
+        if self._p2d_policy is None:
+            raise RuntimeError("global coordinator has no P2D policy actor")
+        self._p2d_policy.direct_submitted(candidate)
+        delay = max(
+            0.0,
+            float(os.getenv("SGLANG_AGENTIC_P2D_LATE_BIND_GRACE_SECONDS", "0.5")),
+        )
+
+        def spill() -> None:
+            with self._p2d_route_lock:
+                self._p2d_spill_timers.pop(candidate.key, None)
+            self._p2d_policy.spill_if_unbound(candidate.key)
+
+        timer = threading.Timer(delay, spill)
+        timer.daemon = True
+        with self._p2d_route_lock:
+            self._pending_p2d_candidates[candidate.key] = candidate
+            self._p2d_spill_timers[candidate.key] = timer
+        timer.start()
+
+    def _take_p2d_candidate(
+        self, key: GenerationKey
+    ) -> Optional[GroupTransferPlan]:
+        with self._p2d_route_lock:
+            candidate = self._pending_p2d_candidates.pop(key, None)
+            timer = self._p2d_spill_timers.pop(key, None)
+        if timer is not None:
+            timer.cancel()
+        return candidate
+
+    @staticmethod
+    def _bind_p2d_target(
+        candidate: GroupTransferPlan, target: Mapping[str, Any]
+    ) -> GroupTransferPlan:
+        target_group = str(target.get("target_group", ""))
+        if not target_group:
+            raise ValueError("P2D target arrival omitted target_group")
+        values = dict(candidate.payload)
+        values.pop("late_bind_pending", None)
+        values["target_group"] = target_group
+        values["target_generation"] = int(
+            target.get("target_generation", candidate.key.generation)
+        )
+        reservation_id = str(target.get("decode_reservation_id", ""))
+        if reservation_id:
+            values["decode_reservation_id"] = reservation_id
+        values["room"] = _room(candidate.key, TransferPath.P2D_DIRECT, target_group)
+        return replace(candidate, payload=values, target_group=target_group)
+
+    def on_materialized(self, _context, plan: GroupTransferPlan, attempt: int) -> None:
+        """Acknowledge replacement of one Router shadow D reservation.
+
+        The callback is emitted only by the fixed group coordinator after all
+        target TP ranks cross their real DMA fences.  It never owns or releases
+        KV and is posted by an independent notifier thread.
+        """
+
+        if plan.path not in {TransferPath.P2D_DIRECT, TransferPath.P2D_HOST}:
+            return
+        if plan.operation not in {
+            TransferOperation.DIRECT,
+            TransferOperation.HOST_RESTORE,
+        }:
+            return
+        reservation_id = str(plan.payload.get("decode_reservation_id", ""))
+        if not reservation_id:
+            return
+        callback = os.getenv(
+            "SGLANG_AGENTIC_DECODE_RESERVATION_CALLBACK_URL", ""
+        ).strip()
+        if not callback:
+            logger.warning(
+                "Decode reservation %s materialized without Router callback",
+                reservation_id,
+            )
+            return
+        if self._route_notifier is None:
+            raise RuntimeError("Decode reservation callback has no notifier")
+        body = json.dumps(
+            {
+                "reservation_id": reservation_id,
+                "target_group": plan.target_group,
+                "request_id": plan.key.request_id,
+                "generation": plan.key.generation,
+                "attempt": int(attempt),
+            },
+            separators=(",", ":"),
+        ).encode()
+
+        def post() -> None:
+            error = None
+            for retry in range(8):
+                try:
+                    request = urllib.request.Request(
+                        callback,
+                        data=body,
+                        headers={"content-type": "application/json"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(request, timeout=5.0) as response:
+                        if response.status != 200:
+                            raise RuntimeError(
+                                "Decode reservation callback rejected: "
+                                f"{response.status}"
+                            )
+                    return
+                except BaseException as caught:
+                    error = caught
+                    if retry != 7:
+                        time.sleep(min(1.0, 0.05 * (2**retry)))
+            logger.error(
+                "Decode reservation callback failed permanently id=%s error=%r",
+                reservation_id,
+                error,
+            )
+
+        self._route_notifier.submit(post)
 
     def plan_decode_complete(self, context, record, item):
         snapshot = self.adapter.source_snapshot(item.req, direction="d2p")
@@ -927,17 +1306,34 @@ class AgenticDefaultPhysicalProvider:
             target_owner=Owner.P_GPU,
             lease_id=f"d2p:{record.key.snapshot_id}",
             payload=payload,
+            source_group=self.config.endpoint_group,
         )
 
     def _child_values(self, candidate, child_record):
         values = dict(candidate.payload)
         hashes = tuple(values["page_chain_hashes"])
-        req = child_record.req
-        common = common_page_prefix_tokens(
-            hashes,
-            req.origin_input_ids,
-            int(self.context.authority.page_size),
-        )
+        if isinstance(child_record, Mapping):
+            child_hashes = tuple(child_record["page_chain_hashes"])
+            pages = 0
+            for parent_hash, child_hash in zip(hashes, child_hashes):
+                if parent_hash != child_hash:
+                    break
+                pages += 1
+            common = min(
+                int(values["token_count"]),
+                pages * int(self.context.authority.page_size),
+            )
+            prompt_tokens = int(child_record["prompt_tokens"])
+            target_generation = int(child_record["target_generation"])
+        else:
+            req = child_record.req
+            common = common_page_prefix_tokens(
+                hashes,
+                req.origin_input_ids,
+                int(self.context.authority.page_size),
+            )
+            prompt_tokens = len(req.origin_input_ids)
+            target_generation = child_record.key.generation
         if self.adapter.hybrid and common != int(values["token_count"]):
             # The transferred Mamba checkpoint is valid only at the frozen
             # pd_mamba boundary.  Never pair it with a shorter Attention prefix.
@@ -947,15 +1343,32 @@ class AgenticDefaultPhysicalProvider:
         values.update(
             {
                 "kind": "d2p",
-                "target_generation": child_record.key.generation,
+                "target_generation": target_generation,
                 "parent_tokens": common,
-                "prompt_tokens": len(req.origin_input_ids),
+                "prompt_tokens": prompt_tokens,
                 "token_count": common,
             }
         )
         return values
 
     def _make_d2p_direct(self, candidate, child_record):
+        timeout = max(
+            0.0,
+            float(
+                os.getenv(
+                    "SGLANG_AGENTIC_MULTINODE_DIRECT_ADMISSION_SECONDS", "1"
+                )
+            ),
+        )
+        target_group = (
+            str(child_record.get("target_group", ""))
+            if isinstance(child_record, Mapping)
+            else self.config.endpoint_group
+        )
+        values = self._child_values(candidate, child_record)
+        values["room"] = _room(
+            candidate.key, TransferPath.D2P_DIRECT, target_group
+        )
         return GroupTransferPlan(
             key=candidate.key,
             path=TransferPath.D2P_DIRECT,
@@ -963,7 +1376,10 @@ class AgenticDefaultPhysicalProvider:
             source_owner=Owner.D_GPU,
             target_owner=Owner.P_GPU,
             lease_id=candidate.lease_id,
-            payload=self._child_values(candidate, child_record),
+            payload=values,
+            source_group=candidate.source_group,
+            target_group=target_group,
+            admission_deadline=(time.monotonic() + timeout if timeout else 0.0),
         )
 
     def _make_d2p_host_store(self, candidate):
@@ -977,11 +1393,17 @@ class AgenticDefaultPhysicalProvider:
             target_owner=Owner.D_HOST,
             lease_id=f"d2h:{candidate.key.snapshot_id}",
             payload=values,
+            source_group=candidate.source_group,
         )
 
     def _make_d2p_host_restore(self, candidate, child_record, descriptors):
         values = self._child_values(candidate, child_record)
         values["kind"] = "d2p_host_restore"
+        values["target_group"] = (
+            str(child_record.get("target_group", ""))
+            if isinstance(child_record, Mapping)
+            else self.config.endpoint_group
+        )
         return build_host_restore_plan(
             self._make_d2p_host_store(candidate),
             descriptors,
@@ -989,6 +1411,200 @@ class AgenticDefaultPhysicalProvider:
             target_owner=Owner.P_GPU,
             target_transfer=values,
         )
+
+    def _make_d2p_recompute(self, parent_key, child_record):
+        if not isinstance(child_record, Mapping):
+            raise TypeError("multi-node recompute requires a wire child descriptor")
+        target_group = str(child_record.get("target_group", ""))
+        if not target_group:
+            raise ValueError("recompute child omitted target_group")
+        generation = int(child_record["target_generation"])
+        prompt_tokens = int(child_record["prompt_tokens"])
+        child_key = GenerationKey(
+            parent_key.run_id, parent_key.request_id, generation
+        )
+        return GroupTransferPlan(
+            key=child_key,
+            path=TransferPath.P2D_DIRECT,
+            operation=TransferOperation.DIRECT,
+            source_owner=Owner.NONE,
+            target_owner=Owner.P_GPU,
+            lease_id=f"recompute:{child_key.snapshot_id}",
+            payload={
+                "kind": "initial_prefill",
+                "recompute_required": True,
+                "evicted_parent_generation": parent_key.generation,
+                "target_generation": generation,
+                "parent_tokens": 0,
+                "prompt_tokens": prompt_tokens,
+                "token_count": prompt_tokens,
+            },
+            target_group=target_group,
+        )
+
+    def _make_d2p_host_evict(
+        self, entry: _D2PHostEntry, *, reason: str = "d2p_host_high_watermark"
+    ):
+        return GroupTransferPlan(
+            key=entry.key,
+            path=TransferPath.D2P_HOST,
+            operation=TransferOperation.HOST_EVICT,
+            source_owner=Owner.D_HOST,
+            target_owner=Owner.NONE,
+            lease_id=f"evict:{entry.key.snapshot_id}",
+            payload={
+                "kind": "d2p_host_evict",
+                "token_count": entry.token_count,
+                "reason": str(reason),
+            },
+            source_group=entry.source_group,
+        )
+
+    def _track_d2p_host(
+        self,
+        plan: GroupTransferPlan,
+        descriptors: HostDescriptorSet,
+    ) -> None:
+        entry = _D2PHostEntry(
+            key=plan.key,
+            source_group=plan.source_group,
+            token_count=int(descriptors.shards[0].token_count),
+            rank_bytes=tuple(int(shard.byte_size) for shard in descriptors.shards),
+            durable_at=time.monotonic(),
+        )
+        with self._d2p_host_lock:
+            old = self._d2p_host_entries.get(plan.key)
+            if old is not None and old != entry:
+                raise RuntimeError("D2P Host accounting changed for one generation")
+            self._d2p_host_entries[plan.key] = entry
+            terminal = plan.key in self._terminal_d2p
+        if terminal:
+            self._submit_terminal_d2p_eviction(plan.key)
+        self._schedule_d2p_host_evictions(entry.source_group)
+
+    def application_final(self, _context, key: GenerationKey) -> None:
+        """Release a parent generation that will never receive a child."""
+
+        with self._d2p_host_lock:
+            self._terminal_d2p.add(key)
+        if self._submit_terminal_d2p_eviction(key):
+            return
+        # The Host eviction may already have committed before the application
+        # terminal edge arrived. Retire that detached EVICTED tombstone
+        # atomically in the policy actor. Active D/Host/Direct states return
+        # False and retain the terminal edge until their physical fence closes.
+        retire = getattr(self._policy, "application_final", None)
+        if callable(retire) and retire(key):
+            self._forget_terminal_d2p(key)
+
+    def _submit_terminal_d2p_eviction(self, key: GenerationKey) -> bool:
+        if self._policy is None or getattr(self, "_submitter", None) is None:
+            return False
+        with self._d2p_host_lock:
+            entry = self._d2p_host_entries.get(key)
+            if entry is None or entry.evicting:
+                return False
+            if not self._policy.begin_eviction(key):
+                return False
+            entry.evicting = True
+        try:
+            self._submitter(
+                self._make_d2p_host_evict(entry, reason="application_final")
+            )
+        except BaseException:
+            with self._d2p_host_lock:
+                current = self._d2p_host_entries.get(key)
+                if current is not None:
+                    current.evicting = False
+            self._policy.eviction_rejected(key)
+            raise
+        return True
+
+    def _forget_d2p_host(self, key: GenerationKey) -> None:
+        lock = getattr(self, "_d2p_host_lock", None)
+        if lock is None:
+            return
+        with lock:
+            self._d2p_host_entries.pop(key, None)
+
+    def _forget_terminal_d2p(self, key: GenerationKey) -> None:
+        lock = getattr(self, "_d2p_host_lock", None)
+        terminal = getattr(self, "_terminal_d2p", None)
+        if lock is None or terminal is None:
+            return
+        with lock:
+            terminal.discard(key)
+
+    def _schedule_d2p_host_evictions(
+        self,
+        source_group: str,
+        *,
+        force: bool = False,
+    ) -> int:
+        """Evict complete unclaimed generations from 90% down to 75%."""
+
+        if self._policy is None or getattr(self, "_submitter", None) is None:
+            return 0
+        capacity = int(
+            float(os.getenv("SGLANG_AGENTIC_MULTINODE_D2P_HOST_GIB", "64"))
+            * 1024**3
+        )
+        high = float(
+            os.getenv("SGLANG_AGENTIC_MULTINODE_D2P_HOST_HIGH_WATERMARK", "0.90")
+        )
+        low = float(
+            os.getenv("SGLANG_AGENTIC_MULTINODE_D2P_HOST_LOW_WATERMARK", "0.75")
+        )
+        if not (0.0 < low < high < 1.0):
+            raise ValueError("D2P Host watermarks must satisfy 0 < low < high < 1")
+        selected: list[_D2PHostEntry] = []
+        with self._d2p_host_lock:
+            entries = [
+                entry
+                for entry in self._d2p_host_entries.values()
+                if entry.source_group == source_group
+            ]
+            rank_count = max((len(entry.rank_bytes) for entry in entries), default=0)
+            usage = [0] * rank_count
+            for entry in entries:
+                for rank, byte_size in enumerate(entry.rank_bytes):
+                    usage[rank] += byte_size
+            if not usage or (not force and max(usage) < high * capacity):
+                return 0
+            target = int(low * capacity)
+            candidates = sorted(
+                (entry for entry in entries if not entry.evicting),
+                key=lambda entry: (entry.token_count, entry.durable_at),
+            )
+            for entry in candidates:
+                if not self._policy.begin_eviction(entry.key):
+                    continue
+                entry.evicting = True
+                selected.append(entry)
+                for rank, byte_size in enumerate(entry.rank_bytes):
+                    usage[rank] -= byte_size
+                if usage and max(usage) <= target:
+                    break
+        for entry in selected:
+            try:
+                self._submitter(self._make_d2p_host_evict(entry))
+            except BaseException:
+                with self._d2p_host_lock:
+                    current = self._d2p_host_entries.get(entry.key)
+                    if current is not None:
+                        current.evicting = False
+                self._policy.eviction_rejected(entry.key)
+                raise
+        if selected:
+            logger.warning(
+                "Agentic V2 D2P Host pressure source=%s selected=%d "
+                "high=%.2f low=%.2f",
+                source_group,
+                len(selected),
+                high,
+                low,
+            )
+        return len(selected)
 
     def _make_p2d_host_store(self, direct):
         values = dict(direct.payload)
@@ -1001,11 +1617,13 @@ class AgenticDefaultPhysicalProvider:
             target_owner=Owner.P_HOST,
             lease_id=f"p2h:{direct.key.snapshot_id}",
             payload=values,
+            source_group=direct.source_group,
         )
 
     def _make_p2d_host_restore(self, direct, descriptors):
         values = dict(direct.payload)
         values["kind"] = "p2d_host_restore"
+        values["target_group"] = direct.target_group
         return build_host_restore_plan(
             self._make_p2d_host_store(direct),
             descriptors,
@@ -1014,7 +1632,77 @@ class AgenticDefaultPhysicalProvider:
             target_transfer=values,
         )
 
+    def progress_diagnostics(self) -> dict[str, object]:
+        """Expose policy queues without advancing or mutating them."""
+
+        with self._p2d_route_lock:
+            pending_candidates = len(self._pending_p2d_candidates)
+            early_targets = len(self._early_p2d_targets)
+            spill_timers = len(self._p2d_spill_timers)
+            initial_wait = len(self._initial_capacity_wait)
+            pending_sample = tuple(
+                key.snapshot_id for key in tuple(self._pending_p2d_candidates)[:4]
+            )
+            early_sample = tuple(
+                key.snapshot_id for key in tuple(self._early_p2d_targets)[:4]
+            )
+        phases = (
+            {} if self._p2d_policy is None else self._p2d_policy.phase_counts()
+        )
+        d2p_phases = (
+            {} if self._policy is None else self._policy.phase_counts()
+        )
+        with self._d2p_host_lock:
+            d2p_host_entries = len(self._d2p_host_entries)
+            d2p_host_bytes = sum(
+                sum(entry.rank_bytes) for entry in self._d2p_host_entries.values()
+            )
+        return {
+            "p2d_pending_candidates": pending_candidates,
+            "p2d_early_targets": early_targets,
+            "p2d_spill_timers": spill_timers,
+            "initial_capacity_wait": initial_wait,
+            "p2d_pending_sample": pending_sample,
+            "p2d_early_sample": early_sample,
+            "p2d_phases": phases,
+            "d2p_phases": d2p_phases,
+            "d2p_host_entries": d2p_host_entries,
+            "d2p_host_gib": round(d2p_host_bytes / 1024**3, 3),
+            "d2p_host_evictions": self._d2p_host_evictions,
+        }
+
     def decide_intent(self, context, intent: LinkIntent, candidate):
+        if intent.kind == _D2P_CHILD_ARRIVED:
+            if self._policy is None:
+                raise RuntimeError("global coordinator has no D2P policy actor")
+            self._policy.child_arrived(intent.key, dict(intent.payload))
+            return None
+        if intent.kind == _P2D_CHILD_ARRIVED:
+            target = dict(intent.payload)
+            pending = self._take_p2d_candidate(intent.key)
+            if pending is None:
+                self._early_p2d_targets[intent.key] = target
+                return None
+            plan = self._bind_p2d_target(pending, target)
+            if self._p2d_policy is None:
+                raise RuntimeError("global coordinator has no P2D policy actor")
+            return self._p2d_policy.bind_target(plan)
+        if candidate is None:
+            raise ValueError(f"unsupported control intent {intent.kind!r}")
+        if (
+            candidate.path is TransferPath.P2D_DIRECT
+            and candidate.operation is TransferOperation.DIRECT
+            and candidate.source_owner is Owner.P_GPU
+        ):
+            target = self._early_p2d_targets.pop(candidate.key, None)
+            if target is None:
+                self._hold_p2d_until_target(candidate)
+                return None
+            plan = self._bind_p2d_target(candidate, target)
+            if self._p2d_policy is None:
+                raise RuntimeError("global coordinator has no P2D policy actor")
+            self._p2d_policy.direct_submitted(plan)
+            return plan
         # Only the fixed P coordinator owns D→P policy.  P→D is already a
         # complete plan produced by P0.
         if candidate.path is not TransferPath.D2P_DIRECT:
@@ -1027,22 +1715,84 @@ class AgenticDefaultPhysicalProvider:
         # deadline.  Rejecting this intent does not lose it.
         return None
 
+    def _request_target_group(self, record, role: str) -> str:
+        metadata = getattr(record.req.sampling_params, "custom_params", None) or {}
+        key = f"agentic_{role}_group"
+        value = str(metadata.get(key, ""))
+        if not value:
+            # Fixed one-P/one-D links predate explicit HTTP route metadata.
+            value = str(getattr(self.config, "peer_group", ""))
+        if not value:
+            raise RuntimeError(f"request omitted {key}")
+        return value
+
+    def capacity_snapshot(
+        self, *, remote_role: str, endpoint_group: str, available_tokens: int
+    ) -> None:
+        if endpoint_group:
+            self._endpoint_capacity[(str(remote_role), str(endpoint_group))] = max(
+                0, int(available_tokens)
+            )
+        if str(remote_role) != "prefill" or not endpoint_group:
+            return
+        remaining = max(0, int(available_tokens))
+        retry = []
+        with self._p2d_route_lock:
+            for key, plan in tuple(self._initial_capacity_wait.items()):
+                if plan.target_group != str(endpoint_group):
+                    continue
+                required = max(0, int(plan.payload.get("prompt_tokens", 0)))
+                if required > remaining:
+                    continue
+                self._initial_capacity_wait.pop(key, None)
+                retry.append(plan)
+                remaining -= required
+        for plan in retry:
+            if self._submitter is None:
+                raise RuntimeError("initial admission retry has no submitter")
+            self._submitter(plan)
+
     def on_committed(self, context, plan, attempt):
+        if plan.payload.get("kind") == "initial_prefill":
+            with self._p2d_route_lock:
+                self._initial_capacity_wait.pop(plan.key, None)
         if (
             self._policy is not None
             and plan.operation is TransferOperation.DIRECT
             and plan.path is TransferPath.D2P_DIRECT
         ):
             self._policy.committed(plan.key)
+            self._forget_terminal_d2p(plan.key)
         elif (
             self._policy is not None
             and plan.operation is TransferOperation.HOST_RESTORE
             and plan.path is TransferPath.D2P_HOST
         ):
             self._policy.committed(plan.key)
+            self._forget_d2p_host(plan.key)
+            self._forget_terminal_d2p(plan.key)
             # This group commit follows all target READ receipts and all
             # source-shard Host releases, so it is the authoritative TP-wide
             # capacity epoch (not a rank-local allocator callback).
+            self._policy.host_memory_available()
+        elif (
+            self._policy is not None
+            and plan.operation is TransferOperation.HOST_EVICT
+            and plan.path is TransferPath.D2P_HOST
+        ):
+            # application_final can race an already-submitted high-watermark
+            # eviction.  Terminal ownership wins regardless of the reason
+            # captured in that older immutable plan: this generation has no
+            # child and must not be published as RECOMPUTE_REQUIRED.
+            with self._d2p_host_lock:
+                terminal = plan.key in self._terminal_d2p
+            if terminal or plan.payload.get("reason") == "application_final":
+                self._policy.cancelled(plan.key)
+                self._forget_terminal_d2p(plan.key)
+            else:
+                self._policy.evicted(plan.key)
+            self._forget_d2p_host(plan.key)
+            self._d2p_host_evictions += 1
             self._policy.host_memory_available()
         elif (
             self._p2d_policy is not None
@@ -1070,11 +1820,11 @@ class AgenticDefaultPhysicalProvider:
         if plan.path is TransferPath.D2P_HOST:
             if self._policy is None:
                 return
-            source_group = self.config.peer_group
+            source_group = plan.source_group
         elif plan.path is TransferPath.P2D_HOST:
             if self._p2d_policy is None:
                 return
-            source_group = self.config.endpoint_group
+            source_group = plan.source_group
         else:
             return
         descriptors = HostDescriptorSet.from_dma_results(
@@ -1083,12 +1833,39 @@ class AgenticDefaultPhysicalProvider:
         self._host_results[plan.key] = descriptors
         if plan.path is TransferPath.D2P_HOST:
             self._policy.host_durable(plan.key, descriptors)
+            self._track_d2p_host(plan, descriptors)
         else:
             self._p2d_policy.host_durable(plan.key, descriptors)
 
     def on_aborted(self, context, plan, attempt, reason):
+        if str(reason).startswith("runtime_shutdown"):
+            if self._policy is not None:
+                self._policy.cancelled(plan.key)
+            if self._p2d_policy is not None:
+                self._p2d_policy.cancelled(plan.key)
+            self._pending_candidates.pop(plan.key, None)
+            self._host_results.pop(plan.key, None)
+            return
+        if plan.payload.get("kind") == "initial_prefill":
+            if "complete target workset is unavailable" not in str(reason):
+                raise RuntimeError(
+                    f"non-capacity initial admission failure for {plan.key}: {reason}"
+                )
+            with self._p2d_route_lock:
+                self._initial_capacity_wait[plan.key] = plan
+            return
         if self._policy is not None and plan.path is TransferPath.D2P_DIRECT:
             self._policy.direct_rejected(plan.key)
+        elif (
+            self._policy is not None
+            and plan.path is TransferPath.D2P_HOST
+            and plan.operation is TransferOperation.HOST_EVICT
+        ):
+            with self._d2p_host_lock:
+                entry = self._d2p_host_entries.get(plan.key)
+                if entry is not None:
+                    entry.evicting = False
+            self._policy.eviction_rejected(plan.key)
         elif (
             self._policy is not None
             and plan.path is TransferPath.D2P_HOST
@@ -1118,26 +1895,54 @@ class AgenticDefaultPhysicalProvider:
                 )
             if plan.path is TransferPath.D2P_HOST and self._policy is not None:
                 self._policy.host_store_rejected(plan.key)
+                self._schedule_d2p_host_evictions(
+                    plan.source_group,
+                    force=True,
+                )
             elif plan.path is TransferPath.P2D_HOST and self._p2d_policy is not None:
                 self._p2d_policy.host_store_rejected(plan.key)
 
-    def memory_available(self, *, remote_role: str) -> None:
+    def memory_available(
+        self,
+        *,
+        remote_role: str,
+        endpoint_group: str = "",
+        available_tokens: Optional[int] = None,
+    ) -> None:
         """Consume a TCP capacity edge; never called from a scheduler poll."""
 
         if remote_role == "decode" and self._p2d_policy is not None:
-            self._p2d_policy.memory_available()
+            self._p2d_policy.memory_available(
+                available_tokens, endpoint_group=endpoint_group
+            )
         elif remote_role == "prefill" and self._policy is not None:
-            self._policy.memory_available()
+            self._policy.memory_available(
+                available_tokens, endpoint_group=endpoint_group
+            )
 
     def close(self):
         if self._policy is not None:
             self._policy.close()
+        with self._p2d_route_lock:
+            timers = tuple(self._p2d_spill_timers.values())
+            self._p2d_spill_timers.clear()
+            self._initial_capacity_wait.clear()
+        for timer in timers:
+            timer.cancel()
+        if self._route_notifier is not None:
+            self._route_notifier.shutdown(wait=False, cancel_futures=True)
         for value in reversed(self._closers):
             close = getattr(value, "close", None)
             if close is not None:
                 close()
         if self._paths_ready:
             self._host_arena.close()
+
+    def check_health(self) -> None:
+        with self._p2d_route_lock:
+            error = self._route_callback_error
+        if error is not None:
+            raise RuntimeError("Prefill-ready callback permanently failed") from error
 
 
 def create_default_physical_provider(scheduler, config):

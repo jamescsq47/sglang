@@ -46,6 +46,18 @@ def _enable_diagnostic_stack_timer():
         logger.warning("NIXL diagnostic thread stacks enabled interval_s=%d", seconds)
 
 
+def _nixl_progress_thread_count(
+    disaggregation_mode: DisaggregationMode, *, agentic_lifecycle: bool
+) -> int:
+    if agentic_lifecycle:
+        value = int(os.getenv("SGLANG_AGENTIC_NIXL_PROGRESS_THREADS", "8"))
+    else:
+        value = 8 if disaggregation_mode == DisaggregationMode.PREFILL else 0
+    if value < 0:
+        raise ValueError("NIXL progress thread count must be non-negative")
+    return value
+
+
 @dataclasses.dataclass
 class TransferInfo:
     """Contains indices for a transfer, sent by KVReceiver. Received by prefill bootstrap thread."""
@@ -196,14 +208,22 @@ class NixlKVManager(CommonKVManager):
             ) from e
 
         backend = envs.SGLANG_DISAGGREGATION_NIXL_BACKEND.get()
+        agentic_lifecycle = envs.SGLANG_AGENTIC_KV_LIFECYCLE.get()
+        # Stock PD only needs background progress on the Prefill sender.  The
+        # agentic pipeline is bidirectional: Decode is also the source of the
+        # D->P Direct path.  Leaving its NIXL agent at zero progress threads
+        # makes reverse transfers rely on sparse Python polling and creates a
+        # large directional bandwidth asymmetry.
+        progress_threads = _nixl_progress_thread_count(
+            disaggregation_mode,
+            agentic_lifecycle=agentic_lifecycle,
+        )
         agent_config_kwargs = {
             "backends": [backend],
-            "num_threads": (
-                8 if disaggregation_mode == DisaggregationMode.PREFILL else 0
-            ),
+            "num_threads": progress_threads,
         }
         self.thread_sync_rw_enabled = False
-        if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get():
+        if agentic_lifecycle:
             try:
                 from nixl._api import nixl_thread_sync_t
 
@@ -212,23 +232,22 @@ class NixlKVManager(CommonKVManager):
                 )
                 self.thread_sync_rw_enabled = True
             except (ImportError, AttributeError):
-                logger.warning(
-                    "This NIXL version does not expose NIXL_THREAD_SYNC_RW; "
-                    "agentic background transfers will retain the Python "
-                    "control lock."
+                raise RuntimeError(
+                    "agentic NIXL requires NIXL_THREAD_SYNC_RW support"
                 )
         try:
             agent_config = nixl_agent_config(**agent_config_kwargs)
-        except TypeError:
-            # Compatibility with NIXL releases that predate ``sync_mode``.
-            # Never advertise lock-free status polling in this fallback.
+        except TypeError as error:
+            # Multiple agentic Direct executors share this manager/agent.  An
+            # old NIXL without THREAD_SYNC_RW has no manager-wide Python lock,
+            # so silently falling back would permit concurrent unsafe calls.
+            # Fail before serving instead of advertising nonexistent safety.
+            if agentic_lifecycle and "sync_mode" in agent_config_kwargs:
+                raise RuntimeError(
+                    "agentic NIXL requires NIXL_THREAD_SYNC_RW support"
+                ) from error
             agent_config_kwargs.pop("sync_mode", None)
             self.thread_sync_rw_enabled = False
-            logger.warning(
-                "This NIXL version cannot configure NIXL_THREAD_SYNC_RW; "
-                "agentic background transfers will retain the Python "
-                "control lock."
-            )
             agent_config = nixl_agent_config(**agent_config_kwargs)
         self.agent = nixl_agent(str(uuid.uuid4()), agent_config)
 

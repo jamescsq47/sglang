@@ -270,6 +270,32 @@ def test_v2_chunk_boundary_never_enters_legacy_kv_sender():
     assert calls == []
 
 
+def test_v2_abort_releases_workset_through_memory_authority_bridge():
+    calls = []
+    lease = SimpleNamespace(snapshot_id="req:1")
+    req = SimpleNamespace(
+        rid="child",
+        sampling_params=SimpleNamespace(custom_params={}),
+        _agentic_p_workset_lease=lease,
+    )
+    bridge = SimpleNamespace(
+        release_abort=lambda released_req, *, reason: calls.append(
+            (released_req, reason)
+        )
+    )
+    req._agentic_p_workset_broker = bridge
+    target = SimpleNamespace(
+        tree_cache=SimpleNamespace(),
+        agentic_p_workset_broker=None,
+    )
+
+    Scheduler._agentic_abort_cleanup(target, req)
+
+    assert calls == [(req, "request_aborted")]
+    assert not hasattr(req, "_agentic_p_workset_lease")
+    assert not hasattr(req, "_agentic_p_workset_broker")
+
+
 def test_v1_chunk_boundary_preserves_legacy_kv_sender():
     calls = []
     req = SimpleNamespace()

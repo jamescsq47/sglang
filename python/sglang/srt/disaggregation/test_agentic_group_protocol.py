@@ -11,6 +11,7 @@ from sglang.srt.disaggregation.agentic_group_protocol import (
     AttemptOutcome,
     GenerationKey,
     LinkCapacityEdge,
+    LinkApplicationFinal,
     GenerationTerminal,
     GroupDisconnectedError,
     GroupLifecycleCoordinator,
@@ -30,9 +31,47 @@ from sglang.srt.disaggregation.agentic_group_protocol import (
     StaleAttemptError,
     TCPGroupRelayServer,
     TCPRankAgent,
+    send_application_final,
     _encode_frame,
     TCPRankZeroServer,
 )
+
+
+def test_external_application_final_reaches_fixed_link_coordinator():
+    links = {
+        "global": {
+            "coordinator": {"endpoint_group": "p0", "rank": 0},
+            "endpoints": [
+                {"endpoint_group": "p0", "role": "prefill", "size": 1}
+            ],
+        }
+    }
+    relay = TCPGroupRelayServer(run_id="run", token="secret", links=links)
+    agent = TCPRankAgent(
+        relay.address,
+        run_id="run",
+        group_id="global",
+        token="secret",
+        rank=0,
+        tp_size=1,
+        endpoint_group="p0",
+        endpoint_role="prefill",
+    )
+    try:
+        assert relay.wait_connected("global", timeout=2)
+        key = GenerationKey("run", "request", 7)
+        send_application_final(
+            relay.address,
+            run_id="run",
+            group_id="global",
+            token="secret",
+            key=key,
+        )
+        event = agent.receive_event()
+        assert event == LinkApplicationFinal("global", key)
+    finally:
+        agent.close()
+        relay.close()
 
 
 def _ack(command, rank, phase, *, ok=True, detail=""):
@@ -498,6 +537,83 @@ def test_link_attempt_commits_only_after_source_and_target_tp8_fences():
                 )
         record = coordinator.commit(key, prepare.attempt)
         assert record.owner is Owner.P_GPU
+    finally:
+        for agent in agents.values():
+            agent.close()
+        relay.close()
+
+
+def test_global_fabric_command_targets_only_selected_tp2_groups():
+    link_id = "global"
+    endpoint_specs = [
+        (role, f"{prefix}{index}", 2)
+        for role, prefix in (("prefill", "p"), ("decode", "d"))
+        for index in range(4)
+    ]
+    links = {
+        link_id: {
+            "coordinator": {"endpoint_group": "p0", "rank": 0},
+            "endpoints": [
+                {"endpoint_group": group, "role": role, "size": size}
+                for role, group, size in endpoint_specs
+            ],
+        }
+    }
+    participants = [
+        LinkParticipant(role, group, rank)
+        for role, group, size in endpoint_specs
+        for rank in range(size)
+    ]
+    relay = TCPGroupRelayServer(run_id="run", token="secret", links=links)
+    agents = {
+        participant: TCPRankAgent(
+            relay.address,
+            run_id="run",
+            group_id=link_id,
+            token="secret",
+            rank=participant.rank,
+            tp_size=2,
+            endpoint_group=participant.endpoint_group,
+            endpoint_role=participant.role,
+        )
+        for participant in participants
+    }
+    coordinator = LinkLifecycleCoordinator("run", link_id, participants)
+    selected = tuple(
+        participant
+        for participant in participants
+        if participant.endpoint_group in {"d1", "p2"}
+    )
+    try:
+        assert relay.wait_connected(link_id, timeout=2)
+        key = GenerationKey("run", "late-bind", 1)
+        command = coordinator.begin_attempt(
+            key,
+            source_owner=Owner.D_GPU,
+            target_owner=Owner.P_GPU,
+            lease_id="d1-to-p2",
+            endpoint_groups=("d1", "p2"),
+        )
+        agents[LinkParticipant("prefill", "p0", 0)].publish(command)
+        received = {
+            participant: agents[participant].receive() for participant in selected
+        }
+        assert set(received) == set(selected)
+        assert coordinator.participants_for(key, command.attempt) == selected
+        for participant, value in received.items():
+            agents[participant].acknowledge(value, RankPhase.PREPARED)
+        for _ in selected:
+            coordinator.apply_ack(
+                agents[LinkParticipant("prefill", "p0", 0)].receive_event()
+            )
+        assert coordinator.group_reached(key, command.attempt, RankPhase.PREPARED)
+        with pytest.raises(GroupProtocolError, match="selected attempt"):
+            coordinator.apply_ack(
+                LinkRankAck(
+                    LinkParticipant("decode", "d0", 0),
+                    _ack(command, 0, RankPhase.PREPARED),
+                )
+            )
     finally:
         for agent in agents.values():
             agent.close()

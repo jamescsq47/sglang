@@ -180,6 +180,8 @@ def build_host_restore_plan(
         target_owner=target_owner,
         lease_id=lease_id,
         payload=transfer,
+        source_group=store_plan.source_group,
+        target_group=str(transfer.get("target_group") or store_plan.target_group),
     )
 
 
@@ -264,19 +266,26 @@ def make_host_restore_target_handler(
 @dataclass(frozen=True, slots=True)
 class _HostRestoreSourceState:
     descriptors: HostDescriptorSet
+    target_group: str
 
 
 def make_host_restore_source_handler(
     worker,
     *,
     source_group: str,
-    target_group: str,
+    target_group: str = "",
     release_host_snapshot: Callable[[str], bool],
 ) -> CallbackPathHandler:
     """Join restore without I/O and free Host only after every target fence."""
 
     def prepare(command: GroupCommand) -> PreparedRankTransfer:
         descriptors = _host_descriptors(command)
+        selected_target = str(
+            command.payload.get("agentic_data_plane", {}).get("target_group")
+            or target_group
+        )
+        if not selected_target:
+            raise ValueError("Host restore command has no target endpoint group")
         if worker.rank >= len(descriptors.shards):
             raise ValueError("source rank is outside the Host descriptor set")
         claimed = worker.claim_export(
@@ -285,15 +294,16 @@ def make_host_restore_source_handler(
         if claimed != descriptors.shards[worker.rank]:
             raise ValueError("claimed Host export differs from restore descriptor")
         return PreparedRankTransfer(
-            _HostRestoreSourceState(descriptors), requires_io=False
+            _HostRestoreSourceState(descriptors, selected_target), requires_io=False
         )
 
     def commit(command, prepared, _completion) -> None:
         state = prepared.transfer_payload
+        selected_target = state.target_group
         receipts = []
         observed = set()
         for participant, result in _rank_results(command):
-            if participant.endpoint_group != target_group:
+            if participant.endpoint_group != selected_target:
                 continue
             value = result.get("read_receipt")
             if value is None:
@@ -320,10 +330,11 @@ def make_host_restore_source_handler(
 
     def abort(command, prepared, _completion) -> None:
         state = prepared.transfer_payload
+        selected_target = state.target_group
         receipts = []
         observed = set()
         for participant, result in _rank_results(command):
-            if participant.endpoint_group != target_group:
+            if participant.endpoint_group != selected_target:
                 continue
             if participant.rank in observed:
                 raise ValueError("duplicate target abort result")

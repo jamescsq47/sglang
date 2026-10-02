@@ -47,7 +47,9 @@ class FakeAllocator:
 
 
 def _ready_decode(allocator, *, growth_tokens=128):
-    authority = AgenticMemoryAuthority(allocator)
+    authority = AgenticMemoryAuthority(
+        allocator, decode_growth_reserve_tokens=growth_tokens
+    )
     bridge = AgenticDMemorySchedulerBridge(authority)
     lease = bridge.reserve_decode(
         RequestGenerationAttempt("r", 1, 1),
@@ -94,7 +96,7 @@ def test_decode_growth_consumes_credit_without_second_allocation_owner():
     )
     assert len(out) == 64
     assert allocator.alloc_calls == 2
-    assert authority.available_tokens() == 1024 - 128 - 128
+    assert authority.available_tokens() == 1024 - 128 - 64 - 128
 
     # A non-page-boundary token uses the existing page and no physical alloc.
     marker = object()

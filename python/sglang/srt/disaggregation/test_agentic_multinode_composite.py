@@ -21,9 +21,14 @@ from sglang.srt.disaggregation.agentic_group_transfer import (
     TransferOperation,
 )
 from sglang.srt.disaggregation.agentic_multinode_composite import (
+    _CapacityAvailableEvent,
     RequestPhase,
     RuntimeFactoryOptions,
     create_runtime,
+)
+from sglang.srt.disaggregation.agentic_multinode_runtime import RuntimeCloseBlocked
+from sglang.srt.disaggregation.agentic_multinode_runtime import (
+    EndpointActivationTicket,
 )
 from sglang.srt.disaggregation.agentic_transfer_queues import (
     FenceKind,
@@ -225,8 +230,12 @@ class FakeProvider:
     def on_aborted(self, _context, _plan, _attempt, _reason):
         pass
 
-    def memory_available(self, *, remote_role):
-        self.capacity_edges.append(remote_role)
+    def memory_available(
+        self, *, remote_role, endpoint_group="", available_tokens=None
+    ):
+        self.capacity_edges.append(
+            (remote_role, endpoint_group, available_tokens)
+        )
 
     def close(self):
         self.closed = True
@@ -372,9 +381,70 @@ def test_remote_decode_capacity_edges_are_coalesced_off_control_thread():
         callback = holder["runtime"].kwargs["on_capacity_edge"]
         callback(edge)
         callback(edge)
-        wait_until(lambda: provider.capacity_edges == ["decode"])
+        wait_until(
+            lambda: provider.capacity_edges == [("decode", "d0", 4096)]
+        )
     finally:
         runtime.close()
+
+
+def test_capacity_coalescing_keeps_newest_absolute_snapshot():
+    scheduler = SimpleNamespace(
+        token_to_kv_pool_allocator=FakeAllocator(), tp_rank=0
+    )
+    provider = FakeProvider("prefill")
+    runtime = create_runtime(
+        scheduler,
+        config("prefill"),
+        physical_provider=provider,
+        options=RuntimeFactoryOptions(low_level_factory=lambda **kw: FakeLowLevel(**kw)),
+    )
+    try:
+        # Model an already queued wake-up whose value is superseded before
+        # the controller consumes it.  Capacity is absolute, so 100 -> 10
+        # must deliver 10 rather than the stale maximum.
+        with runtime._lock:
+            runtime._capacity_edge_pending["decode"] = 100
+        runtime._enqueue_capacity_available("decode", 10)
+        runtime._events.put_nowait(_CapacityAvailableEvent("decode"))
+        wait_until(lambda: provider.capacity_edges == [("decode", "", 10)])
+    finally:
+        runtime.close()
+
+
+def test_composite_close_can_retry_after_low_level_block():
+    class BlockOnceLowLevel(FakeLowLevel):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.calls = 0
+
+        def close(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeCloseBlocked("inflight")
+            super().close()
+
+    scheduler = SimpleNamespace(
+        token_to_kv_pool_allocator=FakeAllocator(), tp_rank=0
+    )
+    provider = FakeProvider("prefill")
+    holder = {}
+
+    def factory(**kwargs):
+        holder["runtime"] = BlockOnceLowLevel(**kwargs)
+        return holder["runtime"]
+
+    runtime = create_runtime(
+        scheduler,
+        config("prefill"),
+        physical_provider=provider,
+        options=RuntimeFactoryOptions(low_level_factory=factory),
+    )
+    with pytest.raises(RuntimeCloseBlocked):
+        runtime.close()
+    assert not runtime._closed and not runtime._closing
+    runtime.close()
+    assert runtime._closed and holder["runtime"].calls == 2
 
 
 def test_tp_follower_records_completion_but_never_submits_a_plan():
@@ -407,5 +477,93 @@ def test_tp_follower_records_completion_but_never_submits_a_plan():
         )
         assert provider.local_completions == [(key, 1)]
         assert holder["runtime"].plans == []
+    finally:
+        runtime.close()
+
+
+def test_scheduler_adoption_clears_noncoordinator_initial_gate():
+    scheduler = SimpleNamespace(
+        token_to_kv_pool_allocator=FakeAllocator(), tp_rank=0
+    )
+    provider = FakeProvider("prefill")
+    runtime = create_runtime(
+        scheduler,
+        config("prefill", tp_size=2),
+        physical_provider=provider,
+        options=RuntimeFactoryOptions(low_level_factory=lambda **kw: FakeLowLevel(**kw)),
+    )
+    req = request("initial-noncoordinator")
+    key = GenerationKey("run", "initial-noncoordinator", 0)
+    try:
+        runtime.submit_request(req)
+        wait_until(lambda: runtime.registry.get(key) is not None)
+        runtime.registry.mark_init_submitted(key, None)
+        runtime.confirm_scheduler_adopted(
+            EndpointActivationTicket(key, 1, "init:test", "prefill", 0)
+        )
+        record = runtime.registry.get(key)
+        assert record is not None
+        assert not record.initial_admission_pending
+        assert record.phase is RequestPhase.READY
+    finally:
+        runtime.close()
+
+
+def test_policy_submitted_recompute_crosses_initial_admission_gate():
+    """A Host eviction recompute is an init admission, not a bare retry.
+
+    Recompute plans originate in the policy actor after the child request has
+    already arrived, so they bypass ``on_request``.  The composite must still
+    track their attempt before consuming the terminal COMMITTED callback.
+    """
+
+    scheduler = SimpleNamespace(
+        token_to_kv_pool_allocator=FakeAllocator(), tp_rank=0
+    )
+    provider = FakeProvider("prefill")
+    holder = {}
+
+    def low_level_factory(**kwargs):
+        holder["runtime"] = FakeLowLevel(**kwargs)
+        return holder["runtime"]
+
+    runtime = create_runtime(
+        scheduler,
+        config("prefill"),
+        physical_provider=provider,
+        options=RuntimeFactoryOptions(low_level_factory=low_level_factory),
+    )
+    req = request("evicted-child")
+    record = runtime.registry.register(req)
+    plan = GroupTransferPlan(
+        key=record.key,
+        path=TransferPath.P2D_DIRECT,
+        operation=TransferOperation.DIRECT,
+        source_owner=Owner.NONE,
+        target_owner=Owner.P_GPU,
+        lease_id="recompute:evicted-child:0",
+        payload={
+            "kind": "initial_prefill",
+            "recompute_required": True,
+            "prompt_tokens": 128,
+            "token_count": 128,
+        },
+        target_group="p",
+    )
+    try:
+        first = runtime._provider_submit(plan)
+        second = runtime._provider_submit(plan)
+        current = runtime.registry.get(record.key)
+        assert current is not None
+        assert current.phase is RequestPhase.INIT_SUBMITTED
+        assert current.initial_admission_pending
+        assert current.submitted_attempt == second
+
+        runtime._handle_committed(plan, second)
+        current = runtime.registry.get(record.key)
+        assert current is not None
+        assert current.phase is RequestPhase.READY
+        assert not current.initial_admission_pending
+        assert first != second
     finally:
         runtime.close()

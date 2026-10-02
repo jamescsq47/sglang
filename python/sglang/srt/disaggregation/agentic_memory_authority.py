@@ -53,8 +53,9 @@ class PhysicalMemoryLease:
     """Immutable description of pages owned by one local TP shard.
 
     ``device_indices`` includes the complete P workset for a prefill lease and
-    only the imported prompt for a decode lease.  Decode growth is a logical
-    credit backed by the same allocator; pages are materialized later through
+    only the imported prompt for a decode lease.  Decode growth is backed by
+    one allocator-wide reserve rather than multiplying headroom by the number
+    of requests; pages are materialized later through
     :meth:`run_decode_growth`.
     """
 
@@ -96,7 +97,6 @@ class _LeaseRecord:
     io_attempt: Optional[str] = None
     io_resume_phase: Optional[LeasePhase] = None
     release_requested: bool = False
-    growth_credit_remaining: int = 0
     suffix_cursor: int = 0
     ready_event: Optional[MemoryReadyEvent] = None
     release_handler: Optional[Callable[[PhysicalMemoryLease], None]] = None
@@ -117,6 +117,7 @@ class AgenticMemoryAuthority:
         token_allocator,
         *,
         state_allocators: Sequence[Any] = (),
+        decode_growth_reserve_tokens: int = 0,
         terminal_history: int = 4096,
     ) -> None:
         self._token_allocator = token_allocator
@@ -132,7 +133,15 @@ class AgenticMemoryAuthority:
         self._ready: Dict[str, Deque[MemoryReadyEvent]] = defaultdict(deque)
         self._next_lease_id = itertools.count(1)
         self._next_ready_sequence = itertools.count(1)
-        self._decode_growth_credit = 0
+        # Decode growth is protected once per D allocator, not once per
+        # request.  Per-request credits made a lightly occupied D appear full
+        # after only a handful of P->D admissions (N * max_new_tokens), even
+        # though those pages had not been materialized.  The native decode
+        # allocator consumes this shared floor as sequences grow; new ingress
+        # work may not consume it.
+        self._decode_growth_reserve = self._round_tokens(
+            int(decode_growth_reserve_tokens)
+        )
         self._capacity_available_sink: Optional[Callable[[int], None]] = None
         self._terminal_history_limit = max(0, int(terminal_history))
         self._terminal: OrderedDict[int, str] = OrderedDict()
@@ -156,13 +165,13 @@ class AgenticMemoryAuthority:
         return ((tokens + self._page_size - 1) // self._page_size) * self._page_size
 
     def available_tokens(self) -> int:
-        """Capacity visible to new work after decode-growth reservations."""
+        """Capacity visible to new work after the group growth reserve."""
 
         with self._lock:
             return max(
                 0,
                 int(self._token_allocator.available_size())
-                - self._decode_growth_credit,
+                - self._decode_growth_reserve,
             )
 
     def install_capacity_available_sink(
@@ -291,15 +300,13 @@ class AgenticMemoryAuthority:
         decode_growth_tokens: int,
         state_slot_counts: Optional[Sequence[int]] = None,
     ) -> Optional[PhysicalMemoryLease]:
-        """Reserve D import pages and capacity credit for future decode growth."""
+        """Reserve D import pages while sharing one allocator growth pool."""
 
         prompt_tokens = int(prompt_tokens)
         decode_growth_tokens = int(decode_growth_tokens)
         if prompt_tokens < 0 or decode_growth_tokens < 0:
             raise ValueError("decode token counts must be non-negative")
         prompt_allocated = self._round_tokens(prompt_tokens)
-        total_allocated = self._round_tokens(prompt_tokens + decode_growth_tokens)
-        growth_reserved = total_allocated - prompt_allocated
         counts = self._state_counts(state_slot_counts)
         with self._lock:
             existing_id = self._lease_by_key.get(key)
@@ -309,11 +316,10 @@ class AgenticMemoryAuthority:
                     existing.kind is LeaseKind.DECODE_RESERVATION
                     and existing.owner == owner
                     and existing.prompt_tokens == prompt_tokens
-                    and existing.growth_reserved_tokens == growth_reserved
                 ):
                     return existing
                 raise RuntimeError(f"attempt already owns another lease: {key}")
-            if self.available_tokens() < prompt_allocated + growth_reserved:
+            if self.available_tokens() < prompt_allocated:
                 return None
             device_indices = self._token_allocator.alloc(prompt_allocated)
             if device_indices is None:
@@ -332,15 +338,11 @@ class AgenticMemoryAuthority:
                 parent_allocated_tokens=prompt_allocated,
                 prompt_tokens=prompt_tokens,
                 prompt_allocated_tokens=prompt_allocated,
-                growth_reserved_tokens=growth_reserved,
+                growth_reserved_tokens=0,
                 device_indices=device_indices,
                 state_indices=state_indices,
             )
-            self._decode_growth_credit += growth_reserved
-            self._leases[lease.lease_id] = _LeaseRecord(
-                lease=lease,
-                growth_credit_remaining=growth_reserved,
-            )
+            self._leases[lease.lease_id] = _LeaseRecord(lease=lease)
             self._lease_by_key[key] = lease.lease_id
             return lease
 
@@ -635,8 +637,8 @@ class AgenticMemoryAuthority:
 
         ``allocate`` receives the existing SGLang allocator, allowing the
         adapter to reuse ``alloc_decode`` without copying its page-placement
-        logic.  Newly materialized pages consume the reservation credit by the
-        measured allocator delta.
+        logic.  Newly materialized pages may consume the allocator-wide growth
+        reserve that new ingress is not allowed to use.
         """
 
         with self._lock:
@@ -651,16 +653,7 @@ class AgenticMemoryAuthority:
                 raise RuntimeError(
                     "decode growth requires native request cleanup ownership"
                 )
-            before = int(self._token_allocator.available_size())
             result = allocate(self._token_allocator)
-            after = int(self._token_allocator.available_size())
-            consumed = max(0, before - after)
-            if consumed > record.growth_credit_remaining:
-                raise RuntimeError(
-                    "decode allocation exceeded its reserved growth capacity"
-                )
-            record.growth_credit_remaining -= consumed
-            self._decode_growth_credit -= consumed
             return result
 
     def run_decode_growth_batch(
@@ -695,12 +688,6 @@ class AgenticMemoryAuthority:
             result = allocate(self._token_allocator)
             if result is None:
                 return None
-            consumed = sum(tokens for _, tokens in records)
-            for record, tokens in records:
-                record.growth_credit_remaining -= tokens
-            self._decode_growth_credit -= consumed
-            if self._decode_growth_credit < 0:
-                raise RuntimeError("decode growth credit accounting underflow")
             return result
 
     def _decode_growth_records_locked(
@@ -727,29 +714,24 @@ class AgenticMemoryAuthority:
     def _ensure_decode_growth_credit_locked(
         self, records: Sequence[tuple[_LeaseRecord, int]]
     ) -> bool:
-        """Renew imminent page credit without turning initial headroom into a cap."""
+        """Check one decode step against real pages in the shared reserve.
 
-        shortages = [
-            max(0, tokens - record.growth_credit_remaining)
-            for record, tokens in records
-        ]
-        required = sum(shortages)
-        if required > self.available_tokens():
-            return False
-        for (record, _), shortage in zip(records, shortages):
-            record.growth_credit_remaining += shortage
-        self._decode_growth_credit += required
-        return True
+        New ingress observes ``available_tokens()`` and therefore leaves the
+        reserve untouched.  Decode growth is the sole consumer allowed to use
+        that floor, so it checks physical availability rather than subtracting
+        the floor a second time.
+        """
+
+        required = sum(tokens for _record, tokens in records)
+        return required <= int(self._token_allocator.available_size())
 
     def ensure_decode_growth_credit(
         self, growth_tokens_by_lease: Dict[int, int]
     ) -> bool:
-        """Atomically reserve the next page(s) or report native backpressure.
+        """Atomically check the next page(s) or report native backpressure.
 
-        The original decode reservation is only initial headroom.  Once it is
-        consumed, long-running requests renew credit page-by-page.  A failed
-        renewal leaves every lease unchanged so SGLang can retract/retry the
-        batch through its existing OOM path.
+        A failed check leaves every lease unchanged so SGLang can retract or
+        retry the batch through its existing OOM path.
         """
 
         charges = {
@@ -826,15 +808,12 @@ class AgenticMemoryAuthority:
                 record.release_handler(record.lease)
             self._leases.pop(lease_id)
             self._lease_by_key.pop(record.lease.key, None)
-            self._decode_growth_credit -= record.growth_credit_remaining
-            if self._decode_growth_credit < 0:
-                raise RuntimeError("decode growth credit accounting underflow")
             self._remember_terminal(lease_id, reason)
             capacity_sink = self._capacity_available_sink
             available_tokens = max(
                 0,
                 int(self._token_allocator.available_size())
-                - self._decode_growth_credit,
+                - self._decode_growth_reserve,
             )
         if capacity_sink is not None:
             capacity_sink(available_tokens)

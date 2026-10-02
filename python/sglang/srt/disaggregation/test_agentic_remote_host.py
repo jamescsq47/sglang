@@ -11,7 +11,21 @@ from sglang.srt.disaggregation.agentic_remote_host import (
 )
 from sglang.srt.disaggregation.agentic_remote_host_worker import (
     RemoteHostRankWorker,
+    _remote_host_progress_thread_count,
 )
+
+
+def test_remote_host_progress_threads_default_and_override(monkeypatch):
+    monkeypatch.delenv("SGLANG_AGENTIC_REMOTE_HOST_NIXL_THREADS", raising=False)
+    monkeypatch.delenv("SGLANG_AGENTIC_NIXL_PROGRESS_THREADS", raising=False)
+    assert _remote_host_progress_thread_count() == 8
+    monkeypatch.setenv("SGLANG_AGENTIC_NIXL_PROGRESS_THREADS", "6")
+    assert _remote_host_progress_thread_count() == 6
+    monkeypatch.setenv("SGLANG_AGENTIC_REMOTE_HOST_NIXL_THREADS", "4")
+    assert _remote_host_progress_thread_count() == 4
+    monkeypatch.setenv("SGLANG_AGENTIC_REMOTE_HOST_NIXL_THREADS", "0")
+    with pytest.raises(ValueError, match="must be positive"):
+        _remote_host_progress_thread_count()
 
 
 class FakeNixl:
@@ -105,6 +119,31 @@ def test_shared_arena_registration_survives_extent_reuse():
     assert second.shard.address == first.shard.address
     assert second.discard_unclaimed()
     assert not agent.deregistered
+
+
+def test_eviction_fence_excludes_reader_and_is_reversible():
+    agent = FakeNixl()
+    transport = RemoteHostTransport(agent)
+    source = export(transport)
+
+    assert source.reserve_eviction("evict-1")
+    with pytest.raises(RuntimeError, match="closed or read lease"):
+        source.claim("reader")
+    assert not source.discard_unclaimed()
+    assert source.cancel_eviction("evict-1")
+    assert source.claim("reader").snapshot_id == source.shard.snapshot_id
+
+
+def test_reserved_eviction_deregisters_exactly_once():
+    agent = FakeNixl()
+    transport = RemoteHostTransport(agent)
+    source = export(transport)
+
+    assert source.reserve_eviction("evict-2")
+    assert source.finish_eviction("evict-2")
+    assert source.closed
+    assert len(agent.deregistered) == 1
+    assert not source.finish_eviction("evict-2")
 
 
 def export(transport, rank=0, size=1):

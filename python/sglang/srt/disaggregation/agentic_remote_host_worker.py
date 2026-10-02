@@ -40,6 +40,18 @@ class DrainedRemoteRead(RuntimeError):
         self.receipt = receipt
 
 
+def _remote_host_progress_thread_count() -> int:
+    value = int(
+        os.getenv(
+            "SGLANG_AGENTIC_REMOTE_HOST_NIXL_THREADS",
+            os.getenv("SGLANG_AGENTIC_NIXL_PROGRESS_THREADS", "8"),
+        )
+    )
+    if value < 1:
+        raise ValueError("remote Host NIXL progress threads must be positive")
+    return value
+
+
 class RemoteHostRankWorker:
     """One rank's data-plane adapter; safe only on a background I/O worker."""
 
@@ -123,10 +135,28 @@ class RemoteHostRankWorker:
                     from nixl._api import nixl_agent, nixl_agent_config
 
                     torch.cuda.set_device(self.gpu_id)
-                    agent = nixl_agent(
-                        "dualpd-host-" + uuid.uuid4().hex,
-                        nixl_agent_config(backends=["UCX"], num_threads=2),
-                    )
+                    progress_threads = _remote_host_progress_thread_count()
+                    config_kwargs = {
+                        "backends": ["UCX"],
+                        "num_threads": progress_threads,
+                    }
+                    try:
+                        from nixl._api import nixl_thread_sync_t
+
+                        config_kwargs["sync_mode"] = (
+                            nixl_thread_sync_t.NIXL_THREAD_SYNC_RW
+                        )
+                    except (ImportError, AttributeError):
+                        pass
+                    try:
+                        config = nixl_agent_config(**config_kwargs)
+                    except TypeError:
+                        # Compatibility with NIXL releases predating
+                        # ``sync_mode``; RemoteHostTransport still serializes
+                        # Python API calls with its lifecycle lock.
+                        config_kwargs.pop("sync_mode", None)
+                        config = nixl_agent_config(**config_kwargs)
+                    agent = nixl_agent("dualpd-host-" + uuid.uuid4().hex, config)
                     self._transport = RemoteHostTransport(agent)
             if destination and not self._destination_registered:
                 agent = self._transport.agent
@@ -229,6 +259,32 @@ class RemoteHostRankWorker:
             if exported is None:
                 raise KeyError(f"unknown Host snapshot {snapshot_id}")
             return exported.claim(attempt_id)
+
+    def reserve_export_eviction(self, snapshot_id: str, eviction_id: str) -> bool:
+        with self._init_lock:
+            exported = self._exports.get(snapshot_id)
+            return bool(
+                exported is not None and exported.reserve_eviction(eviction_id)
+            )
+
+    def cancel_export_eviction(self, snapshot_id: str, eviction_id: str) -> bool:
+        with self._init_lock:
+            exported = self._exports.get(snapshot_id)
+            return bool(
+                exported is not None and exported.cancel_eviction(eviction_id)
+            )
+
+    def finish_export_eviction(self, snapshot_id: str, eviction_id: str) -> bool:
+        with self._init_lock:
+            exported = self._exports.get(snapshot_id)
+            if exported is None or not exported.finish_eviction(eviction_id):
+                return False
+            self._exports.pop(snapshot_id, None)
+            self._export_keepalives.pop(snapshot_id, None)
+            view = self._source_views.pop(snapshot_id, None)
+            if view is not None:
+                view.close()
+            return True
 
     def discard_unclaimed_export(self, snapshot_id: str) -> bool:
         """Abort a Host-store commit before any recovery reader claims it."""
