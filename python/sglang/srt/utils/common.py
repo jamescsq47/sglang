@@ -1102,8 +1102,21 @@ def set_ulimit(target_soft_limit=65535):
     # stack size
     resource_type = resource.RLIMIT_STACK
     current_soft, current_hard = resource.getrlimit(resource_type)
-    target_soft_limit_stack_size = 1024 * target_soft_limit
-    if current_soft < target_soft_limit_stack_size:
+    configured_stack_kib = os.getenv("SGLANG_STACK_SOFT_LIMIT_KIB")
+    target_stack_kib = (
+        int(configured_stack_kib)
+        if configured_stack_kib is not None
+        else int(target_soft_limit)
+    )
+    if target_stack_kib <= 0:
+        raise ValueError("SGLANG_STACK_SOFT_LIMIT_KIB must be positive")
+    target_soft_limit_stack_size = 1024 * target_stack_kib
+    should_update_stack = (
+        current_soft != target_soft_limit_stack_size
+        if configured_stack_kib is not None
+        else current_soft < target_soft_limit_stack_size
+    )
+    if should_update_stack:
         try:
             resource.setrlimit(
                 resource_type, (target_soft_limit_stack_size, current_hard)

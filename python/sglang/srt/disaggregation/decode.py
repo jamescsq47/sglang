@@ -708,6 +708,12 @@ class DecodePreallocQueue:
             if required_tokens_for_request > allocatable_tokens:
                 break
 
+            # Attention-KV capacity alone is insufficient for hybrid models.
+            # Apply ordinary Decode admission backpressure before the request
+            # pool asserts while allocating Mamba recurrent-state slots.
+            if not self._has_mamba_prealloc_capacity(decode_req.req):
+                break
+
             allocatable_tokens -= required_tokens_for_request
             dst_kv_indices = self._pre_alloc(decode_req.req)
 
@@ -796,6 +802,19 @@ class DecodePreallocQueue:
         return sum(
             len(decode_req.req.fill_ids) for decode_req in self.transfer_queue.queue
         )
+
+    def _has_mamba_prealloc_capacity(self, req: Req) -> bool:
+        """Return whether native PD can allocate all recurrent-state slots."""
+        if not isinstance(self.token_to_kv_pool, HybridLinearKVPool):
+            return True
+        state_pool = self.req_to_token_pool.mamba_pool
+        needed_slots = int(req.mamba_pool_idx is None)
+        if (
+            self.req_to_token_pool.enable_mamba_extra_buffer
+            and req.mamba_ping_pong_track_buffer is None
+        ):
+            needed_slots += self.req_to_token_pool.mamba_ping_pong_track_buffer_size
+        return state_pool.available_size() >= needed_slots
 
     def _allocatable_tokens(
         self, retractable_tokens: Optional[int] = None, count_retracted: bool = True
