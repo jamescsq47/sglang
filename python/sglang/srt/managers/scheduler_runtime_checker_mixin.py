@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import time
 import warnings
+from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -30,6 +31,26 @@ def _optional_queue(owner, name: str, child: str | None = None):
 
 
 class SchedulerRuntimeCheckerMixin:
+    def _agentic_memory_snapshot_guard(self: Scheduler):
+        """Make allocator and Radix usage one short, coherent snapshot.
+
+        Agentic terminal fences may release a workset from a background
+        control thread.  The release already uses the memory authority's
+        native guard, but usage readers previously sampled the allocator and
+        Radix cache on opposite sides of that transaction.  That could double
+        count the same pages as both free and evictable and briefly report a
+        negative KV usage.  Reuse the existing guard for the read only; it
+        never covers transport, CUDA work, or Forward.
+        """
+
+        bridge = getattr(self, "agentic_p_memory_v2_bridge", None)
+        if bridge is None:
+            bridge = getattr(self, "agentic_d_memory_v2_bridge", None)
+        authority = None if bridge is None else getattr(bridge, "authority", None)
+        if authority is None:
+            return nullcontext()
+        return authority.native_guard("scheduler-memory-usage-snapshot")
+
     def _agentic_reserved_tokens(
         self: Scheduler, *, include_pending_releases: bool = True
     ) -> int:
@@ -72,8 +93,9 @@ class SchedulerRuntimeCheckerMixin:
         return 0
 
     def _get_token_info(self: Scheduler):
-        available_size = self.token_to_kv_pool_allocator.available_size()
-        evictable_size = self.tree_cache.evictable_size()
+        with self._agentic_memory_snapshot_guard():
+            available_size = self.token_to_kv_pool_allocator.available_size()
+            evictable_size = self.tree_cache.evictable_size()
         num_used = self.max_total_num_tokens - (available_size + evictable_size)
         token_usage = num_used / self.max_total_num_tokens
         return num_used, token_usage, available_size, evictable_size
@@ -82,14 +104,15 @@ class SchedulerRuntimeCheckerMixin:
         is_mamba_radix_cache = (
             self.tree_cache.supports_mamba() and self.tree_cache.is_tree_cache()
         )
-        full_available_size = self.token_to_kv_pool_allocator.available_size()
-        full_evictable_size = (
-            self.tree_cache.full_evictable_size() if is_mamba_radix_cache else 0
-        )
-        mamba_available_size = self.req_to_token_pool.mamba_pool.available_size()
-        mamba_evictable_size = (
-            self.tree_cache.mamba_evictable_size() if is_mamba_radix_cache else 0
-        )
+        with self._agentic_memory_snapshot_guard():
+            full_available_size = self.token_to_kv_pool_allocator.available_size()
+            full_evictable_size = (
+                self.tree_cache.full_evictable_size() if is_mamba_radix_cache else 0
+            )
+            mamba_available_size = self.req_to_token_pool.mamba_pool.available_size()
+            mamba_evictable_size = (
+                self.tree_cache.mamba_evictable_size() if is_mamba_radix_cache else 0
+            )
         full_num_used = self.token_to_kv_pool_allocator.size - (
             full_available_size + full_evictable_size
         )
@@ -110,10 +133,11 @@ class SchedulerRuntimeCheckerMixin:
         )
 
     def _get_swa_token_info(self: Scheduler):
-        full_available_size = self.token_to_kv_pool_allocator.full_available_size()
-        full_evictable_size = self.tree_cache.full_evictable_size()
-        swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
-        swa_evictable_size = self.tree_cache.swa_evictable_size()
+        with self._agentic_memory_snapshot_guard():
+            full_available_size = self.token_to_kv_pool_allocator.full_available_size()
+            full_evictable_size = self.tree_cache.full_evictable_size()
+            swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
+            swa_evictable_size = self.tree_cache.swa_evictable_size()
         full_num_used = self.full_tokens_per_layer - (
             full_available_size + full_evictable_size
         )

@@ -5757,23 +5757,46 @@ class AgenticPHostStagingManager:
                 }
             ):
                 continue
+            # A remote recovery rank can advance the shared ledger from
+            # HOST_READY to H2D_LOADING before this physical Host owner moves
+            # its local record from active to host_ready. Terminal cleanup
+            # must therefore inspect both containers. Remove by object
+            # identity under the manager lock, and restore to the same
+            # container if the physical arena release fails.
+            releasable = {}
             with self._get_state_lock():
-                record = self.host_ready.get(snapshot_id)
-                if record is None or record.get("loading"):
+                for container_name in ("host_ready", "active"):
+                    container = getattr(self, container_name, None)
+                    if container is None:
+                        continue
+                    record = container.get(snapshot_id)
+                    if (
+                        record is None
+                        or record.get("loading")
+                        or container.get(snapshot_id) is not record
+                    ):
+                        continue
+                    container.pop(snapshot_id, None)
+                    item = releasable.setdefault(id(record), [record, []])
+                    item[1].append(container_name)
+            for record, container_names in releasable.values():
+                if not self._release_record(record):
+                    with self._get_state_lock():
+                        for container_name in container_names:
+                            getattr(self, container_name).setdefault(
+                                snapshot_id, record
+                            )
                     continue
-                self.host_ready.pop(snapshot_id, None)
-            if not self._release_record(record):
-                with self._get_state_lock():
-                    self.host_ready.setdefault(snapshot_id, record)
-                continue
-            logger.info(
-                "AgenticKV shared_host_remote_recovery_release "
-                "snapshot=%s host_domain=%d recovery_domain=%s state=%s",
-                snapshot_id,
-                getattr(self, "arena_domain", -1),
-                entry.get("recovery_domain"),
-                entry.get("state"),
-            )
+                logger.info(
+                    "AgenticKV shared_host_remote_recovery_release "
+                    "snapshot=%s containers=%s host_domain=%d "
+                    "recovery_domain=%s state=%s",
+                    snapshot_id,
+                    ",".join(container_names),
+                    getattr(self, "arena_domain", -1),
+                    entry.get("recovery_domain"),
+                    entry.get("state"),
+                )
 
     def _fail_active(self, snapshot_id: str, reason: str, *, free_host: bool = True) -> None:
         with self._get_state_lock():
@@ -5840,7 +5863,10 @@ class AgenticPHostStagingManager:
                 self._fail_active(snapshot_id, "shared_host_ledger_missing")
                 continue
             state = ledger_entry.get("state")
-            if state == HostStageState.HOST_READY.value:
+            if state == HostStageState.HOST_READY.value or (
+                state == HostStageState.H2D_LOADING.value
+                and self._recovery_targets_this_manager(ledger_entry)
+            ):
                 # The complete Shared-Host snapshot is now the authoritative
                 # parent copy.  A Direct marker may have raced the D timeout:
                 # its workset can already be allocated even though no Direct
@@ -5857,12 +5883,20 @@ class AgenticPHostStagingManager:
                         owner=workset_broker.direct_owner(snapshot_id),
                     )
                 # HOST_READY means D has finished writing the complete tmpfs
-                # extent; it does *not* mean P needs the snapshot now.  Eagerly
-                # cudaHostRegister-ing every completed extent caused bursts of
-                # multi-GiB registrations to contend with Prefill even while
-                # the corresponding tool was still running.  Keep the extent
-                # lazy and let gate_request() materialize only the selected
-                # slow-recovery request.
+                # extent; it does *not* mean P needs the snapshot now.  A peer
+                # TP rank may already have claimed the same group restore and
+                # advanced the shared ledger to H2D_LOADING before this rank's
+                # control worker observes HOST_READY.  That transition is
+                # monotonic proof of the same complete Host copy, so the
+                # selected recovery group must still publish its local record
+                # to gate_request().  Otherwise the first claimant reserves
+                # its shard while a slower peer leaves its record in active
+                # forever, deadlocking the all-rank Host command.
+                #
+                # Keep the extent lazy and let gate_request() materialize only
+                # the selected slow-recovery request; a non-selected physical
+                # Host owner must continue to retain its record for the remote
+                # recovery group.
                 entry["ready_at"] = time.time()
                 with self._get_state_lock():
                     # gate_request may observe the ledger before this move,
@@ -5879,14 +5913,29 @@ class AgenticPHostStagingManager:
                     entry["offer"]["token_count"],
                     entry["offer"]["byte_size"],
                 )
+            elif state == HostStageState.REJECTED.value:
+                if self._release_record(entry):
+                    with self._get_state_lock():
+                        if self.active.get(snapshot_id) is entry:
+                            self.active.pop(snapshot_id, None)
             elif state in {
-                HostStageState.REJECTED.value,
+                HostStageState.CONSUMED.value,
                 HostStageState.FAILED.value,
             }:
-                self._release_record(entry)
-                with self._get_state_lock():
-                    self.active.pop(snapshot_id, None)
+                # Terminal physical-owner cleanup is identity-safe and keeps
+                # the exact record discoverable when arena release must retry.
+                self._release_consumed_owned_host(
+                    {snapshot_id: ledger_entry},
+                    snapshot_ids=(snapshot_id,),
+                )
             elif state == HostStageState.ABORTING.value:
+                if ledger_entry.get("h2d_abort_started", False):
+                    # Remote/selected recovery cancellation uses loader-drain
+                    # acknowledgements.  Do not move this physical Host-owner
+                    # record into the D2H writer-drain queue; retain it until
+                    # the all-rank loader protocol publishes FAILED, then let
+                    # the terminal helper above release the arena extent.
+                    continue
                 entry["failure_reason"] = ledger_entry.get(
                     "reason", "shared_host_writer_failed"
                 )

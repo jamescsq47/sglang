@@ -1335,6 +1335,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     model_config: ModelConfig = None
     forward_mode: ForwardMode = None
     enable_overlap: bool = False
+    # Immutable ownership mode captured when a Decode forward is submitted.
+    # Req objects are shared by overlap snapshots and may have their V2
+    # attributes removed when an earlier result finishes the same request.
+    agentic_d_memory_v2_owned: bool = False
     # Tell whether the current running batch is full so that we can skip
     # the check of whether to prefill new requests.
     # This is an optimization to reduce the overhead of the prefill check.
@@ -2495,6 +2499,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,
+            agentic_d_memory_v2_owned=self.agentic_d_memory_v2_owned,
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,

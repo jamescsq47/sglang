@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 import logging
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -88,9 +89,11 @@ elif _is_npu:
     from sglang.srt.hardware_backend.npu.cmo import prepare_weight_cache
 
 
-# TODO: According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
-# We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
-FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
+# FlashInfer's workspace is sized at process startup. Keep upstream's 2048
+# default, but let H100 deployments match it to their actual Prefill chunk.
+FUSE_ALLREDUCE_MAX_BATCH_SIZE = max(
+    1, int(os.getenv("SGLANG_FLASHINFER_ALLREDUCE_MAX_TOKENS", "2048"))
+)
 
 
 def apply_flashinfer_allreduce_fusion(batch_size: int):

@@ -16,6 +16,10 @@ from sglang.srt.disaggregation.agentic_kv_lifecycle import (
 )
 from sglang.srt.mem_cache import common as mem_common
 from sglang.srt.managers import schedule_batch as schedule_batch_module
+from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_output_processor_mixin import (
+    _decode_result_uses_v2_authority,
+)
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 
@@ -44,6 +48,82 @@ class FakeAllocator:
         assert set(values).issubset(self.live)
         self.live.difference_update(values)
         self.free_values.extend(values)
+
+
+def test_overlap_result_keeps_submit_time_v2_ownership_after_final_release():
+    bridge = SimpleNamespace(
+        record_forward_fence=lambda reqs, event: None,
+    )
+    active = SimpleNamespace(
+        _agentic_d_memory_bridge=bridge,
+        finished=lambda: False,
+        is_retracted=False,
+    )
+    retiring = SimpleNamespace(
+        _agentic_d_memory_bridge=bridge,
+        finished=lambda: False,
+        is_retracted=False,
+    )
+    batch = ScheduleBatch(reqs=[retiring, active], enable_overlap=True)
+    scheduler = object.__new__(Scheduler)
+    scheduler.agentic_p_memory_v2_bridge = None
+    scheduler.agentic_d_memory_v2_bridge = bridge
+    scheduler.device_module = SimpleNamespace(
+        Event=lambda: SimpleNamespace(record=lambda: None)
+    )
+
+    scheduler._record_agentic_forward_read_fence(batch)
+    copied = batch.copy()
+    assert copied.agentic_d_memory_v2_owned
+
+    # An earlier overlap result reaches application-final and removes the
+    # bridge attributes from the same shared Req object.
+    del retiring._agentic_d_memory_bridge
+    retiring.finished = lambda: True
+
+    assert _decode_result_uses_v2_authority(scheduler, copied)
+
+
+def test_overlap_result_still_rejects_unowned_active_request():
+    bridge = object()
+    active = SimpleNamespace(finished=lambda: False, is_retracted=False)
+    batch = ScheduleBatch(
+        reqs=[active],
+        enable_overlap=True,
+        agentic_d_memory_v2_owned=True,
+    )
+    scheduler = SimpleNamespace(agentic_d_memory_v2_bridge=bridge)
+
+    try:
+        _decode_result_uses_v2_authority(scheduler, batch)
+    except RuntimeError as error:
+        assert "mixes memory authorities" in str(error)
+    else:
+        raise AssertionError("an active unowned request must fail closed")
+
+
+def test_overlap_result_rejects_foreign_bridge_even_for_finished_request():
+    configured_bridge = object()
+    finished = SimpleNamespace(
+        _agentic_d_memory_bridge=object(),
+        finished=lambda: True,
+        is_retracted=False,
+    )
+    batch = ScheduleBatch(
+        reqs=[finished],
+        enable_overlap=True,
+        agentic_d_memory_v2_owned=True,
+    )
+    scheduler = SimpleNamespace(
+        agentic_d_memory_v2_bridge=configured_bridge
+    )
+
+    try:
+        _decode_result_uses_v2_authority(scheduler, batch)
+    except RuntimeError as error:
+        assert "mixes memory authorities" in str(error)
+    else:
+        raise AssertionError("a foreign bridge must always fail closed")
 
 
 def _ready_decode(allocator, *, growth_tokens=128):

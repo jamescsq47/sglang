@@ -8,6 +8,7 @@ policy, while every rank executes the immutable command for its shard.
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
 import logging
 import os
@@ -356,7 +357,9 @@ class _TargetHandler(RankPathHandler):
         lease_id = prepared.physical_lease_id
         self.provider.context.authority.request_release(lease_id)
         self.provider.context.authority.commit_release(
-            lease_id, reason="target_attempt_aborted"
+            lease_id,
+            reason="target_attempt_aborted",
+            notify_capacity=False,
         )
         if self.direct:
             prepared.transfer_payload.cleanup()
@@ -402,7 +405,9 @@ class _InitialPHandler(RankPathHandler):
             lease_id = prepared.physical_lease_id
             self.provider.context.authority.request_release(lease_id)
             self.provider.context.authority.commit_release(
-                lease_id, reason="initial_admission_aborted"
+                lease_id,
+                reason="initial_admission_aborted",
+                notify_capacity=False,
             )
             self.provider._target_prepared.pop(lease_id, None)
 
@@ -422,9 +427,18 @@ class AgenticDefaultPhysicalProvider:
         self._pending_candidates: dict[GenerationKey, GroupTransferPlan] = {}
         self._pending_p2d_candidates: dict[GenerationKey, GroupTransferPlan] = {}
         self._early_p2d_targets: dict[GenerationKey, Mapping[str, Any]] = {}
-        self._p2d_spill_timers: dict[GenerationKey, threading.Timer] = {}
-        self._initial_capacity_wait: dict[GenerationKey, GroupTransferPlan] = {}
         self._p2d_route_lock = threading.RLock()
+        # Late-bound P->D candidates share one deadline worker.  Creating a
+        # ``threading.Timer`` for every agent turn exhausts native threads
+        # when the model server shares a node with hundreds of SWE verifier
+        # processes, even though only a few timers are live at any instant.
+        self._p2d_spill_deadlines: dict[GenerationKey, tuple[float, int]] = {}
+        self._p2d_spill_heap: list[tuple[float, int, GenerationKey]] = []
+        self._p2d_spill_sequence = 0
+        self._p2d_spill_closed = False
+        self._p2d_spill_condition = threading.Condition(self._p2d_route_lock)
+        self._p2d_spill_thread: Optional[threading.Thread] = None
+        self._initial_capacity_wait: dict[GenerationKey, GroupTransferPlan] = {}
         self._route_callback_error: Optional[BaseException] = None
         self._host_results: dict[GenerationKey, HostDescriptorSet] = {}
         self._d2p_host_entries: dict[GenerationKey, _D2PHostEntry] = {}
@@ -459,6 +473,21 @@ class AgenticDefaultPhysicalProvider:
         }
         self._host_lanes = max(
             1, int(os.getenv("SGLANG_AGENTIC_MULTINODE_HOST_LANES", "4"))
+        )
+        # Source D2H copies benefit from several CPU commit lanes, but every
+        # target Host restore is a remote DRAM -> local VRAM NIXL read.  Letting
+        # all Host queue lanes issue those reads at once can starve the model's
+        # schedule stream (especially when four D groups fan in to one P
+        # group).  Keep queue/D2H parallelism independent from the number of
+        # physical H2D reads allowed to contend with forward kernels.
+        self._host_load_workers = max(
+            1,
+            int(
+                os.getenv(
+                    "SGLANG_AGENTIC_MULTINODE_HOST_LOAD_WORKERS",
+                    "1",
+                )
+            ),
         )
         self._paths_ready = False
         self._closers: list[Any] = []
@@ -577,7 +606,7 @@ class AgenticDefaultPhysicalProvider:
             max_workers=self._host_lanes,
         )
         self._host_load_executor = RemoteHostLoadExecutor(
-            self._target_host_worker, max_workers=self._host_lanes
+            self._target_host_worker, max_workers=self._host_load_workers
         )
         self._host_restore_source = make_host_restore_source_handler(
             self._source_host_worker,
@@ -858,6 +887,9 @@ class AgenticDefaultPhysicalProvider:
         values = _values(command)
         descriptors = HostDescriptorSet.from_payload(values["host_shards"])
         shard = descriptors.shards[int(self.scheduler.tp_rank)]
+        token_count = int(values.get("token_count", shard.token_count))
+        if token_count <= 0 or token_count > int(shard.token_count):
+            raise ValueError("Host restore requested an invalid snapshot prefix")
         state = self._direct_target_state(lease)
         ready_event = None
         if bool(getattr(lease.parent_indices, "is_cuda", False)):
@@ -867,12 +899,12 @@ class AgenticDefaultPhysicalProvider:
         def device_indices():
             values = tuple(
                 int(value)
-                for value in lease.parent_indices[: shard.token_count]
+                for value in lease.parent_indices[:token_count]
                 .detach()
                 .to(device="cpu", dtype=torch.int64)
                 .tolist()
             )
-            if len(values) != int(shard.token_count):
+            if len(values) != token_count:
                 raise ValueError(
                     "Host target lease does not cover the complete snapshot"
                 )
@@ -883,6 +915,7 @@ class AgenticDefaultPhysicalProvider:
             device_indices=device_indices,
             state_indices=state,
             ready_event=ready_event,
+            token_count=token_count,
         )
         return payload
 
@@ -1173,26 +1206,66 @@ class AgenticDefaultPhysicalProvider:
             float(os.getenv("SGLANG_AGENTIC_P2D_LATE_BIND_GRACE_SECONDS", "0.5")),
         )
 
-        def spill() -> None:
-            with self._p2d_route_lock:
-                self._p2d_spill_timers.pop(candidate.key, None)
-            self._p2d_policy.spill_if_unbound(candidate.key)
-
-        timer = threading.Timer(delay, spill)
-        timer.daemon = True
-        with self._p2d_route_lock:
+        with self._p2d_spill_condition:
+            if self._p2d_spill_closed:
+                raise RuntimeError("P2D spill scheduler is closed")
+            if self._p2d_spill_thread is None:
+                self._p2d_spill_thread = threading.Thread(
+                    target=self._p2d_spill_loop,
+                    name="agentic-p2d-spill-deadlines",
+                    daemon=True,
+                )
+                self._p2d_spill_thread.start()
+            self._p2d_spill_sequence += 1
+            identity = (time.monotonic() + delay, self._p2d_spill_sequence)
             self._pending_p2d_candidates[candidate.key] = candidate
-            self._p2d_spill_timers[candidate.key] = timer
-        timer.start()
+            self._p2d_spill_deadlines[candidate.key] = identity
+            heapq.heappush(
+                self._p2d_spill_heap,
+                (identity[0], identity[1], candidate.key),
+            )
+            self._p2d_spill_condition.notify_all()
+
+    def _p2d_spill_loop(self) -> None:
+        """Expire all P->D late-bind deadlines from one bounded thread."""
+
+        while True:
+            key = None
+            with self._p2d_spill_condition:
+                while not self._p2d_spill_closed:
+                    if not self._p2d_spill_heap:
+                        self._p2d_spill_condition.wait()
+                        continue
+                    deadline, sequence, candidate_key = self._p2d_spill_heap[0]
+                    current = self._p2d_spill_deadlines.get(candidate_key)
+                    if current != (deadline, sequence):
+                        heapq.heappop(self._p2d_spill_heap)
+                        continue
+                    delay = deadline - time.monotonic()
+                    if delay > 0:
+                        self._p2d_spill_condition.wait(delay)
+                        continue
+                    heapq.heappop(self._p2d_spill_heap)
+                    self._p2d_spill_deadlines.pop(candidate_key, None)
+                    key = candidate_key
+                    break
+                if self._p2d_spill_closed:
+                    return
+            try:
+                self._p2d_policy.spill_if_unbound(key)
+            except BaseException as error:
+                with self._p2d_route_lock:
+                    if not self._p2d_spill_closed and self._route_callback_error is None:
+                        self._route_callback_error = error
+                return
 
     def _take_p2d_candidate(
         self, key: GenerationKey
     ) -> Optional[GroupTransferPlan]:
-        with self._p2d_route_lock:
+        with self._p2d_spill_condition:
             candidate = self._pending_p2d_candidates.pop(key, None)
-            timer = self._p2d_spill_timers.pop(key, None)
-        if timer is not None:
-            timer.cancel()
+            self._p2d_spill_deadlines.pop(key, None)
+            self._p2d_spill_condition.notify_all()
         return candidate
 
     @staticmethod
@@ -1212,7 +1285,25 @@ class AgenticDefaultPhysicalProvider:
         if reservation_id:
             values["decode_reservation_id"] = reservation_id
         values["room"] = _room(candidate.key, TransferPath.P2D_DIRECT, target_group)
-        return replace(candidate, payload=values, target_group=target_group)
+        # The candidate may have waited for the next decode child for an
+        # arbitrary tool duration.  The Direct admission/connection window
+        # starts only when that child actually arrives and late binding picks
+        # its target; carrying the old zero/stale deadline leaves a START able
+        # to wait for NIXL's much longer transport timeout.
+        timeout = max(
+            0.0,
+            float(
+                os.getenv(
+                    "SGLANG_AGENTIC_MULTINODE_DIRECT_ADMISSION_SECONDS", "1"
+                )
+            ),
+        )
+        return replace(
+            candidate,
+            payload=values,
+            target_group=target_group,
+            admission_deadline=(time.monotonic() + timeout if timeout else 0.0),
+        )
 
     def on_materialized(self, _context, plan: GroupTransferPlan, attempt: int) -> None:
         """Acknowledge replacement of one Router shadow D reservation.
@@ -1638,7 +1729,7 @@ class AgenticDefaultPhysicalProvider:
         with self._p2d_route_lock:
             pending_candidates = len(self._pending_p2d_candidates)
             early_targets = len(self._early_p2d_targets)
-            spill_timers = len(self._p2d_spill_timers)
+            spill_timers = len(self._p2d_spill_deadlines)
             initial_wait = len(self._initial_capacity_wait)
             pending_sample = tuple(
                 key.snapshot_id for key in tuple(self._pending_p2d_candidates)[:4]
@@ -1728,14 +1819,19 @@ class AgenticDefaultPhysicalProvider:
 
     def capacity_snapshot(
         self, *, remote_role: str, endpoint_group: str, available_tokens: int
-    ) -> None:
-        if endpoint_group:
-            self._endpoint_capacity[(str(remote_role), str(endpoint_group))] = max(
-                0, int(available_tokens)
-            )
-        if str(remote_role) != "prefill" or not endpoint_group:
-            return
+    ) -> int:
+        """Reserve one absolute capacity budget across admission classes.
+
+        Initial Prefill retries have precedence because they do not yet have
+        a durable Host owner.  Return the uncommitted remainder so the
+        composite can give only that remainder to Host restore admission.
+        """
+
         remaining = max(0, int(available_tokens))
+        if endpoint_group:
+            self._endpoint_capacity[(str(remote_role), str(endpoint_group))] = remaining
+        if str(remote_role) != "prefill" or not endpoint_group:
+            return remaining
         retry = []
         with self._p2d_route_lock:
             for key, plan in tuple(self._initial_capacity_wait.items()):
@@ -1751,6 +1847,7 @@ class AgenticDefaultPhysicalProvider:
             if self._submitter is None:
                 raise RuntimeError("initial admission retry has no submitter")
             self._submitter(plan)
+        return remaining
 
     def on_committed(self, context, plan, attempt):
         if plan.payload.get("kind") == "initial_prefill":
@@ -1921,14 +2018,20 @@ class AgenticDefaultPhysicalProvider:
             )
 
     def close(self):
+        with self._p2d_spill_condition:
+            self._p2d_spill_closed = True
+            self._p2d_spill_deadlines.clear()
+            self._p2d_spill_heap.clear()
+            spill_thread = self._p2d_spill_thread
+            self._p2d_spill_condition.notify_all()
+        if spill_thread is not None:
+            spill_thread.join(timeout=2.0)
+            if spill_thread.is_alive():
+                raise RuntimeError("P2D spill deadline worker did not stop")
         if self._policy is not None:
             self._policy.close()
         with self._p2d_route_lock:
-            timers = tuple(self._p2d_spill_timers.values())
-            self._p2d_spill_timers.clear()
             self._initial_capacity_wait.clear()
-        for timer in timers:
-            timer.cancel()
         if self._route_notifier is not None:
             self._route_notifier.shutdown(wait=False, cancel_futures=True)
         for value in reversed(self._closers):

@@ -88,6 +88,27 @@ def test_capacity_sink_runs_once_after_release_and_outside_authority_lock():
     assert observed == [(1024, 1024)]
 
 
+def test_failed_prepare_rollback_does_not_create_capacity_retry_edge():
+    allocator = FakeAllocator()
+    authority = AgenticMemoryAuthority(allocator)
+    observed = []
+    authority.install_capacity_available_sink(observed.append)
+    lease = authority.reserve_prefill_workset(
+        key(), owner="slow", parent_tokens=64, prompt_tokens=128
+    )
+
+    assert authority.request_release(lease.lease_id)
+    assert authority.commit_release(
+        lease.lease_id,
+        reason="group_attempt_aborted",
+        notify_capacity=False,
+    )
+    assert allocator.available_size() == 1024
+    assert observed == []
+    assert authority.commit_release(lease.lease_id)
+    assert observed == []
+
+
 def test_state_failure_rolls_back_whole_workset():
     allocator = FakeAllocator()
 

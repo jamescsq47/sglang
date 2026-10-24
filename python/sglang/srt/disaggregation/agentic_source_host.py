@@ -10,6 +10,7 @@ access, lifecycle policy, routing, or scheduler dependency in this module.
 
 from __future__ import annotations
 
+import ctypes
 import mmap
 import os
 import threading
@@ -34,6 +35,29 @@ from sglang.srt.disaggregation.agentic_transfer_queues import (
 
 
 _GIB = 1024**3
+_MFD_CLOEXEC = 0x0001
+_LIBC = ctypes.CDLL(None, use_errno=True)
+_LIBC_MEMFD_CREATE = getattr(_LIBC, "memfd_create", None)
+if _LIBC_MEMFD_CREATE is not None:
+    _LIBC_MEMFD_CREATE.argtypes = (ctypes.c_char_p, ctypes.c_uint)
+    _LIBC_MEMFD_CREATE.restype = ctypes.c_int
+
+
+def _create_source_host_memfd() -> int:
+    """Create the arena even when Python was built without os.memfd_create."""
+
+    name = f"sglang-agentic-host-arena-{os.getpid()}"
+    create = getattr(os, "memfd_create", None)
+    if create is not None:
+        return int(create(name, getattr(os, "MFD_CLOEXEC", _MFD_CLOEXEC)))
+    if _LIBC_MEMFD_CREATE is None:
+        raise RuntimeError("source-local Host staging requires memfd_create")
+    ctypes.set_errno(0)
+    fd = int(_LIBC_MEMFD_CREATE(name.encode(), _MFD_CLOEXEC))
+    if fd < 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+    return fd
 
 
 class HostDirection(str, Enum):
@@ -159,15 +183,7 @@ class SourceLocalHostArena:
         self.capacity_bytes = int(capacity_bytes) // alignment * alignment
         if self.capacity_bytes <= 0:
             raise ValueError("Host arena capacity must be positive")
-        create = getattr(os, "memfd_create", None)
-        if create is None:
-            raise RuntimeError("source-local Host staging requires memfd_create")
-        self._fd = int(
-            create(
-                f"sglang-agentic-host-arena-{os.getpid()}",
-                getattr(os, "MFD_CLOEXEC", 0x0001),
-            )
-        )
+        self._fd = _create_source_host_memfd()
         try:
             os.ftruncate(self._fd, self.capacity_bytes)
             if preallocate:

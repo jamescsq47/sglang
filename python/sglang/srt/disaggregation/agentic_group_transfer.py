@@ -19,14 +19,13 @@ ranks have completed their reads.
 
 from __future__ import annotations
 
-import copy
 import json
 import logging
 import threading
 import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
@@ -47,6 +46,7 @@ from sglang.srt.disaggregation.agentic_group_protocol import (
     Owner,
     RankAck,
     RankPhase,
+    _copy_control_payload,
 )
 from sglang.srt.disaggregation.agentic_memory_authority import (
     AgenticMemoryAuthority,
@@ -109,7 +109,7 @@ class GroupTransferPlan:
             raise ValueError("source_group must be a non-empty identity")
         if self.target_group and not self.target_group.strip():
             raise ValueError("target_group must be a non-empty identity")
-        value = copy.deepcopy(dict(self.payload))
+        value = _copy_control_payload(dict(self.payload))
         json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
         object.__setattr__(self, "payload", MappingProxyType(value))
         deadline = float(self.admission_deadline)
@@ -126,7 +126,7 @@ class GroupTransferPlan:
                 "source_group": self.source_group,
                 "target_group": self.target_group,
             },
-            "transfer": copy.deepcopy(dict(self.payload)),
+            "transfer": _copy_control_payload(dict(self.payload)),
         }
 
 
@@ -443,7 +443,11 @@ class AuthorityPathHandler:
             return
         # A cancelled destination never becomes scheduler-visible.
         self._authority.request_release(lease_id)
-        self._authority.commit_release(lease_id, reason="group_attempt_aborted")
+        self._authority.commit_release(
+            lease_id,
+            reason="group_attempt_aborted",
+            notify_capacity=False,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -478,15 +482,34 @@ class _LocalAttempt:
     activation_published: bool = False
     scheduler_activated: bool = False
     source_released: bool = False
+    # CPU metadata only; lifetime is exactly the existing physical attempt.
+    handoff_base: Optional[GroupCommand] = None
+    handoff_ref_step: int = 0
+
+
+_HANDOFF_REF_KINDS = (
+    CommandKind.HANDOFF,
+    CommandKind.ACTIVATE,
+    CommandKind.ISSUE_ACTIVATION_TICKET,
+    CommandKind.FINALIZE,
+)
+
+
+def _handoff_identity(command: GroupCommand) -> tuple:
+    return (
+        command.key, command.attempt, command.lease_id,
+        command.source_owner, command.target_owner, command.endpoint_groups,
+    )
 
 
 class RankLocalCommandExecutor:
     """Execute rank-zero commands for exactly one TP rank.
 
     PREPARE may reserve local destination pages.  START only enters the
-    already-selected path queue.  RELEASE performs the committed handoff and
-    source release.  A physical failure is first reported to rank zero; the
-    failed/drained ACK is emitted only after rank zero broadcasts CANCEL.
+    already-selected path queue.  DMA completion is handled in the background,
+    while source release and target publication run in native TP scheduler
+    order.  A physical failure is first reported to rank zero; the failed/
+    drained ACK is emitted only after rank zero broadcasts CANCEL.
     """
 
     def __init__(
@@ -497,6 +520,7 @@ class RankLocalCommandExecutor:
         handlers: Mapping[Any, RankPathHandler],
         emit_ack: Callable[[LinkRankAck], None],
         report_failure: Callable[[LocalAttemptFailure], None],
+        compact_handoff_payload: bool = False,
     ) -> None:
         for key in handlers:
             if isinstance(key, TransferPath):
@@ -515,6 +539,7 @@ class RankLocalCommandExecutor:
         self._handlers = dict(handlers)
         self._emit_ack = emit_ack
         self._report_failure = report_failure
+        self._compact_handoff_payload = bool(compact_handoff_payload)
         self._attempts: dict[tuple[GenerationKey, int], _LocalAttempt] = {}
         self._lock = threading.RLock()
         self._changed = threading.Condition(self._lock)
@@ -539,6 +564,33 @@ class RankLocalCommandExecutor:
     def wait_idle(self, timeout: Optional[float] = None) -> bool:
         with self._changed:
             return self._changed.wait_for(lambda: not self._attempts, timeout)
+
+    def wait_physical_idle(
+        self,
+        path: TransferPath,
+        operation: TransferOperation,
+        timeout: Optional[float] = None,
+    ) -> bool:
+        """Wait only for matching DMA that crossed its physical start edge.
+
+        Queue admission, source-ready/connection waits and scheduler-owned
+        handoff stay outside this optional performance gate.  ``transfer``
+        exists before queue submission; only the physical-start callback sets
+        ``submit_ack_sent``.  This is a point-in-time idle check, not a memory
+        safety fence or an exclusion lock against future DMA submissions.
+        """
+
+        def idle() -> bool:
+            return not any(
+                local.path is path
+                and local.operation is operation
+                and local.submit_ack_sent
+                and local.completion is None
+                for local in self._attempts.values()
+            )
+
+        with self._changed:
+            return self._changed.wait_for(idle, timeout)
 
     @staticmethod
     def _identity(command: GroupCommand) -> tuple[GenerationKey, int]:
@@ -577,7 +629,41 @@ class RankLocalCommandExecutor:
             )
         )
 
-    def handle(self, command: GroupCommand) -> None:
+    def _resolve_handoff_payload(self, command: GroupCommand) -> GroupCommand:
+        if "handoff_payload_ref" not in command.payload:
+            return command
+        reference = command.payload["handoff_payload_ref"]
+        if (
+            not self._compact_handoff_payload
+            or set(command.payload) != {"handoff_payload_ref"}
+            or type(reference) is not int
+            or command.kind not in _HANDOFF_REF_KINDS
+        ):
+            raise RuntimeError("invalid or disabled handoff payload reference")
+        with self._lock:
+            local = self._attempts.get(self._identity(command))
+            base = None if local is None else local.handoff_base
+            if (
+                base is None
+                or local.cancel_command is not None
+                or local.failure_detail is not None
+                or local.abort_done
+                or _handoff_identity(command) != _handoff_identity(base)
+                or _handoff_identity(command) != _handoff_identity(local.prepare_command)
+                or reference != base.command_seq
+                or local.handoff_ref_step >= len(_HANDOFF_REF_KINDS)
+                or command.kind is not _HANDOFF_REF_KINDS[local.handoff_ref_step]
+                or command.command_seq != base.command_seq + local.handoff_ref_step + 1
+            ):
+                raise RuntimeError("unknown, stale or out-of-order handoff payload reference")
+            # Keep the existing deep-copy/JSON-validation contract. Callbacks
+            # can mutate nested legacy data without changing the private base.
+            # ACKs retain the CURRENT phase and sequence, never RELEASE's.
+            return replace(command, payload=base.payload)
+
+    def handle(self, command: GroupCommand) -> GroupCommand:
+        was_reference = "handoff_payload_ref" in command.payload
+        command = self._resolve_handoff_payload(command)
         if command.kind is CommandKind.PREPARE:
             self._prepare(command)
         elif command.kind is CommandKind.START:
@@ -602,6 +688,12 @@ class RankLocalCommandExecutor:
             self._abort_finalize(command)
         else:  # pragma: no cover - exhaustive enum guard
             raise ValueError(f"unsupported command {command.kind}")
+        if was_reference:
+            with self._lock:
+                local = self._attempts.get(self._identity(command))
+                if local is not None:
+                    local.handoff_ref_step += 1
+        return command
 
     def _prepare(self, command: GroupCommand) -> None:
         identity = self._identity(command)
@@ -681,9 +773,10 @@ class RankLocalCommandExecutor:
                 submitted_at=now,
                 completed_at=now,
             )
-            with self._lock:
+            with self._changed:
                 local.submit_ack_sent = True
                 local.completion = completion
+                self._changed.notify_all()
             self._ack(command, RankPhase.DMA_DONE, detail="no_io_required")
             return
         try:
@@ -709,9 +802,10 @@ class RankLocalCommandExecutor:
                 completed_at=now,
             )
             local.handler.finish_io(command, local.prepared, completion)
-            with self._lock:
+            with self._changed:
                 local.failure_detail = detail
                 local.completion = completion
+                self._changed.notify_all()
             self._report_failure(
                 LocalAttemptFailure(
                     command.key,
@@ -759,6 +853,7 @@ class RankLocalCommandExecutor:
             if local.completion is not None:
                 raise RuntimeError("physical attempt completed twice")
             local.completion = completion
+            self._changed.notify_all()
             if not local.submit_ack_sent:
                 if completion.fence is FenceKind.NOT_POSTED:
                     # A Direct attempt can fail or be cancelled before the
@@ -878,35 +973,43 @@ class RankLocalCommandExecutor:
                 raise RuntimeError("RELEASE arrived before physical completion")
             if local.completion.state is not PhysicalState.SUCCEEDED:
                 raise RuntimeError("failed physical attempt cannot commit")
-        try:
-            local.handler.prepare_handoff(command, local.prepared, local.completion)
-        except BaseException as error:
-            detail = f"handoff preparation failed: {type(error).__name__}: {error}"
-            with self._lock:
-                local.failure_detail = detail
-            self._report_failure(
-                LocalAttemptFailure(
-                    command.key,
-                    command.attempt,
-                    self.participant,
-                    command.lease_id,
-                    detail,
+            if self._compact_handoff_payload:
+                if (
+                    local.handoff_base is not None
+                    or _handoff_identity(command) != _handoff_identity(local.prepare_command)
+                ):
+                    raise RuntimeError("duplicate or mismatched RELEASE payload base")
+                # Snapshot before any handler callback. This private copy is
+                # never passed to a consumer and is retired with _LocalAttempt.
+                local.handoff_base = replace(command)
+        target_role = self._owner_role(command.target_owner)
+        scheduler_target = self._scheduler_target(
+            command.target_owner
+        ) and self.participant.role in {target_role, "target"}
+        if not scheduler_target:
+            try:
+                local.handler.prepare_handoff(
+                    command, local.prepared, local.completion
                 )
-            )
-            return
+            except BaseException as error:
+                detail = (
+                    "handoff preparation failed: "
+                    f"{type(error).__name__}: {error}"
+                )
+                with self._lock:
+                    local.failure_detail = detail
+                self._report_failure(
+                    LocalAttemptFailure(
+                        command.key,
+                        command.attempt,
+                        self.participant,
+                        command.lease_id,
+                        detail,
+                    )
+                )
+                return
         with self._lock:
             local.handoff_prepared = True
-        # A Host-store RELEASE command exists only after rank zero observed a
-        # durable DMA fence from every source shard.  There is no target GPU
-        # binding to wait for, so retaining the completed request in source
-        # HBM through the later scheduler activation protocol is unnecessary
-        # and directly reduces useful Decode/Prefill concurrency.
-        if local.operation is TransferOperation.HOST_STORE:
-            source_role = self._owner_role(command.source_owner)
-            if self.participant.role in {source_role, "source"}:
-                local.handler.commit(command, local.prepared, local.completion)
-                with self._lock:
-                    local.source_released = True
         self._ack(command, RankPhase.BOUND)
 
     def _handoff(self, command: GroupCommand) -> None:
@@ -922,13 +1025,17 @@ class RankLocalCommandExecutor:
                 raise RuntimeError("HANDOFF arrived before local bind preparation")
             if local.completion.state is not PhysicalState.SUCCEEDED:
                 raise RuntimeError("failed physical attempt cannot hand off")
-        # Rank zero emits HANDOFF only after every target shard is bound.  The
-        # source can therefore release here; scheduler publication remains a
-        # later, target-only transaction.  Keeping source pages until ACTIVATE
-        # made source HBM residency depend on unrelated scheduler control RTTs.
+        # The raw target lease is durable.  A GPU source release is deferred
+        # to the native TP scheduler ticket because it mutates allocator/Radix
+        # state.  A Host source release only retires CPU-arena/export metadata;
+        # it has no scheduler-visible GPU state and commits immediately behind
+        # this all-rank durability fence.  Deferring Host eviction would leak
+        # the physical extent because Host owners do not receive GPU tickets.
         source_role = self._owner_role(command.source_owner)
+        scheduler_source = self._scheduler_target(command.source_owner)
         if (
-            self.participant.role in {source_role, "source"}
+            not scheduler_source
+            and self.participant.role in {source_role, "source"}
             and not local.source_released
         ):
             local.handler.commit(command, local.prepared, local.completion)
@@ -949,29 +1056,10 @@ class RankLocalCommandExecutor:
                 raise RuntimeError("ACTIVATE arrived before local handoff staging")
             if local.completion.state is not PhysicalState.SUCCEEDED:
                 raise RuntimeError("failed physical attempt cannot activate")
-        # Source pages were released by HANDOFF after the all-target bind
-        # barrier.  Publish each target's rank-local ready lease here.  Rank
-        # zero waits for every STAGED ACK before issuing the one scheduler
-        # ticket, so no scheduler rank can consume a partially published TP
-        # group.
-        source_role = self._owner_role(command.source_owner)
-        if (
-            self.participant.role in {source_role, "source"}
-            and not local.source_released
-        ):
-            local.handler.commit(command, local.prepared, local.completion)
+        # ACTIVATE only proves that all raw target leases are staged and both
+        # endpoint scheduler actions are ticketable.
         with self._lock:
-            if self.participant.role in {source_role, "source"}:
-                local.source_released = True
             local.activation_staged = True
-        target_role = self._owner_role(command.target_owner)
-        if self._scheduler_target(command.target_owner) and self.participant.role in {
-            target_role,
-            "target",
-        }:
-            local.handler.commit(command, local.prepared, local.completion)
-            with self._lock:
-                local.activation_published = True
         self._ack(command, RankPhase.STAGED)
 
     @staticmethod
@@ -1021,47 +1109,77 @@ class RankLocalCommandExecutor:
                 raise RuntimeError("activation ticket arrived before ready barrier")
             if local.activation_ticket_command is not None:
                 raise RuntimeError("duplicate activation ticket command")
-            target_role = self._owner_role(command.target_owner)
-            if (
-                self._scheduler_target(command.target_owner)
-                and self.participant.role in {target_role, "target"}
-                and not local.activation_published
-            ):
-                raise RuntimeError("activation ticket arrived before local publish")
             local.activation_ticket_command = command
             scheduler_activated = local.scheduler_activated
+        source_role = self._owner_role(command.source_owner)
         target_role = self._owner_role(command.target_owner)
-        if self._scheduler_target(command.target_owner) and self.participant.role in {
-            target_role,
-            "target",
-        }:
+        scheduler_participant = (
+            self._scheduler_target(command.source_owner)
+            and self.participant.role in {source_role, "source"}
+        ) or (
+            self._scheduler_target(command.target_owner)
+            and self.participant.role in {target_role, "target"}
+        )
+        if scheduler_participant:
             if scheduler_activated:
                 self._ack(command, RankPhase.ACTIVATED)
             return
-        self._ack(command, RankPhase.ACTIVATED, detail="no_scheduler_target")
+        self._ack(command, RankPhase.ACTIVATED, detail="no_scheduler_action")
 
     def activate_staged(
-        self, key: GenerationKey, attempt: int, lease_id: str
+        self,
+        key: GenerationKey,
+        attempt: int,
+        lease_id: str,
+        *,
+        action: str = "activate",
     ) -> None:
-        """Validate TP0's ticket against an already-published ready lease.
+        """Apply one allocator-visible action in native TP broadcast order.
 
-        Physical completion publishes the local lease before rank zero emits
-        this ticket.  The scheduler path therefore performs no memory or
-        network work; it only validates ordering before queue adoption.
+        DMA remains a background operation.  The short source-release or
+        target-publication transaction runs here because this method is called
+        by every endpoint scheduler after consuming the exact same TP0
+        broadcast.  Performing either mutation from independent command
+        workers lets rank-local completion skew create different Radix states
+        and eventually divergent TP forward batches.
         """
+
+        if action not in {"activate", "release"}:
+            raise ValueError(f"unsupported scheduler action {action!r}")
 
         identity = (key, int(attempt))
         with self._lock:
             local = self._attempts.get(identity)
-            if local is None or not local.activation_published:
+            if local is None or not local.activation_staged:
                 raise RuntimeError("scheduler activation has no staged local attempt")
             if local.prepare_command.lease_id != str(lease_id):
                 raise RuntimeError("scheduler activation lease does not match")
+            if local.activation_published:
+                return
+            command = local.activation_ticket_command or local.prepare_command
+            prepared = local.prepared
+            completion = local.completion
+            if prepared is None or completion is None:
+                raise RuntimeError("scheduler activation lacks physical completion")
+
+        # Do not hold the executor lock across native allocator/Radix work.
+        # The handler's memory authority provides the narrow transaction lock.
+        if action == "activate":
+            local.handler.prepare_handoff(command, prepared, completion)
+        local.handler.commit(command, prepared, completion)
+
+        with self._lock:
+            current = self._attempts.get(identity)
+            if current is not local:
+                raise RuntimeError("scheduler activation attempt disappeared")
+            if action == "release":
+                local.source_released = True
+            local.activation_published = True
 
     def confirm_scheduler_adopted(
         self, key: GenerationKey, attempt: int, lease_id: str
     ) -> None:
-        """Acknowledge activation only after native scheduler queue insertion."""
+        """Acknowledge only after the native scheduler action completes."""
 
         identity = (key, int(attempt))
         with self._lock:
@@ -1110,6 +1228,7 @@ class _LinkAttempt:
     phase: CommandKind = CommandKind.PREPARE
     dma_results: dict[LinkParticipant, Mapping[str, Any]] = None
     handoff_payload: Mapping[str, Any] = None
+    handoff_release_seq: int = 0
     abort_reason: str = ""
     dma_slot_held: bool = False
     started_at: float = 0.0
@@ -1141,6 +1260,7 @@ class RankZeroLinkOrchestrator:
         coordinator: LinkLifecycleCoordinator,
         *,
         broadcast: Callable[[GroupCommand], None],
+        compact_handoff_payload: bool = False,
         path_lanes: Optional[Mapping[TransferPath, int]] = None,
         operation_lanes: Optional[
             Mapping[tuple[TransferPath, str], int]
@@ -1174,6 +1294,7 @@ class RankZeroLinkOrchestrator:
     ) -> None:
         self._coordinator = coordinator
         self._broadcast = broadcast
+        self._compact_handoff_payload = bool(compact_handoff_payload)
         self._on_committed = on_committed
         self._on_committed_results = on_committed_results
         self._on_aborted = on_aborted
@@ -1234,6 +1355,13 @@ class RankZeroLinkOrchestrator:
         self._path_active: dict[tuple[object, str], int] = {}
         self._path_pending = {key: deque() for key in admission_keys}
         self._queued_keys: set[GenerationKey] = set()
+        # The target scheduler may start (and, for a short tool turn, finish)
+        # after ISSUE_ACTIVATION_TICKET while the preceding ownership attempt
+        # is still collecting its FINALIZED ACKs.  The reverse-direction
+        # transfer then legitimately reuses the same request-generation key.
+        # Keep exactly one ownership-contiguous successor behind that control
+        # tail; ordinary duplicate/concurrent offers remain errors.
+        self._key_successors: dict[GenerationKey, GroupTransferPlan] = {}
         # A lane completion can discover an expired queued Direct while the
         # orchestrator lock is held.  Defer its fallback callback rather than
         # re-entering policy/lifecycle code under that lock.
@@ -1277,6 +1405,8 @@ class RankZeroLinkOrchestrator:
             pending += len(self._deferred_rejections)
             if pending:
                 counts["admission_pending"] = pending
+            if self._key_successors:
+                counts["key_successor_pending"] = len(self._key_successors)
             if self._rejection_callbacks_active:
                 counts["rejection_callback"] = self._rejection_callbacks_active
             if self._rejection_callback_error is not None:
@@ -1303,6 +1433,7 @@ class RankZeroLinkOrchestrator:
             return self._changed.wait_for(
                 lambda: not self._active
                 and not any(self._path_pending.values())
+                and not self._key_successors
                 and not self._deferred_rejections
                 and self._rejection_callbacks_active == 0
                 and self._rejection_callback_error is None,
@@ -1319,9 +1450,10 @@ class RankZeroLinkOrchestrator:
         # the destination or released the source, so rollback would fabricate
         # a globally consistent owner.  Retain ownership and fail loudly.
         # START may already be physically posted on only a subset of TP ranks.
-        # Withdrawing its peers would strand those shards forever.  Only an
-        # attempt that has not crossed the all-rank PREPARED fence is safe to
-        # cancel.
+        # Withdrawing its peers would strand those shards forever.  The
+        # physical-start ACK is asynchronous, so rank zero cannot safely infer
+        # from a missing ACK that no rank has posted.  Only PREPARE is safely
+        # cancellable.
         return state.phase is CommandKind.PREPARE
 
     def _admission_key(self, plan: GroupTransferPlan):
@@ -1528,6 +1660,38 @@ class RankZeroLinkOrchestrator:
         if self._on_aborted is not None:
             self._rejection_callbacks_active += len(rejected)
 
+    def _late_handoff_predecessor_locked(
+        self, plan: GroupTransferPlan
+    ) -> Optional[_LinkAttempt]:
+        """Return the one safe predecessor whose FINALIZE may overlap compute."""
+
+        for (key, _attempt), state in self._active.items():
+            if key != plan.key:
+                continue
+            if (
+                state.phase
+                in {CommandKind.ISSUE_ACTIVATION_TICKET, CommandKind.FINALIZE}
+                and state.plan.target_owner is plan.source_owner
+            ):
+                return state
+            return None
+        return None
+
+    def _admit_successor_locked(self, key: GenerationKey) -> None:
+        """Move one retired key's successor into normal lane admission."""
+
+        plan = self._key_successors.pop(key, None)
+        if plan is None:
+            return
+        admission = self._admission_key(plan)
+        self._path_pending[admission].append(plan)
+        self._queued_keys.add(plan.key)
+        if self._uses_shared_network(plan):
+            self._drain_shared_pending_locked()
+        else:
+            self._drain_pending_locked(admission)
+        self._changed.notify_all()
+
     def _dispatch_rejection_callbacks(
         self, rejected: list[tuple[GroupTransferPlan, str]]
     ) -> None:
@@ -1562,6 +1726,10 @@ class RankZeroLinkOrchestrator:
         with self._changed:
             rejected.extend(self._deferred_rejections)
             self._deferred_rejections.clear()
+            rejected.extend(
+                (plan, str(reason)) for plan in self._key_successors.values()
+            )
+            self._key_successors.clear()
             for pending in self._path_pending.values():
                 rejected.extend((plan, str(reason)) for plan in pending)
                 pending.clear()
@@ -1594,10 +1762,32 @@ class RankZeroLinkOrchestrator:
 
         expired = False
         with self._changed:
-            if plan.key in self._queued_keys or any(
-                key == plan.key for key, _attempt in self._active
-            ):
+            if plan.key in self._queued_keys:
                 raise RuntimeError("request-generation already has a link attempt")
+            active_for_key = any(
+                key == plan.key for key, _attempt in self._active
+            )
+            if active_for_key:
+                predecessor = self._late_handoff_predecessor_locked(plan)
+                if predecessor is None:
+                    raise RuntimeError(
+                        "request-generation already has a link attempt"
+                    )
+                current = self._key_successors.get(plan.key)
+                if current is not None and current != plan:
+                    raise RuntimeError(
+                        "request-generation already has another handoff successor"
+                    )
+                self._key_successors[plan.key] = plan
+                self._changed.notify_all()
+                return None
+            if plan.key in self._key_successors:
+                current = self._key_successors[plan.key]
+                if current == plan:
+                    return None
+                raise RuntimeError(
+                    "request-generation already has another handoff successor"
+                )
             if (
                 plan.admission_deadline
                 and plan.admission_deadline <= time.monotonic()
@@ -1721,6 +1911,15 @@ class RankZeroLinkOrchestrator:
         with self._changed:
             rejected.extend(self._deferred_rejections)
             self._deferred_rejections.clear()
+            for key, plan in tuple(self._key_successors.items()):
+                if plan.admission_deadline and plan.admission_deadline <= now:
+                    del self._key_successors[key]
+                    rejected.append(
+                        (
+                            plan,
+                            "direct admission deadline expired behind predecessor FINALIZE",
+                        )
+                    )
             for admission, pending in self._path_pending.items():
                 kept = deque()
                 while pending:
@@ -1804,6 +2003,13 @@ class RankZeroLinkOrchestrator:
             raise ValueError("intent decision changed the request-generation key")
         return self.offer(plan)
 
+    def _handoff_tail_payload(self, state: _LinkAttempt) -> Mapping[str, Any]:
+        if not self._compact_handoff_payload:
+            return state.handoff_payload
+        if state.handoff_release_seq <= 0:
+            raise RuntimeError("handoff reference has no RELEASE base")
+        return {"handoff_payload_ref": state.handoff_release_seq}
+
     def on_ack(self, value: LinkRankAck) -> None:
         with self._lock:
             ack = value.ack
@@ -1814,11 +2020,11 @@ class RankZeroLinkOrchestrator:
             state = self._active[identity]
             if ack.phase is RankPhase.DMA_DONE:
                 state.dma_results[value.participant] = MappingProxyType(
-                    copy.deepcopy(dict(ack.result))
+                    _copy_control_payload(dict(ack.result))
                 )
             elif ack.phase is RankPhase.FAILED_DRAINED:
                 state.dma_results[value.participant] = MappingProxyType(
-                    copy.deepcopy(dict(ack.result))
+                    _copy_control_payload(dict(ack.result))
                 )
             if state.phase is CommandKind.PREPARE and self._coordinator.group_reached(
                 ack.key, ack.attempt, RankPhase.PREPARED
@@ -1900,6 +2106,7 @@ class RankZeroLinkOrchestrator:
                     ack.attempt,
                     payload=state.handoff_payload,
                 )
+                state.handoff_release_seq = command.command_seq
                 state.phase = CommandKind.RELEASE
                 self._broadcast(command)
                 return
@@ -1907,25 +2114,10 @@ class RankZeroLinkOrchestrator:
                 ack.key, ack.attempt, RankPhase.BOUND
             ):
                 state.bound_at = time.monotonic()
-                if state.plan.operation is TransferOperation.HOST_STORE:
-                    # Durable Host ownership and source-HBM release are both
-                    # complete at this barrier; no scheduler activation
-                    # follows a Store-only attempt.
-                    self._release_dma_slot_locked(state)
-                    self._log_slow_ownership(state)
-                    self._coordinator.commit(ack.key, ack.attempt)
-                    command = self._coordinator.issue_finalize(
-                        ack.key,
-                        ack.attempt,
-                        payload=state.handoff_payload,
-                    )
-                    state.phase = CommandKind.FINALIZE
-                    self._broadcast(command)
-                    return
                 command = self._coordinator.issue_handoff(
                     ack.key,
                     ack.attempt,
-                    payload=state.handoff_payload,
+                    payload=self._handoff_tail_payload(state),
                 )
                 state.phase = CommandKind.HANDOFF
                 self._broadcast(command)
@@ -1934,16 +2126,16 @@ class RankZeroLinkOrchestrator:
                 ack.key, ack.attempt, RankPhase.RELEASED
             ):
                 state.released_at = time.monotonic()
-                # Ownership has now left the source HBM and the target is
-                # fully bound.  The next attempt may safely reserve memory;
-                # later ready publication and scheduler adoption do not hold
-                # a data-plane lane.
+                # Ownership has now left source HBM and every target rank owns
+                # a fully transferred raw lease.  Native Req/Radix binding is
+                # intentionally delayed to the ordered TP scheduler ticket;
+                # it does not hold a data-plane lane.
                 self._release_dma_slot_locked(state)
                 self._log_slow_ownership(state)
                 command = self._coordinator.issue_activate(
                     ack.key,
                     ack.attempt,
-                    payload=state.handoff_payload,
+                    payload=self._handoff_tail_payload(state),
                 )
                 state.phase = CommandKind.ACTIVATE
                 self._broadcast(command)
@@ -1951,15 +2143,13 @@ class RankZeroLinkOrchestrator:
             if state.phase is CommandKind.ACTIVATE and self._coordinator.group_reached(
                 ack.key, ack.attempt, RankPhase.STAGED
             ):
-                # ACTIVATE publishes every rank-local ready lease.  Only after
-                # all ranks acknowledge that edge does rank zero issue the
-                # single immutable scheduler ticket.  The former ARM/PUBLISH
-                # round trips duplicated this same barrier and allowed the
-                # ownership tail to grow by seconds at TP=8.
+                # ACTIVATE proves every raw target lease is staged.  The one
+                # immutable scheduler ticket now orders native bind + ready
+                # publication identically on every TP rank.
                 command = self._coordinator.issue_activation_ticket(
                     ack.key,
                     ack.attempt,
-                    payload=state.handoff_payload,
+                    payload=self._handoff_tail_payload(state),
                 )
                 state.phase = CommandKind.ISSUE_ACTIVATION_TICKET
                 self._broadcast(command)
@@ -1974,7 +2164,7 @@ class RankZeroLinkOrchestrator:
                 command = self._coordinator.issue_finalize(
                     ack.key,
                     ack.attempt,
-                    payload=state.handoff_payload,
+                    payload=self._handoff_tail_payload(state),
                 )
                 state.phase = CommandKind.FINALIZE
                 self._broadcast(command)
@@ -1988,6 +2178,7 @@ class RankZeroLinkOrchestrator:
                         ack.key, GenerationTerminal.EVICTED
                     )
                 self._active.pop(identity, None)
+                self._admit_successor_locked(ack.key)
                 self._changed.notify_all()
                 if self._on_committed is not None:
                     self._on_committed(state.plan, ack.attempt)
@@ -2094,6 +2285,7 @@ class RemoteHostLoadPayload:
     page_indices: Any = None
     state_indices: Any = None
     ready_event: Any = None
+    token_count: Any = None
 
 
 @dataclass(slots=True)
@@ -2138,6 +2330,7 @@ class RemoteHostLoadExecutor(TransferExecutor):
                 device_indices=device_indices,
                 page_indices=payload.page_indices,
                 state_indices=payload.state_indices,
+                token_count=payload.token_count,
                 cancel_check=cancel.is_set,
             )
 

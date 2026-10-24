@@ -7,11 +7,14 @@ real NIXL fence.  It never scans a directory or makes a scheduling decision.
 from __future__ import annotations
 
 import ctypes
+import logging
 import mmap
 import os
 import threading
 import time
 import uuid
+
+logger = logging.getLogger(__name__)
 
 from sglang.srt.disaggregation.agentic_remote_host import (
     HostShard,
@@ -88,6 +91,9 @@ class RemoteHostRankWorker:
         self.page_size = int(page_size)
         self.rank, self.size = int(tp_rank), int(tp_size)
         self.direction = direction
+        self._profile_host_prepare = os.getenv(
+            "SGLANG_AGENTIC_PROFILE_HOST_PREPARE", "0"
+        ).lower() in {"1", "true"}
         schema = {
             "kind": "mha",
             "dtype": str(full_pool.store_dtype),
@@ -314,6 +320,7 @@ class RemoteHostRankWorker:
         self,
         token_count: int,
         *,
+        source_token_count: int | None = None,
         device_indices=None,
         page_indices=None,
     ) -> list[tuple[int, int, int]]:
@@ -339,6 +346,7 @@ class RemoteHostRankWorker:
             layer_bases=bases,
             token_indices=device_indices,
             bytes_per_token=self.item_size,
+            source_token_count=source_token_count,
         )
 
     def load(
@@ -349,9 +357,12 @@ class RemoteHostRankWorker:
         device_indices=None,
         page_indices=None,
         state_indices=None,
+        token_count=None,
         cancel_check=None,
     ) -> ReadReceipt:
         """Read one complete rank shard and return only after its real fence."""
+        profile = getattr(self, "_profile_host_prepare", False)
+        profile_start = time.perf_counter() if profile else 0.0
         shard = (
             shard_value
             if isinstance(shard_value, HostShard)
@@ -359,8 +370,16 @@ class RemoteHostRankWorker:
         )
         if shard.snapshot_id == "" or shard.token_count <= 0:
             raise ValueError("invalid remote Host shard")
+        requested_tokens = (
+            int(shard.token_count) if token_count is None else int(token_count)
+        )
+        if requested_tokens <= 0 or requested_tokens > int(shard.token_count):
+            raise ValueError("invalid remote Host prefix length")
+        if self.hybrid is not None and requested_tokens != int(shard.token_count):
+            raise ValueError("hybrid Host snapshots cannot be prefix-truncated")
         spans = self._attention_spans(
-            shard.token_count,
+            requested_tokens,
+            source_token_count=int(shard.token_count),
             device_indices=device_indices,
             page_indices=page_indices,
         )
@@ -368,7 +387,17 @@ class RemoteHostRankWorker:
         if self.hybrid is not None:
             spans.extend(self.hybrid.state_spans(shard.token_count, state_indices))
             payload_ranges = self.hybrid.payload_ranges(shard.token_count)
+        elif requested_tokens != int(shard.token_count):
+            layer_count = len(tuple(self.pool.k_buffer) + tuple(self.pool.v_buffer))
+            source_layer_bytes = int(shard.token_count) * self.item_size
+            prefix_bytes = requested_tokens * self.item_size
+            payload_ranges = tuple(
+                (layer * source_layer_bytes, prefix_bytes)
+                for layer in range(layer_count)
+            )
+        profile_spans = time.perf_counter() if profile else 0.0
         transport = self._transport_for_worker(destination=True)
+        profile_transport = time.perf_counter() if profile else 0.0
         pending = None
         try:
             pending = transport.prepare_read(
@@ -381,16 +410,39 @@ class RemoteHostRankWorker:
                 spans=spans,
                 payload_ranges=payload_ranges,
             )
+            profile_prepared = time.perf_counter() if profile else 0.0
             if pending.state == "PREPARED":
                 if cancel_check is not None and cancel_check():
                     raise RuntimeError("remote Host load cancelled before post")
                 pending.start()
+            profile_posted = time.perf_counter() if profile else 0.0
             while True:
                 if cancel_check is not None and cancel_check():
                     raise RuntimeError("remote Host load cancelled")
                 receipt = pending.poll()
                 if receipt is not None:
+                    profile_done = time.perf_counter() if profile else 0.0
                     transport.retire_read(shard.export_id, str(attempt_id))
+                    if profile:
+                        # Wall times, NOT CUDA DMA timers. Index mirroring in
+                        # the caller and group commit/source release are outside
+                        # this scope. Diagnostics must never revoke a receipt.
+                        try:
+                            logger.info(
+                                "Agentic Host prepare profile direction=%s rank=%d "
+                                "tokens=%d spans=%d span_build_s=%.6f "
+                                "transport_setup_s=%.6f prepare_read_s=%.6f "
+                                "post_s=%.6f read_wait_s=%.6f snapshot=%s",
+                                self.direction, self.rank, requested_tokens, len(spans),
+                                profile_spans - profile_start,
+                                profile_transport - profile_spans,
+                                profile_prepared - profile_transport,
+                                profile_posted - profile_prepared,
+                                profile_done - profile_posted,
+                                shard.snapshot_id,
+                            )
+                        except Exception:
+                            pass
                     return receipt
                 if pending.state in {"ERR", "UNKNOWN"}:
                     raise RuntimeError("remote Host READ failed")

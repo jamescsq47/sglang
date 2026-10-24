@@ -783,8 +783,22 @@ class AgenticMemoryAuthority:
             record.phase = LeasePhase.RELEASE_PENDING
             return True
 
-    def commit_release(self, lease_id: int, *, reason: str = "released") -> bool:
-        """Return exact pages after the coordinator has closed all fences."""
+    def commit_release(
+        self,
+        lease_id: int,
+        *,
+        reason: str = "released",
+        notify_capacity: bool = True,
+    ) -> bool:
+        """Return exact pages after the coordinator has closed all fences.
+
+        ``notify_capacity`` is false for a failed group PREPARE rollback.  Such
+        a rollback merely returns pages tentatively reserved by the same
+        failed attempt; it is not a new scheduler-capacity edge.  Publishing
+        it would immediately re-admit the request against unchanged TP-wide
+        capacity and can create an unbounded prepare/abort retry loop when a
+        non-zero TP rank is the limiting rank.
+        """
 
         lease_id = int(lease_id)
         capacity_sink = None
@@ -809,7 +823,9 @@ class AgenticMemoryAuthority:
             self._leases.pop(lease_id)
             self._lease_by_key.pop(record.lease.key, None)
             self._remember_terminal(lease_id, reason)
-            capacity_sink = self._capacity_available_sink
+            capacity_sink = (
+                self._capacity_available_sink if bool(notify_capacity) else None
+            )
             available_tokens = max(
                 0,
                 int(self._token_allocator.available_size())

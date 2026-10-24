@@ -4,8 +4,10 @@ import pytest
 import torch
 
 from sglang.srt.disaggregation.agentic_mamba_prefill import (
+    claim_prefill_batch_checkpoints,
+    restore_prefill_batch_checkpoint,
     reserve_prefill_state, fork_prefill_checkpoint, release_prefill_checkpoint,
-    missing_runtime_slots,
+    missing_runtime_slots, required_prefill_checkpoint_slots,
     prefill_state_admission_enabled,
 )
 from sglang.srt.managers.scheduler import AgenticPWorksetLeaseBroker
@@ -204,3 +206,79 @@ def test_first_chunk_needs_replacement_before_first_checkpoint_exists(capacity):
     release_kv_cache(request, cache)
     pool.free(old)
     assert pool.available_size() == 5
+
+
+@pytest.mark.parametrize(
+    "enable_overlap,chunked,expected",
+    [(False, False, 1), (False, True, 1), (True, False, 1), (True, True, 2)],
+)
+def test_checkpoint_depth_tracks_overlap_pipeline(enable_overlap, chunked, expected):
+    assert required_prefill_checkpoint_slots(
+        enable_overlap=enable_overlap, chunked=chunked
+    ) == expected
+
+
+def test_overlapped_chunk_admission_replenishes_before_next_forward():
+    pool, req_pool, cache = setup(6)
+    request = req()
+    reserve_prefill_state(request, req_pool, cache, checkpoint_slots=2).finish(True)
+    assert request._agentic_mamba_prefill_checkpoint.numel() == 2
+
+    # The next chunk may be scheduled before the previous result consumes its
+    # promised checkpoint.  Once that result is processed, the following
+    # admission restores the two-deep reservation before another Forward.
+    reserve_prefill_state(request, req_pool, cache, checkpoint_slots=2).finish(True)
+    first = fork_prefill_checkpoint(request, pool, request.mamba_pool_idx.reshape(1))
+    assert first is not None
+    assert request._agentic_mamba_prefill_checkpoint.numel() == 1
+    reserve_prefill_state(request, req_pool, cache, checkpoint_slots=2).finish(True)
+    assert request._agentic_mamba_prefill_checkpoint.numel() == 2
+    second = fork_prefill_checkpoint(request, pool, request.mamba_pool_idx.reshape(1))
+    assert second is not None
+    assert request._agentic_mamba_prefill_checkpoint.numel() == 1
+
+    pool.free(first)
+    pool.free(second)
+    release_kv_cache(request, cache)
+    assert pool.available_size() == 6
+
+
+def test_overlap_checkpoint_is_owned_by_its_forward_generation():
+    pool, req_pool, cache = setup(6)
+    request = req()
+    request.rid = "r"
+    reserve_prefill_state(request, req_pool, cache, checkpoint_slots=2).finish(True)
+
+    first_batch = NS(reqs=[request])
+    first_batch._agentic_mamba_prefill_checkpoints = (
+        claim_prefill_batch_checkpoints(first_batch)
+    )
+    assert request._agentic_mamba_prefill_checkpoint.numel() == 1
+
+    # The next Forward claims a different slot before the first result is
+    # processed.  Restoring the first result must put its slot at the front.
+    reserve_prefill_state(request, req_pool, cache, checkpoint_slots=2).finish(True)
+    second_batch = NS(reqs=[request])
+    second_batch._agentic_mamba_prefill_checkpoints = (
+        claim_prefill_batch_checkpoints(second_batch)
+    )
+    first_owned = first_batch._agentic_mamba_prefill_checkpoints[0].clone()
+    second_owned = second_batch._agentic_mamba_prefill_checkpoints[0].clone()
+    assert not torch.equal(first_owned, second_owned)
+
+    restore_prefill_batch_checkpoint(first_batch, request, 0)
+    inserted = fork_prefill_checkpoint(
+        request, pool, request.mamba_pool_idx.reshape(1)
+    )
+    assert torch.equal(inserted, first_owned)
+
+    restore_prefill_batch_checkpoint(second_batch, request, 0)
+    inserted = fork_prefill_checkpoint(
+        request, pool, request.mamba_pool_idx.reshape(1)
+    )
+    assert torch.equal(inserted, second_owned)
+
+    release_kv_cache(request, cache)
+    pool.free(first_owned)
+    pool.free(second_owned)
+    assert pool.available_size() == 6

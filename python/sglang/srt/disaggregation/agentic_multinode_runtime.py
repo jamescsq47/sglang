@@ -76,13 +76,14 @@ class RuntimeTerminal:
 
 @dataclass(frozen=True, slots=True)
 class EndpointActivationTicket:
-    """Target-TP activation carried by SGLang's native scheduler broadcast."""
+    """Endpoint action carried by SGLang's native TP scheduler broadcast."""
 
     key: GenerationKey
     attempt: int
     lease_id: str
     target_role: str
     target_generation: int
+    action: str = "activate"
 
     @property
     def target_key(self) -> GenerationKey:
@@ -227,8 +228,12 @@ class _PathCommandDispatcher:
             identity, command = item
             terminal = command.kind in self._TERMINAL
             try:
-                self._executor.handle(command)
-                self._after_command(command)
+                executed = self._executor.handle(command)
+                if executed is None:  # Legacy test/adaptor executors.
+                    executed = command
+                if not isinstance(executed, GroupCommand):
+                    raise TypeError("command executor returned an invalid command")
+                self._after_command(executed)
             except BaseException as error:
                 self._on_fatal(error)
                 return
@@ -464,12 +469,16 @@ class AgenticMultiNodeRuntime:
             endpoint_group=participant.endpoint_group,
             endpoint_role=participant.role,
         )
+        compact_handoff_payload = os.getenv(
+            "SGLANG_AGENTIC_COMPACT_HANDOFF_PAYLOAD", "0"
+        ).lower() in {"1", "true"}
         self.executor = RankLocalCommandExecutor(
             participant=participant,
             queues=queues,
             handlers=handlers,
             emit_ack=self._emit_ack,
             report_failure=self._report_failure,
+            compact_handoff_payload=compact_handoff_payload,
         )
         command_workers = _command_worker_counts(queues.snapshot())
         self._command_dispatcher = _PathCommandDispatcher(
@@ -487,6 +496,7 @@ class AgenticMultiNodeRuntime:
             self.orchestrator = RankZeroLinkOrchestrator(
                 self.coordinator,
                 broadcast=self.agent.publish,
+                compact_handoff_payload=compact_handoff_payload,
                 path_lanes={
                     path: max(1, int(snapshot.lanes))
                     for path, snapshot in queues.snapshot().items()
@@ -643,25 +653,44 @@ class AgenticMultiNodeRuntime:
             self._record_fatal(error)
 
     def _after_command(self, value: GroupCommand) -> None:
+        if value.kind is not CommandKind.ISSUE_ACTIVATION_TICKET:
+            return
+        if self.participant.rank != 0:
+            return
+
+        source_role = _owner_role(value.source_owner)
+        target_role = _owner_role(value.target_owner)
+        actions = []
         if (
-            value.kind is CommandKind.ISSUE_ACTIVATION_TICKET
-            and self.participant.rank == 0
-            and _scheduler_target(value.target_owner)
-            and self.participant.role == _owner_role(value.target_owner)
+            _scheduler_target(value.source_owner)
+            and self.participant.role == source_role
         ):
-            self._activation_tickets.put_nowait(
-                EndpointActivationTicket(
-                    value.key,
-                    value.attempt,
-                    value.lease_id,
-                    self.participant.role,
-                    int(
-                        value.payload.get("transfer", {}).get(
-                            "target_generation", value.key.generation
-                        )
-                    ),
-                )
+            actions.append("release")
+        if (
+            _scheduler_target(value.target_owner)
+            and self.participant.role == target_role
+        ):
+            actions.append("activate")
+        if len(actions) > 1:
+            raise RuntimeError(
+                "one endpoint cannot release and activate the same transfer ticket"
             )
+        if not actions:
+            return
+        self._activation_tickets.put_nowait(
+            EndpointActivationTicket(
+                value.key,
+                value.attempt,
+                value.lease_id,
+                self.participant.role,
+                int(
+                    value.payload.get("transfer", {}).get(
+                        "target_generation", value.key.generation
+                    )
+                ),
+                actions[0],
+            )
+        )
 
     def _decide_intent(self, intent: LinkIntent) -> Optional[GroupTransferPlan]:
         candidate = (
@@ -951,23 +980,23 @@ class AgenticMultiNodeRuntime:
     def take_activation_ticket(
         self, timeout: Optional[float] = None
     ) -> EndpointActivationTicket:
-        """Target endpoint rank zero consumes this before native TP broadcast."""
+        """Endpoint rank zero consumes this before native TP broadcast."""
 
         if self.participant.rank != 0:
             raise RuntimeError("only endpoint rank zero owns activation tickets")
         return self._activation_tickets.get(timeout=timeout)
 
     def activate_staged(self, ticket: EndpointActivationTicket) -> None:
-        """Publish the locally staged lease in endpoint-TP0 broadcast order."""
+        """Apply one staged endpoint action in endpoint-TP0 broadcast order."""
 
         if ticket.target_role != self.participant.role:
             raise ValueError("activation ticket belongs to another endpoint role")
         self.executor.activate_staged(
-            ticket.key, ticket.attempt, ticket.lease_id
+            ticket.key, ticket.attempt, ticket.lease_id, action=ticket.action
         )
 
     def confirm_scheduler_adopted(self, ticket: EndpointActivationTicket) -> None:
-        """ACK only after this rank inserted the request for compute."""
+        """ACK only after this rank completed the scheduler-owned action."""
 
         if ticket.target_role != self.participant.role:
             raise ValueError("activation ticket belongs to another endpoint role")
@@ -987,6 +1016,17 @@ class AgenticMultiNodeRuntime:
         if not self._command_dispatcher.wait_idle(_remaining(deadline)):
             return False
         return self.executor.wait_idle(_remaining(deadline))
+
+    def wait_p2d_direct_physical_idle(
+        self, timeout: Optional[float] = None
+    ) -> bool:
+        """Fence active P->D Direct DMA without waiting for control handoff."""
+
+        return self.executor.wait_physical_idle(
+            TransferPath.P2D_DIRECT,
+            TransferOperation.DIRECT,
+            timeout,
+        )
 
     def close(self, *, timeout: float = 5.0) -> None:
         """Close only after every attempt has a real terminal physical fence.

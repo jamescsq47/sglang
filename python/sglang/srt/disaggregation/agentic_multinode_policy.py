@@ -333,12 +333,16 @@ class D2PPolicyActor:
         *,
         endpoint_group: str = "",
     ) -> None:
-        """Admit feasible Host restores on one causal allocator edge.
+        """Admit at most one feasible Host restore per allocator edge.
 
         Capacity notification is a hint; the physical authority remains the
         final arbiter on every TP rank.  The epoch prevents a rejected request
-        from immediately retrying against the same unchanged capacity.  A
-        large head item does not block smaller feasible work behind it.
+        from immediately retrying against the same unchanged capacity.  One
+        released request yields one discrete hybrid workset (KV pages plus a
+        Mamba state slot), while the wire snapshot only describes KV tokens.
+        Admitting several restores from that scalar snapshot can therefore
+        overrun the Mamba pool and create a prepare/abort retry storm.  A large
+        head item still does not block a smaller feasible item behind it.
         """
 
         with self._changed:
@@ -379,9 +383,10 @@ class D2PPolicyActor:
                 admitted += 1
                 if remaining is not None:
                     remaining -= required
-                elif admitted >= 1:
-                    # Compatibility for callers without a capacity snapshot.
-                    break
+                # Capacity edges are workset-release edges, not an additive
+                # token credit.  The scalar token snapshot cannot prove that
+                # a second Mamba state slot was released.
+                break
 
     def committed(self, key: GenerationKey) -> None:
         with self._changed:
@@ -697,8 +702,10 @@ class P2DPolicyActor:
                 )
                 if remaining is not None:
                     remaining -= required
-                else:
-                    break
+                # One release edge represents one complete hybrid workset.
+                # ``available_tokens`` alone cannot safely admit a second
+                # request because it omits the Mamba state-slot budget.
+                break
         for plan in plans:
             self._submit(plan)
 

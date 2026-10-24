@@ -7330,33 +7330,75 @@ class Scheduler(
     _AGENTIC_V2_ACTIVATION_KEY = "__sglang_agentic_multinode_activation_v2__"
 
     def _agentic_v2_prepare_activation_control(self):
-        """Drain target tickets only on TP0 for the native TP broadcast.
+        """Drain endpoint action tickets on TP0 for the native TP broadcast.
 
         TCP completion order is not a scheduler order.  The group controller
         emits a ticket only after every target shard is staged; TP0 then puts
         that immutable order on SGLang's existing request broadcast.  No
         scheduler rank polls the network or independently selects ready work.
+
+        A Decode activation also needs one native request-to-token row.  The
+        transfer authority can stage more complete worksets than the native
+        scheduler can run concurrently (notably c256 with two Decode groups),
+        so keep excess activation tickets pending until a row is free.  Source
+        release tickets must continue to pass the gate: they are what retire
+        existing scheduler ownership and can make rows available on the next
+        loop.
         """
 
         runtime = getattr(self, "agentic_multinode_runtime_v2", None)
         if runtime is None or self.tp_rank != 0:
             return None
+
+        deferred = getattr(
+            self, "_agentic_v2_deferred_activation_tickets", None
+        )
+        if deferred is None:
+            deferred = deque()
+            self._agentic_v2_deferred_activation_tickets = deferred
+
+        role = getattr(self.disaggregation_mode, "value", self.disaggregation_mode)
+        request_pool = getattr(self, "req_to_token_pool", None)
+        gate_decode_rows = str(role) == "decode" and request_pool is not None
+        activation_budget = (
+            int(request_pool.available_size()) if gate_decode_rows else 64
+        )
+
+        def encode(ticket):
+            return {
+                "request_id": ticket.key.request_id,
+                "generation": int(ticket.target_generation),
+                "attempt": int(ticket.attempt),
+                "lease_id": ticket.lease_id,
+                "target_role": ticket.target_role,
+                "source_generation": int(ticket.key.generation),
+                "action": ticket.action,
+            }
+
         tickets = []
-        while len(tickets) < 64:
+        while deferred and activation_budget > 0 and len(tickets) < 64:
+            tickets.append(encode(deferred.popleft()))
+            activation_budget -= 1
+
+        # Bound queue work per scheduler iteration just as before.  Even when
+        # Decode has no request row, drain staged tickets so independent source
+        # releases are never hidden behind target activations.
+        drained = 0
+        while drained < 64 and len(tickets) < 64:
             try:
                 ticket = runtime.take_activation_ticket(timeout=0)
             except queue.Empty:
                 break
-            tickets.append(
-                {
-                    "request_id": ticket.key.request_id,
-                    "generation": int(ticket.target_generation),
-                    "attempt": int(ticket.attempt),
-                    "lease_id": ticket.lease_id,
-                    "target_role": ticket.target_role,
-                    "source_generation": int(ticket.key.generation),
-                }
-            )
+            drained += 1
+            if gate_decode_rows and ticket.action == "activate":
+                # Preserve activation order.  New activations cannot pass an
+                # older deferred activation even if a row appeared between
+                # queue reads.
+                if deferred or activation_budget <= 0:
+                    deferred.append(ticket)
+                    continue
+                activation_budget -= 1
+            tickets.append(encode(ticket))
         if not tickets:
             return None
         return {self._AGENTIC_V2_ACTIVATION_KEY: True, "tickets": tickets}
@@ -7392,25 +7434,28 @@ class Scheduler(
                 lease_id=str(value["lease_id"]),
                 target_role=str(value["target_role"]),
                 target_generation=int(value["generation"]),
+                action=str(value.get("action", "activate")),
             )
             runtime.activate_staged(ticket)
             tickets.append(ticket)
-            attempts.append(
-                RequestGenerationAttempt(
-                    str(value["request_id"]),
-                    int(value["generation"]),
-                    int(value["attempt"]),
+            if ticket.action == "activate":
+                attempts.append(
+                    RequestGenerationAttempt(
+                        str(value["request_id"]),
+                        int(value["generation"]),
+                        int(value["attempt"]),
+                    )
                 )
-            )
 
-        if role == "prefill":
-            ready = runtime.p_memory_bridge.activate_prefill_attempts(attempts)
-            self._merge_disagg_prefill_ready(list(ready))
-        elif role == "decode":
-            ready = runtime.d_memory_bridge.activate_decode_attempts(attempts)
-            self.waiting_queue.extend(ready)
-        else:  # pragma: no cover - validated at startup
-            raise RuntimeError(f"unsupported V2 endpoint role {role!r}")
+        if attempts:
+            if role == "prefill":
+                ready = runtime.p_memory_bridge.activate_prefill_attempts(attempts)
+                self._merge_disagg_prefill_ready(list(ready))
+            elif role == "decode":
+                ready = runtime.d_memory_bridge.activate_decode_attempts(attempts)
+                self.waiting_queue.extend(ready)
+            else:  # pragma: no cover - validated at startup
+                raise RuntimeError(f"unsupported V2 endpoint role {role!r}")
         # ACTIVATED means the request is now owned by the native scheduler,
         # not merely published in a rank-local ready queue.
         for ticket in tickets:
@@ -8077,6 +8122,20 @@ class Scheduler(
             if control is not None:
                 raise RuntimeError("V1 and V2 TP controls were mixed")
             self._agentic_v2_consume_activation_control(v2_control)
+            # The native recv broadcast gives every TP rank the same ticket
+            # order, but applying a ticket performs rank-local allocator and
+            # Radix mutations.  Those commits can take different amounts of
+            # time (or briefly wait on a rank-local authority lock).  Without
+            # a fence, a fast rank can schedule the newly activated request
+            # and enter the next model collective while a slower rank is
+            # still committing it, producing divergent forward batches.
+            #
+            # This barrier is ordered by the broadcast above and is entered
+            # only when that broadcast carried V2 endpoint work, so every TP
+            # rank takes it in the same scheduler-loop iteration.  DMA remains
+            # asynchronous; only the short source-release/target-publication
+            # metadata transaction is fenced before compute resumes.
+            barrier(group=self.tp_cpu_group)
             return ordinary
         if control is None:
             return ordinary
@@ -8147,10 +8206,29 @@ class Scheduler(
                 )
                 if apply_commands is not None:
                     apply_commands(control.get("decode_agentic_commands", ()))
-            self._agentic_tp_decode_admit_keys = [
+            # Admission is a rank-local allocator commit.  A follower can still
+            # have the previous tick's terminal transfer entries in its local
+            # queue when TP0 selects the next requests.  In that case
+            # DecodePreallocQueue intentionally defers the selected request for
+            # one tick.  Keep the broadcast key pending on that rank until the
+            # local commit consumes it; replacing the list on the next native
+            # broadcast would otherwise strand the request forever after TP0
+            # has already moved its shard into the transfer queue.
+            new_admit_keys = [
                 (str(rid), int(room))
                 for rid, room in control.get("decode_admit_keys", ())
             ]
+            pending_admit_keys = []
+            pending_admit_set = set()
+            for key in (
+                *getattr(self, "_agentic_tp_decode_admit_keys", ()),
+                *new_admit_keys,
+            ):
+                key = (str(key[0]), int(key[1]))
+                if key not in pending_admit_set:
+                    pending_admit_keys.append(key)
+                    pending_admit_set.add(key)
+            self._agentic_tp_decode_admit_keys = pending_admit_keys
             transfer_keys = control.get("decode_transfer_keys")
             if transfer_keys is None:
                 transfer_rid = control.get("decode_transfer_rid")
@@ -9719,9 +9797,18 @@ class Scheduler(
                 )
                 return None
             if getattr(self, "_agentic_mamba_prefill_admission", False):
-                from sglang.srt.disaggregation.agentic_mamba_prefill import reserve_prefill_state
+                from sglang.srt.disaggregation.agentic_mamba_prefill import (
+                    required_prefill_checkpoint_slots,
+                    reserve_prefill_state,
+                )
                 reservation = reserve_prefill_state(
-                    self.chunked_req, self.req_to_token_pool, self.tree_cache
+                    self.chunked_req,
+                    self.req_to_token_pool,
+                    self.tree_cache,
+                    checkpoint_slots=required_prefill_checkpoint_slots(
+                        enable_overlap=self.enable_overlap,
+                        chunked=True,
+                    ),
                 )
                 if reservation is None:
                     return None
@@ -9784,16 +9871,23 @@ class Scheduler(
             # both this batch and the overlapped previous output remain safe.
             state_reservation = None
             if getattr(self, "_agentic_mamba_prefill_admission", False):
-                from sglang.srt.disaggregation.agentic_mamba_prefill import reserve_prefill_state
+                from sglang.srt.disaggregation.agentic_mamba_prefill import (
+                    required_prefill_checkpoint_slots,
+                    reserve_prefill_state,
+                )
+                will_chunk = (
+                    adder.rem_chunk_tokens is not None
+                    and len(req.origin_input_ids) > adder.rem_chunk_tokens
+                )
                 state_reservation = reserve_prefill_state(
                     req, self.req_to_token_pool, self.tree_cache,
-                    # First-turn chunking has no old checkpoint to retire
-                    # after its first insertion. Reserve the replacement too.
-                    checkpoint_slots=(2 if (
-                        not getattr(req, "_agentic_workset_backed", False)
-                        and adder.rem_chunk_tokens is not None
-                        and len(req.origin_input_ids) > adder.rem_chunk_tokens
-                    ) else 1),
+                    # The same two-deep reservation is required for a restored
+                    # workset: its lease contributes one checkpoint, not the
+                    # second slot needed by overlapped chunk result processing.
+                    checkpoint_slots=required_prefill_checkpoint_slots(
+                        enable_overlap=self.enable_overlap,
+                        chunked=will_chunk,
+                    ),
                 )
                 if state_reservation is None:
                     # A later resident request may need no additional slots.
@@ -10052,6 +10146,25 @@ class Scheduler(
             bridge = getattr(self, "agentic_d_memory_v2_bridge", None)
         if bridge is None:
             return
+        decode_bridge = getattr(self, "agentic_d_memory_v2_bridge", None)
+        if decode_bridge is not None:
+            request_bridges = [
+                getattr(req, "_agentic_d_memory_bridge", None)
+                for req in batch.reqs
+            ]
+            owned = [value for value in request_bridges if value is not None]
+            if owned and (
+                len(owned) != len(request_bridges)
+                or any(value is not decode_bridge for value in owned)
+            ):
+                raise RuntimeError(
+                    "V2 Decode forward batch mixes memory authorities"
+                )
+            # process_batch_result receives a shallow copy whose Req objects
+            # remain shared with newer overlap batches.  Capture ownership on
+            # the batch itself before an earlier result can release a finished
+            # Req and remove its bridge attributes.
+            batch.agentic_d_memory_v2_owned = bool(owned)
         event = self.device_module.Event()
         event.record()
         bridge.record_forward_fence(batch.reqs, event)
@@ -10062,6 +10175,30 @@ class Scheduler(
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
+        # H100 P->D Direct is fast enough that overlapping its HBM/RDMA reads
+        # with the next Prefill hurts TP collective progress more than the
+        # overlap saves. Wait only for DMA that has actually started: a
+        # transfer waiting on admission/connection never gates compute, and
+        # D->P tool-wait state is intentionally unrelated.
+        if (
+            self.server_args.disaggregation_mode == "prefill"
+            and os.getenv(
+                "SGLANG_AGENTIC_SERIALIZE_P2D_DIRECT_WITH_FORWARD", "0"
+            ).lower()
+            in {"1", "true"}
+        ):
+            runtime = getattr(self, "agentic_multinode_runtime_v2", None)
+            if runtime is not None and not runtime.wait_p2d_direct_physical_idle(
+                timeout=float(
+                    os.getenv(
+                        "SGLANG_AGENTIC_P2D_DIRECT_FORWARD_WAIT_SECONDS", "1.0"
+                    )
+                )
+            ):
+                logger.warning(
+                    "AgenticKV P2D Direct remained active at the Forward "
+                    "serialization deadline; preserving compute liveness"
+                )
         self.forward_ct += 1
 
         agentic_tp_debug = (

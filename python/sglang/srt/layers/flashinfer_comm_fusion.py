@@ -1,5 +1,6 @@
 import contextlib
 import logging
+import os
 import platform
 from typing import Optional, Tuple
 
@@ -23,6 +24,9 @@ _flashinfer_comm = None
 _workspace_manager = None
 _flashinfer_allreduce_unavailable = False
 _posix_transport_override_logged = False
+FLASHINFER_ALLREDUCE_MAX_TOKEN_NUM = max(
+    1, int(os.getenv("SGLANG_FLASHINFER_ALLREDUCE_MAX_TOKENS", "2048"))
+)
 
 
 def _should_force_posix_fd_transport() -> bool:
@@ -220,7 +224,7 @@ _workspace_manager = FlashInferWorkspaceManager()
 
 
 def ensure_workspace_initialized(
-    max_token_num: int = 2048,
+    max_token_num: int = FLASHINFER_ALLREDUCE_MAX_TOKEN_NUM,
     hidden_dim: int = 4096,
     dtype: torch.dtype = torch.float16,
     token_num: Optional[int] = None,
@@ -301,7 +305,7 @@ def flashinfer_allreduce_residual_rmsnorm(
     residual: torch.Tensor,
     weight: torch.Tensor,
     eps: float = 1e-6,
-    max_token_num: int = 2048,
+    max_token_num: int = FLASHINFER_ALLREDUCE_MAX_TOKEN_NUM,
     use_oneshot: Optional[bool] = None,
     trigger_completion_at_end: bool = False,
     fp32_acc: bool = False,

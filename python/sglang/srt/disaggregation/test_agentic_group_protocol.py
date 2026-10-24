@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import builtins
+import copy
+import json
 import os
+import random
 import threading
 import time
 
 import pytest
+from sglang.srt.disaggregation import agentic_group_protocol as protocol
 
 from sglang.srt.disaggregation.agentic_group_protocol import (
     AttemptOutcome,
@@ -934,3 +938,132 @@ def test_wait_condition_is_event_driven():
         timeout=1,
     )
     thread.join(timeout=1)
+
+
+def test_control_payload_copy_preserves_aliases_cycles_and_fallback_types():
+    class IntSubclass(int):
+        pass
+
+    class ListSubclass(list):
+        pass
+
+    shared = [1, {"value": [2, 3]}]
+    value = {"left": shared, "right": shared, "tuple": (shared,),
+             "subclass": ListSubclass([IntSubclass(7)])}
+    cloned = protocol._copy_control_payload(value)
+    assert cloned == copy.deepcopy(value)
+    assert cloned["left"] is cloned["right"] is cloned["tuple"][0]
+    assert cloned["left"] is not shared
+    assert type(cloned["subclass"]) is ListSubclass
+    assert type(cloned["subclass"][0]) is IntSubclass
+    shared[1]["value"].append(4)
+    assert cloned["left"][1]["value"] == [2, 3]
+
+    cyclic = []
+    pair = (cyclic,)
+    cyclic.append(pair)
+    clone_cycle = protocol._copy_control_payload(cyclic)
+    assert clone_cycle[0][0] is clone_cycle
+    with pytest.raises(ValueError, match="Circular reference"):
+        protocol._frozen_payload({"cycle": cyclic})
+
+    memo = {}
+    protocol._copy_control_payload(value, memo)
+    assert any(item is value for item in memo[id(memo)])
+    assert any(item is shared for item in memo[id(memo)])
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf"),
+                                 object(), b"not-json", {1, 2}])
+def test_fast_payload_copy_does_not_skip_json_validation(bad):
+    with pytest.raises((ValueError, TypeError)):
+        protocol._frozen_payload({"nested": [{"bad": bad}]})
+
+
+def test_control_payload_copy_matches_deepcopy_on_nested_json():
+    rng = random.Random(2026)
+
+    def generate(depth):
+        if depth == 0 or rng.random() < 0.35:
+            return rng.choice([None, True, False, 0, -17, 2**100, 0.125, "汉字"])
+        values = [generate(depth - 1) for _ in range(rng.randrange(5))]
+        return values if rng.random() < 0.5 else dict(enumerate(values))
+
+    for _ in range(256):
+        payload = {"data": generate(5)}
+        expected = copy.deepcopy(payload)
+        actual = protocol._copy_control_payload(payload)
+        assert actual == expected
+        assert json.dumps(actual, allow_nan=False) == json.dumps(expected, allow_nan=False)
+        assert protocol._encode_frame(actual) == protocol._encode_frame(expected)
+
+
+def _broadcast_fixture(*, selected=(), missing=None, fail=None):
+    class Connection:
+        def __init__(self, rank):
+            self.rank = rank
+            self.frames = []
+
+        def sendall(self, frame):
+            if self.rank == fail:
+                raise OSError("injected disconnected socket")
+            self.frames.append(frame)
+
+    relay = object.__new__(TCPGroupRelayServer)
+    relay._condition = threading.Condition()
+    members = tuple(LinkParticipant(role, group, rank)
+                    for role, group in [("prefill", "p0"), ("decode", "d0")]
+                    for rank in range(8))
+    relay.links = {"global": {"members": members, "sizes": {"p0": 8, "d0": 8}}}
+    connections = {("global", member.endpoint_group, member.rank): Connection(i)
+                   for i, member in enumerate(members)}
+    relay._sessions = {key: conn for key, conn in connections.items()
+                       if conn.rank != missing}
+    relay._send_locks = {key: threading.Lock() for key in relay._sessions}
+    coordinator = GroupLifecycleCoordinator("run", "p0", 8)
+    command = coordinator.begin_attempt(
+        GenerationKey("run", "broadcast", 0), source_owner=Owner.P_GPU,
+        target_owner=Owner.D_GPU, lease_id="lease", payload={"indices": list(range(1024))},
+    ).to_dict()
+    command["endpoint_groups"] = list(selected)
+    return relay, connections, command
+
+
+@pytest.mark.parametrize("selected,count", [((), 16), (("d0",), 8)])
+def test_relay_broadcast_encodes_once_and_preserves_identical_frames(monkeypatch, selected, count):
+    relay, connections, command = _broadcast_fixture(selected=selected)
+    encoded = []
+    original = protocol._encode_frame
+
+    def encode(value):
+        result = original(value)
+        encoded.append(result)
+        return result
+
+    monkeypatch.setattr(protocol, "_encode_frame", encode)
+    relay._broadcast("global", command)
+    frames = [frame for connection in connections.values() for frame in connection.frames]
+    assert len(encoded) == 1 and len(frames) == count
+    assert all(frame is encoded[0] for frame in frames)
+    assert frames[0] == original(command)
+
+
+def test_relay_broadcast_still_rejects_missing_rank_before_any_send():
+    relay, connections, command = _broadcast_fixture(missing=15)
+    with pytest.raises(GroupDisconnectedError):
+        relay._broadcast("global", command)
+    assert not any(connection.frames for connection in connections.values())
+
+
+def test_relay_broadcast_partial_socket_failure_is_not_swallowed():
+    relay, connections, command = _broadcast_fixture(fail=1)
+    with pytest.raises(OSError, match="injected disconnected"):
+        relay._broadcast("global", command)
+    assert [len(conn.frames) for conn in connections.values()] == [1] + [0] * 15
+
+
+def test_relay_broadcast_still_rejects_unknown_endpoint():
+    relay, connections, command = _broadcast_fixture(selected=("not-a-member",))
+    with pytest.raises(GroupProtocolError, match="unknown endpoints"):
+        relay._broadcast("global", command)
+    assert not any(connection.frames for connection in connections.values())

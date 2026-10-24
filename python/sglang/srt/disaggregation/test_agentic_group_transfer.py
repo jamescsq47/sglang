@@ -37,6 +37,7 @@ from sglang.srt.disaggregation.agentic_transfer_queues import (
     FenceKind,
     PhysicalProgress,
     PhysicalState,
+    TransferCompletion,
     TransferPath,
 )
 
@@ -138,7 +139,7 @@ def wait_phase(values, phase, timeout=2.0):
     raise AssertionError(f"missing {phase.name} ACK")
 
 
-def test_rank_executor_releases_source_only_after_group_handoff():
+def test_rank_executor_releases_source_only_in_scheduler_ticket_order():
     queues, executors = make_queues()
     acks, failures, released = [], [], []
     handler = CallbackPathHandler(
@@ -167,20 +168,84 @@ def test_rank_executor_releases_source_only_after_group_handoff():
     assert released == []
     rank.handle(command(CommandKind.HANDOFF, 4))
     wait_phase(acks, RankPhase.RELEASED)
-    assert released == [(1, FenceKind.DMA_COMPLETE)]
+    assert released == []
     rank.handle(command(CommandKind.ACTIVATE, 5))
     wait_phase(acks, RankPhase.STAGED)
-    assert released == [(1, FenceKind.DMA_COMPLETE)]
+    assert released == []
     rank.handle(command(CommandKind.SCHEDULER_ACTIVATE, 6))
     wait_phase(acks, RankPhase.ACTIVATION_ARMED)
     rank.handle(command(CommandKind.PUBLISH_ACTIVATION, 7))
     wait_phase(acks, RankPhase.ACTIVATION_READY)
     rank.handle(command(CommandKind.ISSUE_ACTIVATION_TICKET, 8))
+    assert all(value.ack.phase is not RankPhase.ACTIVATED for value in acks)
+    rank.activate_staged(
+        command(CommandKind.ISSUE_ACTIVATION_TICKET, 8).key,
+        1,
+        "logical-lease",
+        action="release",
+    )
+    rank.confirm_scheduler_adopted(
+        command(CommandKind.ISSUE_ACTIVATION_TICKET, 8).key,
+        1,
+        "logical-lease",
+    )
     wait_phase(acks, RankPhase.ACTIVATED)
+    assert released == [(1, FenceKind.DMA_COMPLETE)]
     rank.handle(command(CommandKind.FINALIZE, 9))
     wait_phase(acks, RankPhase.FINALIZED)
     assert released == [(1, FenceKind.DMA_COMPLETE)]
     assert failures == []
+    queues.close()
+
+
+def test_host_source_releases_at_group_handoff_without_gpu_ticket():
+    queues, executors = make_queues()
+    acks, released = [], []
+    handler = CallbackPathHandler(
+        lambda _cmd: PreparedRankTransfer(
+            ("host", "descriptor"), requires_io=False
+        ),
+        commit=lambda cmd, _prepared, completion: released.append(
+            (cmd.attempt, completion.fence)
+        ),
+    )
+    rank = RankLocalCommandExecutor(
+        participant=LinkParticipant("source", "d", 0),
+        queues=queues,
+        handlers={path: handler for path in TransferPath},
+        emit_ack=acks.append,
+        report_failure=lambda failure: (_ for _ in ()).throw(
+            AssertionError(failure)
+        ),
+    )
+
+    def host_command(kind, seq):
+        value = command(
+            kind,
+            seq,
+            path=TransferPath.D2P_HOST,
+            operation="host_evict",
+        )
+        return GroupCommand(
+            value.key,
+            value.attempt,
+            value.command_seq,
+            value.kind,
+            Owner.D_HOST,
+            Owner.NONE,
+            value.lease_id,
+            value.payload,
+        )
+
+    rank.handle(host_command(CommandKind.PREPARE, 1))
+    rank.handle(host_command(CommandKind.START, 2))
+    wait_phase(acks, RankPhase.DMA_DONE)
+    rank.handle(host_command(CommandKind.RELEASE, 3))
+    wait_phase(acks, RankPhase.BOUND)
+    assert released == []
+    rank.handle(host_command(CommandKind.HANDOFF, 4))
+    wait_phase(acks, RankPhase.RELEASED)
+    assert released == [(1, FenceKind.NO_IO_REQUIRED)]
     queues.close()
 
 
@@ -277,20 +342,19 @@ def drive_attempt(orchestrator, coordinator, commands, plan, *, offered=False):
     assert release.payload["transfer"] == dict(plan.payload)
     for participant in coordinator.participants:
         send_ack(orchestrator, participant, release, RankPhase.BOUND)
-    if plan.operation is not TransferOperation.HOST_STORE:
-        handoff = commands[-1]
-        assert handoff.kind is CommandKind.HANDOFF
-        for participant in coordinator.participants:
-            send_ack(orchestrator, participant, handoff, RankPhase.RELEASED)
-        activate = commands[-1]
-        assert activate.kind is CommandKind.ACTIVATE
-        for participant in coordinator.participants:
-            send_ack(orchestrator, participant, activate, RankPhase.STAGED)
-        ticket = commands[-1]
-        assert ticket.kind is CommandKind.ISSUE_ACTIVATION_TICKET
-        assert ticket.payload["transfer"] == dict(plan.payload)
-        for participant in coordinator.participants:
-            send_ack(orchestrator, participant, ticket, RankPhase.ACTIVATED)
+    handoff = commands[-1]
+    assert handoff.kind is CommandKind.HANDOFF
+    for participant in coordinator.participants:
+        send_ack(orchestrator, participant, handoff, RankPhase.RELEASED)
+    activate = commands[-1]
+    assert activate.kind is CommandKind.ACTIVATE
+    for participant in coordinator.participants:
+        send_ack(orchestrator, participant, activate, RankPhase.STAGED)
+    ticket = commands[-1]
+    assert ticket.kind is CommandKind.ISSUE_ACTIVATION_TICKET
+    assert ticket.payload["transfer"] == dict(plan.payload)
+    for participant in coordinator.participants:
+        send_ack(orchestrator, participant, ticket, RankPhase.ACTIVATED)
     finalize = commands[-1]
     assert finalize.kind is CommandKind.FINALIZE
     for participant in coordinator.participants:
@@ -323,6 +387,119 @@ def test_activation_ticket_retains_next_generation_for_d2p():
     )
     assert ticket.key.generation == 0
     assert ticket.payload["transfer"]["target_generation"] == 1
+
+
+def test_reverse_handoff_waits_behind_predecessor_finalize():
+    """A fast tool turn may return before the prior direction retires."""
+
+    coordinator = LinkLifecycleCoordinator.from_endpoint_sizes(
+        "run", "p-d-p", [("prefill", "p", 1), ("decode", "d", 1)]
+    )
+    commands = []
+    orchestrator = RankZeroLinkOrchestrator(
+        coordinator, broadcast=commands.append
+    )
+    key = GenerationKey("run", "short-tool-turn", 7)
+    p2d = GroupTransferPlan(
+        key,
+        TransferPath.P2D_DIRECT,
+        TransferOperation.DIRECT,
+        Owner.P_GPU,
+        Owner.D_GPU,
+        "p2d",
+        {"prompt_tokens": 128},
+        source_group="p",
+        target_group="d",
+    )
+    d2p = GroupTransferPlan(
+        key,
+        TransferPath.D2P_DIRECT,
+        TransferOperation.DIRECT,
+        Owner.D_GPU,
+        Owner.P_GPU,
+        "d2p",
+        {"parent_tokens": 64, "target_generation": 8},
+        source_group="d",
+        target_group="p",
+        admission_deadline=time.monotonic() + 60,
+    )
+
+    assert orchestrator.offer(p2d) == 1
+    prepare = commands[-1]
+    for participant in coordinator.participants:
+        send_ack(orchestrator, participant, prepare, RankPhase.PREPARED)
+    start = commands[-1]
+    for phase in (RankPhase.DMA_SUBMITTED, RankPhase.DMA_DONE):
+        for participant in coordinator.participants:
+            send_ack(orchestrator, participant, start, phase)
+    release = commands[-1]
+    for participant in coordinator.participants:
+        send_ack(orchestrator, participant, release, RankPhase.BOUND)
+    handoff = commands[-1]
+    for participant in coordinator.participants:
+        send_ack(orchestrator, participant, handoff, RankPhase.RELEASED)
+    activate = commands[-1]
+    for participant in coordinator.participants:
+        send_ack(orchestrator, participant, activate, RankPhase.STAGED)
+    ticket = commands[-1]
+    for participant in coordinator.participants:
+        send_ack(orchestrator, participant, ticket, RankPhase.ACTIVATED)
+    finalize = commands[-1]
+    assert finalize.kind is CommandKind.FINALIZE
+
+    # D may finish a short turn while P->D still gathers FINALIZED ACKs.  The
+    # reverse handoff is an ownership-contiguous successor, not a duplicate.
+    assert orchestrator.offer(d2p) is None
+    assert orchestrator.progress_diagnostics()[0]["key_successor_pending"] == 1
+    assert commands[-1] is finalize
+
+    for participant in coordinator.participants:
+        send_ack(orchestrator, participant, finalize, RankPhase.FINALIZED)
+    successor_prepare = commands[-1]
+    assert successor_prepare.kind is CommandKind.PREPARE
+    assert successor_prepare.lease_id == "d2p"
+    assert successor_prepare.attempt == 2
+
+
+def test_unrelated_same_key_offer_during_finalize_still_fails():
+    import pytest
+
+    coordinator = LinkLifecycleCoordinator.from_endpoint_sizes(
+        "run", "p-d", [("prefill", "p", 1), ("decode", "d", 1)]
+    )
+    commands = []
+    orchestrator = RankZeroLinkOrchestrator(
+        coordinator, broadcast=commands.append
+    )
+    key = GenerationKey("run", "real-duplicate", 1)
+    first = GroupTransferPlan(
+        key,
+        TransferPath.P2D_DIRECT,
+        TransferOperation.DIRECT,
+        Owner.P_GPU,
+        Owner.D_GPU,
+        "first",
+        {},
+        source_group="p",
+        target_group="d",
+    )
+    assert orchestrator.offer(first) == 1
+    # A same-direction duplicate is not ownership-contiguous and must retain
+    # the strict invariant even though the valid reverse direction can queue.
+    orchestrator._active[(key, 1)].phase = CommandKind.FINALIZE
+    duplicate = GroupTransferPlan(
+        key,
+        TransferPath.P2D_DIRECT,
+        TransferOperation.DIRECT,
+        Owner.P_GPU,
+        Owner.D_GPU,
+        "duplicate",
+        {},
+        source_group="p",
+        target_group="d",
+    )
+    with pytest.raises(RuntimeError, match="already has a link attempt"):
+        orchestrator.offer(duplicate)
 
 
 def test_materialized_callback_fires_once_after_every_tp_rank_finishes_dma():
@@ -1475,6 +1652,18 @@ def test_tp8_host_store_collects_source_descriptors_only_for_active_attempt():
 
     for participant in coordinator.participants:
         send_ack(orchestrator, participant, release, RankPhase.BOUND)
+    handoff = commands[-1]
+    assert handoff.kind is CommandKind.HANDOFF
+    for participant in coordinator.participants:
+        send_ack(orchestrator, participant, handoff, RankPhase.RELEASED)
+    activate = commands[-1]
+    assert activate.kind is CommandKind.ACTIVATE
+    for participant in coordinator.participants:
+        send_ack(orchestrator, participant, activate, RankPhase.STAGED)
+    ticket = commands[-1]
+    assert ticket.kind is CommandKind.ISSUE_ACTIVATION_TICKET
+    for participant in coordinator.participants:
+        send_ack(orchestrator, participant, ticket, RankPhase.ACTIVATED)
     finalize = commands[-1]
     assert finalize.kind is CommandKind.FINALIZE
     for participant in coordinator.participants:
@@ -1554,6 +1743,127 @@ def test_no_io_endpoint_joins_barrier_without_consuming_lane():
     queues.close()
 
 
+class DeferredStartQueue:
+    """Queue acceptance deliberately precedes the physical-start callback."""
+
+    def submit(self, attempt, completed, started):
+        self.attempt, self.completed, self.started = attempt, completed, started
+        return True
+
+
+class ObservedCondition(threading.Condition):
+    def __init__(self, lock):
+        super().__init__(lock)
+        self.sleeping = threading.Event()
+        self.notifications = 0
+
+    def wait(self, timeout=None):
+        self.sleeping.set()
+        return super().wait(timeout)
+
+    def notify_all(self):
+        self.notifications += 1
+        return super().notify_all()
+
+
+def make_idle_gate_rank(*, queues=None, requires_io=True):
+    queues = DeferredStartQueue() if queues is None else queues
+    acks, failures = [], []
+    rank = RankLocalCommandExecutor(
+        participant=LinkParticipant("source", "p", 0),
+        queues=queues,
+        handlers={
+            TransferPath.P2D_DIRECT: CallbackPathHandler(
+                lambda _cmd: PreparedRankTransfer(None, requires_io=requires_io)
+            )
+        },
+        emit_ack=acks.append,
+        report_failure=failures.append,
+    )
+    rank._changed = ObservedCondition(rank._lock)
+    rank.handle(command(CommandKind.PREPARE, 1, path=TransferPath.P2D_DIRECT))
+    rank._changed.notifications = 0  # Only observe START/completion changes.
+    rank.handle(command(CommandKind.START, 2, path=TransferPath.P2D_DIRECT))
+    return rank, queues, acks, failures
+
+
+def test_physical_idle_ignores_queued_unposted_direct():
+    rank, queues, acks, failures = make_idle_gate_rank()
+    assert queues.attempt is not None  # START/queue admission already happened.
+    assert rank.wait_physical_idle(TransferPath.P2D_DIRECT, TransferOperation.DIRECT, 0)
+    assert [value.ack.phase for value in acks] == [RankPhase.PREPARED]
+    assert not failures
+
+
+def test_physical_idle_waits_only_for_matching_posted_operation():
+    rank, queues, _acks, _failures = make_idle_gate_rank()
+    queues.started()
+    assert not rank.wait_physical_idle(
+        TransferPath.P2D_DIRECT, TransferOperation.DIRECT, 0
+    )
+    assert rank.wait_physical_idle(TransferPath.D2P_DIRECT, TransferOperation.DIRECT, 0)
+    assert rank.wait_physical_idle(TransferPath.P2D_DIRECT, TransferOperation.HOST_STORE, 0)
+
+
+def test_physical_completion_wakes_idle_waiter_without_releasing_source():
+    rank, queues, acks, failures = make_idle_gate_rank()
+    queues.started()
+    result = []
+    waiter = threading.Thread(
+        target=lambda: result.append(
+            rank.wait_physical_idle(TransferPath.P2D_DIRECT, TransferOperation.DIRECT, 5)
+        ),
+        daemon=True,
+    )
+    waiter.start()
+    try:
+        assert rank._changed.sleeping.wait(2)
+        queues.completed(
+            TransferCompletion(
+                attempt=queues.attempt,
+                state=PhysicalState.SUCCEEDED,
+                fence=FenceKind.DMA_COMPLETE,
+                error=None,
+                submitted_at=1.0,
+                completed_at=2.0,
+            )
+        )
+        waiter.join(2)
+        assert result == [True]
+        assert not waiter.is_alive()
+        # Physical-idle is not ownership commit or source-release authority.
+        assert [value.ack.phase for value in acks] == [
+            RankPhase.PREPARED, RankPhase.DMA_SUBMITTED, RankPhase.DMA_DONE
+        ]
+        assert rank.active_count == 1
+        assert not next(iter(rank._attempts.values())).source_released
+        assert not failures
+    finally:
+        waiter.join(5)
+
+
+def test_no_io_completion_notifies_condition():
+    rank, _queues, _acks, failures = make_idle_gate_rank(requires_io=False)
+    assert rank._changed.notifications == 1
+    assert rank.wait_physical_idle(TransferPath.P2D_DIRECT, TransferOperation.DIRECT, 0)
+    assert not failures
+
+
+def test_submit_failure_notifies_condition_and_keeps_source_owned():
+    class FailingQueue:
+        def submit(self, *_args):
+            raise RuntimeError("injected queue rejection before post")
+
+    rank, _queues, acks, failures = make_idle_gate_rank(queues=FailingQueue())
+    assert rank._changed.notifications == 1
+    assert rank.wait_physical_idle(TransferPath.P2D_DIRECT, TransferOperation.DIRECT, 0)
+    assert len(failures) == 1
+    assert [value.ack.phase for value in acks] == [RankPhase.PREPARED]
+    local = next(iter(rank._attempts.values()))
+    assert local.completion.fence is FenceKind.NOT_POSTED
+    assert not local.source_released
+
+
 class ListAllocator:
     page_size = 64
 
@@ -1579,7 +1889,7 @@ class ListAllocator:
         self.free_values.extend(values)
 
 
-def test_authority_handler_publishes_only_on_group_handoff():
+def test_authority_handler_publishes_only_on_scheduler_activation():
     authority = AgenticMemoryAuthority(ListAllocator())
     handler = AuthorityPathHandler(
         authority,
@@ -1615,9 +1925,63 @@ def test_authority_handler_publishes_only_on_group_handoff():
     assert authority.take_ready("prefill-ready", timeout=0.01) == ()
     rank.handle(command(CommandKind.ACTIVATE, 5))
     wait_phase(acks, RankPhase.STAGED)
-    # ACTIVATE is the all-rank ready-publication barrier.  Rank zero issues
-    # the scheduler ticket only after every participant emitted STAGED.
+    assert authority.take_ready("prefill-ready", timeout=0.01) == ()
+    rank.handle(command(CommandKind.ISSUE_ACTIVATION_TICKET, 6))
+    rank.activate_staged(
+        GenerationKey("run", "request", 3), 1, "logical-lease"
+    )
+    # Native binding/publication is driven by the scheduler's ordered TP
+    # broadcast, never by the rank-local background command worker.
     assert len(authority.take_ready("prefill-ready", timeout=0.2)) == 1
+    queues.close()
+
+
+def test_scheduler_target_native_bind_and_commit_are_not_background_actions():
+    queues, executors = make_queues()
+    acks, native_actions = [], []
+    handler = CallbackPathHandler(
+        lambda _cmd: PreparedRankTransfer("target-descriptor"),
+        prepare_handoff=lambda _cmd, _prepared, _completion: (
+            native_actions.append("bind")
+        ),
+        commit=lambda _cmd, _prepared, _completion: (
+            native_actions.append("publish")
+        ),
+    )
+    rank = RankLocalCommandExecutor(
+        participant=LinkParticipant("target", "p", 0),
+        queues=queues,
+        handlers={path: handler for path in TransferPath},
+        emit_ack=acks.append,
+        report_failure=lambda failure: (_ for _ in ()).throw(
+            AssertionError(failure)
+        ),
+    )
+    rank.handle(command(CommandKind.PREPARE, 1))
+    rank.handle(command(CommandKind.START, 2))
+    handle = executors[TransferPath.D2P_DIRECT].wait_handle()
+    executors[TransferPath.D2P_DIRECT].finish(
+        handle, PhysicalProgress(PhysicalState.SUCCEEDED, FenceKind.DMA_COMPLETE)
+    )
+    wait_phase(acks, RankPhase.DMA_DONE)
+    rank.handle(command(CommandKind.RELEASE, 3))
+    wait_phase(acks, RankPhase.BOUND)
+    rank.handle(command(CommandKind.HANDOFF, 4))
+    wait_phase(acks, RankPhase.RELEASED)
+    rank.handle(command(CommandKind.ACTIVATE, 5))
+    wait_phase(acks, RankPhase.STAGED)
+    rank.handle(command(CommandKind.ISSUE_ACTIVATION_TICKET, 6))
+    assert native_actions == []
+
+    rank.activate_staged(
+        GenerationKey("run", "request", 3), 1, "logical-lease"
+    )
+    assert native_actions == ["bind", "publish"]
+    # Scheduler replay is idempotent and cannot bind the same lease twice.
+    rank.activate_staged(
+        GenerationKey("run", "request", 3), 1, "logical-lease"
+    )
+    assert native_actions == ["bind", "publish"]
     queues.close()
 
 
@@ -1686,31 +2050,30 @@ def test_tp8_missing_bound_keeps_all_ready_and_source_release_invisible():
     deliver(handoff, participants[:-1])
     assert commands[-1] is handoff
     assert ready == []
-    # HANDOFF itself proves that rank zero observed every target BOUND ACK.
-    # Source ranks may release as soon as they consume that command; they do
-    # not wait for unrelated target HANDOFF ACKs or scheduler activation.
-    assert len(released) == 8
+    # HANDOFF proves durability, but allocator-visible source release remains
+    # deferred until every rank consumes the same native scheduler ticket.
+    assert released == []
     deliver(handoff, participants[-1:])
     activate = commands[-1]
     assert activate.kind is CommandKind.ACTIVATE
     deliver(activate, participants)
     ticket = commands[-1]
     assert ticket.kind is CommandKind.ISSUE_ACTIVATION_TICKET
-    assert len(ready) == 8
-    assert len(released) == 8
+    assert ready == []
+    assert released == []
     deliver(ticket, participants)
     for participant in participants:
-        if participant.role == "target":
-            executors[participant].activate_staged(
-                ticket.key,
-                ticket.attempt,
-                ticket.lease_id,
-            )
-            executors[participant].confirm_scheduler_adopted(
-                ticket.key,
-                ticket.attempt,
-                ticket.lease_id,
-            )
+        executors[participant].activate_staged(
+            ticket.key,
+            ticket.attempt,
+            ticket.lease_id,
+            action="release" if participant.role == "source" else "activate",
+        )
+        executors[participant].confirm_scheduler_adopted(
+            ticket.key,
+            ticket.attempt,
+            ticket.lease_id,
+        )
     staged_acks = tuple(emitted)
     del emitted[:]
     for ack in staged_acks:

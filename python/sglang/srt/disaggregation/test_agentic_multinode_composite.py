@@ -412,6 +412,39 @@ def test_capacity_coalescing_keeps_newest_absolute_snapshot():
         runtime.close()
 
 
+def test_capacity_snapshot_remainder_is_forwarded_to_restore_policy():
+    class BudgetProvider(FakeProvider):
+        def capacity_snapshot(
+            self, *, remote_role, endpoint_group="", available_tokens=None
+        ):
+            assert (remote_role, endpoint_group, available_tokens) == (
+                "prefill",
+                "p0",
+                100,
+            )
+            return 35
+
+    scheduler = SimpleNamespace(
+        token_to_kv_pool_allocator=FakeAllocator(), tp_rank=0
+    )
+    provider = BudgetProvider("prefill")
+    runtime = create_runtime(
+        scheduler,
+        config("prefill"),
+        physical_provider=provider,
+        options=RuntimeFactoryOptions(low_level_factory=lambda **kw: FakeLowLevel(**kw)),
+    )
+    try:
+        runtime._enqueue_capacity_available(
+            "prefill", 100, endpoint_group="p0"
+        )
+        wait_until(
+            lambda: provider.capacity_edges == [("prefill", "p0", 35)]
+        )
+    finally:
+        runtime.close()
+
+
 def test_composite_close_can_retry_after_low_level_block():
     class BlockOnceLowLevel(FakeLowLevel):
         def __init__(self, **kwargs):

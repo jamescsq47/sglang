@@ -470,7 +470,7 @@ def test_one_capacity_edge_wakes_only_one_restore():
     assert len(submitted) == before + 1
 
 
-def test_capacity_snapshot_admits_all_feasible_and_skips_large_head():
+def test_capacity_snapshot_admits_one_feasible_and_skips_large_head():
     submitted = []
     actor = P2DPolicyActor(
         submit=submitted.append,
@@ -496,7 +496,7 @@ def test_capacity_snapshot_admits_all_feasible_and_skips_large_head():
     actor.memory_available(700)
 
     restored = submitted[before:]
-    assert [value.key.request_id for value in restored] == ["small-a", "small-b"]
+    assert [value.key.request_id for value in restored] == ["small-a"]
 
 
 def test_decode_capacity_edge_only_wakes_matching_p2d_target_group():

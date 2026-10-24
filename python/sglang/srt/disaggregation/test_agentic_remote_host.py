@@ -2,8 +2,10 @@
 
 import gc
 import weakref
+from types import SimpleNamespace
 
 import pytest
+import sglang.srt.disaggregation.agentic_remote_host_worker as worker_module
 
 from sglang.srt.disaggregation.agentic_remote_host import (
     HostShard, ReadReceipt, RemoteHostTransport, group_ack, mha_read_spans,
@@ -83,6 +85,42 @@ class FakeNixl:
         if self.release_raises:
             raise RuntimeError("transfer still in flight")
         self.released.append(handle)
+
+
+@pytest.mark.parametrize("profile,broken_logger", [(False, False), (True, False), (True, True)])
+def test_host_prepare_profile_does_not_change_receipt_or_release(monkeypatch, profile, broken_logger):
+    agent = FakeNixl()
+    agent.status = "DONE"
+    transport = RemoteHostTransport(agent)
+    source = export(transport)
+    shard = source.claim("profile-test")
+    worker = object.__new__(RemoteHostRankWorker)
+    worker._profile_host_prepare = profile
+    worker.rank, worker.size, worker.direction = 0, 1, "d2p"
+    worker.hybrid, worker.layout = None, shard.layout
+    worker.pool = SimpleNamespace(k_buffer=[SimpleNamespace(device=SimpleNamespace(index=0))])
+    worker._attention_spans = lambda *a, **k: [(0, 2000, shard.byte_size)]
+    worker._transport_for_worker = lambda **k: transport
+    logs = []
+
+    def record(*args):
+        logs.append(args)
+        if broken_logger:
+            raise RuntimeError("diagnostic logger unavailable")
+
+    monkeypatch.setattr(worker_module.logger, "info", record)
+    receipt = worker.load(shard, attempt_id="profile-test")
+    assert receipt.outcome == "loaded"
+    assert receipt.read_id == "profile-test"
+    assert not transport.reads
+    assert not source.closed  # Physical READ completion is not group commit.
+    assert len(logs) == int(profile)
+    if profile:
+        assert "prepare_read_s" in logs[0][0]
+        assert logs[0][1:5] == ("d2p", 0, 3, 1)
+        assert all(value >= 0 for value in logs[0][5:10])
+    source.release_after_group_ack([shard], [receipt], committed_read_id="profile-test")
+    assert source.closed
 
 
 def test_peer_connection_stays_live_across_sequential_reads():
@@ -272,6 +310,38 @@ def test_mha_coalesces_runs_but_preserves_layer_order():
                           token_indices=[2, 3, 8], bytes_per_token=4)
     assert spans == [(0, 10008, 8), (8, 10032, 4),
                      (12, 20008, 8), (20, 20032, 4)]
+
+
+def test_mha_prefix_uses_full_source_layer_stride():
+    spans = mha_read_spans(
+        layer_bases=[10000, 20000],
+        token_indices=[2, 3, 8],
+        bytes_per_token=4,
+        source_token_count=5,
+    )
+    assert spans == [
+        (0, 10008, 8),
+        (8, 10032, 4),
+        (20, 20008, 8),
+        (28, 20032, 4),
+    ]
+
+
+def test_explicit_payload_ranges_allow_full_attention_prefix_read():
+    transport = RemoteHostTransport(FakeNixl())
+    source = export(transport)
+    shard = source.claim("prefix-read")
+    pending = transport.prepare_read(
+        shard,
+        read_id="prefix-read",
+        tp_rank=0,
+        tp_size=1,
+        layout=shard.layout,
+        gpu_id=0,
+        spans=[(0, 10000, 8), (12, 20000, 8)],
+        payload_ranges=[(0, 8), (12, 8)],
+    )
+    assert pending.state == "PREPARED"
 
 
 def test_mha_duplicate_page_refuses_overwrite():

@@ -402,8 +402,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Get available memory before model loading
         pre_model_load_memory = self.init_torch_distributed()
 
-        # Init forward stream for overlap schedule
-        self.forward_stream = torch.get_device_module(self.device).Stream()
+        # Init forward stream for overlap schedule.  Agentic KV transport uses
+        # independent normal-priority streams.  On TP workers a short delay on
+        # one rank is amplified at every NCCL collective because the other
+        # ranks enter the collective kernel and spin until the delayed rank
+        # arrives.  Let deployments give model compute priority over those
+        # background streams without changing transfer ownership or adding a
+        # CPU-side synchronization barrier.
+        forward_stream_priority = int(
+            os.getenv("SGLANG_AGENTIC_FORWARD_STREAM_PRIORITY", "0")
+        )
+        self.forward_stream = torch.get_device_module(self.device).Stream(
+            priority=forward_stream_priority
+        )
 
         # CPU offload
         set_offloader(create_offloader_from_server_args(server_args, dp_rank=dp_rank))

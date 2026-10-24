@@ -2313,9 +2313,24 @@ class SchedulerDisaggregationDecodeMixin:
                 if self.tp_size > 1
                 else None
             )
-            req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated(
-                tp_admit_keys
+            req_conns, failed_reqs = (
+                self.disagg_decode_prealloc_queue.pop_preallocated(tp_admit_keys)
             )
+            if self.tp_size > 1 and tp_admit_keys:
+                # TP0's admission command is authoritative, but the physical
+                # allocation is rank-local and may be deferred while a follower
+                # retires terminal transfers from the previous tick.  Retire a
+                # broadcast key only after this rank actually consumed it (or
+                # observed an abort); unconsumed keys must survive later empty
+                # broadcasts so every shard eventually reaches transfer_queue.
+                consumed_keys = {
+                    (str(entry.req.rid), int(entry.req.bootstrap_room))
+                    for entry in (*req_conns, *failed_reqs)
+                }
+                if consumed_keys:
+                    self._agentic_tp_decode_admit_keys = [
+                        key for key in tp_admit_keys if key not in consumed_keys
+                    ]
             self.disagg_decode_transfer_queue.extend(req_conns)
             if self.tp_size > 1:
                 transfer_keys = getattr(self, "_agentic_tp_decode_transfer_keys", ())

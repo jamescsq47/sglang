@@ -38,6 +38,50 @@ logger = logging.getLogger(__name__)
 DEFAULT_FORCE_STREAM_INTERVAL = 50
 
 
+def _decode_result_uses_v2_authority(scheduler, batch: ScheduleBatch) -> bool:
+    """Resolve Decode ownership without consulting mutable finished Reqs.
+
+    In overlap mode, a later forward can already be in flight when processing
+    an earlier result finishes and releases the same Req.  The release removes
+    the Req's V2 bridge attributes, but must not retroactively turn the copied
+    in-flight batch into a native-allocation batch.  The submit-time batch bit
+    is therefore authoritative.  Only requests already finished/retracted by
+    an earlier result may have lost their attributes.
+    """
+
+    configured_bridge = getattr(scheduler, "agentic_d_memory_v2_bridge", None)
+    request_bridges = [
+        getattr(req, "_agentic_d_memory_bridge", None) for req in batch.reqs
+    ]
+    submitted_v2 = bool(
+        configured_bridge is not None
+        and getattr(batch, "agentic_d_memory_v2_owned", False)
+    )
+    if submitted_v2:
+        for req, bridge in zip(batch.reqs, request_bridges):
+            if bridge is configured_bridge:
+                continue
+            retired_overlap_req_lost_attributes = bool(
+                bridge is None
+                and batch.enable_overlap
+                and (req.finished() or req.is_retracted)
+            )
+            if not retired_overlap_req_lost_attributes:
+                raise RuntimeError(
+                    "V2 Decode result batch mixes memory authorities"
+                )
+        return True
+
+    v2_batch = configured_bridge is not None and any(
+        bridge is configured_bridge for bridge in request_bridges
+    )
+    if v2_batch and any(
+        bridge is not configured_bridge for bridge in request_bridges
+    ):
+        raise RuntimeError("V2 Decode result batch mixes memory authorities")
+    return v2_batch
+
+
 class SchedulerOutputProcessorMixin:
     """
     This class implements the output processing logic for Scheduler.
@@ -468,17 +512,7 @@ class SchedulerOutputProcessorMixin:
                 value=can_run_cuda_graph
             )
 
-        configured_v2_bridge = getattr(self, "agentic_d_memory_v2_bridge", None)
-        v2_bridges = [
-            getattr(req, "_agentic_d_memory_bridge", None) for req in batch.reqs
-        ]
-        v2_batch = configured_v2_bridge is not None and any(
-            bridge is configured_v2_bridge for bridge in v2_bridges
-        )
-        if v2_batch and any(
-            bridge is not configured_v2_bridge for bridge in v2_bridges
-        ):
-            raise RuntimeError("V2 Decode result batch mixes memory authorities")
+        v2_batch = _decode_result_uses_v2_authority(self, batch)
         if not v2_batch:
             self.token_to_kv_pool_allocator.free_group_begin()
 

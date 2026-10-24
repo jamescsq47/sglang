@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
+import struct
 import threading
 from typing import Any, Optional, Sequence
 
@@ -89,8 +90,16 @@ def token_page_chain_hashes(
     result = []
     for offset in range(0, len(token_ids), page_size):
         page = token_ids[offset : offset + page_size]
-        for token in page:
-            digest.update(int(token).to_bytes(8, "little", signed=True))
+        # Same signed little-endian int64 byte stream and cumulative page
+        # boundaries, but only one Python->hashlib call per page. This proof
+        # is built by controller threads sharing the Forward process's GIL.
+        values = tuple(map(int, page))
+        try:
+            encoded = struct.pack(f"<{len(values)}q", *values)
+        except struct.error as error:
+            # Preserve int.to_bytes' rejection of IDs outside signed int64.
+            raise OverflowError("int too big to convert") from error
+        digest.update(encoded)
         result.append(digest.hexdigest())
     return tuple(result)
 
@@ -138,13 +147,23 @@ def prefill_state_slot_count(scheduler: Any, *, imported_parent: bool) -> int:
 
 
 def decode_state_slot_count(scheduler: Any) -> int:
+    """Complete Decode state footprint, including its first Radix fork.
+
+    A transferred Decode request owns the active state plus the native
+    ping-pong buffers.  ``process_prebuilt`` immediately caches the committed
+    imported prefix, and MambaRadix must fork one additional checkpoint for
+    that prefix.  Reserving that checkpoint with the workset keeps staged
+    transfers from consuming the whole Mamba pool before the scheduler can
+    adopt them.
+    """
+
     req_pool = getattr(scheduler, "req_to_token_pool", None)
     if getattr(req_pool, "mamba_pool", None) is None:
         return 0
     count = 1
     if bool(getattr(req_pool, "enable_mamba_extra_buffer", False)):
         count += int(req_pool.mamba_ping_pong_track_buffer_size)
-    return count
+    return count + 1
 
 
 class NativeRequestMemoryAdapter:
@@ -429,6 +448,12 @@ class NativeRequestMemoryAdapter:
                 req.mamba_ping_pong_track_buffer = state[cursor : cursor + size]
                 req.mamba_next_track_idx = 0
                 cursor += size
+            # MambaRadix.cache_unfinished_req() forks the imported committed
+            # prefix before the first Decode forward.  Donate one admission-
+            # reserved slot to that fork instead of asking the already-full
+            # pool for an unaccounted fourth slot.
+            req._agentic_mamba_prefill_checkpoint = state[cursor : cursor + 1]
+            cursor += 1
             if cursor != len(state):
                 raise RuntimeError("Decode state lease has unused slots")
             req._agentic_v2_decode_state_attached = True

@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 import threading
+import time
 
 import pytest
 import torch
@@ -91,6 +92,44 @@ def test_direct_lane_count_is_configurable_without_initializing_paths(
     assert lanes[TransferPath.P2D_HOST] == 6
 
 
+def test_host_load_workers_are_independent_from_host_queue_lanes(monkeypatch):
+    monkeypatch.setenv("SGLANG_AGENTIC_MULTINODE_HOST_LANES", "6")
+    monkeypatch.setenv("SGLANG_AGENTIC_MULTINODE_HOST_LOAD_WORKERS", "1")
+
+    provider = AgenticDefaultPhysicalProvider(
+        SimpleNamespace(tp_rank=1), SimpleNamespace(role="decode")
+    )
+
+    assert provider._host_lanes == 6
+    assert provider._host_load_workers == 1
+
+
+def test_p2d_late_bind_starts_a_fresh_direct_admission_window(monkeypatch):
+    monkeypatch.setenv("SGLANG_AGENTIC_MULTINODE_DIRECT_ADMISSION_SECONDS", "1")
+    candidate = GroupTransferPlan(
+        key=GenerationKey("run", "p2d-late-bind", 3),
+        path=TransferPath.P2D_DIRECT,
+        operation=TransferOperation.DIRECT,
+        source_owner=Owner.P_GPU,
+        target_owner=Owner.D_GPU,
+        lease_id="p2d-late-bind",
+        payload={"late_bind_pending": True},
+        source_group="p0",
+    )
+
+    before = time.monotonic()
+    bound = AgenticDefaultPhysicalProvider._bind_p2d_target(
+        candidate,
+        {"target_group": "d2", "target_generation": 4},
+    )
+    after = time.monotonic()
+
+    assert bound.target_group == "d2"
+    assert bound.payload["target_generation"] == 4
+    assert "late_bind_pending" not in bound.payload
+    assert before + 1 <= bound.admission_deadline <= after + 1
+
+
 class Authority:
     def __init__(self):
         self.begun = []
@@ -104,8 +143,8 @@ class Authority:
         self.released.append(("request", lease_id))
         return True
 
-    def commit_release(self, lease_id, *, reason):
-        self.released.append(("commit", lease_id, reason))
+    def commit_release(self, lease_id, *, reason, notify_capacity=True):
+        self.released.append(("commit", lease_id, reason, notify_capacity))
         return True
 
 
@@ -177,7 +216,7 @@ def test_direct_target_posted_cancel_cleans_after_workset_release():
 
     assert authority.released == [
         ("request", physical.lease_id),
-        ("commit", physical.lease_id, "target_attempt_aborted"),
+        ("commit", physical.lease_id, "target_attempt_aborted", False),
     ]
     assert payload.cleanup_calls == 1
     assert provider._target_prepared == {}
@@ -366,6 +405,82 @@ def test_application_final_wins_race_with_submitted_pressure_eviction():
     assert key not in provider._terminal_d2p
 
 
+def test_application_final_and_pressure_commit_concurrently_clean_once():
+    key = GenerationKey("run", "terminal-concurrent-evict", 6)
+    calls = []
+    calls_lock = threading.Lock()
+    evicted_keys = set()
+
+    def record(value):
+        with calls_lock:
+            calls.append(value)
+
+    def evicted(value):
+        with calls_lock:
+            calls.append(("evicted", value))
+            evicted_keys.add(value)
+
+    def retire_evicted(value):
+        with calls_lock:
+            if value not in evicted_keys:
+                return False
+            evicted_keys.remove(value)
+            return True
+
+    provider = AgenticDefaultPhysicalProvider.__new__(
+        AgenticDefaultPhysicalProvider
+    )
+    provider._policy = SimpleNamespace(
+        application_final=retire_evicted,
+        cancelled=lambda value: record(("cancelled", value)),
+        evicted=evicted,
+        host_memory_available=lambda: record(("capacity", None)),
+    )
+    provider._p2d_policy = None
+    provider._d2p_host_lock = threading.RLock()
+    provider._terminal_d2p = set()
+    provider._d2p_host_entries = {
+        key: _D2PHostEntry(key, "d0", 128, (1024, 1024), 1.0, evicting=True)
+    }
+    provider._d2p_host_evictions = 0
+    provider._pending_candidates = {}
+    provider._host_results = {}
+    plan = GroupTransferPlan(
+        key=key,
+        path=TransferPath.D2P_HOST,
+        operation=TransferOperation.HOST_EVICT,
+        source_owner=Owner.D_HOST,
+        target_owner=Owner.NONE,
+        lease_id="pressure-evict-concurrent",
+        payload={"reason": "d2p_host_high_watermark"},
+        source_group="d0",
+    )
+    barrier = threading.Barrier(2)
+
+    def finalize():
+        barrier.wait()
+        provider.application_final(None, key)
+
+    def commit_pressure_eviction():
+        barrier.wait()
+        provider.on_committed(None, plan, 1)
+
+    final_thread = threading.Thread(target=finalize)
+    eviction_thread = threading.Thread(target=commit_pressure_eviction)
+    final_thread.start()
+    eviction_thread.start()
+    final_thread.join(timeout=2)
+    eviction_thread.join(timeout=2)
+
+    assert not final_thread.is_alive()
+    assert not eviction_thread.is_alive()
+    assert calls.count(("capacity", None)) == 1
+    terminal_actions = [name for name, _value in calls if name in {"cancelled", "evicted"}]
+    assert len(terminal_actions) == 1
+    assert key not in provider._d2p_host_entries
+    assert key not in provider._terminal_d2p
+
+
 def test_application_final_after_eviction_commit_retires_tombstone():
     key = GenerationKey("run", "terminal-after-evict", 7)
     retired = []
@@ -410,8 +525,16 @@ def test_p2d_prefill_candidate_waits_for_late_bound_decode_group():
     )
     provider._pending_p2d_candidates = {}
     provider._early_p2d_targets = {}
-    provider._p2d_spill_timers = {}
     provider._p2d_route_lock = __import__("threading").RLock()
+    provider._p2d_spill_deadlines = {}
+    provider._p2d_spill_heap = []
+    provider._p2d_spill_sequence = 0
+    provider._p2d_spill_closed = False
+    provider._p2d_spill_condition = __import__("threading").Condition(
+        provider._p2d_route_lock
+    )
+    provider._p2d_spill_thread = None
+    provider._route_callback_error = None
     provider.role = "prefill"
     provider.scheduler = SimpleNamespace(tp_rank=0)
 
@@ -542,7 +665,7 @@ def test_host_target_payload_defers_destination_indices_to_io_thread():
         0,
         1,
         "a" * 64,
-        3,
+        5,
         4096,
         8192,
         "YQ==",
@@ -562,7 +685,10 @@ def test_host_target_payload_defers_destination_indices_to_io_thread():
                 "path": "p2d_host",
                 "operation": "host_restore",
             },
-            "transfer": {"host_shards": [shard.to_dict()]},
+            "transfer": {
+                "host_shards": [shard.to_dict()],
+                "token_count": 3,
+            },
         },
     )
 
@@ -570,6 +696,7 @@ def test_host_target_payload_defers_destination_indices_to_io_thread():
 
     assert callable(payload.device_indices)
     assert payload.device_indices() == (64, 65, 66)
+    assert payload.token_count == 3
 
 
 def test_host_store_capacity_abort_waits_but_other_failure_is_fatal():
@@ -599,6 +726,41 @@ def test_host_store_capacity_abort_waits_but_other_failure_is_fatal():
     assert calls == [key]
     with pytest.raises(RuntimeError, match="non-capacity Host-store failure"):
         provider.on_aborted(None, host_store, 6, "CUDA copy failed")
+
+
+def test_prefill_capacity_snapshot_returns_budget_after_initial_admission():
+    provider = AgenticDefaultPhysicalProvider.__new__(
+        AgenticDefaultPhysicalProvider
+    )
+    provider._endpoint_capacity = {}
+    provider._p2d_route_lock = threading.RLock()
+    submitted = []
+    provider._submitter = submitted.append
+
+    def initial(request_id, prompt_tokens):
+        return GroupTransferPlan(
+            key=GenerationKey("run", request_id, 0),
+            path=TransferPath.D2P_DIRECT,
+            operation=TransferOperation.DIRECT,
+            source_owner=Owner.NONE,
+            target_owner=Owner.P_GPU,
+            lease_id=f"initial:{request_id}",
+            payload={"kind": "initial_prefill", "prompt_tokens": prompt_tokens},
+            target_group="p0",
+        )
+
+    first = initial("first", 60)
+    second = initial("second", 50)
+    provider._initial_capacity_wait = {first.key: first, second.key: second}
+
+    remaining = provider.capacity_snapshot(
+        remote_role="prefill", endpoint_group="p0", available_tokens=100
+    )
+
+    assert remaining == 40
+    assert submitted == [first]
+    assert provider._initial_capacity_wait == {second.key: second}
+    assert provider._endpoint_capacity[("prefill", "p0")] == 100
 
 
 def test_dispatch_handler_retires_no_io_participant_state():

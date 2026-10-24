@@ -62,7 +62,11 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
-from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeTransferQueue
+from sglang.srt.disaggregation.decode import (
+    DecodePreallocQueue,
+    DecodeTransferQueue,
+    SchedulerDisaggregationDecodeMixin,
+)
 from sglang.srt.disaggregation.nixl.conn import (
     NixlKVManager,
     NixlKVReceiver,
@@ -5024,6 +5028,198 @@ def test_host_ready_retires_only_the_racing_unstarted_direct_workset():
     assert cancelled == [(snapshot_id, f"direct:{snapshot_id}")]
     assert manager.active == {}
     assert manager.host_ready == {snapshot_id: record}
+
+
+def test_tp_host_peer_claim_keeps_late_rank_recovery_discoverable():
+    """A peer HOST_READY->H2D_LOADING claim must not strand this P shard."""
+
+    snapshot_id = "slow-peer-claimed:0"
+    retired = []
+
+    class Broker:
+        @staticmethod
+        def direct_owner(observed_snapshot_id):
+            return f"direct:{observed_snapshot_id}"
+
+        @staticmethod
+        def supersede_unstarted(observed_snapshot_id, *, owner=None):
+            retired.append((observed_snapshot_id, owner))
+            return True
+
+    record = {
+        "offer": {"token_count": 128, "byte_size": 4096},
+    }
+    ledger_entry = {
+        "state": HostStageState.H2D_LOADING.value,
+        "recovery_domain": 7,
+    }
+    manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
+    manager._state_lock = threading.RLock()
+    manager.active = {snapshot_id: record}
+    manager.host_ready = {}
+    manager.workset_broker = Broker()
+    manager.arena_domain = 7
+    manager.ledger = SimpleNamespace(
+        get=lambda observed_snapshot_id: (
+            ledger_entry if observed_snapshot_id == snapshot_id else None
+        )
+    )
+
+    manager._poll_active()
+
+    assert retired == [(snapshot_id, f"direct:{snapshot_id}")]
+    assert manager.active == {}
+    assert manager.host_ready == {snapshot_id: record}
+
+
+def test_tp_host_peer_claim_does_not_publish_on_nonselected_p():
+    """A nonselected Host owner retains through remote abort until terminal."""
+
+    snapshot_id = "slow-peer-claimed-remote:0"
+    snapshot = object()
+    record = {
+        "snapshot": snapshot,
+        "loading": False,
+        "offer": {"token_count": 128, "byte_size": 4096},
+    }
+    ledger_entry = {
+        "state": HostStageState.H2D_LOADING.value,
+        "p_owner": "p:host",
+        "recovery_domain": 8,
+    }
+    released = []
+    manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
+    manager._state_lock = threading.RLock()
+    manager.active = {snapshot_id: record}
+    manager.host_ready = {}
+    manager.aborting = {}
+    manager.owner = "p:host"
+    manager.workset_broker = SimpleNamespace(
+        direct_owner=lambda *_args: pytest.fail("non-target workset touched"),
+        supersede_unstarted=lambda *_args, **_kwargs: pytest.fail(
+            "non-target workset touched"
+        ),
+    )
+    manager.arena_domain = 7
+    manager.arena = SimpleNamespace(
+        release=lambda value: released.append(value) or True
+    )
+    manager.ledger = SimpleNamespace(
+        get=lambda observed_snapshot_id: (
+            ledger_entry
+            if observed_snapshot_id == snapshot_id
+            else None
+        )
+    )
+
+    manager._poll_active()
+
+    assert manager.active == {snapshot_id: record}
+    assert manager.host_ready == {}
+
+    ledger_entry.update(
+        state=HostStageState.ABORTING.value,
+        h2d_abort_started=True,
+        loader_drained_ranks=[0],
+    )
+    manager._poll_active()
+
+    assert manager.active == {snapshot_id: record}
+    assert manager.aborting == {}
+    assert released == []
+
+    ledger_entry["state"] = HostStageState.FAILED.value
+    manager._poll_active()
+
+    assert released == [snapshot]
+    assert manager.active == {}
+    assert manager.host_ready == {}
+
+
+def test_tp_host_terminal_cleanup_releases_mixed_local_containers_once():
+    """Fast/slow Host-owner ranks both release after remote group commit."""
+
+    snapshot_id = "slow-peer-claimed-mixed:0"
+    released = []
+    entry = {
+        "state": HostStageState.CONSUMED.value,
+        "p_owner": "p:host",
+        "recovery_domain": 8,
+    }
+
+    def manager_with(container_name, snapshot):
+        manager = AgenticPHostStagingManager.__new__(
+            AgenticPHostStagingManager
+        )
+        manager._state_lock = threading.RLock()
+        manager.owner = "p:host"
+        manager.arena_domain = 7
+        record = {
+            "snapshot": snapshot,
+            "loading": False,
+            "offer": {"token_count": 128, "byte_size": 4096},
+        }
+        manager.active = (
+            {snapshot_id: record} if container_name == "active" else {}
+        )
+        manager.host_ready = (
+            {snapshot_id: record} if container_name == "host_ready" else {}
+        )
+        manager.arena = SimpleNamespace(
+            release=lambda value: released.append(value) or True
+        )
+        return manager
+
+    snapshots = [object(), object()]
+    managers = [
+        manager_with("host_ready", snapshots[0]),
+        manager_with("active", snapshots[1]),
+    ]
+    for manager in managers:
+        manager._release_consumed_owned_host({snapshot_id: entry})
+        manager._release_consumed_owned_host({snapshot_id: entry})
+
+    assert released == snapshots
+    assert all(not manager.active for manager in managers)
+    assert all(not manager.host_ready for manager in managers)
+
+
+def test_tp_host_terminal_cleanup_restores_active_record_on_release_failure():
+    """Production FAILED polling keeps the exact owner across release retry."""
+
+    snapshot_id = "slow-peer-release-retry:0"
+    record = {
+        "snapshot": object(),
+        "loading": False,
+        "offer": {"token_count": 128, "byte_size": 4096},
+    }
+    manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
+    manager._state_lock = threading.RLock()
+    manager.owner = "p:host"
+    manager.active = {snapshot_id: record}
+    manager.host_ready = {}
+    manager.aborting = {}
+    ledger_entry = {
+        "state": HostStageState.FAILED.value,
+        "p_owner": "p:host",
+        "recovery_domain": 8,
+    }
+    manager.ledger = SimpleNamespace(get=lambda _snapshot_id: ledger_entry)
+    releases = []
+    manager._release_record = lambda observed: releases.append(observed) or False
+
+    manager._poll_active()
+
+    assert manager.active == {snapshot_id: record}
+    assert manager.host_ready == {}
+    assert releases == [record]
+
+    manager._release_record = lambda observed: releases.append(observed) or True
+    manager._poll_active()
+
+    assert manager.active == {}
+    assert manager.host_ready == {}
+    assert releases == [record, record]
 
 
 def test_tp_p2d_host_wait_fails_closed_instead_of_hanging():
@@ -11464,6 +11660,78 @@ def test_tp_decode_release_uses_native_scheduler_control():
         scheduler, [ordinary, control]
     ) == [ordinary]
     assert released == ["request:3"]
+
+
+def test_tp_decode_admission_control_retains_unconsumed_rank_local_keys():
+    """A one-tick follower delay must not lose TP0's admission command."""
+
+    old_key = ("delayed", 101)
+    new_key = ("new", 202)
+    scheduler = SimpleNamespace(
+        tp_size=2,
+        tp_rank=1,
+        disaggregation_mode=DisaggregationMode.DECODE,
+        _AGENTIC_TP_CONTROL_KEY=Scheduler._AGENTIC_TP_CONTROL_KEY,
+        _agentic_tp_decode_admit_keys=[old_key],
+        decode_offload_manager=None,
+        disagg_decode_transfer_queue=SimpleNamespace(queue=[]),
+    )
+    control = {
+        Scheduler._AGENTIC_TP_CONTROL_KEY: True,
+        "decode_release_snapshot": None,
+        "decode_admit_keys": [new_key, old_key, new_key],
+        "decode_transfer_keys": [],
+        "decode_transfer_statuses": [],
+        "decode_transfer_cancel_keys": [],
+        "decode_agentic_commands": [],
+    }
+
+    assert Scheduler._agentic_tp_consume_admission_control(
+        scheduler, [control]
+    ) == []
+    assert scheduler._agentic_tp_decode_admit_keys == [old_key, new_key]
+
+    control["decode_admit_keys"] = []
+    Scheduler._agentic_tp_consume_admission_control(scheduler, [control])
+    assert scheduler._agentic_tp_decode_admit_keys == [old_key, new_key]
+
+
+def test_tp_decode_queue_retires_only_locally_consumed_admission_keys():
+    """Deferred follower keys survive while successful/failed keys retire."""
+
+    delayed_key = ("delayed", 101)
+    admitted = SimpleNamespace(
+        req=SimpleNamespace(rid="admitted", bootstrap_room=202)
+    )
+    failed = SimpleNamespace(
+        req=SimpleNamespace(rid="failed", bootstrap_room=303)
+    )
+    admitted_key = (admitted.req.rid, admitted.req.bootstrap_room)
+    failed_key = (failed.req.rid, failed.req.bootstrap_room)
+    transfer_entries = []
+    scheduler = SimpleNamespace(
+        tp_size=2,
+        polling_count=0,
+        polling_interval=1,
+        _agentic_tp_decode_admit_keys=[delayed_key, admitted_key, failed_key],
+        _agentic_tp_decode_transfer_keys=[],
+        decode_offload_manager=None,
+        disagg_decode_prealloc_queue=SimpleNamespace(
+            retracted_queue=[],
+            resume_retracted_reqs=lambda: [],
+            pop_preallocated=lambda _keys: ([admitted], [failed]),
+        ),
+        disagg_decode_transfer_queue=SimpleNamespace(
+            extend=lambda entries: transfer_entries.extend(entries),
+        ),
+        waiting_queue=[],
+        enable_hisparse=False,
+    )
+
+    SchedulerDisaggregationDecodeMixin.process_decode_queue(scheduler)
+
+    assert transfer_entries == [admitted]
+    assert scheduler._agentic_tp_decode_admit_keys == [delayed_key]
 
 
 def test_tp_pending_release_accounts_only_uncached_tail():

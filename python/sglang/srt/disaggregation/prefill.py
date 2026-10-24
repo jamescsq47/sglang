@@ -1682,8 +1682,20 @@ class SchedulerDisaggregationPrefillMixin:
             if batch:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
+                batch_checkpoints = None
+                if getattr(self, "_agentic_mamba_prefill_admission", False):
+                    from sglang.srt.disaggregation.agentic_mamba_prefill import (
+                        claim_prefill_batch_checkpoints,
+                    )
+
+                    batch_checkpoints = claim_prefill_batch_checkpoints(batch)
                 batch_result = self.run_batch(batch)
-                self.result_queue.append((batch.copy(), batch_result))
+                result_batch = batch.copy()
+                if batch_checkpoints is not None:
+                    result_batch._agentic_mamba_prefill_checkpoints = (
+                        batch_checkpoints
+                    )
+                self.result_queue.append((result_batch, batch_result))
             else:
                 batch_result = None
                 self.cancel_bubble_timer()
@@ -1753,6 +1765,12 @@ class SchedulerDisaggregationPrefillMixin:
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
+            if getattr(self, "_agentic_mamba_prefill_admission", False):
+                from sglang.srt.disaggregation.agentic_mamba_prefill import (
+                    restore_prefill_batch_checkpoint,
+                )
+
+                restore_prefill_batch_checkpoint(batch, req, i)
             if req.is_chunked <= 0:
                 req.time_stats.set_prefill_finished_time()
 

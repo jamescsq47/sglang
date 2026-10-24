@@ -165,7 +165,7 @@ def _hybrid_fixture(*, row_available=True):
     pool = HybridReqToTokenPool.__new__(HybridReqToTokenPool)
     pool.free_slots = [0] if row_available else []
     pool.req_to_token = torch.zeros((1, 16), dtype=torch.int32)
-    pool.mamba_pool = _StrictPool([10, 11, 12])
+    pool.mamba_pool = _StrictPool([10, 11, 12, 13])
     pool.enable_mamba_extra_buffer = True
     pool.mamba_ping_pong_track_buffer_size = 2
     pool.req_index_to_mamba_index_mapping = torch.zeros(1, dtype=torch.int32)
@@ -187,7 +187,7 @@ def _hybrid_fixture(*, row_available=True):
     )
     lease = SimpleNamespace(
         prompt_tokens=4, device_indices=torch.arange(4, 8),
-        state_indices=(torch.tensor([10, 11, 12]),),
+        state_indices=(torch.tensor([10, 11, 12, 13]),),
     )
     return NativeRequestMemoryAdapter(scheduler), pool, allocator, req, lease
 
@@ -198,6 +198,7 @@ def test_decode_binding_uses_lease_state_in_real_hybrid_row_mapping():
     assert pool.mamba_pool.allocations == []
     assert pool.req_index_to_mamba_index_mapping.tolist() == [10]
     assert pool.req_index_to_mamba_ping_pong_track_buffer_mapping.tolist() == [[11, 12]]
+    assert req._agentic_mamba_prefill_checkpoint.tolist() == [13]
     assert pool.req_to_token[0, :4].tolist() == [4, 5, 6, 7]
 
 

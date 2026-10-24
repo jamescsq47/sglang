@@ -394,6 +394,26 @@ def test_source_local_host_descriptor_crosses_json_and_restores_full_tp(
             ranks[participant].handle(command)
             if (
                 command.kind is CommandKind.ISSUE_ACTIVATION_TICKET
+                and command.source_owner in {
+                    Owner.P_GPU,
+                    Owner.PREFILL_READY,
+                    Owner.D_GPU,
+                    Owner.DECODE_READY,
+                }
+                and participant == source[-1]
+            ):
+                for source_participant in source:
+                    ranks[source_participant].activate_staged(
+                        command.key,
+                        command.attempt,
+                        command.lease_id,
+                        action="release",
+                    )
+                    ranks[source_participant].confirm_scheduler_adopted(
+                        command.key, command.attempt, command.lease_id
+                    )
+            if (
+                command.kind is CommandKind.ISSUE_ACTIVATION_TICKET
                 and command.target_owner in {
                     Owner.P_GPU,
                     Owner.PREFILL_READY,
@@ -741,10 +761,33 @@ def test_host_store_results_automatically_drive_remote_restore_attempt(
     orchestrator.begin(store_plan)
     deadline = time.monotonic() + 3
     while not final and time.monotonic() < deadline:
-        kind, *values = events.get(timeout=1)
+        try:
+            kind, *values = events.get(timeout=1)
+        except queue.Empty as error:
+            raise AssertionError(orchestrator.progress_diagnostics()) from error
         if kind == "command":
             participant, command = values
             ranks[participant].handle(command)
+            if (
+                command.kind is CommandKind.ISSUE_ACTIVATION_TICKET
+                and command.source_owner in {
+                    Owner.P_GPU,
+                    Owner.PREFILL_READY,
+                    Owner.D_GPU,
+                    Owner.DECODE_READY,
+                }
+                and participant == source[-1]
+            ):
+                for source_participant in source:
+                    ranks[source_participant].activate_staged(
+                        command.key,
+                        command.attempt,
+                        command.lease_id,
+                        action="release",
+                    )
+                    ranks[source_participant].confirm_scheduler_adopted(
+                        command.key, command.attempt, command.lease_id
+                    )
             if (
                 command.kind is CommandKind.ISSUE_ACTIVATION_TICKET
                 and command.target_owner in {

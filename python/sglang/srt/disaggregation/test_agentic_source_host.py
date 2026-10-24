@@ -114,6 +114,19 @@ def test_mha_arena_allocates_complete_extent_and_recycles_memfd_space():
     arena.close()
 
 
+def test_arena_uses_libc_memfd_when_python_does_not_export_it(monkeypatch):
+    monkeypatch.delattr(os, "memfd_create", raising=False)
+    arena = SourceLocalHostArena(
+        direction=HostDirection.D2P,
+        device_pool=MHAPool(),
+        capacity_bytes=mmap.ALLOCATIONGRANULARITY,
+        snapshot_factory=fake_snapshot_factory,
+        preallocate=False,
+    )
+    assert os.path.exists(arena.path)
+    arena.close()
+
+
 def test_direction_capacity_reads_only_new_multinode_environment(monkeypatch):
     monkeypatch.setenv("SGLANG_AGENTIC_MULTINODE_D2P_HOST_GIB", "0.001")
     monkeypatch.setenv("SGLANG_AGENTIC_MULTINODE_P2D_HOST_GIB", "0.002")

@@ -421,6 +421,160 @@ def test_tp8_activation_order_is_chosen_once_and_applied_on_every_rank():
     ]
 
 
+def test_decode_activation_waits_for_request_row_but_release_passes():
+    tickets = queue.Queue()
+    for request_id in ("a", "b"):
+        tickets.put(
+            EndpointActivationTicket(
+                GenerationKey("run", request_id, 0),
+                1,
+                f"lease-{request_id}",
+                "decode",
+                1,
+                "activate",
+            )
+        )
+    tickets.put(
+        EndpointActivationTicket(
+            GenerationKey("run", "old", 3),
+            2,
+            "lease-old",
+            "decode",
+            3,
+            "release",
+        )
+    )
+
+    class Pool:
+        free = 0
+
+        def available_size(self):
+            return self.free
+
+    class Runtime:
+        def take_activation_ticket(self, timeout=None):
+            return tickets.get(timeout=timeout)
+
+    pool = Pool()
+    scheduler = SimpleNamespace(
+        tp_rank=0,
+        _AGENTIC_V2_ACTIVATION_KEY=Scheduler._AGENTIC_V2_ACTIVATION_KEY,
+        disaggregation_mode=DisaggregationMode.DECODE,
+        agentic_multinode_runtime_v2=Runtime(),
+        req_to_token_pool=pool,
+    )
+
+    control = Scheduler._agentic_v2_prepare_activation_control(scheduler)
+    assert [ticket["action"] for ticket in control["tickets"]] == ["release"]
+    assert [
+        ticket.key.request_id
+        for ticket in scheduler._agentic_v2_deferred_activation_tickets
+    ] == ["a", "b"]
+
+    pool.free = 1
+    control = Scheduler._agentic_v2_prepare_activation_control(scheduler)
+    assert [ticket["request_id"] for ticket in control["tickets"]] == ["a"]
+    assert [
+        ticket.key.request_id
+        for ticket in scheduler._agentic_v2_deferred_activation_tickets
+    ] == ["b"]
+
+    pool.free = 1
+    control = Scheduler._agentic_v2_prepare_activation_control(scheduler)
+    assert [ticket["request_id"] for ticket in control["tickets"]] == ["b"]
+    assert not scheduler._agentic_v2_deferred_activation_tickets
+
+
+def test_source_release_ticket_never_publishes_a_compute_request():
+    tickets = queue.Queue()
+    tickets.put(
+        EndpointActivationTicket(
+            GenerationKey("run", "request", 3),
+            7,
+            "lease-7",
+            "decode",
+            4,
+            "release",
+        )
+    )
+    applied = []
+    confirmed = []
+
+    class Runtime:
+        config = SimpleNamespace(run_id="run")
+        d_memory_bridge = SimpleNamespace(
+            activate_decode_attempts=lambda _attempts: pytest.fail(
+                "source release must not publish a decode request"
+            )
+        )
+
+        def take_activation_ticket(self, timeout=None):
+            return tickets.get(timeout=timeout)
+
+        def activate_staged(self, ticket):
+            applied.append(ticket.action)
+
+        def confirm_scheduler_adopted(self, ticket):
+            confirmed.append(ticket.action)
+
+    scheduler = SimpleNamespace(
+        tp_rank=0,
+        _AGENTIC_V2_ACTIVATION_KEY=Scheduler._AGENTIC_V2_ACTIVATION_KEY,
+        disaggregation_mode=DisaggregationMode.DECODE,
+        agentic_multinode_runtime_v2=Runtime(),
+        waiting_queue=[],
+    )
+    control = Scheduler._agentic_v2_prepare_activation_control(scheduler)
+    assert control["tickets"][0]["action"] == "release"
+    Scheduler._agentic_v2_consume_activation_control(scheduler, control)
+    assert applied == ["release"]
+    assert confirmed == ["release"]
+    assert scheduler.waiting_queue == []
+
+
+def test_v2_activation_control_fences_rank_local_commit_before_return(monkeypatch):
+    order = []
+    cpu_group = object()
+    monkeypatch.setattr(
+        scheduler_module,
+        "barrier",
+        lambda *, group: order.append(("barrier", group)),
+    )
+    target = SimpleNamespace(
+        tp_size=8,
+        tp_cpu_group=cpu_group,
+        _agentic_v2_consume_activation_control=lambda control: order.append(
+            ("commit", control)
+        ),
+    )
+    control = {
+        Scheduler._AGENTIC_V2_ACTIVATION_KEY: True,
+        "tickets": [{"attempt": 7}],
+    }
+    ordinary = object()
+
+    remaining = Scheduler._agentic_tp_consume_admission_control(
+        target, [ordinary, control]
+    )
+
+    assert remaining == [ordinary]
+    assert order == [("commit", control), ("barrier", cpu_group)]
+
+
+def test_recv_without_v2_activation_does_not_add_tp_barrier(monkeypatch):
+    monkeypatch.setattr(
+        scheduler_module,
+        "barrier",
+        lambda **_kwargs: pytest.fail("ordinary ingress must not add a barrier"),
+    )
+    target = SimpleNamespace(tp_size=8)
+    ordinary = object()
+
+    assert Scheduler._agentic_tp_consume_admission_control(
+        target, [ordinary]
+    ) == [ordinary]
+
+
 def test_agentic_forward_fence_is_recorded_before_bridge_publication():
     order = []
 

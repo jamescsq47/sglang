@@ -141,7 +141,11 @@ def group_ack(shards: Sequence[HostShard], receipts: Sequence[ReadReceipt], *,
 
 
 def mha_read_spans(
-    *, layer_bases: Sequence[int], token_indices: Sequence[int], bytes_per_token: int
+    *,
+    layer_bases: Sequence[int],
+    token_indices: Sequence[int],
+    bytes_per_token: int,
+    source_token_count: int | None = None,
 ) -> list[tuple[int, int, int]]:
     """Map [K/V,layer,token,...] Host data into paged device KV, coalescing runs.
 
@@ -164,7 +168,12 @@ def mha_read_spans(
         start = end
 
     spans = []
-    layer_stride = len(indices) * bytes_per_token
+    source_token_count = (
+        len(indices) if source_token_count is None else int(source_token_count)
+    )
+    if source_token_count < len(indices):
+        raise ValueError("source snapshot is shorter than the requested prefix")
+    layer_stride = source_token_count * bytes_per_token
     for layer, base in enumerate(layer_bases):
         base = int(base)
         if base <= 0:
@@ -599,7 +608,11 @@ class RemoteHostTransport:
                      ) -> RemoteHostRead:
         """Prepare after source claim and full destination workset allocation.
 
-        Spans must cover the entire exported shard exactly once in source order.
+        Spans must cover every byte named by ``payload_ranges`` exactly once in
+        source order.  With no explicit ranges this is the entire exported
+        shard.  Explicit ranges permit a destination to consume only the common
+        prefix of a full-attention snapshot while preserving the immutable
+        source export until the group receipt commits.
         The existing destination VRAM pool registration remains caller-owned.
         """
         shard.validate()
@@ -622,9 +635,6 @@ class RemoteHostTransport:
             if start < previous_end or length <= 0 or start + length > shard.byte_size:
                 raise ValueError("invalid payload ranges")
             previous_end = start + length
-        if ranges[0][0] != 0 or previous_end != shard.byte_size:
-            raise ValueError("payload ranges must cover both ends of the shard")
-
         range_index = 0
         offset = ranges[0][0]
         local, remote, destinations = [], [], []
@@ -648,8 +658,9 @@ class RemoteHostTransport:
             local.append((int(target_address), int(length), int(gpu_id)))
             remote.append((shard.address + int(source_offset), int(length), 0))
             destinations.append((target_address, target_address + length))
-        if range_index != len(ranges) - 1 or offset != shard.byte_size:
-            raise ValueError("must transfer the complete shard")
+        final_end = ranges[-1][0] + ranges[-1][1]
+        if range_index != len(ranges) - 1 or offset != final_end:
+            raise ValueError("must transfer every requested payload range")
         ordered = sorted(destinations)
         if any(left[1] > right[0] for left, right in zip(ordered, ordered[1:])):
             raise ValueError("overlapping destination spans")

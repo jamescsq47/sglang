@@ -24,6 +24,20 @@ def missing_runtime_slots(req, req_pool):
     return count
 
 
+def required_prefill_checkpoint_slots(*, enable_overlap, chunked):
+    """Return the checkpoint reservation depth required before Forward.
+
+    The overlap scheduler can admit the next chunk before it processes the
+    previous chunk's result.  One checkpoint may therefore still be promised
+    to the previous result while the newly admitted Forward needs another.
+    Keeping two slots for every overlapped chunk continuation makes that
+    pipeline reservation explicit instead of relying on a best-effort refill
+    after Forward, when it is already too late to apply backpressure.
+    """
+
+    return 2 if enable_overlap and chunked else 1
+
+
 class PrefillStateReservation:
     def __init__(self, req, pool, indices, fields):
         self.req, self.pool, self.indices, self.fields = req, pool, indices, fields
@@ -98,3 +112,50 @@ def fork_prefill_checkpoint(req, pool, source):
     pool.copy_from(source, target)
     req._agentic_mamba_prefill_checkpoint = indices[1:] if indices.numel() > 1 else None
     return target
+
+
+def claim_prefill_batch_checkpoints(batch):
+    """Move one reserved checkpoint per admitted request onto this Forward.
+
+    The overlap scheduler may schedule the next chunk before processing this
+    batch's result.  Keeping the in-flight generation's checkpoint on ``Req``
+    lets later scheduling or cleanup steal it.  A claimed checkpoint instead
+    follows the immutable batch/result pair until result processing.
+    """
+
+    claimed = []
+    for req in batch.reqs:
+        indices = getattr(req, "_agentic_mamba_prefill_checkpoint", None)
+        if not getattr(req, "_agentic_prefill_mamba_admitted", False):
+            claimed.append(None)
+            continue
+        if indices is None or indices.numel() == 0:
+            raise RuntimeError(
+                f"Prefill Forward has no reserved Mamba checkpoint: rid={req.rid}"
+            )
+        claimed.append(indices[:1])
+        req._agentic_mamba_prefill_checkpoint = (
+            indices[1:] if indices.numel() > 1 else None
+        )
+    return claimed
+
+
+def restore_prefill_batch_checkpoint(batch, req, index):
+    """Return one batch-owned checkpoint immediately before cache insertion."""
+
+    claimed = getattr(batch, "_agentic_mamba_prefill_checkpoints", None)
+    if claimed is None:
+        return
+    owned = claimed[index]
+    if owned is None:
+        return
+    current = getattr(req, "_agentic_mamba_prefill_checkpoint", None)
+    if current is None:
+        req._agentic_mamba_prefill_checkpoint = owned
+    else:
+        import torch
+
+        # fork_prefill_checkpoint consumes the first entry, so the result of
+        # this batch cannot consume a reservation belonging to a later chunk.
+        req._agentic_mamba_prefill_checkpoint = torch.cat((owned, current))
+    claimed[index] = None

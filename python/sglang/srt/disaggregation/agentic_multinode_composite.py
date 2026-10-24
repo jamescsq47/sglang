@@ -598,6 +598,13 @@ class SchedulerAgenticMultinodeRuntime:
         self._low_level.report_registered(record.key)
         self._events.put_nowait(record)
 
+    def wait_p2d_direct_physical_idle(
+        self, timeout: Optional[float] = None
+    ) -> bool:
+        """Expose the narrow physical-DMA fence to the scheduler facade."""
+
+        return self._low_level.wait_p2d_direct_physical_idle(timeout)
+
     def _key_from_completion(self, item: Any) -> GenerationKey:
         key = item.lease.key
         return GenerationKey(self.config.run_id, key.request_id, key.generation)
@@ -745,11 +752,19 @@ class SchedulerAgenticMultinodeRuntime:
                     callback = getattr(self.provider, "memory_available", None)
                     snapshot = getattr(self.provider, "capacity_snapshot", None)
                     if snapshot is not None:
-                        snapshot(
+                        remaining = snapshot(
                             remote_role=event.remote_role,
                             endpoint_group=event.endpoint_group,
                             available_tokens=available_tokens,
                         )
+                        # A provider may synchronously spend part of this
+                        # absolute snapshot on an earlier admission class
+                        # (for example, initial Prefill work).  Forward only
+                        # the uncommitted remainder to the Host-restore
+                        # policy; otherwise both classes can promise the same
+                        # pages before either PREPARE reaches the allocator.
+                        if remaining is not None:
+                            available_tokens = max(0, int(remaining))
                     if callback is not None:
                         callback(
                             remote_role=event.remote_role,

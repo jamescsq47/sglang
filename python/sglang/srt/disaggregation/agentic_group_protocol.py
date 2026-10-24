@@ -150,8 +150,54 @@ class GenerationRecord:
     terminal: GenerationTerminal = GenerationTerminal.OPEN
 
 
+_PAYLOAD_ATOMIC_TYPES = frozenset((type(None), bool, int, float, str, bytes))
+
+
+def _copy_control_payload(value: Any, memo: Optional[dict[int, Any]] = None) -> Any:
+    """Deep-copy control data without generic dispatch for every token/hash.
+
+    Only exact builtin types use the fast path. Mutable lists/dicts are still
+    isolated, shared references/cycles retain deepcopy semantics, and tuples,
+    subclasses and other objects use the original copier with the same memo.
+    This is not validation: callers retain their strict JSON validation.
+    """
+    if type(value) in _PAYLOAD_ATOMIC_TYPES:
+        return value
+    if memo is None:
+        memo = {}
+    identity = id(value)
+    if identity in memo:
+        return memo[identity]
+    if type(value) is list:
+        result = []
+        memo[identity] = result
+        result.extend(
+            item if type(item) in _PAYLOAD_ATOMIC_TYPES
+            else _copy_control_payload(item, memo)
+            for item in value
+        )
+        # Match deepcopy's source keepalive convention when a memo is reused.
+        memo.setdefault(id(memo), []).append(value)
+        return result
+    if type(value) is dict:
+        result = {}
+        memo[identity] = result
+        for key, item in value.items():
+            cloned_key = (
+                key if type(key) in _PAYLOAD_ATOMIC_TYPES
+                else _copy_control_payload(key, memo)
+            )
+            result[cloned_key] = (
+                item if type(item) in _PAYLOAD_ATOMIC_TYPES
+                else _copy_control_payload(item, memo)
+            )
+        memo.setdefault(id(memo), []).append(value)
+        return result
+    return copy.deepcopy(value, memo)
+
+
 def _frozen_payload(payload: Optional[Mapping[str, Any]]) -> Mapping[str, Any]:
-    value = {} if payload is None else copy.deepcopy(dict(payload))
+    value = {} if payload is None else _copy_control_payload(dict(payload))
     # Validate that messages never retain Python/CUDA objects by accident.
     json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
     return MappingProxyType(value)
@@ -543,6 +589,9 @@ class TCPGroupRelayServer:
             ).start()
 
     def _send(self, identity: tuple[str, str, int], frame: Mapping[str, Any]) -> None:
+        self._send_encoded(identity, _encode_frame(frame))
+
+    def _send_encoded(self, identity: tuple[str, str, int], encoded: bytes) -> None:
         with self._condition:
             connection = self._sessions.get(identity)
             lock = self._send_locks.get(identity)
@@ -550,7 +599,6 @@ class TCPGroupRelayServer:
             raise GroupDisconnectedError(
                 f"link {identity[0]} endpoint {identity[1]} rank {identity[2]} is disconnected"
             )
-        encoded = _encode_frame(frame)
         with lock:
             connection.sendall(encoded)
 
@@ -581,8 +629,13 @@ class TCPGroupRelayServer:
             raise GroupDisconnectedError(
                 f"link {group_id} lacks participants {missing}"
             )
+        # All selected ranks receive exactly the same immutable bytes. Do not
+        # redo JSON encoding once per rank (16 times for a TP8 P/D link).
+        encoded = _encode_frame(command)
         for member in members:
-            self._send((group_id, member.endpoint_group, member.rank), command)
+            self._send_encoded(
+                (group_id, member.endpoint_group, member.rank), encoded
+            )
 
     def _notify_rank0_disconnect(
         self, group_id: str, endpoint_group: str, role: str, rank: int

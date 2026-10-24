@@ -419,30 +419,46 @@ def _report_ready(runtimes, plan):
             runtime.report_registered(target_key)
 
 
-def _activate_target(runtimes, role="prefill"):
-    rank0 = next(
-        runtime
-        for participant, runtime in runtimes.items()
-        if participant.role == role and participant.rank == 0
-    )
-    ticket = rank0.take_activation_ticket(timeout=10)
-    for participant, runtime in runtimes.items():
-        if participant.role == role:
-            runtime.activate_staged(ticket)
-            runtime.confirm_scheduler_adopted(ticket)
-    return ticket
+def _apply_scheduler_actions(runtimes, roles=("decode", "prefill")):
+    tickets = {}
+    for role in roles:
+        rank0 = next(
+            runtime
+            for participant, runtime in runtimes.items()
+            if participant.role == role and participant.rank == 0
+        )
+        ticket = rank0.take_activation_ticket(timeout=10)
+        tickets[role] = ticket
+        for participant, runtime in runtimes.items():
+            if participant.role == role:
+                runtime.activate_staged(ticket)
+                runtime.confirm_scheduler_adopted(ticket)
+    return tickets
 
 
+@pytest.mark.parametrize("compact", [False, True])
 @pytest.mark.parametrize("tp_size", [1, 2, 8])
-def test_decode_rank0_proposal_commits_one_atomic_two_endpoint_transaction(tp_size):
+def test_decode_rank0_proposal_commits_one_atomic_two_endpoint_transaction(tp_size, compact, monkeypatch):
+    monkeypatch.setenv("SGLANG_AGENTIC_COMPACT_HANDOFF_PAYLOAD", str(int(compact)))
     relay, runtimes, coordinator, committed, aborted = _runtimes(tp_size)
     plan = _plan(f"tp{tp_size}")
+    from dataclasses import replace
+    plan = replace(plan, payload={**plan.payload, "target_generation": 2})
+    wire_commands = []
+    publish = runtimes[coordinator].orchestrator._broadcast
+    def record(command):
+        wire_commands.append(command)
+        publish(command)
+    runtimes[coordinator].orchestrator._broadcast = record
     try:
         # D rank zero proposes; only fixed P rank zero may make and publish the
         # decision.  All 2*TP participants join the same attempt/barrier.
         _report_ready(runtimes, plan)
         assert runtimes[LinkParticipant("decode", "d0", 0)].submit(plan) is None
-        _activate_target(runtimes)
+        tickets = _apply_scheduler_actions(runtimes)
+        assert tickets["decode"].action == "release"
+        assert tickets["prefill"].action == "activate"
+        assert tickets["prefill"].target_generation == 2
         terminal = runtimes[coordinator].take_terminal(timeout=10)
         assert terminal.committed
         assert terminal.key == plan.key
@@ -451,6 +467,9 @@ def test_decode_rank0_proposal_commits_one_atomic_two_endpoint_transaction(tp_si
         assert committed == [(plan.key, terminal.attempt)]
         assert aborted == []
         assert all(runtime.wait_idle(5) for runtime in runtimes.values())
+        assert all(runtime.executor.active_count == 0 for runtime in runtimes.values())
+        refs = [cmd for cmd in wire_commands if "handoff_payload_ref" in cmd.payload]
+        assert len(refs) == (4 if compact else 0)
         assert runtimes[coordinator].coordinator is not None
         assert (
             len(runtimes[coordinator].coordinator.participants) == 2 * tp_size
@@ -488,7 +507,9 @@ def test_tp8_decode_capacity_edge_reaches_p0_without_lifecycle_attempt():
         _close(relay, runtimes, coordinator)
 
 
-def test_tp8_follower_failure_broadcasts_cancel_and_drains_all_participants():
+@pytest.mark.parametrize("compact", [False, True])
+def test_tp8_follower_failure_broadcasts_cancel_and_drains_all_participants(compact, monkeypatch):
+    monkeypatch.setenv("SGLANG_AGENTIC_COMPACT_HANDOFF_PAYLOAD", str(int(compact)))
     failing = LinkParticipant("decode", "d0", 6)
     relay, runtimes, coordinator, committed, aborted = _runtimes(
         8, failing=failing
@@ -546,26 +567,33 @@ def test_tp8_out_of_order_readiness_gates_prepare_and_target_scheduler_ticket():
             held_runtime.report_source_ready(plan.key)
         else:
             held_runtime.report_registered(target_key)
-        ticket = p0.take_activation_ticket(timeout=10)
-        assert ticket.target_role == "prefill"
-        assert ticket.target_generation == 1
-        assert ticket.target_key == target_key
-        with pytest.raises(queue.Empty):
-            d0.take_activation_ticket(timeout=0.05)
+        source_ticket = d0.take_activation_ticket(timeout=10)
+        target_ticket = p0.take_activation_ticket(timeout=10)
+        assert source_ticket.action == "release"
+        assert source_ticket.target_role == "decode"
+        assert target_ticket.action == "activate"
+        assert target_ticket.target_role == "prefill"
+        assert target_ticket.target_generation == 1
+        assert target_ticket.target_key == target_key
+
+        for rank in range(8):
+            runtime = runtimes[LinkParticipant("decode", "d0", rank)]
+            runtime.activate_staged(source_ticket)
+            runtime.confirm_scheduler_adopted(source_ticket)
 
         target_runtimes = [
             runtimes[LinkParticipant("prefill", "p0", rank)]
             for rank in range(8)
         ]
         for runtime in target_runtimes[:-1]:
-            runtime.activate_staged(ticket)
-            runtime.confirm_scheduler_adopted(ticket)
+            runtime.activate_staged(target_ticket)
+            runtime.confirm_scheduler_adopted(target_ticket)
         time.sleep(0.05)
-        # Source HBM was released at ACTIVATE, but the control attempt remains
-        # live until every target rank confirms native scheduler adoption.
+        # Source HBM is released in scheduler order, but the control attempt
+        # remains live until every target rank confirms native adoption.
         assert p0.orchestrator.active_count == 1
-        target_runtimes[-1].activate_staged(ticket)
-        target_runtimes[-1].confirm_scheduler_adopted(ticket)
+        target_runtimes[-1].activate_staged(target_ticket)
+        target_runtimes[-1].confirm_scheduler_adopted(target_ticket)
         terminal = p0.take_terminal(timeout=10)
         assert terminal.committed
         assert committed == [(plan.key, terminal.attempt)]
@@ -601,9 +629,7 @@ def test_close_does_not_cancel_a_partially_posted_start():
 
         for executor in manual.values():
             executor.succeed()
-        ticket = p0.take_activation_ticket(timeout=5)
-        p0.activate_staged(ticket)
-        p0.confirm_scheduler_adopted(ticket)
+        _apply_scheduler_actions(runtimes)
         terminal = p0.take_terminal(timeout=5)
         assert terminal.committed
         assert committed == [(plan.key, terminal.attempt)] and aborted == []
