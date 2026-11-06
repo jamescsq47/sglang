@@ -373,8 +373,15 @@ class DecodePreallocQueue:
         self.p2d_prebind_ablation = os.environ.get(
             "SGLANG_PD_ABLATION_P2D_PREBIND", "false"
         ).strip().lower() in {"1", "true", "yes", "on"}
-        if self.p2d_prebind_ablation and self.tp_size != 1:
-            raise ValueError("P->D pre-binding ablation currently requires TP=1")
+        self.p2d_native_prealloc_ablation = os.environ.get(
+            "SGLANG_PD_ABLATION_P2D_NATIVE_PREALLOC", "false"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if (
+            self.p2d_prebind_ablation or self.p2d_native_prealloc_ablation
+        ) and self.tp_size != 1:
+            raise ValueError(
+                "P->D destination-first ablation currently requires TP=1"
+            )
         if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get() and not self.p_ready_dir:
             raise ValueError(
                 "SGLANG_AGENTIC_KV_LIFECYCLE requires SGLANG_PD_P_READY_DIR "
@@ -447,8 +454,36 @@ class DecodePreallocQueue:
         return bool(
             self.p_ready_dir
             and not self.p2d_prebind_ablation
+            and not self.p2d_native_prealloc_ablation
             and decode_req.req.bootstrap_host != FAKE_BOOTSTRAP_HOST
         )
+
+    def _publish_d_reserved_marker(self, decode_req: DecodeRequest) -> None:
+        """Publish proof that D owns physical destination KV for this request.
+
+        This marker is intentionally emitted immediately after ``_pre_alloc``
+        succeeds, before P is allowed to enter its scheduler.  HTTP admission,
+        receiver creation, and NIXL bootstrap are not reservations and must not
+        release the destination-first ablation's Router fence.
+        """
+
+        if not self.p2d_native_prealloc_ablation or not self.p_ready_dir:
+            return
+        room = int(decode_req.req.bootstrap_room)
+        reserved_path = os.path.join(self.p_ready_dir, f"{room}.d_reserved")
+        tmp_path = f"{reserved_path}.{os.getpid()}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "rid": str(decode_req.req.rid),
+                    "room": room,
+                    "tokens": int(decode_req.req.kv_allocated_len),
+                },
+                handle,
+                separators=(",", ":"),
+            )
+        decode_req._p2d_d_destination_reserved = True
+        os.replace(tmp_path, reserved_path)
 
     def enable_async_progress(self) -> None:
         # Each TP rank owns a distinct KV shard but receives the same logical
@@ -1180,21 +1215,120 @@ class DecodePreallocQueue:
                 failed_reqs.append(decode_req)
                 indices_to_remove.add(i)
 
+        # Destination-first P->D ablation: reserve D's physical request slot
+        # and KV pages before the matching P request exists.  Only after this
+        # allocation may Router target the parent recovery and submit P.
+        # Receiver bootstrap may therefore wait briefly for P; that is
+        # expected.  The marker is independently auditable proof of physical
+        # ownership and the fence for starting that recovery sequence.
+        # There is deliberately no request-count/inflight cap here: admission
+        # is bounded solely by D's native request slots, KV allocator and decode
+        # safety headroom.
+        if self.p2d_native_prealloc_ablation:
+            for i, decode_req in enumerate(self.queue):
+                if not selected(decode_req) or i in indices_to_remove:
+                    continue
+                if getattr(
+                    decode_req, "_p2d_d_destination_reserved", False
+                ):
+                    continue
+                if self.req_to_token_pool.available_size() <= 0:
+                    blocked_reason = "request_slots"
+                    blocked_req = decode_req
+                    break
+
+                origin_input_len = len(decode_req.req.origin_input_ids)
+                required_tokens_for_request = (
+                    origin_input_len + self.num_reserved_decode_tokens
+                )
+                safety_tokens = max(
+                    required_tokens_for_request,
+                    origin_input_len
+                    + min(
+                        decode_req.req.sampling_params.max_new_tokens,
+                        CLIP_MAX_NEW_TOKEN,
+                    )
+                    - retractable_tokens,
+                )
+                if safety_tokens > allocatable_tokens:
+                    blocked_reason = "decode_safety"
+                    blocked_req = decode_req
+                    blocked_required_tokens = safety_tokens
+                    break
+                if required_tokens_for_request > allocatable_tokens:
+                    blocked_reason = "prompt_kv"
+                    blocked_req = decode_req
+                    blocked_required_tokens = required_tokens_for_request
+                    break
+
+                if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get() and isinstance(
+                    self.token_to_kv_pool, HybridLinearKVPool
+                ):
+                    state_pool = self.req_to_token_pool.mamba_pool
+                    needed_slots = (
+                        int(decode_req.req.mamba_pool_idx is None)
+                        + (
+                            self.req_to_token_pool.mamba_ping_pong_track_buffer_size
+                            if decode_req.req.mamba_ping_pong_track_buffer is None
+                            else 0
+                        )
+                    )
+                    if state_pool.available_size() < needed_slots:
+                        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+                        self.tree_cache.evict(
+                            EvictParams(
+                                num_tokens=0,
+                                mamba_num=(
+                                    needed_slots - state_pool.available_size()
+                                ),
+                            )
+                        )
+                    if state_pool.available_size() < needed_slots:
+                        blocked_reason = "mamba_slots"
+                        blocked_req = decode_req
+                        break
+
+                allocatable_tokens -= required_tokens_for_request
+                self._pre_alloc(decode_req.req)
+                self._publish_d_reserved_marker(decode_req)
+
         # Then, preallocate the remaining requests if possible
         for i, decode_req in enumerate(self.queue):
-            if (
-                self.max_transfer_inflight > 0
-                and len(self.transfer_queue.queue)
-                + len(preallocated_reqs)
-                + self._async_metadata_pending_count
-                >= self.max_transfer_inflight
-            ):
-                break
             if not selected(decode_req):
                 continue
 
             if i in indices_to_remove:
                 continue
+
+            # The native Direct window prevents too many remote handshakes
+            # from pinning destination KV at once.  A P->D Host snapshot has
+            # already released its P pages and is restored by a separately
+            # bounded local H2D worker, so letting saturated Direct receivers
+            # block it creates an artificial cycle: D has free KV and durable
+            # Host work, but cannot consume that work until a remote Direct
+            # transfer finishes.  Count/apply this gate only to native Direct.
+            is_p2d_host = isinstance(
+                decode_req.kv_receiver, AgenticPToDHostReceiver
+            )
+            if not is_p2d_host and self.max_transfer_inflight > 0:
+                direct_transfer_reqs = sum(
+                    not isinstance(item.kv_receiver, AgenticPToDHostReceiver)
+                    for item in self.transfer_queue.queue
+                )
+                direct_preallocated_reqs = sum(
+                    not isinstance(item.kv_receiver, AgenticPToDHostReceiver)
+                    for item in preallocated_reqs
+                )
+                if (
+                    direct_transfer_reqs
+                    + direct_preallocated_reqs
+                    + self._async_metadata_pending_count
+                    >= self.max_transfer_inflight
+                ):
+                    blocked_reason = blocked_reason or "direct_transfer_slots"
+                    blocked_req = blocked_req or decode_req
+                    continue
 
             if not decode_req.waiting_for_input:
                 blocked_reason = blocked_reason or "handshake"
@@ -1218,7 +1352,14 @@ class DecodePreallocQueue:
                         continue
                     self._record_p_ready_domain(decode_req, ready_path)
 
-            if self.req_to_token_pool.available_size() <= 0:
+            destination_reserved = getattr(
+                decode_req, "_p2d_d_destination_reserved", False
+            )
+
+            if (
+                not destination_reserved
+                and self.req_to_token_pool.available_size() <= 0
+            ):
                 blocked_reason = "request_slots"
                 blocked_req = decode_req
                 break
@@ -1228,57 +1369,81 @@ class DecodePreallocQueue:
                 blocked_req = decode_req
                 break
 
-            # Memory estimation: don't add if the projected memory cannot be met
-            # TODO: add new_token ratio
-            origin_input_len = len(decode_req.req.origin_input_ids)
-            required_tokens_for_request = (
-                origin_input_len + self.num_reserved_decode_tokens
-            )
-
-            if (
-                max(
-                    required_tokens_for_request,
-                    origin_input_len
-                    + min(
-                        decode_req.req.sampling_params.max_new_tokens,
-                        CLIP_MAX_NEW_TOKEN,
-                    )
-                    - retractable_tokens,
+            if destination_reserved:
+                # The destination-first pass above already owns both the
+                # request slot and physical KV pages.  Do not estimate or
+                # allocate them a second time once the sender handshake lands.
+                origin_input_len = len(decode_req.req.origin_input_ids)
+                dst_kv_indices = self.req_to_token_pool.req_to_token[
+                    decode_req.req.req_pool_idx, :origin_input_len
+                ]
+            else:
+                # Memory estimation: don't add if the projected memory cannot be met
+                # TODO: add new_token ratio
+                origin_input_len = len(decode_req.req.origin_input_ids)
+                required_tokens_for_request = (
+                    origin_input_len + self.num_reserved_decode_tokens
                 )
-                > allocatable_tokens
-            ):
-                blocked_reason = "decode_safety"
-                blocked_req = decode_req
-                blocked_required_tokens = max(
-                    required_tokens_for_request,
-                    origin_input_len
-                    + min(
-                        decode_req.req.sampling_params.max_new_tokens,
-                        CLIP_MAX_NEW_TOKEN,
-                    )
-                    - retractable_tokens,
-                )
-                break
-            if required_tokens_for_request > allocatable_tokens:
-                blocked_reason = "prompt_kv"
-                blocked_req = decode_req
-                blocked_required_tokens = required_tokens_for_request
-                break
 
-            if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get() and isinstance(self.token_to_kv_pool, HybridLinearKVPool):
-                state_pool = self.req_to_token_pool.mamba_pool
-                needed_slots = (int(decode_req.req.mamba_pool_idx is None)
-                                + (self.req_to_token_pool.mamba_ping_pong_track_buffer_size
-                                   if decode_req.req.mamba_ping_pong_track_buffer is None else 0))
-                if state_pool.available_size() < needed_slots:
-                    from sglang.srt.mem_cache.base_prefix_cache import EvictParams
-                    self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=needed_slots - state_pool.available_size()))
-                if state_pool.available_size() < needed_slots:
-                    blocked_reason = "mamba_slots"
+                if (
+                    max(
+                        required_tokens_for_request,
+                        origin_input_len
+                        + min(
+                            decode_req.req.sampling_params.max_new_tokens,
+                            CLIP_MAX_NEW_TOKEN,
+                        )
+                        - retractable_tokens,
+                    )
+                    > allocatable_tokens
+                ):
+                    blocked_reason = "decode_safety"
                     blocked_req = decode_req
+                    blocked_required_tokens = max(
+                        required_tokens_for_request,
+                        origin_input_len
+                        + min(
+                            decode_req.req.sampling_params.max_new_tokens,
+                            CLIP_MAX_NEW_TOKEN,
+                        )
+                        - retractable_tokens,
+                    )
                     break
-            allocatable_tokens -= required_tokens_for_request
-            dst_kv_indices = self._pre_alloc(decode_req.req)
+                if required_tokens_for_request > allocatable_tokens:
+                    blocked_reason = "prompt_kv"
+                    blocked_req = decode_req
+                    blocked_required_tokens = required_tokens_for_request
+                    break
+
+                if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get() and isinstance(
+                    self.token_to_kv_pool, HybridLinearKVPool
+                ):
+                    state_pool = self.req_to_token_pool.mamba_pool
+                    needed_slots = (
+                        int(decode_req.req.mamba_pool_idx is None)
+                        + (
+                            self.req_to_token_pool.mamba_ping_pong_track_buffer_size
+                            if decode_req.req.mamba_ping_pong_track_buffer is None
+                            else 0
+                        )
+                    )
+                    if state_pool.available_size() < needed_slots:
+                        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+                        self.tree_cache.evict(
+                            EvictParams(
+                                num_tokens=0,
+                                mamba_num=(
+                                    needed_slots - state_pool.available_size()
+                                ),
+                            )
+                        )
+                    if state_pool.available_size() < needed_slots:
+                        blocked_reason = "mamba_slots"
+                        blocked_req = decode_req
+                        break
+                allocatable_tokens -= required_tokens_for_request
+                dst_kv_indices = self._pre_alloc(decode_req.req)
 
             if self._async_progress_enabled and self.tp_size == 1:
                 decode_req.metadata_buffer_index = (

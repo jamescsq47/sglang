@@ -159,8 +159,15 @@ class PrefillBootstrapQueue:
         self.p2d_prebind_ablation = os.environ.get(
             "SGLANG_PD_ABLATION_P2D_PREBIND", "false"
         ).strip().lower() in {"1", "true", "yes", "on"}
-        if self.p2d_prebind_ablation and self.tp_size != 1:
-            raise ValueError("P->D pre-binding ablation currently requires TP=1")
+        self.p2d_native_prealloc_ablation = os.environ.get(
+            "SGLANG_PD_ABLATION_P2D_NATIVE_PREALLOC", "false"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if (
+            self.p2d_prebind_ablation or self.p2d_native_prealloc_ablation
+        ) and self.tp_size != 1:
+            raise ValueError(
+                "P->D destination-first ablation currently requires TP=1"
+            )
         if envs.SGLANG_AGENTIC_KV_LIFECYCLE.get() and not self.p_ready_dir:
             raise ValueError(
                 "SGLANG_AGENTIC_KV_LIFECYCLE requires SGLANG_PD_P_READY_DIR "
@@ -311,7 +318,11 @@ class PrefillBootstrapQueue:
     def _compute_ahead_enabled(self) -> bool:
         """Whether P may compute before a Decode receiver is preallocated."""
 
-        return bool(self.p_ready_dir and not self.p2d_prebind_ablation)
+        return bool(
+            self.p_ready_dir
+            and not self.p2d_prebind_ablation
+            and not self.p2d_native_prealloc_ablation
+        )
 
     def pop_bootstrapped(
         self,
