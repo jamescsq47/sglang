@@ -1,0 +1,25 @@
+{
+  "files": [
+    {
+      "source_repository": "DualPD",
+      "source_revision": "fd9dbb5",
+      "original": "late_binding_router.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/router/late_binding_router.py",
+      "sha256": "f6813d64b8f6321bd4e20bc6a78ed3f6d2b2f1e85d9278d65f05a5de4d2c1990"
+    },
+    {
+      "source_repository": "DualPD",
+      "source_revision": "fd9dbb5",
+      "original": "scripts/cluster/global_pd_router.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/router/global_pd_router.py",
+      "sha256": "a08197e0de26960b63fc7ec477aee86c50ee759d8e132806c7d1cfa51d8534f8"
+    },
+    {
+      "source_repository": "slime",
+      "source_revision": "82e18c19e21a85e0ef3dc1a52784d2fa4f788173",
+      "original": "examples/pd/late_binding_router.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/router/legacy_mamba_pinned.py",
+      "sha256": "71e07a334b09ae201100f9a6e8bd60b6caa78fb23b133c301a58b4d8ca73c4f4"
+    }
+  ]
+}
