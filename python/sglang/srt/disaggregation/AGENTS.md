@@ -3,7 +3,7 @@
 Before modifying files in this directory for the custom agentic PD pipeline,
 read the complete design source of truth at:
 
-`/home/shangy/dualpd/DualPD/src/dualpd/docs/AGENTIC_PD_DESIGN_INVARIANTS.md`
+`/home/shangy/dualpd/DualPD/docs/AGENTIC_PD_DESIGN_INVARIANTS.md`
 
 All agentic P→D/D→P Direct, Shared Host Arena, TP coordination, allocator,
 Radix ownership, and scheduler changes must preserve its eight acceptance
