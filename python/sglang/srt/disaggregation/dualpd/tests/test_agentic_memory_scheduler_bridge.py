@@ -9,7 +9,6 @@ from sglang.srt.disaggregation.agentic_memory_authority import (
 )
 from sglang.srt.disaggregation.agentic_memory_scheduler_bridge import (
     AgenticPMemorySchedulerBridge,
-    memory_authority_v2_enabled,
 )
 
 
@@ -37,11 +36,6 @@ class FakeAllocator:
         assert set(values).issubset(self.live)
         self.live.difference_update(values)
         self.free_values.extend(values)
-
-
-def test_v2_flag_is_default_off(monkeypatch):
-    monkeypatch.delenv("SGLANG_AGENTIC_MEMORY_AUTHORITY_V2", raising=False)
-    assert not memory_authority_v2_enabled()
 
 
 def test_controller_binds_then_scheduler_only_adopts_ready_lease():

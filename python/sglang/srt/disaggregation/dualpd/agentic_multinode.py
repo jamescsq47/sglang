@@ -386,18 +386,6 @@ def validate_multinode_runtime(server_args, kv_pool=None) -> Optional[MultiNodeC
     return config
 
 
-def control_poll_interval(
-    environ: Optional[Mapping[str, str]] = None,
-) -> None:
-    """Compatibility hook for the old single-node watcher.
-
-    V2 never turns a local file watcher into a shared-filesystem poller.  The
-    function remains importable so disabled/single-node ``pd_mamba`` modules
-    keep their original edge-triggered behavior.
-    """
-    return None
-
-
 def source_host_placement(
     tp_size: int, recovery_domain: int
 ) -> Optional[tuple[int, list[int]]]:

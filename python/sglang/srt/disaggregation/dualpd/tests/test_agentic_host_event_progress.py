@@ -5,7 +5,7 @@ from types import SimpleNamespace as NS
 import pytest
 
 from sglang.srt.disaggregation.agentic_host_staging import AgenticPHostStagingManager as Manager
-from sglang.srt.disaggregation.test_agentic_h2d_decoupling import (
+from sglang.srt.disaggregation.dualpd.tests.test_agentic_h2d_decoupling import (
     manager, prepared_manager_and_scheduler,
 )
 from sglang.srt.managers.scheduler import Scheduler

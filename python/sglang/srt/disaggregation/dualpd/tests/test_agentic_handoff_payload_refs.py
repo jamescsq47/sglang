@@ -13,7 +13,7 @@ from sglang.srt.disaggregation.agentic_group_transfer import (
 from sglang.srt.disaggregation.agentic_transfer_queues import (
     FenceKind, PhysicalProgress, PhysicalState, TransferPath,
 )
-from sglang.srt.disaggregation.test_agentic_group_transfer import (
+from sglang.srt.disaggregation.dualpd.tests.test_agentic_group_transfer import (
     command, make_queues, wait_phase,
 )
 

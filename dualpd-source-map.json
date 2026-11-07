@@ -39,7 +39,8 @@
     {
       "original": "python/sglang/srt/disaggregation/agentic_host_staging.py",
       "path": "python/sglang/srt/disaggregation/dualpd/agentic_host_staging.py",
-      "sha256": "f4f0465bb94a7a920fdefb17bc782ab499cfe1e7102c0321ac1f760ceed9208b"
+      "sha256": "f4f0465bb94a7a920fdefb17bc782ab499cfe1e7102c0321ac1f760ceed9208b",
+      "current_sha256": "7c17443d5f9e484ed4fad4eb401de6d23a4caec841aa94e39dc98f2babcab589"
     },
     {
       "original": "python/sglang/srt/disaggregation/agentic_host_transfer.py",
@@ -79,12 +80,14 @@
     {
       "original": "python/sglang/srt/disaggregation/agentic_memory_scheduler_bridge.py",
       "path": "python/sglang/srt/disaggregation/dualpd/agentic_memory_scheduler_bridge.py",
-      "sha256": "8d606641b5e22444669327563a8a2bec02d0f633aeddc52b409bc9cb414ae1cc"
+      "sha256": "8d606641b5e22444669327563a8a2bec02d0f633aeddc52b409bc9cb414ae1cc",
+      "current_sha256": "65be02026687896c24f30b4dc3ffd47111f17dc0dbef6c6d34376eb9603f1905"
     },
     {
       "original": "python/sglang/srt/disaggregation/agentic_multinode.py",
       "path": "python/sglang/srt/disaggregation/dualpd/agentic_multinode.py",
-      "sha256": "ca18be27cea95d3c96cb6303089b2176daa3bd67520f6d9c5e547e73f9db02d2"
+      "sha256": "ca18be27cea95d3c96cb6303089b2176daa3bd67520f6d9c5e547e73f9db02d2",
+      "current_sha256": "eed49ae0deef70b56bb7856ea68a85882c3dc9f039dc56d9dfca18171b4cee60"
     },
     {
       "original": "python/sglang/srt/disaggregation/agentic_multinode_composite.py",
@@ -163,208 +166,215 @@
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_app_termination.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_app_termination.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_app_termination.py",
       "sha256": "6806b0a31ea59bd3ba948096ad69afdb79294921ea30c138a9ef982c99c91b08"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_cuda_worker.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_cuda_worker.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_cuda_worker.py",
       "sha256": "028de96d16d5751676dcd01a3505fb02cb7e06d2bad0e215a13b1b4a664929ec"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_decode_memory_bridge.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_decode_memory_bridge.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_decode_memory_bridge.py",
       "sha256": "c5fefe00ff71f5d09bda5c92752696709329dfdb5268847c778c372cd7390927"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_default_physical_provider.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_default_physical_provider.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_default_physical_provider.py",
       "sha256": "bcf7616ea78066b571ba95940e187b791abd7737f9463349a70ecf1975413019"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_dma_descriptors.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_dma_descriptors.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_dma_descriptors.py",
       "sha256": "edd616f93840fbf5db096a447888cad90e4eb09aee2dc706ad049de46e6f12f0"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_final_host_cleanup.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_final_host_cleanup.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_final_host_cleanup.py",
       "sha256": "1307ffe395287cdecb8133eccf9747f33a5d92390c878bf805f90836627ba804"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_group_protocol.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_group_protocol.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_group_protocol.py",
       "sha256": "050e6ca8e36bf09512524a95c1083ff3509c30e57c32c05f2be7a877c69c4f57"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_group_transfer.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_group_transfer.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_group_transfer.py",
       "sha256": "86455e5d3928e76081a28c288e6463227c3efd57f26095fe79ae78788155bea3"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_h2d_decoupling.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_h2d_decoupling.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_h2d_decoupling.py",
       "sha256": "6d4c3835bd6935c58c2cea818bc184c876ba79bd2d528f282d2edbce00254b1e"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_handoff_payload_refs.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_handoff_payload_refs.py",
-      "sha256": "c213bd2b090f3e52abefcae09a408b7d72996e302a4c48a59b9c7c279517873e"
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_handoff_payload_refs.py",
+      "sha256": "c213bd2b090f3e52abefcae09a408b7d72996e302a4c48a59b9c7c279517873e",
+      "current_sha256": "4efacb711d03897c439eec5152928e6453b218e56075ea04a5f07b94e16e9e57"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_host_async_prepare.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_host_async_prepare.py",
-      "sha256": "62e62036363f4e7d8a488d3533e61f14d6fa60b18b0ce2427e30916e8028f1cd"
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_host_async_prepare.py",
+      "sha256": "62e62036363f4e7d8a488d3533e61f14d6fa60b18b0ce2427e30916e8028f1cd",
+      "current_sha256": "8c49d891114875ada7b71578bff860f646f62a694c20844325be332e108b387c"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_host_event_progress.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_host_event_progress.py",
-      "sha256": "e3848d73e951b4d4e54ff7a76aef53394b768fd50a1bc95ff8fe038f106906d8"
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_host_event_progress.py",
+      "sha256": "e3848d73e951b4d4e54ff7a76aef53394b768fd50a1bc95ff8fe038f106906d8",
+      "current_sha256": "02c2e2a4b5fca7dd0da463632735ed0cebfb78004d43b7b31ebaf51fbb9b217b"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_host_transfer.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_host_transfer.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_host_transfer.py",
       "sha256": "63b62d66b24830a869e8fa720c2f5750c7e38cd79cd4fbf6b52a434aa99c3f88"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_hybrid_dma.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_hybrid_dma.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_hybrid_dma.py",
       "sha256": "2213ca8355a3359a5bbc4a8db11e81e550c0322b3fcbf2b935150e86e56bb951"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_integration_safety.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_integration_safety.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_integration_safety.py",
       "sha256": "036caee79253b3cdee9b28672f4afaaa31c0522072fa526be0c8f55883fcde33"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_kv_lifecycle.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_kv_lifecycle.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_kv_lifecycle.py",
       "sha256": "3a9cdc1e3708dd8efd4528a97f4144836cfac946c230c302994700b08ac5ac1b"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_mamba_prefill.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_mamba_prefill.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_mamba_prefill.py",
       "sha256": "91d12e59ab48cff1acf72dd79acf01b94eff284c3e4798dc40994bbbb8ae2031"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_mamba_resident_admission.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_mamba_resident_admission.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_mamba_resident_admission.py",
       "sha256": "e560b9402d3c56e54887c06b5ab00bb5736414136063a0bd4a6b966897622911"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_memory_authority.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_memory_authority.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_memory_authority.py",
       "sha256": "3b47efb98dd1f4b12595626d25d0b26d537e8e2270ca7c7319e8bd2533f19a2c"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_memory_scheduler_bridge.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_memory_scheduler_bridge.py",
-      "sha256": "f628c9aa7dad9e7fe86e3d4b724c33e194b74b8057974e11d0b64c505631b721"
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_memory_scheduler_bridge.py",
+      "sha256": "f628c9aa7dad9e7fe86e3d4b724c33e194b74b8057974e11d0b64c505631b721",
+      "current_sha256": "c6348b69b9fdc2e6c947798069fe4b1d44d3ad5ede5b835463f3f8bbfce597d9"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_memory_usage_snapshot.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_memory_usage_snapshot.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_memory_usage_snapshot.py",
       "sha256": "eecc0bb0e22f6c7ffc6b982d424aa028ef3f509593422cf89c194b6618afce93"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_multinode.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_multinode.py",
-      "sha256": "4e8c0c9cadf2c72a29ec0db11596e8c9d604f231b45bfcb97ab2b92587e0fc48"
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_multinode.py",
+      "sha256": "4e8c0c9cadf2c72a29ec0db11596e8c9d604f231b45bfcb97ab2b92587e0fc48",
+      "current_sha256": "6820d5de0a82f63e6c95294ef67d1f05c4cc310659524aaf3bfe5343cae38794"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_multinode_composite.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_multinode_composite.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_multinode_composite.py",
       "sha256": "fe436c06b04b1da706d81e8d89fcb6802a898b880bda8b58febb4c88935677c8"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_multinode_policy.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_multinode_policy.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_multinode_policy.py",
       "sha256": "08c7f2e66900602cd27efbd7024aa873d0e9497290dacfc7988dd603c091a611"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_multinode_runtime.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_multinode_runtime.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_multinode_runtime.py",
       "sha256": "8b8c3f33f3ec8749f3cb21268bef57bf39097e2e2ffda6bbd09f7fe3a99e71e2"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_multinode_scheduler_shell.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_multinode_scheduler_shell.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_multinode_scheduler_shell.py",
       "sha256": "80fbad7c7c74b27f95b0c837d48797e865e6938a1170caa5f69c74d07e5612b2"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_native_memory_adapter.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_native_memory_adapter.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_native_memory_adapter.py",
       "sha256": "2640407fe28f542e1db0efd234cc80cb12b8d5753deb9301433cde6a9a32ba92"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_nixl_direct_adapter.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_nixl_direct_adapter.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_nixl_direct_adapter.py",
       "sha256": "56b7491d209014dbb8370903f1a1b3b1851380ea5600deb21c639c212055c3f5"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_prompt_checkpoint.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_prompt_checkpoint.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_prompt_checkpoint.py",
       "sha256": "26cc7308212f32712e5b5b2943cb7ca068d67acd50bd95f96ac7c04574781bf3"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_remote_host.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_remote_host.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_remote_host.py",
       "sha256": "3dd08ef5e492b13666754dcae044ed002d386c5b267723d0c85b1147212bdcd8"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_request_owned_mamba.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_request_owned_mamba.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_request_owned_mamba.py",
       "sha256": "f4e0d632f1207d71a761544c96b813d70953c7153391abfbfad99dd58063c829"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_slow_congestion.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_slow_congestion.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_slow_congestion.py",
       "sha256": "1213bbcd7400ba22e70bac0369014232f16e6751d4cc6c2ad2e793e9ab0c9797"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_source_host.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_source_host.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_source_host.py",
       "sha256": "22b8d3e2732bcc1e891729ac0e93b1b6cb486e81b3aedb586949bbe63a6921f0"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_startup_prewarm.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_startup_prewarm.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_startup_prewarm.py",
       "sha256": "1e10ce3caaa9f988fe44112d79287495bbc41d5d33064c0d80c1a62c7417b218"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_token_content_hash.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_token_content_hash.py",
-      "sha256": "709a653729931c4890125e71ca63c46cc6b05ea16819a6fb628e1f2fe83f549a"
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_token_content_hash.py",
+      "sha256": "709a653729931c4890125e71ca63c46cc6b05ea16819a6fb628e1f2fe83f549a",
+      "current_sha256": "0582c2ff13e86b5df3e734728aa0a10fc546569edd17d1be4e41a3c07d445cc0"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_token_page_hashes.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_token_page_hashes.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_token_page_hashes.py",
       "sha256": "f735bc50ecfd2a2dec7b49b61d35dc83b124d4f6163b25a18ef165fc1d43f64a"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_tp.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_tp.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_tp.py",
       "sha256": "edc4d43b44527c02b950dabf948aa14ebf4b9f2bf2ab64817d7f9239905debd1"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_tp_foreign_host_readiness.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_tp_foreign_host_readiness.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_tp_foreign_host_readiness.py",
       "sha256": "95ca0a056cd618a7053f0b6bac43cd7e7cbe90260f228c4ba76541872886afcd"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_tp_host_cancel_control.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_tp_host_cancel_control.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_tp_host_cancel_control.py",
       "sha256": "0b6b33546e094abe21eabca5ba3d8e189433a7a3ede72fa9f090be0b79f80c00"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_tp_host_commit_order.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_tp_host_commit_order.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_tp_host_commit_order.py",
       "sha256": "c6e1421e86653d5d8bfb1112aa03ce7b1788222aab5ec6a9d1ef749793ce0031"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_transfer_queues.py",
-      "path": "python/sglang/srt/disaggregation/dualpd/test_agentic_transfer_queues.py",
+      "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_transfer_queues.py",
       "sha256": "18e90fba36a90c698f00b4f0e5c1a070fec1c045253f970fe554ec287e9a091d"
     }
-  ]
+  ],
+  "refactor_validation": "tools/verify_dualpd_cleanup.py"
 }

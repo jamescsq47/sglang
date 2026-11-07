@@ -46,7 +46,7 @@ def test_unknown_setting_does_not_silently_disable(monkeypatch):
 def test_hash_off_host_admission_still_rejects_short_parent(monkeypatch):
     from types import SimpleNamespace as NS
     from sglang.srt.disaggregation.agentic_kv_lifecycle import RequestGeneration
-    from sglang.srt.disaggregation.test_agentic_h2d_decoupling import manager
+    from sglang.srt.disaggregation.dualpd.tests.test_agentic_h2d_decoupling import manager
     from sglang.srt.managers.scheduler import AgenticPWorksetLeaseBroker
 
     monkeypatch.setenv("SGLANG_AGENTIC_KV_TOKEN_CONTENT_HASH", "false")

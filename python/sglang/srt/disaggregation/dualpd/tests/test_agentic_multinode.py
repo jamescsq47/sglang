@@ -9,7 +9,7 @@ import pytest
 
 
 def _module():
-    path = pathlib.Path(__file__).with_name("agentic_multinode.py")
+    path = pathlib.Path(__file__).resolve().parents[1] / "agentic_multinode.py"
     spec = importlib.util.spec_from_file_location("agentic_multinode_v2_unit", path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module

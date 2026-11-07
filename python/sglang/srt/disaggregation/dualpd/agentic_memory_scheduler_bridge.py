@@ -10,7 +10,6 @@ network endpoint or allocates the same workset again.
 The module is opt-in and has no import-time effect on the pd_mamba path.
 """
 
-import os
 import threading
 import itertools
 from collections import deque
@@ -23,13 +22,6 @@ from sglang.srt.disaggregation.agentic_memory_authority import (
     PhysicalMemoryLease,
     RequestGenerationAttempt,
 )
-
-
-def memory_authority_v2_enabled() -> bool:
-    return os.getenv("SGLANG_AGENTIC_MEMORY_AUTHORITY_V2", "0").lower() in {
-        "1",
-        "true",
-    }
 
 
 @dataclass(frozen=True)
