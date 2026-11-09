@@ -5,7 +5,8 @@
       "source_revision": "fd9dbb5",
       "original": "late_binding_router.py",
       "path": "python/sglang/srt/disaggregation/dualpd/router/late_binding_router.py",
-      "sha256": "f6813d64b8f6321bd4e20bc6a78ed3f6d2b2f1e85d9278d65f05a5de4d2c1990"
+      "sha256": "f6813d64b8f6321bd4e20bc6a78ed3f6d2b2f1e85d9278d65f05a5de4d2c1990",
+      "current_sha256": "fa5a1298a0e8afe1e4b426ee8ab85688d1f1c9f49b6ba08f595147bc05f11e06"
     },
     {
       "source_repository": "DualPD",
@@ -21,5 +22,6 @@
       "path": "python/sglang/srt/disaggregation/dualpd/router/legacy_mamba_pinned.py",
       "sha256": "71e07a334b09ae201100f9a6e8bd60b6caa78fb23b133c301a58b4d8ca73c4f4"
     }
-  ]
+  ],
+  "refactor_validation": "tools/verify_dualpd_router_cleanup.py"
 }

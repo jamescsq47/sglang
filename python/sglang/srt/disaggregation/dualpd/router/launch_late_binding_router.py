@@ -16,7 +16,8 @@ else:
     from pathlib import Path
 
     spec = importlib.util.spec_from_file_location(
-        "dualpd_engine_late_binding_router", Path(__file__).with_name("late_binding_router.py")
+        "dualpd_engine_late_binding_router", Path(__file__).with_name("late_binding_router.py"),
+        submodule_search_locations=[str(Path(__file__).parent)],
     )
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module

@@ -273,3 +273,35 @@ individual restoration, with process cleanup separately verified. This is a
 gross-regression pass, not statistical equivalence or validation of the known
 optional Relay error case or all model/TP configurations. Next is Router
 policy/admission/HTTP separation; all later stages remain required.
+
+## Local Router separation (performance gate pending)
+
+The local concrete Router now retains its constructor and select_pair, with
+capacity/shadow reservations, admission and HTTP orchestration in three
+method-only components (33/38/27 methods). All100 original method bodies and14
+top-level definitions reconstruct the complete original module against09911f4.
+There is one concrete state/lock owner and no new constructor or super call in
+the mixins. Shared records, enum aliases and historical logger identity survive
+both canonical imports and the private file-as-package historical overlay.
+Only three existing private _sync_json_get test hooks move to their defining
+module; assertions remain exact.
+
+The Router verifier rejects extra executable statements and unbound runtime
+globals, in addition to checking exact definition ASTs and allowed import owners.
+Twenty-six focused tests cover MRO, aliases, old pickle references, annotation
+resolution, dynamic parsing, a fresh overlay process and12 destructive in-memory
+mutations. Independent code review and an independent26/26 rerun return GO;
+Full gates subsequently pass208 frontend+481 engine tests and2 subtests
+(691 JUnit records); node2700 native/Router regression passes716 tests+2 subtests
+and2 actual H100 DMA roundtrips. No failures/errors/skips occur. The actual frozen
+BrowseComp comparison remains pending.
+The frontend source verifier distinguishes11 directly compared original serving
+ASTs from the one completely reconstructed Router AST; it does not skip the
+Router's body. Both TCP and pinned legacy implementations remain byte-identical.
+
+This step changes no physical ownership, DMA fences, workset credits, timeout,
+cancel joins, reservations, queue priorities or TP decisions; eight-invariant
+mapping is recorded in router/README.md. Local state records still depend on
+native Host imports. TCP Router organization, Scheduler extraction, genuine
+control-plane dependency removal, configuration and launcher cleanup and final
+acceptance are not completed by this local-only change.

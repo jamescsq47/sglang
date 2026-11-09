@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 import orjson
 import sglang.srt.disaggregation.dualpd.router.late_binding_router as late_binding_router_module
+import sglang.srt.disaggregation.dualpd.router.local_capacity as local_capacity_module
 from sglang.srt.disaggregation.agentic_early_claim import AgenticEarlyClaimStore
 from sglang.srt.disaggregation.agentic_kv_lifecycle import (
     AgenticRequestMetadata,
@@ -3179,7 +3180,7 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
         router = self.make_router(Path("/dev/shm/test-ready"))
         loop_thread = threading.get_ident()
         worker_threads = []
-        original = late_binding_router_module._sync_json_get
+        original = local_capacity_module._sync_json_get
 
         def fetch(_url, _timeout):
             worker_threads.append(threading.get_ident())
@@ -3194,11 +3195,11 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
                 }
             ]
 
-        late_binding_router_module._sync_json_get = fetch
+        local_capacity_module._sync_json_get = fetch
         try:
             load = await router._fetch_decode_load_legacy(None, "http://d0")
         finally:
-            late_binding_router_module._sync_json_get = original
+            local_capacity_module._sync_json_get = original
 
         self.assertEqual(load.running, 6)
         self.assertEqual(load.used_tokens, 1234)
