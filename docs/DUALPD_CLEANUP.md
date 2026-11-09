@@ -80,7 +80,7 @@ The large Scheduler body and remaining Host transport code are not fully
 decoupled yet. Those are separate follow-ups requiring their own lifecycle
 tests; this pass does not delete reachable branches to meet a line-count goal.
 
-## Next stage: Host DMA ABI (performance gate pending)
+## Host DMA ABI (performance gate passed)
 
 `agentic_host_dma.py` owns the six CUDA ABI types/helpers and four process-local
 handle/cache/lock definitions formerly inline in Host staging. Their complete
@@ -111,5 +111,47 @@ The AST verifier now reconstructs ten DMA nodes as well as the nine ledger
 nodes and all remaining Host worker bodies. New CPU checks cover alias identity,
 Ampere/no-driver fallback, library lifetime/ABI shape, zero/mismatched arrays,
 descriptor contents/lifetime, and both single and batch submission errors.
-The rest of Host arena/registration/workers, Router, Scheduler, configuration
+The DMA stage subsequently passed the same node2700 BrowseComp300+1200 check:
+Decode11246.55 token/s versus11265.01 baseline (−0.16%), Prefill74816.50,
+6682 completions,0 failures/scoped OOMs and GPU/port/FUSE cleanup all0.
+Parent reuse99.992% differs only by one harness terminal-parser repair: its
+17280 extra Prefill tokens exactly explain the shortfall. Fresh H100-host
+TP/Host/Mamba/integration fault suites also passed373+42=415 tests. This is
+fixture-based native-import validation, not TP>1 full-model performance.
+
+The rest of Host arena/workers, Router, Scheduler, configuration
 and maintained/archival launcher organization remain outstanding stages.
+
+## Host registration and prewarm (performance gate pending)
+
+`agentic_host_registration.py` owns mapping authentication, the persistent
+registered-window cache and startup prewarm. Ten complete top-level AST nodes
+are identical to the pre-cleanup reference, including window/user references,
+zero-ref LRU eviction, partial-acquire rollback, stale-inode reclamation and
+startup manifests/failure records. The historical logger identity is retained.
+All ten former Host-staging names remain aliases to the canonical objects;
+hybrid DMA continues to use the same cache lock and lookup. Private global
+rebinding hooks now target the defining module; the three existing startup
+tests change only that import, not assertions. No configuration selector,
+default, supported fallback or local/TCP path is removed.
+
+Ownership mapping: registration prepares addressability, not snapshot ownership.
+P/D/Host remain their existing owners; only the unchanged caller CUDA fence and
+ledger commit permit transfer/release. Successful acquire keeps refs until the
+existing caller releases them. Capacity/register failures unwind newly acquired
+refs; unregister failure leaves the affected cache entry intact and raises.
+Startup timeout/failure publishes the existing failed record, not completion.
+Cancellation and shutdown still wait for caller physical fences before mapping
+or allocator release; startup-pinned mappings remain process-lifetime resources.
+No new queue, Forward wait, TP decision, admission deadline or rescheduling rule
+is introduced. Invariants1–4 and6–7 retain all lifecycle bodies;5 retains all
+thread/wait behavior;8 requires the new capacity/lifetime/fault tests, independent
+audit and a real same-configuration throughput comparison before the next part.
+
+Sixteen new CPU cases exercise alias/logger identity, overlapping references,
+fully referenced cache exhaustion, register/unregister failures, live-reference
+stale-inode protection, real libc memfd authentication/mapping and prewarm error
+publication. The existing three startup topology cases now run without importing
+the heavy worker module. AST validation rejects executable additions other than
+the exact historical logger binding. Remaining arena/snapshot/manager cleanup
+and all later stages still require their own performance acceptance.

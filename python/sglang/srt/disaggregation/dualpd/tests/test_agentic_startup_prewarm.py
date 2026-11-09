@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from sglang.srt.disaggregation import agentic_host_staging as staging
+from sglang.srt.disaggregation import agentic_host_registration as staging
 
 
 class _FakeMapping:

@@ -40,7 +40,7 @@
       "original": "python/sglang/srt/disaggregation/agentic_host_staging.py",
       "path": "python/sglang/srt/disaggregation/dualpd/agentic_host_staging.py",
       "sha256": "f4f0465bb94a7a920fdefb17bc782ab499cfe1e7102c0321ac1f760ceed9208b",
-      "current_sha256": "c2b3d25044b03babb3eb71db0daadc4417e127e78627da92caff3b683bc4a2f5"
+      "current_sha256": "7d7d8e85f1077132b2e327684de4568d409d60e1e514286d8ce84a0d2a3ce8ce"
     },
     {
       "original": "python/sglang/srt/disaggregation/agentic_host_transfer.py",
@@ -337,7 +337,8 @@
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_startup_prewarm.py",
       "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_startup_prewarm.py",
-      "sha256": "1e10ce3caaa9f988fe44112d79287495bbc41d5d33064c0d80c1a62c7417b218"
+      "sha256": "1e10ce3caaa9f988fe44112d79287495bbc41d5d33064c0d80c1a62c7417b218",
+      "current_sha256": "dba3d06c0f8fd7838f85ce3e2699253dacc581e80820a7ee0d993b8f7d65dc93"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_token_content_hash.py",

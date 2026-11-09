@@ -22,6 +22,13 @@ DMA_NAMES = {
     "_cuda_memcpy_async", "_cuda_driver_batch_memcpy", "_cuda_batch_memcpy_async",
     "_CUDA_RUNTIME", "_CUDA_RUNTIME_LOCK", "_CUDA_DRIVER_BATCH", "_CUDA_DRIVER_BATCH_LOCK",
 }
+REGISTRATION_NAMES = {
+    "_is_memfd_backing_path", "_validate_shared_host_backing_path",
+    "_open_shared_host_backing", "_RegisteredHostArenaMapping",
+    "_REGISTERED_HOST_ARENAS", "_REGISTERED_HOST_ARENAS_LOCK",
+    "_REGISTERED_HOST_PREWARM_PINS", "_registered_host_arena",
+    "_write_startup_prewarm_record", "start_registered_host_arena_startup_prewarm",
+}
 
 
 def original(name):
@@ -38,6 +45,8 @@ def label(node):
         return node.name
     if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
         return node.targets[0].id
+    if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+        return node.target.id
     return None
 
 
@@ -75,7 +84,21 @@ def verify():
                  and not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant)
                           and isinstance(n.value.value, str))]
     assert not extra_dma, "Unexpected executable code in extracted DMA module"
-    assert dump(module_body(original("agentic_host_staging.py"), exclude=LEDGER_NAMES | DMA_NAMES, imports=False)) == dump(
+    registration = ast.parse(current("agentic_host_registration.py"))
+    expected_registration = [n for n in old.body if label(n) in REGISTRATION_NAMES]
+    actual_registration = [n for n in registration.body if label(n) in REGISTRATION_NAMES]
+    assert len(expected_registration) == len(actual_registration) == len(REGISTRATION_NAMES)
+    assert dump(expected_registration) == dump(actual_registration), "Host registration/cache/prewarm branches changed"
+    registration_logger = ast.parse(
+        'logger = logging.getLogger("sglang.srt.disaggregation.agentic_host_staging")'
+    ).body[0]
+    extra_registration = [n for n in registration.body
+                          if label(n) not in REGISTRATION_NAMES
+                          and not isinstance(n, (ast.Import, ast.ImportFrom))
+                          and not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant)
+                                   and isinstance(n.value.value, str))]
+    assert len(extra_registration) == 1 and dump(extra_registration[0]) == dump(registration_logger)
+    assert dump(module_body(original("agentic_host_staging.py"), exclude=LEDGER_NAMES | DMA_NAMES | REGISTRATION_NAMES, imports=False)) == dump(
         module_body(current("agentic_host_staging.py"), imports=False)), "Host DMA/worker logic changed"
 
     old_bridge = ast.parse(original("agentic_memory_scheduler_bridge.py"))
@@ -106,6 +129,10 @@ def verify():
             "sglang.srt.disaggregation.test_agentic_",
             "sglang.srt.disaggregation.dualpd.tests.test_agentic_")
         assert dump(ast.parse(expected_test)) == dump(ast.parse(current("tests/" + name)))
+    expected_prewarm_test = original("test_agentic_startup_prewarm.py").replace(
+        "import agentic_host_staging as staging", "import agentic_host_registration as staging"
+    )
+    assert dump(ast.parse(expected_prewarm_test)) == dump(ast.parse(current("tests/test_agentic_startup_prewarm.py")))
     # All other relocated source/test files remain byte-identical. Current
     # hashes are explicit for the reviewed transformations above.
     source_map = json.loads((ROOT / "dualpd-source-map.json").read_text())
@@ -113,7 +140,7 @@ def verify():
                if "current_sha256" in item}
     assert changed == {"agentic_host_staging.py", "agentic_memory_scheduler_bridge.py",
                        "agentic_multinode.py", "test_agentic_memory_scheduler_bridge.py",
-                       "test_agentic_multinode.py"} | cross_import_tests, changed
+                       "test_agentic_multinode.py", "test_agentic_startup_prewarm.py"} | cross_import_tests, changed
     # Inventory literal environment keys across every extension implementation,
     # including both Router variants. Only the proven no-op selector disappears.
     before = subprocess.check_output([
@@ -132,10 +159,11 @@ def verify():
         "reference_commit": BASE,
         "ledger_nodes_ast_identical": len(LEDGER_NAMES),
         "dma_nodes_ast_identical": len(DMA_NAMES),
+        "registration_nodes_ast_identical": len(REGISTRATION_NAMES),
         "host_dma_and_worker_ast_identical": True,
         "preserved_environment_identifiers": len(after_keys),
-        "runtime_changes": "ledger and CUDA ABI relocation; only two uncalled helpers removed",
-        "test_changes": "directory relocation, source lookup and obsolete helper assertion",
+        "runtime_changes": "ledger, CUDA ABI and registration relocation; only two uncalled helpers removed",
+        "test_changes": "directory relocation, source lookup, prewarm private-hook import and obsolete helper assertion",
     }
 
 
