@@ -162,7 +162,7 @@ Prefill75281.01,6667 completions,0 failures,100% parent reuse. Job-scoped OOM
 deltas were0 and final GPU/ports/helpers empty. This is not acceptance of later
 buffer or manager extractions.
 
-## Physical Host buffers and Arena (performance gate pending)
+## Physical Host buffers and Arena (performance gate passed)
 
 `agentic_host_buffers.py` now owns twelve exact function/class ASTs and the
 sixteen exact libc initialization nodes formerly in Host staging. These cover
@@ -198,3 +198,66 @@ extent release; a failed synchronization does not release the extent.
 Host managers/Relay/client role separation, Router policy/admission/HTTP,
 Scheduler extraction, pure control-plane dependencies, configuration parsing,
 maintained/archival launchers and final packaging/verification remain open.
+
+Physical buffers subsequently passed BrowseComp301.006+1200.000 seconds:
+Decode11254.37 token/s (−0.09% versus original baseline), Prefill75462.39,
+6688 completions,0 failures,100% parent reuse. Scoped OOM deltas0 and final
+GPU/ports/helpers empty; independent SSH confirms controllers gone and GPU0.
+Whole-run event sets match11338 P→D Host five-stage IDs and21628 D→P Direct
+send/receive/source-release IDs. All9 measured-window D→P Host durables restore
+and release;128 additional durables occur only during controlled drain without
+individual restoration, with final process cleanup separately verified.
+
+## D Host writer and optional Relay (performance gate pending)
+
+`agentic_host_writer.py` owns four exact top-level AST nodes: the one
+`_LEDGER_ENTRY_UNSET` sentinel, `_cleanup_nixl_room`, `AgenticDRelayWorker` and
+`AgenticDHostStagingClient`. Staging reexports the same sentinel/classes/helper;
+the keyword default and identity branch thus share one object. Writer imports
+leaf ledger/buffer/DMA and lifecycle/base/utils directly, never staging. The
+historical logger is unchanged. Old pickle class paths resolve through aliases;
+newly serialized instances name the defining writer module. Existing test
+assertions and P-manager private hooks are unchanged.
+
+The first H100-host regression exposed an overly strong new cold-import fixture
+assertion (556 passed,1 failed): the accepted pre-writer commit a41aab254 already
+initializes CUDA on visible H100 during cold Host import. A traced first lazy
+initialization comes from unchanged `sglang.srt.utils.common` importing installed
+`sgl_kernel`, whose architecture query calls `torch.cuda.current_device()`.
+No production fix is appropriate for pure relocation. The new test instead uses
+two fresh processes: unchanged native base/utils dependencies versus cold writer,
+asserting equal CUDA initialization and no staging cycle before checking aliases.
+This preserves CPU no-extra-init coverage and checks actual native parity;
+it does not claim that heavy engine dependencies are CUDA-independent.
+
+Ownership mapping: the writer retains D source responsibility until its existing
+bounded D2H fences, CPU commits and complete ledger/TP commit report host_ready;
+it never frees request HBM itself. Before-submit failure retries without moving
+ownership; partial submission drains the armed physical fence, or quarantines
+all refs for process lifetime if no completion fence exists. CPU/unregister
+errors retain their existing cleanup carrier and lane until retry. Capacity,
+cancellation, peer abort and failed drain ACK retain the existing grant/source
+protocol. No new Forward/Direct/Slow wait or TP decision is introduced; all
+state/CAS/fence branches remain exact AST, covering invariant1–7 preservation.
+Invariant8 requires CPU/fault tests, independent audit and full BrowseComp before
+advancing. Preservation is not a claim that every historical optional path is
+defect-free.
+
+Independent scoping found a pre-existing optional-Relay risk: `_fail_active`
+publishes fallback in finally even when `_finish_active` synchronization fails.
+It remains unchanged in this pure extraction. New Relay ordering tests cover the
+physically successful cleanup case, not that exceptional failure. A semantic
+repair requires separate fault analysis and audit rather than an unreviewed
+change hidden in relocation. This stage's benchmark keeps Relay disabled as in
+the original baseline; it cannot validate that optional failure case.
+
+Final writer pre-model gates pass208 frontend+455 engine tests and2 subtests
+(665 JUnit records),557 native H100-host fault/import fixtures and2 actual tiny
+registered/bounce roundtrips. The overlay SciPy import also had one transient
+child crash during an intermediate CPU gate: both unchanged overlay variants
+passed separately, then the complete gate passed without environment/assertion
+changes. Diagnostic history is retained in frontend reports
+`host-writer-import-evidence.json`; no failed gate is counted as a pass. Exact
+code and revised test have independent GO; the model plan/performance is still
+pending. Host/P-manager internals, Router, Scheduler, control-plane dependencies,
+configuration, maintained/archival launchers and final verification remain open.

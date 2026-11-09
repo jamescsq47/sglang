@@ -40,7 +40,7 @@
       "original": "python/sglang/srt/disaggregation/agentic_host_staging.py",
       "path": "python/sglang/srt/disaggregation/dualpd/agentic_host_staging.py",
       "sha256": "f4f0465bb94a7a920fdefb17bc782ab499cfe1e7102c0321ac1f760ceed9208b",
-      "current_sha256": "e42cb01a855d43bd58b2eaeaef7f3276823a97ccac2cb420515a9d4c764798ca"
+      "current_sha256": "9b36eaf809c03424e659b2485404bc4bd9ec7d5cc2a1b0bbbcca35bc561ce3df"
     },
     {
       "original": "python/sglang/srt/disaggregation/agentic_host_transfer.py",

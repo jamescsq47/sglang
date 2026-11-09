@@ -36,6 +36,10 @@ BUFFER_NAMES = {
     "LayerFirstD2HStaging", "SharedMHAHostSnapshot", "PinnedMHAHostBounce",
     "LazySharedMHAHostSnapshot", "SharedHostSnapshotArena",
 }
+WRITER_NAMES = {
+    "_LEDGER_ENTRY_UNSET", "_cleanup_nixl_room",
+    "AgenticDRelayWorker", "AgenticDHostStagingClient",
+}
 
 
 def original(name):
@@ -126,8 +130,18 @@ def verify():
                      and not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant)
                               and isinstance(n.value.value, str))]
     assert len(extra_buffers) == 1 and dump(extra_buffers[0]) == dump(registration_logger)
+    writer = ast.parse(current("agentic_host_writer.py"))
+    expected_writer = [n for n in old.body if label(n) in WRITER_NAMES]
+    actual_writer = [n for n in writer.body if label(n) in WRITER_NAMES]
+    assert len(expected_writer) == len(actual_writer) == len(WRITER_NAMES)
+    assert dump(expected_writer) == dump(actual_writer), "D writer/Relay/sentinel branches changed"
+    extra_writer = [n for n in writer.body if label(n) not in WRITER_NAMES
+                    and not isinstance(n, (ast.Import, ast.ImportFrom))
+                    and not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant)
+                             and isinstance(n.value.value, str))]
+    assert len(extra_writer) == 1 and dump(extra_writer[0]) == dump(registration_logger)
     old_remaining = [n for n in old.body if n not in old_initializers
-                     and label(n) not in LEDGER_NAMES | DMA_NAMES | REGISTRATION_NAMES | BUFFER_NAMES
+                     and label(n) not in LEDGER_NAMES | DMA_NAMES | REGISTRATION_NAMES | BUFFER_NAMES | WRITER_NAMES
                      and not isinstance(n, (ast.Import, ast.ImportFrom))]
     assert dump(old_remaining) == dump(
         module_body(current("agentic_host_staging.py"), imports=False)), "Host DMA/worker logic changed"
@@ -217,10 +231,11 @@ def verify():
         "dma_nodes_ast_identical": len(DMA_NAMES),
         "registration_nodes_ast_identical": len(REGISTRATION_NAMES),
         "buffer_nodes_ast_identical": len(BUFFER_NAMES),
+        "writer_nodes_ast_identical": len(WRITER_NAMES),
         "libc_initializer_nodes_ast_identical": len(old_initializers),
         "host_dma_and_worker_ast_identical": True,
         "preserved_environment_identifiers": len(after_keys),
-        "runtime_changes": "ledger, CUDA ABI, registration and physical buffer relocation; only two uncalled helpers removed",
+        "runtime_changes": "ledger, CUDA ABI, registration, physical buffer and D writer relocation; only two uncalled helpers removed",
         "test_changes": "directory relocation, source lookup, defining-module private hooks and obsolete helper assertion",
     }
 
