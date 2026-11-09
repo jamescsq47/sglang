@@ -274,7 +274,7 @@ gross-regression pass, not statistical equivalence or validation of the known
 optional Relay error case or all model/TP configurations. Next is Router
 policy/admission/HTTP separation; all later stages remain required.
 
-## Local Router separation (performance gate pending)
+## Local Router separation (performance gate passed)
 
 The local concrete Router now retains its constructor and select_pair, with
 capacity/shadow reservations, admission and HTTP orchestration in three
@@ -305,3 +305,14 @@ mapping is recorded in router/README.md. Local state records still depend on
 native Host imports. TCP Router organization, Scheduler extraction, genuine
 control-plane dependency removal, configuration and launcher cleanup and final
 acceptance are not completed by this local-only change.
+
+The actual router-local-r1 comparison subsequently passes300.861+1200.001
+seconds: Decode11206.66 token/s (−0.52% versus ORIGINAL baseline), Prefill75201.48,
+6668 completions,0 failures,100% parent reuse. Scoped events0 and GPU/port/helper
+cleanup all0; independent SSH confirms both owned controller/launcher gone.
+Whole-run ownership sets match12418 P→D Host snapshots across five stages and
+21503 D→P Direct send/receive/source releases. All141 D→P Host durables match D
+source release;10 measured durables restore/release,131 additional durables occur
+only during controlled drain without individual restoration. Process cleanup is
+separate evidence. This is a gross-regression pass, not statistical equivalence,
+TCP model-path validation or completion of later stages.
