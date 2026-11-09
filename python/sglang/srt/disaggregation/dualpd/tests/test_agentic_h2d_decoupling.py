@@ -14,6 +14,7 @@ from sglang.srt.disaggregation.agentic_kv_lifecycle import RequestGeneration
 from sglang.srt.disaggregation.agentic_kv_lifecycle import token_ids_digest
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.managers import scheduler as sched_module
+from sglang.srt.disaggregation import agentic_workset as workset_module
 from sglang.srt.managers.scheduler import Scheduler, AgenticPWorksetLeaseBroker
 
 
@@ -185,8 +186,8 @@ def test_both_slow_and_direct_preserve_index_readiness_sync(monkeypatch):
         def alloc(self, n): return torch.arange(n)
         def free(self, x): pass
     calls = []
-    original = sched_module.kv_to_page_indices
-    monkeypatch.setattr(sched_module, 'kv_to_page_indices', lambda *a: calls.append(True) or original(*a))
+    original = workset_module.kv_to_page_indices
+    monkeypatch.setattr(workset_module, 'kv_to_page_indices', lambda *a: calls.append(True) or original(*a))
     broker = AgenticPWorksetLeaseBroker(page_size=4)
     broker.request('slow:0', 4, 8, owner=broker.slow_owner('slow:0', 'rid'))
     broker.request('direct:0', 4, 8, owner=broker.direct_owner('direct:0'))

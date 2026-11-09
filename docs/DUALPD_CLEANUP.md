@@ -35,8 +35,9 @@ The original `sglang-src/pd` tree and baseline environments are not modified.
 
 The verifier inventories all literal SGLang environment identifiers across the
 extension and both Router variants. Only the proven no-op memory-authority
-helper selector disappears. Native `environ.py`, scheduler, model and allocator
-integration files are unchanged in this cleanup.
+helper selector disappears. Native `environ.py`, model and allocator integration
+files remain unchanged. Scheduler was unchanged through the Router stages; the
+workset stage below now has an explicit whole-native-module reconstruction.
 
 ## Ownership and failure mapping
 
@@ -79,6 +80,30 @@ This is not performance acceptance of the later changes described below.
 The large Scheduler body and remaining Host transport code are not fully
 decoupled yet. Those are separate follow-ups requiring their own lifecycle
 tests; this pass does not delete reachable branches to meet a line-count goal.
+
+## Scheduler physical worksets (intermediate gate, not stage completion)
+
+The complete AgenticPWorksetLease and AgenticPWorksetLeaseBroker definitions
+move together into canonical agentic_workset.py. Four lease properties and
+39 broker methods retain identical ASTs. Native Scheduler reexports both at
+their old definition position, preserving eager annotations in its early-Direct
+record. Two exact __module__ assignments retain historical serialization
+identity without importing Scheduler back. The early-Direct record, native
+mixed integration hooks and all other Scheduler code remain unchanged.
+
+The new scheduler verifier reconstructs the entire original native module
+against a995eb0, checks exact leaf imports/identities/runtime global bindings,
+and permits only the broker-specific readiness hook retarget in the existing
+H2D fixture. The source map includes one explicit same-path native entry, not
+a filename exemption. Complete parent+suffix allocation, hybrid slot rollback,
+attempt fencing, binding/handoff, cancellation and immutable TP retirement are
+the same implementation. No ownership transition, release rule or progress wait
+changes. See ../DualPD/docs/WORKSET_EXTRACTION.md for all eight invariants.
+
+Structural/mutation and native Scheduler/TP/Mamba faults are required, followed
+by independent code/plan GO and a separate frozen BrowseComp comparison.
+Direct progress, TP coordination, ready/admission and later cleanup stages
+remain open; moving these two classes does not complete Scheduler cleanup.
 
 ## Host DMA ABI (performance gate passed)
 

@@ -208,7 +208,8 @@
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_h2d_decoupling.py",
       "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_h2d_decoupling.py",
-      "sha256": "6d4c3835bd6935c58c2cea818bc184c876ba79bd2d528f282d2edbce00254b1e"
+      "sha256": "6d4c3835bd6935c58c2cea818bc184c876ba79bd2d528f282d2edbce00254b1e",
+      "current_sha256": "d10b0b965a7a0da1d84615274615170d08034a9f26bf8465e000ac2a21a147ef"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_handoff_payload_refs.py",
@@ -378,6 +379,12 @@
       "original": "python/sglang/srt/disaggregation/test_agentic_transfer_queues.py",
       "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_transfer_queues.py",
       "sha256": "18e90fba36a90c698f00b4f0e5c1a070fec1c045253f970fe554ec287e9a091d"
+    },
+    {
+      "original": "python/sglang/srt/managers/scheduler.py",
+      "path": "python/sglang/srt/managers/scheduler.py",
+      "sha256": "46f5e6111cf8e7b05f8479220efef5338ecd9fed5adaa01e6b05980ce61771f3",
+      "current_sha256": "7ef3f95a6eab489c8bf8f59e4799eb4c253d483a7ec5ef7874854fd4a3bf8a61"
     }
   ],
   "refactor_validation": "tools/verify_dualpd_cleanup.py"
