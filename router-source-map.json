@@ -13,7 +13,8 @@
       "source_revision": "fd9dbb5",
       "original": "scripts/cluster/global_pd_router.py",
       "path": "python/sglang/srt/disaggregation/dualpd/router/global_pd_router.py",
-      "sha256": "a08197e0de26960b63fc7ec477aee86c50ee759d8e132806c7d1cfa51d8534f8"
+      "sha256": "a08197e0de26960b63fc7ec477aee86c50ee759d8e132806c7d1cfa51d8534f8",
+      "current_sha256": "8b3f8451f7e9aab67d4558a1e85a805ece456467f6b18fa3148dab66f2f22432"
     },
     {
       "source_repository": "slime",

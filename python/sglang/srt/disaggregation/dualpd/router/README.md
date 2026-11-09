@@ -12,6 +12,8 @@ sglang-router, never on DualPD or Slime. DualPD configures and launches them.
 | `local_types.py` / `local_config.py` | Shared records/logger and unchanged dynamic parsing helpers |
 | `launch_late_binding_router.py` | Local Router service startup/shutdown |
 | `global_pd_router.py` | TCP/group-protocol Router and callback HTTP endpoints |
+| `tcp_capacity.py` | TCP causal load epochs, shadow reservations and its distinct record |
+| `tcp_http.py` | TCP backend HTTP and generation retry lifetime, not local policy |
 | `legacy_mamba_router.py` | Explicit historical Mamba compatibility startup/adapter |
 | `legacy_mamba_pinned.py` | Immutable matched old Router; only used by that historical launcher |
 | `tests/` | Routing, admission, congestion and standalone-dependency tests |
@@ -64,3 +66,24 @@ resolution, canonical aliases, old pickle paths and a fresh-process historical
 overlay entry are checked separately. These checks do not establish a pure
 control plane: local records still import the existing Host state definitions;
 removing that native dependency is a later, explicit stage.
+
+## TCP Router organization in progress
+
+The concrete TCP root keeps eight methods: construction/close, provisional P
+selection, request-group annotations, room parsing and P-ready callback/waiting.
+Its capacity component has12 methods and owns the private Decode reservation
+record; its HTTP component has9 methods. There is still only one instance and
+one set of counters, queues, tasks and epochs. Neither helper imports the root,
+registers callbacks or creates a session/task on import. The three decorated
+callbacks, main and -m guard remain unchanged at the original service entry;
+the original aiohttp and send_application_final patch sites remain available.
+
+TCP capacity charges are hints, never physical ownership. Original TP memory
+authorities and DMA/ledger fences still authorize handoff and release. Exact
+method bodies preserve successful handoff, no-capacity waiting, causal sample
+retirement, timeout, cancellation/shielding, backend settlement and shutdown.
+Thus invariants1–4/6–7 have no new transition;5 has no new queue, blocking work
+or scheduling priority;8 still requires fault tests, independent GO and actual
+performance validation. The local frozen performance case does not exercise
+the TCP model path and must not be presented as such. Local and pinned policies
+are unchanged in this stage. TCP performance acceptance is still pending.

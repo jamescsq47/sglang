@@ -80,9 +80,9 @@ def import_specs(tree):
     return result
 
 
-def verify_global_bindings(source, tree, filename):
+def verify_global_bindings(source, tree, filename, *, definition_names=None):
     """AST reconstruction must not hide missing imports in relocated bodies."""
-    bound = set(definitions(tree)) | {
+    bound = set(definitions(tree) if definition_names is None else definition_names) | {
         "__name__", "__package__", "__file__", "__doc__", "__builtins__"
     }
     for node in tree.body:
@@ -100,6 +100,97 @@ def verify_global_bindings(source, tree, filename):
     visit(symtable.symtable(source, filename, "exec"))
     missing = referenced - bound - set(vars(builtins))
     assert not missing, (filename, "Unbound runtime globals", sorted(missing))
+
+
+def verify_tcp(overrides=None):
+    """Reconstruct TCP separately; retain every root callback and service guard."""
+    overrides = overrides or {}
+    def read(name):
+        return overrides[name] if name in overrides else (ROOT / REL / name).read_text()
+    old_source = original("global_pd_router.py")
+    old = ast.parse(old_source)
+    names = ("global_pd_router.py", "tcp_capacity.py", "tcp_http.py")
+    trees = {name: ast.parse(read(name)) for name in names}
+
+    def top(tree):
+        result = {}
+        for index, node in enumerate(tree.body):
+            if isinstance(node, (ast.Import, ast.ImportFrom)) or (index == 0 and is_doc(node)):
+                continue
+            name = label(node)
+            if name is None and isinstance(node, ast.If):
+                name = "service_guard"
+            assert name is not None and name not in result, "Extra/duplicate TCP executable node"
+            result[name] = node
+        return result
+
+    expected = top(old)
+    defs = {name: top(tree) for name, tree in trees.items()}
+    main = defs["global_pd_router.py"]
+    assert set(main) == set(expected) - {"_DecodeReservation"}
+    assert dump(trees["global_pd_router.py"].body[0]) == dump(old.body[0])
+    assert set(defs["tcp_capacity.py"]) == {"TCPCapacityMixin", "_DecodeReservation"}
+    assert set(defs["tcp_http.py"]) == {"TCPHTTPMixin"}
+    expected_imports = {
+        "global_pd_router.py": import_specs(old) - import_specs(ast.parse(
+            "import time, copy, uuid\nfrom dataclasses import dataclass\n"
+            "from fastapi.responses import ORJSONResponse, StreamingResponse")) | import_specs(ast.parse(
+            "from .tcp_capacity import TCPCapacityMixin, _DecodeReservation\n"
+            "from .tcp_http import TCPHTTPMixin")),
+        "tcp_capacity.py": import_specs(ast.parse(
+            "from __future__ import annotations\nimport asyncio, time, uuid\n"
+            "from dataclasses import dataclass\nimport aiohttp")),
+        "tcp_http.py": import_specs(ast.parse(
+            "from __future__ import annotations\nimport asyncio, copy, json, logging, uuid\n"
+            "import aiohttp\nfrom fastapi.responses import ORJSONResponse, StreamingResponse")),
+    }
+    for name, tree in trees.items():
+        assert import_specs(tree) == expected_imports[name], (name, "TCP import owners changed")
+        verify_global_bindings(read(name), tree, name, definition_names=set(defs[name]) - {"service_guard"})
+    record = defs["tcp_capacity.py"]["_DecodeReservation"]
+    assert dump(record) == dump(expected["_DecodeReservation"]), "TCP record changed"
+    concrete = main["GlobalEndpointMiniLoadBalancer"]
+    assert [ast.unparse(node) for node in concrete.bases] == [
+        "TCPCapacityMixin", "TCPHTTPMixin", "mini_lb_module.MiniLoadBalancer"]
+    moved = methods(concrete)
+    assert set(moved) == {"__init__", "close", "select_pair", "_annotate_prefill",
+                          "_annotate_decode", "_room", "publish_prefill_ready", "_wait_prefill_ready"}
+    counts = {}
+    for filename, name, count in [("tcp_capacity.py", "TCPCapacityMixin", 12),
+                                  ("tcp_http.py", "TCPHTTPMixin", 9)]:
+        cls = defs[filename][name]
+        assert not cls.bases and not cls.keywords and not cls.decorator_list
+        component = methods(cls)
+        assert len(component) == count and "__init__" not in component
+        assert not set(component) & set(moved)
+        assert not any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                       and node.func.id == "super" for node in ast.walk(cls))
+        moved.update(component)
+        counts[name] = len(component)
+    original_cls = expected["GlobalEndpointMiniLoadBalancer"]
+    old_methods = methods(original_cls)
+    assert len(moved) == len(old_methods) == 29 and moved.keys() == old_methods.keys()
+    for name, method in moved.items():
+        assert dump(method) == dump(old_methods[name]), (name, "TCP policy/lifecycle body changed")
+    rebuilt = copy.deepcopy(concrete)
+    rebuilt.bases = copy.deepcopy(original_cls.bases)
+    rebuilt.body = [moved[node.name] for node in original_cls.body]
+    assert dump(rebuilt) == dump(original_cls), "Complete TCP class does not reconstruct"
+    reconstructed = dict(main, _DecodeReservation=record, GlobalEndpointMiniLoadBalancer=rebuilt)
+    for name in expected:
+        assert dump(reconstructed[name]) == dump(expected[name]), (name, "TCP callback/main/guard changed")
+    tree = ast.Module(body=[reconstructed[label(node) or "service_guard"]
+                           if not isinstance(node, (ast.Import, ast.ImportFrom)) and not is_doc(node)
+                           else node for node in old.body], type_ignores=[])
+    assert dump(tree) == dump(old), "Complete TCP module does not reconstruct"
+    source_map = json.loads((ROOT / "router-source-map.json").read_text())
+    entry = next(item for item in source_map["files"] if item["path"].endswith("/global_pd_router.py"))
+    assert hashlib.sha256(old_source.encode()).hexdigest() == entry["sha256"]
+    assert original("tests/test_global_pd_router.py") == read("tests/test_global_pd_router.py"), "Existing TCP test source changed"
+    return {"methods_ast_identical": 29, "component_methods": counts,
+            "record_ast_identical": True, "complete_original_module_reconstructed": True,
+            "callbacks_main_and_service_guard_ast_identical": True,
+            "runtime_global_bindings_verified": True, "existing_tests_unchanged": True}
 
 
 def verify(overrides=None, *, return_tree=False):
@@ -206,6 +297,9 @@ def verify(overrides=None, *, return_tree=False):
               "runtime_global_bindings_verified": True,
               "standalone_loader_change": "same alias/native overlay; file-as-package search path only",
               "existing_test_change": "one defining-module import and three private hook references; assertions identical"}
+    if any(item["path"].endswith("/global_pd_router.py") and "current_sha256" in item
+           for item in source_map["files"]):
+        result["tcp_reconstruction"] = verify_tcp(overrides)
     return (result, reconstructed) if return_tree else result
 
 

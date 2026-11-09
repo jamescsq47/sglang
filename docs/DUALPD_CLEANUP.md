@@ -316,3 +316,31 @@ source release;10 measured durables restore/release,131 additional durables occu
 only during controlled drain without individual restoration. Process cleanup is
 separate evidence. This is a gross-regression pass, not statistical equivalence,
 TCP model-path validation or completion of later stages.
+
+## TCP Router separation (performance gate pending)
+
+The TCP concrete entry keeps8 methods plus its three decorated callbacks, main
+and service guard. Causal capacity/reservations (12 methods and the distinct
+slotted record) and backend HTTP/generation retry lifetime (9 methods) each have
+one method-only component. There are no new queues, tasks, constructors or
+ownership authorities. The complete29-method/record/module reconstruction and
+exact import-owner/global-binding proof pass; native app registration and the
+original aiohttp/send_application_final patch sites remain at the root. Neither
+helper imports the root back; fresh -m startup registers each callback once.
+Local Router and pinned legacy policy bodies are unchanged.
+
+Original15 tests pass without editing their source. New22 cases include12
+destructive mutations, record aliases/annotations/old pickle paths, fresh lazy
+helper/service entry, streaming/backend failure cleanup, close/ready cancellation,
+capacity rejection and actual ASGI callback dispatch with causal sample retirement.
+An initial new fixture used unsupported protocol0 for a slotted instance; the
+unchanged record requires protocol>=2. The corrected fixture preserves that
+TypeError and tests historical class/instance paths with protocols0/2. No runtime
+workaround or original assertion change occurred. See frontend evidence JSON.
+The final focused37 pass and an independent37/37 rerun gives code audit GO.
+Full gates pass208 frontend+503 engine+2 subtests (713 JUnit records),738 native
+H100-host tests+2 subtests (740 records), and2 actual H100 DMA roundtrips.
+Nine model/TP launch plans also match. The frozen local nonregression comparison
+remains pending and cannot certify a TCP model run; later representative TCP
+model-path coverage and all Scheduler/control-plane/config/launcher/final work
+remain open.
