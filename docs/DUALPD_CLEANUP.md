@@ -317,7 +317,7 @@ only during controlled drain without individual restoration. Process cleanup is
 separate evidence. This is a gross-regression pass, not statistical equivalence,
 TCP model-path validation or completion of later stages.
 
-## TCP Router separation (performance gate pending)
+## TCP Router separation (local regression passed; TCP model coverage pending)
 
 The TCP concrete entry keeps8 methods plus its three decorated callbacks, main
 and service guard. Causal capacity/reservations (12 methods and the distinct
@@ -344,3 +344,14 @@ Nine model/TP launch plans also match. The frozen local nonregression comparison
 remains pending and cannot certify a TCP model run; later representative TCP
 model-path coverage and all Scheduler/control-plane/config/launcher/final work
 remain open.
+
+The subsequent frozen local regression passes300.855+1200.000 seconds:
+Decode11203.87 token/s (−0.54% versus ORIGINAL baseline), Prefill75023.20,
+6660 completions,0 failures,100% reuse, scoped memory events0 and empty GPU/
+port/helper final gates. Both owned controllers are independently confirmed
+gone. Ownership event sets match12054 P2D Host and21362 D2P Direct snapshots;
+all10 measured D2P Host durables restore/release,138 only-drain durables are
+documented separately. Tail sampled liveness progress1294413 spans116.169 seconds
+inside the final120-second interval; the separate harness rolling counter is
+1319512. The original measurement code is unchanged. This is local nonregression
+acceptance only; actual TCP model-path representative coverage remains required.
