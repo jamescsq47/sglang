@@ -208,7 +208,7 @@ send/receive/source-release IDs. All9 measured-window D→P Host durables restor
 and release;128 additional durables occur only during controlled drain without
 individual restoration, with final process cleanup separately verified.
 
-## D Host writer and optional Relay (performance gate pending)
+## D Host writer and optional Relay (performance gate passed)
 
 `agentic_host_writer.py` owns four exact top-level AST nodes: the one
 `_LEDGER_ENTRY_UNSET` sentinel, `_cleanup_nixl_room`, `AgenticDRelayWorker` and
@@ -261,3 +261,15 @@ changes. Diagnostic history is retained in frontend reports
 code and revised test have independent GO; the model plan/performance is still
 pending. Host/P-manager internals, Router, Scheduler, control-plane dependencies,
 configuration, maintained/archival launchers and final verification remain open.
+
+Writer subsequently passed BrowseComp301.030+1200.020 seconds: Decode11214.24
+token/s (−0.45% versus ORIGINAL baseline), Prefill74889.97,6671 completions,
+0 failures,100% parent reuse. Scoped memory-event deltas0; GPU/ports/helpers
+empty and independent SSH confirms controllers gone/GPU0/job OOM0. Whole-run
+event sets match12008 P→D Host snapshots at all five stages and21496 D→P Direct
+send/receive/source-release IDs. All15 measured-window D→P Host durables restore
+and release;141 additional durables occur only in controlled drain with no
+individual restoration, with process cleanup separately verified. This is a
+gross-regression pass, not statistical equivalence or validation of the known
+optional Relay error case or all model/TP configurations. Next is Router
+policy/admission/HTTP separation; all later stages remain required.
