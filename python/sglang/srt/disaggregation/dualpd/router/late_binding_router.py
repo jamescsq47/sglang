@@ -33,11 +33,11 @@ from sglang.srt.disaggregation.agentic_kv_lifecycle import (
     RequestGeneration,
     unpack_agentic_extra_key,
 )
-from sglang.srt.disaggregation.agentic_host_staging import (
+from .local_dependencies import (
     HostStageState,
     SharedHostStagingLedger,
 )
-from sglang.srt.disaggregation.p2d_host_staging import (
+from .local_dependencies import (
     P2D_CUSTOM_PREFILL_DOMAIN,
     P2D_CUSTOM_SNAPSHOT_ID,
     p2d_snapshot_id,

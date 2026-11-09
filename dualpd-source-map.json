@@ -162,7 +162,8 @@
     {
       "original": "python/sglang/srt/disaggregation/p2d_host_staging.py",
       "path": "python/sglang/srt/disaggregation/dualpd/p2d_host_staging.py",
-      "sha256": "57b3713117d9a5e27978fa7fe4ab192caeb70e3c42444377a86e6d9b9b3d1c78"
+      "sha256": "57b3713117d9a5e27978fa7fe4ab192caeb70e3c42444377a86e6d9b9b3d1c78",
+      "current_sha256": "728c8203153bb43be6b376407fe1a929722426c9f57a000593e896423b2d0f37"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_app_termination.py",

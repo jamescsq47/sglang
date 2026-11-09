@@ -10,6 +10,7 @@ from pathlib import Path
 import subprocess
 
 from verify_dualpd_scheduler_cleanup import verify as verify_scheduler
+from verify_dualpd_control_dependencies import verify as verify_control_dependencies
 
 ROOT = Path(__file__).resolve().parents[1]
 BASE = "bc67aa0814364f2c7ce3df3f83f9d5ff013c5b5f"
@@ -84,6 +85,7 @@ def buffer_initializers(tree):
 
 
 def verify():
+    control_dependencies = verify_control_dependencies()
     old = ast.parse(original("agentic_host_staging.py"))
     ledger = ast.parse(current("agentic_host_ledger.py"))
     expected = [n for n in old.body if label(n) in LEDGER_NAMES]
@@ -217,7 +219,7 @@ def verify():
     source_map = json.loads((ROOT / "dualpd-source-map.json").read_text())
     changed = {item["original"].rsplit("/", 1)[-1] for item in source_map["files"]
                if "current_sha256" in item}
-    assert changed == {"agentic_host_staging.py", "agentic_memory_scheduler_bridge.py",
+    assert changed == {"agentic_host_staging.py", "p2d_host_staging.py", "agentic_memory_scheduler_bridge.py",
                        "agentic_multinode.py", "test_agentic_memory_scheduler_bridge.py",
                        "test_agentic_multinode.py", "test_agentic_startup_prewarm.py",
                        "scheduler.py", "test_agentic_h2d_decoupling.py",
@@ -249,6 +251,7 @@ def verify():
         "libc_initializer_nodes_ast_identical": len(old_initializers),
         "host_dma_and_worker_ast_identical": True,
         "scheduler_reconstruction": verify_scheduler(),
+        "control_dependency_reconstruction": control_dependencies,
         "preserved_environment_identifiers": len(after_keys),
         "environment_inventory_scope": "extension_and_entire_native_scheduler",
         "runtime_changes": "ledger, CUDA ABI, registration, physical buffer and D writer relocation; only two uncalled helpers removed",

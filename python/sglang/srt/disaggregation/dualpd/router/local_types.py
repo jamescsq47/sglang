@@ -5,7 +5,7 @@ import logging
 import asyncio
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
-from sglang.srt.disaggregation.agentic_host_staging import HostStageState
+from .local_dependencies import HostStageState
 
 logger = logging.getLogger(
     __package__ if __package__ == "dualpd_engine_late_binding_router"

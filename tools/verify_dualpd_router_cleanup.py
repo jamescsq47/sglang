@@ -7,6 +7,7 @@ import ast
 import builtins
 import copy
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 import subprocess
@@ -195,6 +196,11 @@ def verify_tcp(overrides=None):
 
 def verify(overrides=None, *, return_tree=False):
     overrides = overrides or {}
+    spec = importlib.util.spec_from_file_location(
+        "router_control_dependency_proof", ROOT / "tools/verify_dualpd_control_dependencies.py")
+    control_proof = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(control_proof)
+    control_result = control_proof.verify(router_overrides=overrides)
     def read(name):
         return overrides[name] if name in overrides else (ROOT / REL / name).read_text()
     old_source = original("late_binding_router.py")
@@ -202,6 +208,16 @@ def verify(overrides=None, *, return_tree=False):
     expected = definitions(old)
     trees = {name: ast.parse(read(name)) for name in
              ["late_binding_router.py", "local_types.py", "local_config.py", *PARTS]}
+    # The separate whole-module proof above validates all six exact relocations.
+    # Invert only their import owners before the original complete reconstruction.
+    for tree in trees.values():
+        for node in tree.body:
+            if isinstance(node, ast.ImportFrom) and node.module == "local_dependencies":
+                names = tuple(a.name for a in node.names)
+                node.module = ("sglang.srt.disaggregation.p2d_host_staging"
+                               if names == control_proof.PROTOCOL else
+                               "sglang.srt.disaggregation.agentic_host_staging")
+                node.level = 0
     defs = {name: definitions(tree) for name, tree in trees.items()}
     main = defs["late_binding_router.py"]
     assert set(main) == {"logger", "LateBindingMiniLoadBalancer"}
@@ -292,6 +308,7 @@ def verify(overrides=None, *, return_tree=False):
     local = next(item for item in source_map["files"] if item["path"].endswith("/late_binding_router.py"))
     assert hashlib.sha256(old_source.encode()).hexdigest() == local["sha256"], "Reference provenance changed"
     result = {"reference_commit": BASE, "local_methods_ast_identical": 100,
+              "control_dependency_reconstruction": control_result,
               "component_methods": counts, "moved_top_level_nodes_ast_identical": 14,
               "complete_original_module_reconstructed": True,
               "runtime_global_bindings_verified": True,

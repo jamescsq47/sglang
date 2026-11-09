@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Optional
 import aiohttp
 import orjson
-from sglang.srt.disaggregation.agentic_host_staging import HostStageState
+from .local_dependencies import HostStageState
 
 from .local_types import (
     DecodeLoad,

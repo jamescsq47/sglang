@@ -12,8 +12,8 @@ from sglang.srt.disaggregation.agentic_kv_lifecycle import (
     AgenticRequestMetadata,
     RequestGeneration,
 )
-from sglang.srt.disaggregation.agentic_host_staging import HostStageState
-from sglang.srt.disaggregation.p2d_host_staging import (
+from .local_dependencies import HostStageState
+from .local_dependencies import (
     P2D_CUSTOM_PREFILL_DOMAIN,
     P2D_CUSTOM_SNAPSHOT_ID,
     p2d_snapshot_id,

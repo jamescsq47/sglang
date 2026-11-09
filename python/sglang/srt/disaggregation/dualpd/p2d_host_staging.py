@@ -23,6 +23,12 @@ from typing import Any, Optional
 
 import torch
 
+from sglang.srt.disaggregation.p2d_host_protocol import (
+    P2D_CUSTOM_SNAPSHOT_ID,
+    P2D_CUSTOM_PREFILL_DOMAIN,
+    p2d_snapshot_id,
+)
+
 from sglang.srt.disaggregation.agentic_host_staging import (
     H2DLaunchFence,
     HostStageState,
@@ -41,8 +47,6 @@ from sglang.srt.disaggregation.base import KVPoll
 
 logger = logging.getLogger(__name__)
 
-P2D_CUSTOM_SNAPSHOT_ID = "agentic_p2d_host_snapshot_id"
-P2D_CUSTOM_PREFILL_DOMAIN = "agentic_p2d_prefill_domain"
 # P->D Host snapshots are not evictable.  This is a reservation ceiling (the
 # environment variable retains its legacy ``HARD_WATERMARK`` name), not an
 # eviction watermark, so the default exposes the complete physical arena.
@@ -83,10 +87,6 @@ def _raise_if_p2d_host_failed(
         )
 
 
-def p2d_snapshot_id(bootstrap_room: int) -> str:
-    """Return a collision-free id in the direction-specific ledger."""
-
-    return f"p2d:{int(bootstrap_room)}"
 
 
 def p2d_snapshot_from_req(req) -> Optional[str]:

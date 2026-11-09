@@ -408,3 +408,41 @@ run's one barrier fixture failure is retained; only two defining-module patch
 targets and an import were corrected, with original-test AST reconstruction.
 Independent portable36-case rerun passes. There is no changed production barrier
 or weakened assertion. Snapshot and nine model/TP launch-plan checks also pass.
+
+Scheduler components subsequently pass the complete300.588+1200.012-second
+BrowseComp comparison: Decode11238.17 token/s, −0.24% versus ORIGINAL baseline;
+Prefill74979.20,100% parent reuse, no execution failure/OOM and empty final
+GPU/port/helper gates. Independent ownership/full-request/cleanup audit accepts
+this local TP1 regression, not actual TCP/TP2/hybrid model coverage.
+
+## Control-plane dependency boundaries
+
+Local Router consumers now share a five-binding local_dependencies module.
+Maintained imports reference the existing pure agentic_host_ledger and the new
+p2d_host_protocol containing only two unchanged wire keys and the unchanged ID
+helper. Public worker aliases retain historical import/pickle paths; the helper
+naturally belongs to the pure protocol. No state, policy, queue, ownership or
+physical-transfer implementation moves into the Router. Only the historical
+private file-package may fall back to its selected old worker modules, and only
+for an exact missing requested leaf; nested/parent/import/runtime errors propagate.
+
+verify_dualpd_control_dependencies.py locks the entire four consumer modules,
+complete worker and protocol, import timing and reviewed bridge againsta550.
+Existing Host/Scheduler/Router reconstruction proofs remain active. Nine portable
+dependency tests and three destructive-proof test groups are in the CPU gate;
+two additional native tests cover actual public aliases/pickle and a genuinely
+missing-leaf legacy overlay. The first legacy test incorrectly assumed a
+namespace package has __file__; its fixture now checks the exact sole resolved
+__path__, retaining all native-namespace/object/source checks and the initial
+failed report. Full CPU passes813 JUnit records with zero failures/errors/skips.
+Final native, independent code audit, actual CUDA and fresh300+1200 acceptance
+remain separate gates. No representative TCP or hybrid model run is claimed.
+
+Final native r2 passes1018 JUnit records (981 ordinary+37 subtests), including
+all prior969 record names and all new import/mutation/real-legacy cases; no
+failures/errors/skips. Independent code audit returns GO bound to runtime bundle
+34823ae87f11255a661a85dcfdda82a7e8a304fce208457573b6a2a6eaf46b0c.
+Actual DMA and model comparison still require their own recorded results.
+
+The two actual H100 registered/bounce D2H→H2D roundtrips subsequently pass2/2
+without skips. The frozen BrowseComp model comparison is next, not yet accepted.
