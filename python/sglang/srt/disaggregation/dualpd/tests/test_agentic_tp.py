@@ -17,6 +17,7 @@ import pytest
 import torch
 import sglang.srt.disaggregation.prefill as prefill_module
 import sglang.srt.disaggregation.agentic_host_staging as host_staging_module
+import sglang.srt.disaggregation.agentic_host_buffers as host_buffers_module
 import sglang.srt.disaggregation.p2d_host_staging as p2d_host_module
 
 from sglang.srt.disaggregation.agentic_host_staging import (
@@ -4509,7 +4510,7 @@ def test_lazy_shared_host_extent_enospc_never_touches_sparse_pages(monkeypatch):
         memset_called = True
 
     monkeypatch.setattr(os, "posix_fallocate", fail_fallocate)
-    monkeypatch.setattr(host_staging_module, "_HOST_MEMSET", record_memset)
+    monkeypatch.setattr(host_buffers_module, "_HOST_MEMSET", record_memset)
     try:
         with pytest.raises(OSError) as error:
             snapshot.prefault_for_write()

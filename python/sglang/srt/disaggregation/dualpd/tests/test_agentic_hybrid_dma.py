@@ -8,6 +8,7 @@ import tempfile
 import numpy as np
 
 import sglang.srt.disaggregation.agentic_hybrid_dma as dma
+import sglang.srt.disaggregation.agentic_host_buffers as buffers
 from sglang.srt.disaggregation.agentic_host_staging import H2DLaunchFence
 from sglang.srt.managers.scheduler import AgenticPWorksetLeaseBroker
 
@@ -35,7 +36,7 @@ def test_actual_arena_lazy_materializes_hybrid_layout_once(monkeypatch, host_are
             assert snapshot._materialized is None
             assert tuple(indices) == tuple(range(1, slots + 1))
         return NS(state_slots=kwargs.get("state_slots", 1), set_state_indices=install, close=lambda **kwargs: None)
-    monkeypatch.setattr(host, "SharedMHAHostSnapshot", factory)
+    monkeypatch.setattr(buffers, "SharedMHAHostSnapshot", factory)
     if slots:
         indices = np.arange(1, slots + 1)
         snapshot.set_state_indices(indices)
@@ -59,7 +60,7 @@ def test_lazy_state_failure_closes_unpublished_inner(monkeypatch, host_arena):
         snapshot.set_state_indices([1, 3])
     def fail(indices):
         raise RuntimeError("state install failure")
-    monkeypatch.setattr(host, "SharedMHAHostSnapshot", lambda **kwargs: NS(
+    monkeypatch.setattr(buffers, "SharedMHAHostSnapshot", lambda **kwargs: NS(
         set_state_indices=fail, close=lambda **kwargs: closed.append(kwargs)))
     with pytest.raises(RuntimeError, match="state install failure"):
         snapshot.materialize()
@@ -79,7 +80,7 @@ def test_lazy_hybrid_default_h2d_mirrors_once_after_materialize(monkeypatch, hos
         assert "state_slots" not in kwargs  # D2P defaults to one slot.
         return NS(state_slots=1, set_state_indices=lambda values: installs.append(tuple(values)),
                   close=lambda **kwargs: None)
-    monkeypatch.setattr(host, "SharedMHAHostSnapshot", factory)
+    monkeypatch.setattr(buffers, "SharedMHAHostSnapshot", factory)
     device_indices = object()  # Simulate the GPU vector without requiring CUDA.
     def mirror(value):
         assert value is device_indices
@@ -122,7 +123,7 @@ def test_hybrid_host_retry_rebinds_only_after_composite_fence(monkeypatch, host_
     inner.__dict__.update(device_pool=pool, state_slots=1, state_indices=None,
                           _closed=False, _state_bounce_refs=None)
     inner.close = lambda **kwargs: None
-    monkeypatch.setattr(host, "SharedMHAHostSnapshot", lambda **kwargs: inner)
+    monkeypatch.setattr(buffers, "SharedMHAHostSnapshot", lambda **kwargs: inner)
     record = {"snapshot": snapshot, "loading": True}
     lease = NS(state_device_indices=(torch.tensor([7]),))
     event = NS(done=False, query=lambda: event.done, synchronize=lambda: None)

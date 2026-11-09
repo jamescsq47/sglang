@@ -29,6 +29,13 @@ REGISTRATION_NAMES = {
     "_REGISTERED_HOST_PREWARM_PINS", "_registered_host_arena",
     "_write_startup_prewarm_record", "start_registered_host_arena_startup_prewarm",
 }
+BUFFER_NAMES = {
+    "_registered_indexed_batch_copy", "_device_indices_to_host",
+    "_create_agentic_host_memfd", "_copy_layer_first_host_range",
+    "HostCopyWorkerPool", "H2DLaunchFence", "_concrete_kv_pool_device",
+    "LayerFirstD2HStaging", "SharedMHAHostSnapshot", "PinnedMHAHostBounce",
+    "LazySharedMHAHostSnapshot", "SharedHostSnapshotArena",
+}
 
 
 def original(name):
@@ -60,6 +67,14 @@ def module_body(source, *, exclude=(), imports=True):
     return [n for n in ast.parse(source).body
             if label(n) not in exclude
             and (imports or not isinstance(n, (ast.Import, ast.ImportFrom)))]
+
+
+def buffer_initializers(tree):
+    start = next(i for i, n in enumerate(tree.body) if label(n) == "_HOST_LIBC")
+    end = next(i for i, n in enumerate(tree.body) if label(n) == "_CUDA_MEMCPY_DEVICE_TO_HOST")
+    result = tree.body[start:end + 1]
+    assert len(result) == 16, "Host libc initializer block changed"
+    return result
 
 
 def verify():
@@ -98,7 +113,23 @@ def verify():
                           and not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant)
                                    and isinstance(n.value.value, str))]
     assert len(extra_registration) == 1 and dump(extra_registration[0]) == dump(registration_logger)
-    assert dump(module_body(original("agentic_host_staging.py"), exclude=LEDGER_NAMES | DMA_NAMES | REGISTRATION_NAMES, imports=False)) == dump(
+    buffers = ast.parse(current("agentic_host_buffers.py"))
+    old_initializers, new_initializers = buffer_initializers(old), buffer_initializers(buffers)
+    assert dump(old_initializers) == dump(new_initializers), "Host libc ABI/defaults changed"
+    expected_buffers = [n for n in old.body if label(n) in BUFFER_NAMES]
+    actual_buffers = [n for n in buffers.body if label(n) in BUFFER_NAMES]
+    assert len(expected_buffers) == len(actual_buffers) == len(BUFFER_NAMES)
+    assert dump(expected_buffers) == dump(actual_buffers), "Snapshot/buffer/fence/extent branches changed"
+    extra_buffers = [n for n in buffers.body if n not in new_initializers
+                     and label(n) not in BUFFER_NAMES
+                     and not isinstance(n, (ast.Import, ast.ImportFrom))
+                     and not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant)
+                              and isinstance(n.value.value, str))]
+    assert len(extra_buffers) == 1 and dump(extra_buffers[0]) == dump(registration_logger)
+    old_remaining = [n for n in old.body if n not in old_initializers
+                     and label(n) not in LEDGER_NAMES | DMA_NAMES | REGISTRATION_NAMES | BUFFER_NAMES
+                     and not isinstance(n, (ast.Import, ast.ImportFrom))]
+    assert dump(old_remaining) == dump(
         module_body(current("agentic_host_staging.py"), imports=False)), "Host DMA/worker logic changed"
 
     old_bridge = ast.parse(original("agentic_memory_scheduler_bridge.py"))
@@ -133,6 +164,31 @@ def verify():
         "import agentic_host_staging as staging", "import agentic_host_registration as staging"
     )
     assert dump(ast.parse(expected_prewarm_test)) == dump(ast.parse(current("tests/test_agentic_startup_prewarm.py")))
+    buffer_hook_tests = {
+        "test_agentic_dma_descriptors.py": [
+            ("import agentic_host_staging as host_module", "import agentic_host_buffers as host_module"),
+        ],
+        "test_agentic_tp.py": [
+            ("import sglang.srt.disaggregation.agentic_host_staging as host_staging_module",
+             "import sglang.srt.disaggregation.agentic_host_staging as host_staging_module\n"
+             "import sglang.srt.disaggregation.agentic_host_buffers as host_buffers_module"),
+            ('monkeypatch.setattr(host_staging_module, "_HOST_MEMSET", record_memset)',
+             'monkeypatch.setattr(host_buffers_module, "_HOST_MEMSET", record_memset)'),
+        ],
+        "test_agentic_hybrid_dma.py": [
+            ("import sglang.srt.disaggregation.agentic_hybrid_dma as dma",
+             "import sglang.srt.disaggregation.agentic_hybrid_dma as dma\n"
+             "import sglang.srt.disaggregation.agentic_host_buffers as buffers"),
+            ('monkeypatch.setattr(host, "SharedMHAHostSnapshot",',
+             'monkeypatch.setattr(buffers, "SharedMHAHostSnapshot",'),
+        ],
+    }
+    for name, replacements in buffer_hook_tests.items():
+        expected_test = original(name)
+        for before, after in replacements:
+            assert before in expected_test, (name, before)
+            expected_test = expected_test.replace(before, after)
+        assert dump(ast.parse(expected_test)) == dump(ast.parse(current("tests/" + name))), name
     # All other relocated source/test files remain byte-identical. Current
     # hashes are explicit for the reviewed transformations above.
     source_map = json.loads((ROOT / "dualpd-source-map.json").read_text())
@@ -140,7 +196,7 @@ def verify():
                if "current_sha256" in item}
     assert changed == {"agentic_host_staging.py", "agentic_memory_scheduler_bridge.py",
                        "agentic_multinode.py", "test_agentic_memory_scheduler_bridge.py",
-                       "test_agentic_multinode.py", "test_agentic_startup_prewarm.py"} | cross_import_tests, changed
+                       "test_agentic_multinode.py", "test_agentic_startup_prewarm.py"} | cross_import_tests | set(buffer_hook_tests), changed
     # Inventory literal environment keys across every extension implementation,
     # including both Router variants. Only the proven no-op selector disappears.
     before = subprocess.check_output([
@@ -160,10 +216,12 @@ def verify():
         "ledger_nodes_ast_identical": len(LEDGER_NAMES),
         "dma_nodes_ast_identical": len(DMA_NAMES),
         "registration_nodes_ast_identical": len(REGISTRATION_NAMES),
+        "buffer_nodes_ast_identical": len(BUFFER_NAMES),
+        "libc_initializer_nodes_ast_identical": len(old_initializers),
         "host_dma_and_worker_ast_identical": True,
         "preserved_environment_identifiers": len(after_keys),
-        "runtime_changes": "ledger, CUDA ABI and registration relocation; only two uncalled helpers removed",
-        "test_changes": "directory relocation, source lookup, prewarm private-hook import and obsolete helper assertion",
+        "runtime_changes": "ledger, CUDA ABI, registration and physical buffer relocation; only two uncalled helpers removed",
+        "test_changes": "directory relocation, source lookup, defining-module private hooks and obsolete helper assertion",
     }
 
 

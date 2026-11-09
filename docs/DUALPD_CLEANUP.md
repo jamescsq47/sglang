@@ -122,7 +122,7 @@ fixture-based native-import validation, not TP>1 full-model performance.
 The rest of Host arena/workers, Router, Scheduler, configuration
 and maintained/archival launcher organization remain outstanding stages.
 
-## Host registration and prewarm (performance gate pending)
+## Host registration and prewarm (performance gate passed)
 
 `agentic_host_registration.py` owns mapping authentication, the persistent
 registered-window cache and startup prewarm. Ten complete top-level AST nodes
@@ -155,3 +155,46 @@ publication. The existing three startup topology cases now run without importing
 the heavy worker module. AST validation rejects executable additions other than
 the exact historical logger binding. Remaining arena/snapshot/manager cleanup
 and all later stages still require their own performance acceptance.
+
+Registration subsequently passed the same node2700 BrowseComp300+1200 gate:
+Decode11220.31 token/s versus11265.01 original baseline (−0.40%),
+Prefill75281.01,6667 completions,0 failures,100% parent reuse. Job-scoped OOM
+deltas were0 and final GPU/ports/helpers empty. This is not acceptance of later
+buffer or manager extractions.
+
+## Physical Host buffers and Arena (performance gate pending)
+
+`agentic_host_buffers.py` now owns twelve exact function/class ASTs and the
+sixteen exact libc initialization nodes formerly in Host staging. These cover
+indexed DMA descriptors, CPU copy workers, fences, D2H staging, pinned bounce,
+shared/lazy snapshots and extent allocation. Historical imports remain identity
+aliases, including libc handles/constants; the original logger name is retained.
+The staging entry module decreases from6976 to5421 lines, not by deleting
+reachable behavior. Hybrid construction remains lazy to avoid an import cycle.
+
+Private monkeypatches for buffer factories/libc now target their defining module;
+manager call-site hooks remain in Host staging. Existing assertions are unchanged.
+Registration, DMA ABI, ledger, remaining manager/Relay/client bodies and143
+environment identifiers are checked against the pre-cleanup reference by AST.
+
+Ownership mapping: physical mapping/extent reservation alone never commits
+ownership. Existing D2H completion plus durable commit permits source release;
+existing H2D completion and consumer binding permits Host release. Allocation
+failure retains the old owner, constructor failure rolls back its reservation,
+and close/unregister failure retains the extent for retry. Timeout/cancellation
+and shutdown retain existing fence/drain handling; no new waits or TP decisions
+are introduced. Thus invariants1–7 preserve the same branches and invariant8
+requires fault tests, independent GO and the next real throughput comparison.
+
+The full CPU gate passes208 frontend+441 engine tests and2 subtests. Expanded
+H100-host TP/Mamba/Host/integration/hybrid suites pass543 cases. Two actual tiny
+H100 D2H/H2D roundtrips cover registered batch DMA and pinned-bounce fallback,
+checking all layers/K/V with disjoint data and source/destination permutation.
+The first tiny run preceded confirmation of its final strengthened fixture hash;
+this audit-order slip is recorded, and the exact tests are rerun after GO before
+model validation. Descriptor refs and physical stream synchronization precede
+extent release; a failed synchronization does not release the extent.
+
+Host managers/Relay/client role separation, Router policy/admission/HTTP,
+Scheduler extraction, pure control-plane dependencies, configuration parsing,
+maintained/archival launchers and final packaging/verification remain open.

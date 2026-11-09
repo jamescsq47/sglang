@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import torch
 
-from sglang.srt.disaggregation import agentic_host_staging as host_module
+from sglang.srt.disaggregation import agentic_host_buffers as host_module
 
 
 @pytest.mark.parametrize("host_to_device", [False, True])

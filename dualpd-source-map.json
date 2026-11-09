@@ -40,7 +40,7 @@
       "original": "python/sglang/srt/disaggregation/agentic_host_staging.py",
       "path": "python/sglang/srt/disaggregation/dualpd/agentic_host_staging.py",
       "sha256": "f4f0465bb94a7a920fdefb17bc782ab499cfe1e7102c0321ac1f760ceed9208b",
-      "current_sha256": "7d7d8e85f1077132b2e327684de4568d409d60e1e514286d8ce84a0d2a3ce8ce"
+      "current_sha256": "e42cb01a855d43bd58b2eaeaef7f3276823a97ccac2cb420515a9d4c764798ca"
     },
     {
       "original": "python/sglang/srt/disaggregation/agentic_host_transfer.py",
@@ -187,7 +187,8 @@
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_dma_descriptors.py",
       "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_dma_descriptors.py",
-      "sha256": "edd616f93840fbf5db096a447888cad90e4eb09aee2dc706ad049de46e6f12f0"
+      "sha256": "edd616f93840fbf5db096a447888cad90e4eb09aee2dc706ad049de46e6f12f0",
+      "current_sha256": "d23ed734f13cf9eebeddf05111a0292ca52ca9cef8e4ec24222d114d73cee1e4"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_final_host_cleanup.py",
@@ -235,7 +236,8 @@
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_hybrid_dma.py",
       "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_hybrid_dma.py",
-      "sha256": "2213ca8355a3359a5bbc4a8db11e81e550c0322b3fcbf2b935150e86e56bb951"
+      "sha256": "2213ca8355a3359a5bbc4a8db11e81e550c0322b3fcbf2b935150e86e56bb951",
+      "current_sha256": "64e1efd1474f5c4afb7e515f929a335d1629a81521261ceaa9d0d0f3af8e2582"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_integration_safety.py",
@@ -354,7 +356,8 @@
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_tp.py",
       "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_tp.py",
-      "sha256": "edc4d43b44527c02b950dabf948aa14ebf4b9f2bf2ab64817d7f9239905debd1"
+      "sha256": "edc4d43b44527c02b950dabf948aa14ebf4b9f2bf2ab64817d7f9239905debd1",
+      "current_sha256": "3a9f6cf0bfc1e676af84e71b4121bd7504310651fdb0b4380a8f60d6202146f9"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_tp_foreign_host_readiness.py",
