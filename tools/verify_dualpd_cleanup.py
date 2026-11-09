@@ -17,6 +17,11 @@ LEDGER_NAMES = {
     "_TERMINAL_STATES", "_ALLOWED_STAGE_TRANSITIONS", "_LEDGER_OWNERSHIP_CHANGED",
     "P2D_RELEASE_NATIVE_WON", "P2D_RELEASE_HOST_OWNED", "P2D_RELEASE_HOST_TERMINAL",
 }
+DMA_NAMES = {
+    "_CUDAMemLocation", "_CUDAMemcpyAttributes", "_cuda_runtime",
+    "_cuda_memcpy_async", "_cuda_driver_batch_memcpy", "_cuda_batch_memcpy_async",
+    "_CUDA_RUNTIME", "_CUDA_RUNTIME_LOCK", "_CUDA_DRIVER_BATCH", "_CUDA_DRIVER_BATCH_LOCK",
+}
 
 
 def original(name):
@@ -60,7 +65,17 @@ def verify():
              and not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant)
                       and isinstance(n.value.value, str))]
     assert not extra, "Unexpected executable code in the extracted ledger"
-    assert dump(module_body(original("agentic_host_staging.py"), exclude=LEDGER_NAMES, imports=False)) == dump(
+    dma = ast.parse(current("agentic_host_dma.py"))
+    expected_dma = [n for n in old.body if label(n) in DMA_NAMES]
+    actual_dma = [n for n in dma.body if label(n) in DMA_NAMES]
+    assert len(expected_dma) == len(actual_dma) == len(DMA_NAMES)
+    assert dump(expected_dma) == dump(actual_dma), "CUDA ABI, cache or submission branches changed"
+    extra_dma = [n for n in dma.body if label(n) not in DMA_NAMES
+                 and not isinstance(n, (ast.Import, ast.ImportFrom))
+                 and not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant)
+                          and isinstance(n.value.value, str))]
+    assert not extra_dma, "Unexpected executable code in extracted DMA module"
+    assert dump(module_body(original("agentic_host_staging.py"), exclude=LEDGER_NAMES | DMA_NAMES, imports=False)) == dump(
         module_body(current("agentic_host_staging.py"), imports=False)), "Host DMA/worker logic changed"
 
     old_bridge = ast.parse(original("agentic_memory_scheduler_bridge.py"))
@@ -116,9 +131,10 @@ def verify():
     return {
         "reference_commit": BASE,
         "ledger_nodes_ast_identical": len(LEDGER_NAMES),
+        "dma_nodes_ast_identical": len(DMA_NAMES),
         "host_dma_and_worker_ast_identical": True,
         "preserved_environment_identifiers": len(after_keys),
-        "runtime_changes": "only two uncalled helpers removed",
+        "runtime_changes": "ledger and CUDA ABI relocation; only two uncalled helpers removed",
         "test_changes": "directory relocation, source lookup and obsolete helper assertion",
     }
 
