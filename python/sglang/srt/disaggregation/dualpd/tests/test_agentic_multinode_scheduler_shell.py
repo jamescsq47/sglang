@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from sglang.srt.disaggregation import agentic_multinode
+from sglang.srt.disaggregation import agentic_scheduler_tp
 from sglang.srt.disaggregation.agentic_group_protocol import GenerationKey
 from sglang.srt.disaggregation.agentic_multinode_runtime import (
     EndpointActivationTicket,
@@ -536,7 +537,7 @@ def test_v2_activation_control_fences_rank_local_commit_before_return(monkeypatc
     order = []
     cpu_group = object()
     monkeypatch.setattr(
-        scheduler_module,
+        agentic_scheduler_tp,
         "barrier",
         lambda *, group: order.append(("barrier", group)),
     )
@@ -563,7 +564,7 @@ def test_v2_activation_control_fences_rank_local_commit_before_return(monkeypatc
 
 def test_recv_without_v2_activation_does_not_add_tp_barrier(monkeypatch):
     monkeypatch.setattr(
-        scheduler_module,
+        agentic_scheduler_tp,
         "barrier",
         lambda **_kwargs: pytest.fail("ordinary ingress must not add a barrier"),
     )

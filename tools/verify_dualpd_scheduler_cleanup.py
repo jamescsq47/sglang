@@ -3,14 +3,17 @@
 import ast
 import builtins
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 import subprocess
 import symtable
 
 ROOT = Path(__file__).resolve().parents[1]
+REFERENCE_ROOT = ROOT
 BASE = "a995eb0afd596ba8eebbaf9377c51693541b96ca"
 SCHEDULER = "python/sglang/srt/managers/scheduler.py"
+DIRECT_RECORD = "python/sglang/srt/disaggregation/dualpd/agentic_scheduler_direct.py"
 WORKSET = "python/sglang/srt/disaggregation/dualpd/agentic_workset.py"
 TEST = "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_h2d_decoupling.py"
 NAMES = ("AgenticPWorksetLease", "AgenticPWorksetLeaseBroker")
@@ -43,7 +46,7 @@ AgenticPWorksetLeaseBroker.__module__ = "sglang.srt.managers.scheduler"
 
 def original(path):
     return subprocess.check_output(
-        ["git", "-C", str(ROOT), "show", f"{BASE}:{path}"], text=True)
+        ["git", "-C", str(REFERENCE_ROOT), "show", f"{BASE}:{path}"], text=True)
 
 
 def dump(node):
@@ -83,6 +86,16 @@ def verify(overrides=None):
     assert not referenced - bound - set(vars(builtins)), "Unbound workset global"
 
     current = ast.parse(read(SCHEDULER))
+    components = None
+    if any(isinstance(node, ast.ImportFrom) and node.module ==
+           "sglang.srt.disaggregation.agentic_scheduler_direct" for node in current.body):
+        path = Path(__file__).with_name("verify_dualpd_scheduler_components.py")
+        spec = importlib.util.spec_from_file_location("_dualpd_scheduler_component_proof", path)
+        checker = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(checker)
+        checker.ROOT = ROOT
+        checker.REFERENCE_ROOT = REFERENCE_ROOT
+        components, current = checker.verify(overrides, return_tree=True)
     alias = ast.parse(IMPORT).body[0]
     assert dump(current.body[start]) == dump(alias), "Alias/import timing changed"
     reconstructed = ast.Module(
@@ -106,7 +119,7 @@ def verify(overrides=None):
         expected_test = expected_test.replace(before, after)
     assert dump(ast.parse(expected_test)) == dump(ast.parse(read(TEST))), (
         "Existing H2D test changed beyond defining-module hook retarget")
-    source_map = json.loads((ROOT / "dualpd-source-map.json").read_text())
+    source_map = json.loads(read("dualpd-source-map.json"))
     for path in (SCHEDULER, TEST):
         entry = next(item for item in source_map["files"] if item["path"] == path)
         assert entry["current_sha256"] == hashlib.sha256(read(path).encode()).hexdigest()
@@ -120,7 +133,8 @@ def verify(overrides=None):
         "historical_serialization_identity_preserved": True,
         "existing_h2d_assertions_unchanged": True,
         "runtime_global_bindings_verified": True,
-        "remaining_scheduler_responsibilities": "Direct, TP coordination, ready/admission",
+        "components_reconstruction": components,
+        "remaining_scheduler_responsibilities": "Actual native/throughput acceptance and final integration audit",
     }
 
 

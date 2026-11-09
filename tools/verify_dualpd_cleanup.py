@@ -181,6 +181,13 @@ def verify():
     )
     assert dump(ast.parse(expected_prewarm_test)) == dump(ast.parse(current("tests/test_agentic_startup_prewarm.py")))
     buffer_hook_tests = {
+        "test_agentic_multinode_scheduler_shell.py": [
+            ("from sglang.srt.disaggregation import agentic_multinode\n",
+             "from sglang.srt.disaggregation import agentic_multinode\n"
+             "from sglang.srt.disaggregation import agentic_scheduler_tp\n"),
+            ('        scheduler_module,\n        "barrier",',
+             '        agentic_scheduler_tp,\n        "barrier",'),
+        ],
         "test_agentic_dma_descriptors.py": [
             ("import agentic_host_staging as host_module", "import agentic_host_buffers as host_module"),
         ],
@@ -213,12 +220,14 @@ def verify():
     assert changed == {"agentic_host_staging.py", "agentic_memory_scheduler_bridge.py",
                        "agentic_multinode.py", "test_agentic_memory_scheduler_bridge.py",
                        "test_agentic_multinode.py", "test_agentic_startup_prewarm.py",
-                       "scheduler.py", "test_agentic_h2d_decoupling.py"} | cross_import_tests | set(buffer_hook_tests), changed
+                       "scheduler.py", "test_agentic_h2d_decoupling.py",
+                       "test_agentic_tp_host_commit_order.py"} | cross_import_tests | set(buffer_hook_tests), changed
     # Inventory literal environment keys across every extension implementation,
     # including both Router variants. Only the proven no-op selector disappears.
     before = subprocess.check_output([
         "git", "-C", str(ROOT), "grep", "-h", "-o", "-E",
         "SGLANG_[A-Z0-9_]+", BASE, "--", EXT,
+        "python/sglang/srt/managers/scheduler.py",
         ":(exclude)**/test*.py", ":(exclude)**/*.md",
     ], text=True)
     before_keys = set(before.splitlines())
@@ -226,6 +235,8 @@ def verify():
     for path in (ROOT / EXT).rglob("*.py"):
         if not path.name.startswith("test"):
             after_keys.update(re.findall(r"\bSGLANG_[A-Z0-9_]+\b", path.read_text()))
+    after_keys.update(re.findall(r"\bSGLANG_[A-Z0-9_]+\b",
+                                 (ROOT / "python/sglang/srt/managers/scheduler.py").read_text()))
     assert before_keys - after_keys == {"SGLANG_AGENTIC_MEMORY_AUTHORITY_V2"}
     assert not after_keys - before_keys, sorted(after_keys - before_keys)
     return {
@@ -239,6 +250,7 @@ def verify():
         "host_dma_and_worker_ast_identical": True,
         "scheduler_reconstruction": verify_scheduler(),
         "preserved_environment_identifiers": len(after_keys),
+        "environment_inventory_scope": "extension_and_entire_native_scheduler",
         "runtime_changes": "ledger, CUDA ABI, registration, physical buffer and D writer relocation; only two uncalled helpers removed",
         "test_changes": "directory relocation, source lookup, defining-module private hooks and obsolete helper assertion",
     }

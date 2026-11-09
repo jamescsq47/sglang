@@ -39,7 +39,7 @@ def test_complete_native_scheduler_reconstruction():
      "    AgenticPWorksetLeaseBroker as OtherBroker,"),
     (proof.SCHEDULER, "logger = logging.getLogger(__name__)",
      "logger = logging.getLogger('changed-native-hook')"),
-    (proof.SCHEDULER, "prefill_domain: Optional[int] = None\n    workset_lease: Optional[AgenticPWorksetLease] = None",
+    (proof.DIRECT_RECORD, "prefill_domain: Optional[int] = None\n    workset_lease: Optional[AgenticPWorksetLease] = None",
      "prefill_domain: Optional[int] = None\n    workset_lease: Optional[str] = None"),
     (proof.TEST, "assert len(calls) == 2", "assert len(calls) >= 0"),
     (proof.TEST, "monkeypatch.setattr(workset_module, 'kv_to_page_indices'",
@@ -67,5 +67,3 @@ assert workset.AgenticPWorksetLease.__module__ == 'sglang.srt.managers.scheduler
 assert workset.AgenticPWorksetLeaseBroker.__module__ == 'sglang.srt.managers.scheduler'
 """
     subprocess.run([sys.executable, "-c", code], check=True, timeout=120)
-
-

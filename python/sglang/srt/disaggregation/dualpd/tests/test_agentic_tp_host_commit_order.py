@@ -2,7 +2,7 @@
 
 from types import SimpleNamespace
 
-import sglang.srt.managers.scheduler as scheduler_module
+import sglang.srt.disaggregation.agentic_scheduler_tp as tp_module
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.disaggregation.agentic_kv_lifecycle import (
@@ -32,7 +32,7 @@ def test_host_commit_order_survives_rank_local_hash_order(monkeypatch):
             def __iter__(self):
                 return iter(sorted(set.copy(self), reverse=bool(rank)))
 
-        monkeypatch.setattr(scheduler_module, "set", RankSet, raising=False)
+        monkeypatch.setattr(tp_module, "set", RankSet, raising=False)
         admitted = []
         owner = SimpleNamespace(
             tp_size=2, tp_rank=rank,

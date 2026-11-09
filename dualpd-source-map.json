@@ -300,6 +300,7 @@
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_multinode_scheduler_shell.py",
       "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_multinode_scheduler_shell.py",
+      "current_sha256": "9aa10fce5f2a3139e614cf79dcc8633761d9107f71693be07e16794be3a55a59",
       "sha256": "80fbad7c7c74b27f95b0c837d48797e865e6938a1170caa5f69c74d07e5612b2"
     },
     {
@@ -373,7 +374,8 @@
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_tp_host_commit_order.py",
       "path": "python/sglang/srt/disaggregation/dualpd/tests/test_agentic_tp_host_commit_order.py",
-      "sha256": "c6e1421e86653d5d8bfb1112aa03ce7b1788222aab5ec6a9d1ef749793ce0031"
+      "sha256": "c6e1421e86653d5d8bfb1112aa03ce7b1788222aab5ec6a9d1ef749793ce0031",
+      "current_sha256": "353106d1aa140693b2bcdb6a28afce1135ef55000b370adca8565b1b842a00f2"
     },
     {
       "original": "python/sglang/srt/disaggregation/test_agentic_transfer_queues.py",
@@ -384,7 +386,7 @@
       "original": "python/sglang/srt/managers/scheduler.py",
       "path": "python/sglang/srt/managers/scheduler.py",
       "sha256": "46f5e6111cf8e7b05f8479220efef5338ecd9fed5adaa01e6b05980ce61771f3",
-      "current_sha256": "7ef3f95a6eab489c8bf8f59e4799eb4c253d483a7ec5ef7874854fd4a3bf8a61"
+      "current_sha256": "b9b71cddfacce1a504b57a35ca9c84823168f84faf33f93cc5c87018098c7758"
     }
   ],
   "refactor_validation": "tools/verify_dualpd_cleanup.py"

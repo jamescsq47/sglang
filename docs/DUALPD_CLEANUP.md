@@ -380,3 +380,31 @@ documented separately. Tail sampled liveness progress1294413 spans116.169 second
 inside the final120-second interval; the separate harness rolling counter is
 1319512. The original measurement code is unchanged. This is local nonregression
 acceptance only; actual TCP model-path representative coverage remains required.
+
+## Scheduler workset acceptance and remaining component extraction
+
+The workset lease/broker stage passed the complete300.601+1200.000-second
+BrowseComp regression at commit2dbb67ccc5c4c2a61a00440efe58831b08d1c08c:
+Decode11207.29 token/s (−0.51% versus ORIGINAL baseline), Prefill74549.10,
+6654 completions,100% reuse, zero failures/OOM and empty final GPU/port/helper
+gates. Ownership sets match11413 P2D snapshots across all five stages and21370
+D2P Direct snapshots;143 Host durables match source releases,11 measured
+restores/releases and132 only-drain durables are explicitly distinguished.
+
+The next maintained extraction separates20 Direct,15 TP and15 ready-workset
+methods, plus four ownership implementations behind explicit native wrappers.
+Original signatures, eager record identity, class dispatch and all mixed native
+methods reconstruct exactly; there is no new owner, worker, queue or fence.
+Eight invariants retain their original transitions: P source release follows
+P2D completion/durable, D release follows D2P completion/durable, Host release
+follows consumer fence, and TP decisions and abort/timeout/cancel/shutdown paths
+retain their complete original bodies. Independent audit and native fault gates
+remain required before GPU validation; CPU766-record pass is not performance
+acceptance. Full TCP model coverage and later cleanup stages remain open.
+
+Formal components gates pass766 CPU records and969 real-kernel native/fault
+records (967 ordinary+2 subtests), no failures/errors/skips. The first native
+run's one barrier fixture failure is retained; only two defining-module patch
+targets and an import were corrected, with original-test AST reconstruction.
+Independent portable36-case rerun passes. There is no changed production barrier
+or weakened assertion. Snapshot and nine model/TP launch-plan checks also pass.
