@@ -1,5 +1,23 @@
 # DualPD engine fork
 
+## Organized release (2026-11-09)
+
+The `main` branch publishes the cleaned standalone DualPD engine fork. This
+release reorganizes Router, Host transport/ledger and Scheduler integration into
+focused components while preserving public imports, runtime switches and
+experiment semantics. It does not replace or update the existing baseline
+branches or environments.
+
+The companion application is [DualPD](https://github.com/jamescsq47/DualPD),
+which pins this engine as `3rdparty/sglang`. Its
+[cleanup handoff](https://github.com/jamescsq47/DualPD/blob/main/docs/CLEANUP_HANDOFF.md)
+records the CPU, source-equivalence and GPU verification scope and limitations.
+The final BrowseComp regression retained the 300 s warmup + 1200 s measurement
+window; Decode throughput differed by -0.23% from its comparison baseline.
+This is not a new SWE-Bench accuracy validation.
+
+## Layout and compatibility
+
 This checkout preserves SGLang's normal package and server entrypoints. The
 custom extension sources are grouped in
 `python/sglang/srt/disaggregation/dualpd/`, with focused tests under `tests/`
