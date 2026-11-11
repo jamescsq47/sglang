@@ -11,12 +11,9 @@ branches or environments.
 The companion application is [DualPD](https://github.com/jamescsq47/DualPD),
 which pins this engine as `3rdparty/sglang`. Its
 [README](https://github.com/jamescsq47/DualPD#installation) provides installation
-and experiment commands. Historical validation material is retained in the
-[pre-release cleanup handoff](https://github.com/jamescsq47/DualPD/blob/61e3342fc006920af5553961697dfc5c255e0735/docs/CLEANUP_HANDOFF.md),
-not distributed in the current application source tree.
-The final BrowseComp regression retained the 300 s warmup + 1200 s measurement
-window; Decode throughput differed by -0.23% from its comparison baseline.
-This is not a new SWE-Bench accuracy validation.
+and experiment commands. The public application tree contains source code and
+workload configuration, not internal experiment records. Engine cleanup does
+not constitute new throughput or SWE-bench accuracy validation.
 
 ## Layout and compatibility
 
