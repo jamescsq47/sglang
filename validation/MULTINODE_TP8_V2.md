@@ -1,4 +1,4 @@
-# DualPD multi-node TP8 rebuild
+# DPD multi-node TP8 rebuild
 
 This branch starts from `pd_mamba`.  The prior `pd_multi_node` control plane is
 preserved only on `pd_multi_node_failed_20260924` and is not a compatibility

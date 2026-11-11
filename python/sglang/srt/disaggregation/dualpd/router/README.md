@@ -1,7 +1,7 @@
 # Agentic Router implementations
 
 These are engine services, not benchmark harnesses. They depend on SGLang and
-sglang-router, never on DualPD or Slime. DualPD configures and launches them.
+sglang-router, never on DPD or Slime. DPD configures and launches them.
 
 | Module | Purpose |
 |---|---|

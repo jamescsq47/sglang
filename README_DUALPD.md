@@ -1,14 +1,14 @@
-# DualPD engine fork
+# DPD engine fork
 
 ## Organized release (2026-11-09)
 
-The `main` branch publishes the cleaned standalone DualPD engine fork. This
+The `main` branch publishes the cleaned standalone DPD engine fork. This
 release reorganizes Router, Host transport/ledger and Scheduler integration into
 focused components while preserving public imports, runtime switches and
 experiment semantics. It does not replace or update the existing baseline
 branches or environments.
 
-The companion application is [DualPD](https://github.com/jamescsq47/DualPD),
+The companion application is [DPD](https://github.com/jamescsq47/DualPD),
 which pins this engine as `3rdparty/sglang`. Its
 [README](https://github.com/jamescsq47/DualPD#installation) provides installation
 and experiment commands. The public application tree contains source code and
