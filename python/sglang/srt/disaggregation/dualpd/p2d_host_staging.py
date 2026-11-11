@@ -537,6 +537,13 @@ class AgenticPToDHostStagingManager:
             raise ValueError(
                 "P->D Host arena backend must be memfd, tmpfs, or registered_tmpfs"
             )
+        if os.environ.get("PD_DRAM_TRACE_DIR"):
+            try:
+                from sglang.srt.disaggregation.agentic_host_observation import register_arena
+
+                register_arena(self.arena, "p2d")
+            except Exception as error:
+                logger.warning("P->D arena observation unavailable: %s", error)
         self.chunk_tokens = max(
             self.page_size,
             int(os.getenv("SGLANG_AGENTIC_KV_P2D_D2H_CHUNK_TOKENS", "512")),

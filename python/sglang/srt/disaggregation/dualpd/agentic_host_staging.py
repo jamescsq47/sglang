@@ -444,6 +444,13 @@ class AgenticPHostStagingManager:
             int(arena_capacity_bytes),
             backend=arena_backend,
         )
+        if os.environ.get("PD_DRAM_TRACE_DIR"):
+            try:
+                from sglang.srt.disaggregation.agentic_host_observation import register_arena
+
+                register_arena(self.arena, "d2p")
+            except Exception as error:
+                logger.warning("D->P arena observation unavailable: %s", error)
         # Kept for scheduler runtime accounting compatibility.  The new slow
         # path reserves no fixed P-HBM staging slots.
         self.reserved_hbm_bytes = 0
