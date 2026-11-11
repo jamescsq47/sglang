@@ -10,8 +10,10 @@ branches or environments.
 
 The companion application is [DualPD](https://github.com/jamescsq47/DualPD),
 which pins this engine as `3rdparty/sglang`. Its
-[cleanup handoff](https://github.com/jamescsq47/DualPD/blob/main/docs/CLEANUP_HANDOFF.md)
-records the CPU, source-equivalence and GPU verification scope and limitations.
+[README](https://github.com/jamescsq47/DualPD#installation) provides installation
+and experiment commands. Historical validation material is retained in the
+[pre-release cleanup handoff](https://github.com/jamescsq47/DualPD/blob/61e3342fc006920af5553961697dfc5c255e0735/docs/CLEANUP_HANDOFF.md),
+not distributed in the current application source tree.
 The final BrowseComp regression retained the 300 s warmup + 1200 s measurement
 window; Decode throughput differed by -0.23% from its comparison baseline.
 This is not a new SWE-Bench accuracy validation.
@@ -44,6 +46,6 @@ The original integration cleanup was a type-only HostKVCache import in
 `hicache_storage.py`, allowing metadata/control-plane modules to load on CPU
 hosts without importing CUDA kernels solely for type annotations.
 
-See the sibling `../DualPD/docs/EXTRACTION.md` for validation. Performance and
+See `docs/DUALPD_CLEANUP.md` for the engine validation scope. Performance and
 GPU-correctness claims still require actual GPU runs. Existing baseline Python
 environments must remain pointed at their separately selected baseline checkout.
