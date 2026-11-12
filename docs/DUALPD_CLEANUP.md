@@ -1,448 +1,67 @@
-# Staged engine cleanup: scope and compatibility
+# Engine boundaries and validation
 
-Reference: engine commit `bc67aa0814364f2c7ce3df3f83f9d5ff013c5b5f`.
-The original `sglang-src/pd` tree and baseline environments are not modified.
+Installation, model/data preparation and experiment commands live in the
+[DPD application README](https://github.com/jamescsq47/DualPD#installation).
+Use its Python 3.12 environment and the engine commit pinned by its submodule.
+Native baselines use a separate engine checkout and environment; never replace
+them with this modified fork.
 
-## Implemented
+## Component boundaries
 
-- Extract the Host control ledger from `agentic_host_staging.py` into
-  `agentic_host_ledger.py`. Nine top-level state/constants/class nodes, including
-  the CAS ownership sentinel, retain identical ASTs. The remaining DMA, arena,
-  registration, transport worker and manager bodies are unchanged.
-- Preserve the old import locations as aliases to the same class, enum and
-  state-table objects, not duplicate implementations. New ledger code has no
-  Torch, NumPy or native kernel dependency of its own.
-- Move the 41 existing flat test files into `dualpd/tests/`; fix four cross-test
-  imports and one source-file lookup. Keep Router tests in `router/tests/`.
-- Remove `memory_authority_v2_enabled` and its assertion-only test. No runtime
-  code read it. The similarly named `SGLANG_AGENTIC_MEMORY_AUTHORITY_V2` export
-  is removed from the maintained multi-node launcher. Actual activation remains
-  `SGLANG_AGENTIC_MULTINODE_ENABLED` with its existing validation and defaults.
-- Remove `control_poll_interval`, an uncalled compatibility hook that always
-  returned `None`. The actual directory watchers and event-driven transport
-  controllers remain intact.
+The application owns workload loading, tool execution, model HTTP requests,
+grading, launch orchestration and resource sampling. The engine owns routing,
+admission, KV transport, allocator integration and Scheduler progress.
 
-## Switch policy: retained, not inferred obsolete
+Engine extension sources are in `python/sglang/srt/disaggregation/dualpd/`:
 
-| Category | Examples | Decision |
-|---|---|---|
-| Runtime selection | `SGLANG_AGENTIC_MULTINODE_ENABLED`, `SGLANG_AGENTIC_KV_LIFECYCLE`, `SGLANG_AGENTIC_KV_CUSTOM_STORAGE_ONLY` | Preserve local/TCP selection and validation |
-| Ablations | `SGLANG_AGENTIC_KV_DISABLE_D2P_REUSE`, `SGLANG_PD_ABLATION_P2D_PREBIND` | Preserve, including TP restrictions |
-| Direct/Slow policy | Fast-tool/admission thresholds, slow-congestion recompute, high/low queue thresholds | Preserve values and scope; do not unify local/TCP defaults |
-| Memory/transport | Arena sizes, NUMA placement, Relay, lanes, registration windows, startup prewarm | Preserve; default-off does not mean dead |
-| Compatibility/fallback | Historical Mamba Router, registered-DMA fallback, bounce buffers, legacy manifest migration | Preserve supported replay and physical safety paths |
-| Correctness/diagnostics | Token hashes, digest logging, TP and Mamba checks | Preserve |
+| Component | Responsibility |
+| --- | --- |
+| `router/` | Request routing, admission and local/remote control-plane coordination |
+| `agentic_host_*` | D-to-P Host staging, ledger, registration, buffers and DMA helpers |
+| `p2d_host_*` | P-to-D snapshot transport and protocol declarations |
+| Workset and Scheduler integration | Complete-workset admission, staging and binding |
+| `agentic_client.py` | Application ACK adapter for the existing local marker protocol |
+| `agentic_host_observation.py` | Opt-in, read-only Host arena counters |
 
-The verifier inventories all literal SGLang environment identifiers across the
-extension and both Router variants. Only the proven no-op memory-authority
-helper selector disappears. Native `environ.py`, model and allocator integration
-files remain unchanged. Scheduler was unchanged through the Router stages; the
-workset stage below now has an explicit whole-native-module reconstruction.
+Public imports remain `sglang.srt.disaggregation.agentic_*` and
+`sglang.srt.disaggregation.p2d_host_staging`. Do not import a second copy via
+`sglang.srt.disaggregation.dualpd.*`; that creates distinct module identities.
+Local shared-arena and event-driven TCP/TP execution are both retained.
 
-## Ownership and failure mapping
+## Compatibility and safety
 
-There are no new states, paths, deadlines, thread queues or transfer decisions.
-Physical owners, complete-workset admission, DMA fences, durable commits,
-failure/timeout/cancel/shutdown transitions, TP atomicity and parent reuse are
-the same implementation. All eight design invariants remain mandatory.
+Runtime selection, Direct/Host policies, arena sizing, NUMA/registration controls,
+ablation switches and fault diagnostics remain supported. A default-off switch
+is not necessarily obsolete. `PD_DRAM_TRACE_DIR` enables read-only Host counters;
+the observer does not own allocator capacity, DMA fences or transfer decisions.
 
-The ledger classes now report `agentic_host_ledger` as their `__module__`.
-Old pickle class/enum references resolve through the historical aliases; new
-references require the new module. These classes are not serialized in the
-durable JSON ledger. Rebinding a *module attribute* such as an old private
-sentinel is not a supported monkeypatch contract after extraction; existing
-instance-method patches and shared state-table identity remain valid. Actual
-DMA/arena monkeypatch sites remained in `agentic_host_staging` at the ledger-only
-stage. See the later DMA ABI boundary below for its precise private-hook scope.
+Transfers require complete snapshots/worksets. Source HBM and Host extents must
+remain owned until the existing durable completion and physical DMA fences.
+Claim, commit, handoff and release remain coordinated across TP ranks. A timeout
+is not a DMA fence. Cancellation and failure must converge before buffer reuse.
+Direct transfer, Host recovery, tool execution and model Forward progress must
+remain decoupled; shared radix prefixes retain reference-safe lifetimes.
 
-## Verification and remaining work
+## Validation scope
 
-`python tools/verify_dualpd_cleanup.py` reconstructs the original module AST
-boundary and rejects any change to ledger, DMA/worker or runtime behavior
-beyond the two named dead helpers. `dualpd-source-map.json` retains original
-hashes and records current hashes for the nine reviewed source/test edits.
-The frontend snapshot verifier also checks every mapped file hash.
+Extension tests remain alongside the engine in `dualpd/tests/` and
+`dualpd/router/tests/`. Run applicable tests in the installed engine environment;
+some import native kernels and require CUDA libraries even during collection.
+Missing dependencies or failed collection must not be counted as passing tests.
+The [validation helpers](../validation/README.md) are optional diagnostics, not
+a substitute for end-to-end experiments.
 
-The reproducible CPU gate is `../DualPD/.venv/bin/python
-../DualPD/scripts/check_cpu.py`; its evidence is stored under
-`../DualPD/tests/reports/`. Additional tests cover alias identity, old/new pickle
-paths, replay-after-claim and isolated ledger imports.
+The latest application/engine boundary changes passed scoped CPU contracts and
+independent CPU review. These checks do not establish GPU correctness,
+throughput or task accuracy for the current checkout. BrowseComp acceptance
+requires the complete 300-second warmup plus 1200-second steady-state window;
+SWE-bench comparisons use the recorded T450 window and matching harness.
 
-Some broader tests import native kernels requiring `libcuda.so.1`; collecting
-all tests on the login host therefore fails for those modules. Do not count
-those tests as passes, stub the CUDA library or weaken their assertions.
-The ledger-only code at `4cde672cc` subsequently passed the actual BrowseComp
-baseline on node2700: 300.98 s warmup, 1200.00 s measurement, 11265.01 Decode
-token/s, 75367.90 Prefill token/s, parent reuse100%, 6704 completed agents and
-zero failures. GPU/port/FUSE cleanup passed and all scoped OOM deltas were0.
-This is not performance acceptance of the later changes described below.
-
-The large Scheduler body and remaining Host transport code are not fully
-decoupled yet. Those are separate follow-ups requiring their own lifecycle
-tests; this pass does not delete reachable branches to meet a line-count goal.
-
-## Scheduler physical worksets (intermediate gate, not stage completion)
-
-The complete AgenticPWorksetLease and AgenticPWorksetLeaseBroker definitions
-move together into canonical agentic_workset.py. Four lease properties and
-39 broker methods retain identical ASTs. Native Scheduler reexports both at
-their old definition position, preserving eager annotations in its early-Direct
-record. Two exact __module__ assignments retain historical serialization
-identity without importing Scheduler back. The early-Direct record, native
-mixed integration hooks and all other Scheduler code remain unchanged.
-
-The new scheduler verifier reconstructs the entire original native module
-against a995eb0, checks exact leaf imports/identities/runtime global bindings,
-and permits only the broker-specific readiness hook retarget in the existing
-H2D fixture. The source map includes one explicit same-path native entry, not
-a filename exemption. Complete parent+suffix allocation, hybrid slot rollback,
-attempt fencing, binding/handoff, cancellation and immutable TP retirement are
-the same implementation. No ownership transition, release rule or progress wait
-changes. See ../DualPD/docs/WORKSET_EXTRACTION.md for all eight invariants.
-
-Structural/mutation and native Scheduler/TP/Mamba faults are required, followed
-by independent code/plan GO and a separate frozen BrowseComp comparison.
-Direct progress, TP coordination, ready/admission and later cleanup stages
-remain open; moving these two classes does not complete Scheduler cleanup.
-
-## Host DMA ABI (performance gate passed)
-
-`agentic_host_dma.py` owns the six CUDA ABI types/helpers and four process-local
-handle/cache/lock definitions formerly inline in Host staging. Their complete
-ASTs remain identical, including the Ampere fallback, versioned eight-argument
-`cuMemcpyBatchAsync_v2` ABI, conservative stream ordering, descriptor keepalive
-and distinction between unavailable-before-submit and failure-after-submit.
-The historical helper imports in Host staging are aliases to these same
-objects. Native callers and the indexed-copy helper continue using the existing
-interfaces. No actual feature or configuration switch is removed.
-
-The mutable runtime/driver cache globals now belong only to the DMA module.
-ABI-internal test patches should target that module; rebinding a historical
-helper alias does not forward into another module's globals. Existing indexed
-descriptor, arena and snapshot hooks remain at their original caller boundary.
-
-Ownership/failure mapping: this leaf has no snapshot, ledger, capacity or TP
-policy. The caller remains the owner until its existing physical CUDA fence and
-durable commit. Success returns the same descriptor keepalive; pre-submit
-unavailability returns the same fallback indication; post-submit errors raise
-and must drain/quarantine through the unchanged caller fence. Timeout,
-cancellation and shutdown are still handled by existing managers. No I/O queue
-or Forward scheduling order changes, and TP still has its existing group owner.
-Thus invariants1–4 and6–7 have no state/branch changes,5 has no new waits, and8
-requires the new ABI fault tests, existing lifecycle suite, independent GO and
-the same real BrowseComp comparison before proceeding.
-
-The AST verifier now reconstructs ten DMA nodes as well as the nine ledger
-nodes and all remaining Host worker bodies. New CPU checks cover alias identity,
-Ampere/no-driver fallback, library lifetime/ABI shape, zero/mismatched arrays,
-descriptor contents/lifetime, and both single and batch submission errors.
-The DMA stage subsequently passed the same node2700 BrowseComp300+1200 check:
-Decode11246.55 token/s versus11265.01 baseline (−0.16%), Prefill74816.50,
-6682 completions,0 failures/scoped OOMs and GPU/port/FUSE cleanup all0.
-Parent reuse99.992% differs only by one harness terminal-parser repair: its
-17280 extra Prefill tokens exactly explain the shortfall. Fresh H100-host
-TP/Host/Mamba/integration fault suites also passed373+42=415 tests. This is
-fixture-based native-import validation, not TP>1 full-model performance.
-
-The rest of Host arena/workers, Router, Scheduler, configuration
-and maintained/archival launcher organization remain outstanding stages.
-
-## Host registration and prewarm (performance gate passed)
-
-`agentic_host_registration.py` owns mapping authentication, the persistent
-registered-window cache and startup prewarm. Ten complete top-level AST nodes
-are identical to the pre-cleanup reference, including window/user references,
-zero-ref LRU eviction, partial-acquire rollback, stale-inode reclamation and
-startup manifests/failure records. The historical logger identity is retained.
-All ten former Host-staging names remain aliases to the canonical objects;
-hybrid DMA continues to use the same cache lock and lookup. Private global
-rebinding hooks now target the defining module; the three existing startup
-tests change only that import, not assertions. No configuration selector,
-default, supported fallback or local/TCP path is removed.
-
-Ownership mapping: registration prepares addressability, not snapshot ownership.
-P/D/Host remain their existing owners; only the unchanged caller CUDA fence and
-ledger commit permit transfer/release. Successful acquire keeps refs until the
-existing caller releases them. Capacity/register failures unwind newly acquired
-refs; unregister failure leaves the affected cache entry intact and raises.
-Startup timeout/failure publishes the existing failed record, not completion.
-Cancellation and shutdown still wait for caller physical fences before mapping
-or allocator release; startup-pinned mappings remain process-lifetime resources.
-No new queue, Forward wait, TP decision, admission deadline or rescheduling rule
-is introduced. Invariants1–4 and6–7 retain all lifecycle bodies;5 retains all
-thread/wait behavior;8 requires the new capacity/lifetime/fault tests, independent
-audit and a real same-configuration throughput comparison before the next part.
-
-Sixteen new CPU cases exercise alias/logger identity, overlapping references,
-fully referenced cache exhaustion, register/unregister failures, live-reference
-stale-inode protection, real libc memfd authentication/mapping and prewarm error
-publication. The existing three startup topology cases now run without importing
-the heavy worker module. AST validation rejects executable additions other than
-the exact historical logger binding. Remaining arena/snapshot/manager cleanup
-and all later stages still require their own performance acceptance.
-
-Registration subsequently passed the same node2700 BrowseComp300+1200 gate:
-Decode11220.31 token/s versus11265.01 original baseline (−0.40%),
-Prefill75281.01,6667 completions,0 failures,100% parent reuse. Job-scoped OOM
-deltas were0 and final GPU/ports/helpers empty. This is not acceptance of later
-buffer or manager extractions.
-
-## Physical Host buffers and Arena (performance gate passed)
-
-`agentic_host_buffers.py` now owns twelve exact function/class ASTs and the
-sixteen exact libc initialization nodes formerly in Host staging. These cover
-indexed DMA descriptors, CPU copy workers, fences, D2H staging, pinned bounce,
-shared/lazy snapshots and extent allocation. Historical imports remain identity
-aliases, including libc handles/constants; the original logger name is retained.
-The staging entry module decreases from6976 to5421 lines, not by deleting
-reachable behavior. Hybrid construction remains lazy to avoid an import cycle.
-
-Private monkeypatches for buffer factories/libc now target their defining module;
-manager call-site hooks remain in Host staging. Existing assertions are unchanged.
-Registration, DMA ABI, ledger, remaining manager/Relay/client bodies and143
-environment identifiers are checked against the pre-cleanup reference by AST.
-
-Ownership mapping: physical mapping/extent reservation alone never commits
-ownership. Existing D2H completion plus durable commit permits source release;
-existing H2D completion and consumer binding permits Host release. Allocation
-failure retains the old owner, constructor failure rolls back its reservation,
-and close/unregister failure retains the extent for retry. Timeout/cancellation
-and shutdown retain existing fence/drain handling; no new waits or TP decisions
-are introduced. Thus invariants1–7 preserve the same branches and invariant8
-requires fault tests, independent GO and the next real throughput comparison.
-
-The full CPU gate passes208 frontend+441 engine tests and2 subtests. Expanded
-H100-host TP/Mamba/Host/integration/hybrid suites pass543 cases. Two actual tiny
-H100 D2H/H2D roundtrips cover registered batch DMA and pinned-bounce fallback,
-checking all layers/K/V with disjoint data and source/destination permutation.
-The first tiny run preceded confirmation of its final strengthened fixture hash;
-this audit-order slip is recorded, and the exact tests are rerun after GO before
-model validation. Descriptor refs and physical stream synchronization precede
-extent release; a failed synchronization does not release the extent.
-
-Host managers/Relay/client role separation, Router policy/admission/HTTP,
-Scheduler extraction, pure control-plane dependencies, configuration parsing,
-maintained/archival launchers and final packaging/verification remain open.
-
-Physical buffers subsequently passed BrowseComp301.006+1200.000 seconds:
-Decode11254.37 token/s (−0.09% versus original baseline), Prefill75462.39,
-6688 completions,0 failures,100% parent reuse. Scoped OOM deltas0 and final
-GPU/ports/helpers empty; independent SSH confirms controllers gone and GPU0.
-Whole-run event sets match11338 P→D Host five-stage IDs and21628 D→P Direct
-send/receive/source-release IDs. All9 measured-window D→P Host durables restore
-and release;128 additional durables occur only during controlled drain without
-individual restoration, with final process cleanup separately verified.
-
-## D Host writer and optional Relay (performance gate passed)
-
-`agentic_host_writer.py` owns four exact top-level AST nodes: the one
-`_LEDGER_ENTRY_UNSET` sentinel, `_cleanup_nixl_room`, `AgenticDRelayWorker` and
-`AgenticDHostStagingClient`. Staging reexports the same sentinel/classes/helper;
-the keyword default and identity branch thus share one object. Writer imports
-leaf ledger/buffer/DMA and lifecycle/base/utils directly, never staging. The
-historical logger is unchanged. Old pickle class paths resolve through aliases;
-newly serialized instances name the defining writer module. Existing test
-assertions and P-manager private hooks are unchanged.
-
-The first H100-host regression exposed an overly strong new cold-import fixture
-assertion (556 passed,1 failed): the accepted pre-writer commit a41aab254 already
-initializes CUDA on visible H100 during cold Host import. A traced first lazy
-initialization comes from unchanged `sglang.srt.utils.common` importing installed
-`sgl_kernel`, whose architecture query calls `torch.cuda.current_device()`.
-No production fix is appropriate for pure relocation. The new test instead uses
-two fresh processes: unchanged native base/utils dependencies versus cold writer,
-asserting equal CUDA initialization and no staging cycle before checking aliases.
-This preserves CPU no-extra-init coverage and checks actual native parity;
-it does not claim that heavy engine dependencies are CUDA-independent.
-
-Ownership mapping: the writer retains D source responsibility until its existing
-bounded D2H fences, CPU commits and complete ledger/TP commit report host_ready;
-it never frees request HBM itself. Before-submit failure retries without moving
-ownership; partial submission drains the armed physical fence, or quarantines
-all refs for process lifetime if no completion fence exists. CPU/unregister
-errors retain their existing cleanup carrier and lane until retry. Capacity,
-cancellation, peer abort and failed drain ACK retain the existing grant/source
-protocol. No new Forward/Direct/Slow wait or TP decision is introduced; all
-state/CAS/fence branches remain exact AST, covering invariant1–7 preservation.
-Invariant8 requires CPU/fault tests, independent audit and full BrowseComp before
-advancing. Preservation is not a claim that every historical optional path is
-defect-free.
-
-Independent scoping found a pre-existing optional-Relay risk: `_fail_active`
-publishes fallback in finally even when `_finish_active` synchronization fails.
-It remains unchanged in this pure extraction. New Relay ordering tests cover the
-physically successful cleanup case, not that exceptional failure. A semantic
-repair requires separate fault analysis and audit rather than an unreviewed
-change hidden in relocation. This stage's benchmark keeps Relay disabled as in
-the original baseline; it cannot validate that optional failure case.
-
-Final writer pre-model gates pass208 frontend+455 engine tests and2 subtests
-(665 JUnit records),557 native H100-host fault/import fixtures and2 actual tiny
-registered/bounce roundtrips. The overlay SciPy import also had one transient
-child crash during an intermediate CPU gate: both unchanged overlay variants
-passed separately, then the complete gate passed without environment/assertion
-changes. Diagnostic history is retained in frontend reports
-`host-writer-import-evidence.json`; no failed gate is counted as a pass. Exact
-code and revised test have independent GO; the model plan/performance is still
-pending. Host/P-manager internals, Router, Scheduler, control-plane dependencies,
-configuration, maintained/archival launchers and final verification remain open.
-
-Writer subsequently passed BrowseComp301.030+1200.020 seconds: Decode11214.24
-token/s (−0.45% versus ORIGINAL baseline), Prefill74889.97,6671 completions,
-0 failures,100% parent reuse. Scoped memory-event deltas0; GPU/ports/helpers
-empty and independent SSH confirms controllers gone/GPU0/job OOM0. Whole-run
-event sets match12008 P→D Host snapshots at all five stages and21496 D→P Direct
-send/receive/source-release IDs. All15 measured-window D→P Host durables restore
-and release;141 additional durables occur only in controlled drain with no
-individual restoration, with process cleanup separately verified. This is a
-gross-regression pass, not statistical equivalence or validation of the known
-optional Relay error case or all model/TP configurations. Next is Router
-policy/admission/HTTP separation; all later stages remain required.
-
-## Local Router separation (performance gate passed)
-
-The local concrete Router now retains its constructor and select_pair, with
-capacity/shadow reservations, admission and HTTP orchestration in three
-method-only components (33/38/27 methods). All100 original method bodies and14
-top-level definitions reconstruct the complete original module against09911f4.
-There is one concrete state/lock owner and no new constructor or super call in
-the mixins. Shared records, enum aliases and historical logger identity survive
-both canonical imports and the private file-as-package historical overlay.
-Only three existing private _sync_json_get test hooks move to their defining
-module; assertions remain exact.
-
-The Router verifier rejects extra executable statements and unbound runtime
-globals, in addition to checking exact definition ASTs and allowed import owners.
-Twenty-six focused tests cover MRO, aliases, old pickle references, annotation
-resolution, dynamic parsing, a fresh overlay process and12 destructive in-memory
-mutations. Independent code review and an independent26/26 rerun return GO;
-Full gates subsequently pass208 frontend+481 engine tests and2 subtests
-(691 JUnit records); node2700 native/Router regression passes716 tests+2 subtests
-and2 actual H100 DMA roundtrips. No failures/errors/skips occur. The actual frozen
-BrowseComp comparison remains pending.
-The frontend source verifier distinguishes11 directly compared original serving
-ASTs from the one completely reconstructed Router AST; it does not skip the
-Router's body. Both TCP and pinned legacy implementations remain byte-identical.
-
-This step changes no physical ownership, DMA fences, workset credits, timeout,
-cancel joins, reservations, queue priorities or TP decisions; eight-invariant
-mapping is recorded in router/README.md. Local state records still depend on
-native Host imports. TCP Router organization, Scheduler extraction, genuine
-control-plane dependency removal, configuration and launcher cleanup and final
-acceptance are not completed by this local-only change.
-
-The actual router-local-r1 comparison subsequently passes300.861+1200.001
-seconds: Decode11206.66 token/s (−0.52% versus ORIGINAL baseline), Prefill75201.48,
-6668 completions,0 failures,100% parent reuse. Scoped events0 and GPU/port/helper
-cleanup all0; independent SSH confirms both owned controller/launcher gone.
-Whole-run ownership sets match12418 P→D Host snapshots across five stages and
-21503 D→P Direct send/receive/source releases. All141 D→P Host durables match D
-source release;10 measured durables restore/release,131 additional durables occur
-only during controlled drain without individual restoration. Process cleanup is
-separate evidence. This is a gross-regression pass, not statistical equivalence,
-TCP model-path validation or completion of later stages.
-
-## TCP Router separation (local regression passed; TCP model coverage pending)
-
-The TCP concrete entry keeps8 methods plus its three decorated callbacks, main
-and service guard. Causal capacity/reservations (12 methods and the distinct
-slotted record) and backend HTTP/generation retry lifetime (9 methods) each have
-one method-only component. There are no new queues, tasks, constructors or
-ownership authorities. The complete29-method/record/module reconstruction and
-exact import-owner/global-binding proof pass; native app registration and the
-original aiohttp/send_application_final patch sites remain at the root. Neither
-helper imports the root back; fresh -m startup registers each callback once.
-Local Router and pinned legacy policy bodies are unchanged.
-
-Original15 tests pass without editing their source. New22 cases include12
-destructive mutations, record aliases/annotations/old pickle paths, fresh lazy
-helper/service entry, streaming/backend failure cleanup, close/ready cancellation,
-capacity rejection and actual ASGI callback dispatch with causal sample retirement.
-An initial new fixture used unsupported protocol0 for a slotted instance; the
-unchanged record requires protocol>=2. The corrected fixture preserves that
-TypeError and tests historical class/instance paths with protocols0/2. No runtime
-workaround or original assertion change occurred. See frontend evidence JSON.
-The final focused37 pass and an independent37/37 rerun gives code audit GO.
-Full gates pass208 frontend+503 engine+2 subtests (713 JUnit records),738 native
-H100-host tests+2 subtests (740 records), and2 actual H100 DMA roundtrips.
-Nine model/TP launch plans also match. The frozen local nonregression comparison
-remains pending and cannot certify a TCP model run; later representative TCP
-model-path coverage and all Scheduler/control-plane/config/launcher/final work
-remain open.
-
-The subsequent frozen local regression passes300.855+1200.000 seconds:
-Decode11203.87 token/s (−0.54% versus ORIGINAL baseline), Prefill75023.20,
-6660 completions,0 failures,100% reuse, scoped memory events0 and empty GPU/
-port/helper final gates. Both owned controllers are independently confirmed
-gone. Ownership event sets match12054 P2D Host and21362 D2P Direct snapshots;
-all10 measured D2P Host durables restore/release,138 only-drain durables are
-documented separately. Tail sampled liveness progress1294413 spans116.169 seconds
-inside the final120-second interval; the separate harness rolling counter is
-1319512. The original measurement code is unchanged. This is local nonregression
-acceptance only; actual TCP model-path representative coverage remains required.
-
-## Scheduler workset acceptance and remaining component extraction
-
-The workset lease/broker stage passed the complete300.601+1200.000-second
-BrowseComp regression at commit2dbb67ccc5c4c2a61a00440efe58831b08d1c08c:
-Decode11207.29 token/s (−0.51% versus ORIGINAL baseline), Prefill74549.10,
-6654 completions,100% reuse, zero failures/OOM and empty final GPU/port/helper
-gates. Ownership sets match11413 P2D snapshots across all five stages and21370
-D2P Direct snapshots;143 Host durables match source releases,11 measured
-restores/releases and132 only-drain durables are explicitly distinguished.
-
-The next maintained extraction separates20 Direct,15 TP and15 ready-workset
-methods, plus four ownership implementations behind explicit native wrappers.
-Original signatures, eager record identity, class dispatch and all mixed native
-methods reconstruct exactly; there is no new owner, worker, queue or fence.
-Eight invariants retain their original transitions: P source release follows
-P2D completion/durable, D release follows D2P completion/durable, Host release
-follows consumer fence, and TP decisions and abort/timeout/cancel/shutdown paths
-retain their complete original bodies. Independent audit and native fault gates
-remain required before GPU validation; CPU766-record pass is not performance
-acceptance. Full TCP model coverage and later cleanup stages remain open.
-
-Formal components gates pass766 CPU records and969 real-kernel native/fault
-records (967 ordinary+2 subtests), no failures/errors/skips. The first native
-run's one barrier fixture failure is retained; only two defining-module patch
-targets and an import were corrected, with original-test AST reconstruction.
-Independent portable36-case rerun passes. There is no changed production barrier
-or weakened assertion. Snapshot and nine model/TP launch-plan checks also pass.
-
-Scheduler components subsequently pass the complete300.588+1200.012-second
-BrowseComp comparison: Decode11238.17 token/s, −0.24% versus ORIGINAL baseline;
-Prefill74979.20,100% parent reuse, no execution failure/OOM and empty final
-GPU/port/helper gates. Independent ownership/full-request/cleanup audit accepts
-this local TP1 regression, not actual TCP/TP2/hybrid model coverage.
-
-## Control-plane dependency boundaries
-
-Local Router consumers now share a five-binding local_dependencies module.
-Maintained imports reference the existing pure agentic_host_ledger and the new
-p2d_host_protocol containing only two unchanged wire keys and the unchanged ID
-helper. Public worker aliases retain historical import/pickle paths; the helper
-naturally belongs to the pure protocol. No state, policy, queue, ownership or
-physical-transfer implementation moves into the Router. Only the historical
-private file-package may fall back to its selected old worker modules, and only
-for an exact missing requested leaf; nested/parent/import/runtime errors propagate.
-
-verify_dualpd_control_dependencies.py locks the entire four consumer modules,
-complete worker and protocol, import timing and reviewed bridge againsta550.
-Existing Host/Scheduler/Router reconstruction proofs remain active. Nine portable
-dependency tests and three destructive-proof test groups are in the CPU gate;
-two additional native tests cover actual public aliases/pickle and a genuinely
-missing-leaf legacy overlay. The first legacy test incorrectly assumed a
-namespace package has __file__; its fixture now checks the exact sole resolved
-__path__, retaining all native-namespace/object/source checks and the initial
-failed report. Full CPU passes813 JUnit records with zero failures/errors/skips.
-Final native, independent code audit, actual CUDA and fresh300+1200 acceptance
-remain separate gates. No representative TCP or hybrid model run is claimed.
-
-Final native r2 passes1018 JUnit records (981 ordinary+37 subtests), including
-all prior969 record names and all new import/mutation/real-legacy cases; no
-failures/errors/skips. Independent code audit returns GO bound to runtime bundle
-34823ae87f11255a661a85dcfdda82a7e8a304fce208457573b6a2a6eaf46b0c.
-Actual DMA and model comparison still require their own recorded results.
-
-The two actual H100 registered/bounce D2H→H2D roundtrips subsequently pass2/2
-without skips. The frozen BrowseComp model comparison is next, not yet accepted.
+`dualpd-source-map.json`, `router-source-map.json` and
+`tools/verify_dualpd_*.py` retain provenance and exact equivalence checks for
+particular historical extraction stages. Later reviewed changes, including
+Host observation registration, can invalidate those frozen comparisons. They
+are not a current-release test suite and are not expected to certify the current
+tree. Do not weaken their historical assertions to manufacture a passing gate.
+Older development narratives and internal experiment records are available in
+Git history rather than presented as current installation or validation steps.
